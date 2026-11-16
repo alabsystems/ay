@@ -598,7 +598,7 @@ pub fn authenticate_premise_clauses_strict_with_context_and_progress(
         GenericTheoryDeferral::Reject,
         progress,
     )?;
-    debug_assert!(deferred_generic.is_empty());
+    debug_assert_eq!(deferred_generic, []);
     Ok(AuthenticatedPremiseClauses { derived_clauses })
 }
 
@@ -643,7 +643,7 @@ pub fn authenticate_premise_clauses_strict_with_typed_context_and_progress(
         GenericTheoryDeferral::Reject,
         progress,
     )?;
-    debug_assert!(deferred_generic.is_empty());
+    debug_assert_eq!(deferred_generic, []);
     Ok(AuthenticatedPremiseClauses { derived_clauses })
 }
 
@@ -813,7 +813,7 @@ pub fn check_proof_strict_with_context_and_progress(
         GenericTheoryDeferral::Reject,
         progress,
     )?;
-    debug_assert!(deferred_generic.is_empty());
+    debug_assert_eq!(deferred_generic, []);
     ensure_terminal_empty_clause(&derived_clauses)?;
     Ok(quality)
 }
@@ -838,7 +838,7 @@ pub fn check_proof_strict_with_typed_context_and_progress(
         GenericTheoryDeferral::Reject,
         progress,
     )?;
-    debug_assert!(deferred_generic.is_empty());
+    debug_assert_eq!(deferred_generic, []);
     ensure_terminal_empty_clause(&derived_clauses)?;
     Ok(quality)
 }
@@ -1975,7 +1975,7 @@ const CLAUSE_IDENTITY_WORK_FACTOR: usize = 8;
 /// the multiplier is at least `log2(n) + 1` there and the product is at least
 /// `n`; `n = 0` maps to `0`, which is correct — there is nothing to sort.
 fn comparison_sort_bound(n: usize) -> usize {
-    let bits = (usize::BITS - n.leading_zeros()) as usize;
+    let bits = n.bit_width() as usize;
     n.saturating_mul(bits.saturating_add(1))
 }
 
@@ -2390,7 +2390,7 @@ fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> Semantic
 /// without descending into argument subterms. This grants no proof authority:
 /// unproven `TermId`-identity bounds stay `General` with tree-unfolded charge;
 /// add routes only when their strict validator has an equivalent DAG bound.
-
+///
 /// The three components of one step's up-front strict charge, kept apart so
 /// the `--probe-strict-check` charge census can say WHICH of them a walk spent
 /// its envelope on. `total` is what the meter is debited.
@@ -2703,11 +2703,11 @@ fn validate_strict_steps_with_context(
 // The optional retained path changes only how the already-prepaid ordinary BV
 // steps are discharged. All other strict checks and terminal proof obligations
 // remain shared with the legacy entry points.
-fn validate_strict_steps_with_retained<'proof, 'wire>(
+fn validate_strict_steps_with_retained<'proof>(
     proof: &'proof Proof,
     context: StrictProofContext<'proof>,
     generic_theory_deferral: GenericTheoryDeferral,
-    retained_request: Option<retained::Request<'wire>>,
+    retained_request: Option<retained::Request<'_>>,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(StrictValidationArtifacts, retained::Output), ProofCheckError> {
     validate_strict_steps_with_evidence(
@@ -2720,11 +2720,11 @@ fn validate_strict_steps_with_retained<'proof, 'wire>(
     )
 }
 
-fn validate_strict_steps_with_evidence<'proof, 'wire>(
+fn validate_strict_steps_with_evidence<'proof>(
     proof: &'proof Proof,
     context: StrictProofContext<'proof>,
     generic_theory_deferral: GenericTheoryDeferral,
-    retained_request: Option<retained::Request<'wire>>,
+    retained_request: Option<retained::Request<'_>>,
     fp_steps: Option<&native_fp::ValidatedSteps<'proof>>,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(StrictValidationArtifacts, retained::Output), ProofCheckError> {

@@ -49,7 +49,7 @@ fn with_context() -> SerializableProofBundle {
 fn compare(
     bundle: &SerializableProofBundle,
 ) -> Result<HashMap<String, &'static str>, ProofCheckError> {
-    let old = crate::bundle::preflight_bundle_legacy(bundle);
+    let old = preflight_bundle_legacy(bundle);
     let new = preflight_bundle_with_progress(bundle, &mut |_, _| true);
     assert_eq!(old.is_ok(), new.is_ok(), "old={old:?}, new={new:?}");
     if let (Ok(old), Ok(new)) = (&old, &new) {

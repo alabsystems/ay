@@ -124,7 +124,9 @@ fn original_deadline_is_checked_before_prepayment_issuance_and_finish() {
         Err(BvCreditError::Refused)
     ));
     let mut credits = prepaid(&proof, &terms);
-    drop(credits.take(ProofId(0), &mut |_, _| true).unwrap());
+    {
+        let _credit = credits.take(ProofId(0), &mut |_, _| true).unwrap();
+    }
     credits.control.deadline = Instant::now();
     assert_eq!(credits.finish(), Err(BvCreditError::Deadline));
 }

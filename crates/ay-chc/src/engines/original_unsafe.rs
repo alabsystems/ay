@@ -83,10 +83,7 @@ fn eligible(
     }
     // Existing syntactic graph analysis; no fresh theory classification or
     // rewrite of the original clauses/signatures is needed for eligibility.
-    if !problem.has_cycles() || !owner.open() || Instant::now() >= probe_deadline {
-        return false;
-    }
-    true
+    problem.has_cycles() && owner.open() && Instant::now() < probe_deadline
 }
 
 #[cfg(test)]

@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn test_minimize_classify_empty() {
         let result = run_and_compare(&[], &[], &[], &[], &[], 5);
-        assert!(result.is_empty());
+        assert_eq!(result.as_slice(), &[] as &[u8]);
     }
 
     #[test]

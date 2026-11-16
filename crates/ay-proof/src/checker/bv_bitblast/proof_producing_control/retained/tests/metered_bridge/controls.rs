@@ -64,7 +64,7 @@ fn every_metered_callback_including_wire_and_restricted_subsetup_is_terminal() {
 #[test]
 fn all_five_absolute_deadlines_stop_before_lowering_or_callback() {
     let (terms, clause) = tiny();
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for operation in [Operation::Capture, Operation::Replay] {
         for expired in 0..5 {
             let end = deadline();
@@ -176,9 +176,7 @@ fn typed_control_keeps_nested_stops_and_caught_callback_panics_sticky() {
     let calls = Cell::new(0);
     let mut callback = || {
         calls.set(calls.get() + 1);
-        if calls.get() == 2 {
-            panic!("caught typed callback panic");
-        }
+        assert!(calls.get() != 2, "caught typed callback panic");
         true
     };
     let result: Result<(), MeteredBridgeError> =

@@ -22,9 +22,8 @@ impl FpSolver<'_> {
             return Ok(result);
         }
         let mut lz = self.const_bv(n as u64, result_width);
-        for i in 0..n {
+        for (i, &bit) in bits.iter().enumerate() {
             self.conversion_poll(control)?;
-            let bit = bits[i];
             let count = n - 1 - i;
             let count_bv = self.const_bv(count as u64, result_width);
             lz = self.make_ite_bits(bit, &count_bv, &lz);

@@ -185,10 +185,11 @@ mod unix_tests {
             .filter(|trial| !before_main(trial))
             .filter(|trial| trial.stdout != "unknown\n" || trial.code != Some(124))
             .collect();
+        let wrong_delays_us: Vec<u64> = wrong.iter().map(|trial| trial.delay_us).collect();
         assert!(
             wrong.is_empty(),
             "{extra:?}: a SIGTERM after main must be answered by exactly one `unknown` and \
-             exit 124; wrong trials: {wrong:#?}"
+             exit 124; wrong delays (us): {wrong_delays_us:?}; wrong trials: {wrong:#?}"
         );
         let answered = trials.iter().filter(|trial| !before_main(trial)).count();
         assert!(

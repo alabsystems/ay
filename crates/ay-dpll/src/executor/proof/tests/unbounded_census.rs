@@ -13,7 +13,7 @@ use ay_core::{AletheRule, Proof, ProofStep};
 use ay_frontend::parse;
 
 use crate::executor::proof_repair::proof_trust_surgery_surface_audit::{
-    surface_source_work, surface_source_work_probe, SurfaceSourceRefusal,
+    surface_source_work, surface_source_work_probe_as, SurfaceSourceRefusal, SurfaceWorkModel,
 };
 use crate::executor::proof_trust_surgery_provenance::{
     canonical_term_work, canonical_term_work_refusal, CanonicalWorkRefusal,
@@ -44,7 +44,7 @@ fn the_source_probe_agrees_with_the_option_view_and_names_the_bound() {
         vec![FrontendTerm::Symbol("p".to_string()); 8],
     );
     assert!(surface_source_work(&bounded).is_some());
-    assert!(surface_source_work_probe(&bounded).is_ok());
+    assert!(surface_source_work_probe_as(&bounded, SurfaceWorkModel::PerSubtree).is_ok());
 
     // 20_000 leaves under one `and`: past MAX_SURFACE_NODES, so `Nodes`.
     let wide = FrontendTerm::App(
@@ -53,7 +53,7 @@ fn the_source_probe_agrees_with_the_option_view_and_names_the_bound() {
     );
     assert!(surface_source_work(&wide).is_none());
     assert_eq!(
-        surface_source_work_probe(&wide),
+        surface_source_work_probe_as(&wide, SurfaceWorkModel::PerSubtree),
         Err(SurfaceSourceRefusal::Nodes)
     );
 
@@ -64,7 +64,7 @@ fn the_source_probe_agrees_with_the_option_view_and_names_the_bound() {
     }
     assert!(surface_source_work(&deep).is_none());
     assert_eq!(
-        surface_source_work_probe(&deep),
+        surface_source_work_probe_as(&deep, SurfaceWorkModel::PerSubtree),
         Err(SurfaceSourceRefusal::Depth)
     );
 }

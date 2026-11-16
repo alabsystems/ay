@@ -18,7 +18,7 @@ impl Executor {
         cache: &mut HashMap<TermId, TermId>,
         control: &Control<'_>,
     ) -> Result<Option<TermId>, UnknownOrigin> {
-        control.phase(Some(terms), FpEvalPhase::Concretize(term_id))?;
+        control.phase(Some(terms), FpEvalPhase::Concretize)?;
         let result = (|| {
             if let Some(&cached) = cache.get(&term_id) {
                 return Ok(Some(cached));

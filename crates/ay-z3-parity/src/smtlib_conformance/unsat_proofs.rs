@@ -19,9 +19,6 @@ const CARCARA_ROLE: &str = "independent strict Alethe proof parser and semantic 
 // Resolved at runtime: $CARCARA_PATH, else ~/.cargo/bin/carcara. A literal
 // developer home path here is forbidden content for the public export.
 const CARCARA_DEFAULT_RELATIVE: &str = ".cargo/bin/carcara";
-pub(super) const CARCARA_VERSION_OUTPUT: &str = "carcara 1.1.0 [git master 9a352ee]";
-pub(super) const CARCARA_SHA256: &str =
-    "edd0457d7eb71132ac505297ad493c3b0b3a52e9938108d9b365157277bd2bdf";
 const MAX_RETAINED_PROOF_BYTES: u64 = 1024 * 1024;
 
 const FOREIGN_PROBLEM: &str = "(set-logic QF_UF)\n\
@@ -577,6 +574,10 @@ fn normalize_diagnostic_rows(
     paths: &current_abi::StagingPaths,
 ) -> Result<(), String> {
     for row in rows {
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = ".proof is an exact row-ID schema token, not a filesystem extension"
+        )]
         if row.id.starts_with("fixture.") && row.id.ends_with(".proof") {
             continue;
         }
@@ -1422,6 +1423,26 @@ mod tests {
         normalize_diagnostic_rows(&mut rows, &paths).expect("normalize diagnostics");
         assert_eq!(rows, vec![original]);
         assert_eq!(rows[0].stdout.as_deref(), Some(proof.as_str()));
+    }
+
+    #[test]
+    fn uppercase_proof_suffix_does_not_take_row_schema_exemption() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let proof = format!(
+            "; literal {}\n(step t0 (cl) :rule false)\n",
+            directory.path().join("artifact").display()
+        );
+        let capture = completed_capture(FIXTURES[0].expected_stdout, String::new(), 0);
+        let mut row = proof_fixture_row(FIXTURES[0], &capture, Some(proof.as_bytes()));
+        row.id = row.id.replace(".proof", ".PROOF");
+        let paths = current_abi::StagingPaths::new(&[(directory.path(), "@UNSAT_FIXTURES@")])
+            .expect("owned paths");
+        normalize_diagnostic_rows(std::slice::from_mut(&mut row), &paths)
+            .expect("normalize diagnostics");
+        assert_eq!(row.id, format!("fixture.{}.PROOF", FIXTURES[0].id));
+        let stdout = row.stdout.as_deref().unwrap();
+        assert!(stdout.contains("@UNSAT_FIXTURES@/artifact"));
+        assert!(!stdout.contains(directory.path().to_str().unwrap()));
     }
 
     #[test]

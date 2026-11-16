@@ -83,7 +83,7 @@ impl Search<'_, '_> {
             }
         }
         let mut c = self.power(nonresidue, odd)?;
-        let mut r = self.power(value, (odd + 1) / 2)?;
+        let mut r = self.power(value, odd.div_ceil(2))?;
         let inverse = self.inverse(value)?;
         for i in 1..s {
             let square = self.mul(r, r)?;
@@ -162,7 +162,7 @@ impl Search<'_, '_> {
         self.pay(1, 0)?;
         if constraints.len() == constraints.capacity() {
             let capacity = constraints.capacity().max(2).checked_mul(2)?;
-            self.pay(0, capacity.checked_mul(std::mem::size_of::<Constraint>())?)?;
+            self.pay(0, capacity.checked_mul(size_of::<Constraint>())?)?;
             constraints
                 .try_reserve_exact(capacity - constraints.len())
                 .ok()?;
@@ -212,7 +212,7 @@ pub(super) fn witness_with_progress(
     let base = seen
         .len()
         .checked_mul(256)?
-        .checked_add(stack_capacity.checked_mul(std::mem::size_of::<(TermId, bool, usize)>())?)?;
+        .checked_add(stack_capacity.checked_mul(size_of::<(TermId, bool, usize)>())?)?;
     if !control(0, base) {
         return None;
     }
@@ -288,8 +288,9 @@ pub(super) fn witness_with_progress(
                 }
                 for i in 1..args.len() {
                     let left = search.polynomial(args[i], 0)?;
-                    for j in 0..if equal { 1 } else { i } {
-                        let right = search.polynomial(args[j], 0)?;
+                    let bound = if equal { 1 } else { i };
+                    for &arg in &args[..bound] {
+                        let right = search.polynomial(arg, 0)?;
                         let poly = std::array::from_fn(|k| search.sub(left[k], right[k]));
                         search.push(
                             &mut constraints,
@@ -356,7 +357,7 @@ pub(super) fn witness_with_progress(
         }
         for value in 0..excluded.checked_add(1)?.min(field.modulus()) {
             if search.satisfies(&constraints, value)? {
-                search.pay(0, std::mem::size_of::<(TermId, u32, FiniteFieldSort)>())?;
+                search.pay(0, size_of::<(TermId, u32, FiniteFieldSort)>())?;
                 return Some(Candidate::Model(vec![(variable, value, field)]));
             }
         }
@@ -364,7 +365,7 @@ pub(super) fn witness_with_progress(
     };
     for value in candidates.into_iter().take(count) {
         if search.satisfies(&constraints, value)? {
-            search.pay(0, std::mem::size_of::<(TermId, u32, FiniteFieldSort)>())?;
+            search.pay(0, size_of::<(TermId, u32, FiniteFieldSort)>())?;
             return Some(Candidate::Model(vec![(variable, value, field)]));
         }
     }

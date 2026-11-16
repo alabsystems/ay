@@ -74,13 +74,12 @@ impl AletheDocumentScan {
                     }
                 }
             }
-            Some("step") => {
+            Some("step")
                 if head
                     .get(1)
-                    .is_some_and(|id| self.anchors.last() == Some(id))
-                {
-                    self.anchors.pop();
-                }
+                    .is_some_and(|id| self.anchors.last() == Some(id)) =>
+            {
+                self.anchors.pop();
             }
             _ => {}
         }

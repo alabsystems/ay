@@ -25,9 +25,9 @@ mod truncating;
 mod value;
 pub(crate) use value::Value;
 
-pub use truncating::truncating_rem;
+pub(crate) use truncating::truncating_rem;
 
-pub use ops::{
+pub(crate) use ops::{
     abs, add, div, fma, max, min, mul, neg, rem, round_to_integral, sqrt, sub, to_fp_from_fp,
     to_fp_from_rational, to_real, to_sbv, to_ubv,
 };
@@ -237,19 +237,19 @@ fn order(a: &Val, b: &Val) -> Option<Ordering> {
 }
 
 /// `fp.eq`: IEEE equality, false on NaN, `-0 == +0`.
-pub fn fp_eq(a: &Value, b: &Value) -> Option<bool> {
+pub(crate) fn fp_eq(a: &Value, b: &Value) -> Option<bool> {
     same_format(&[a, b])?;
     Some(order(&decode(a), &decode(b)) == Some(Ordering::Equal))
 }
 
 /// `fp.lt`, false on NaN.
-pub fn fp_lt(a: &Value, b: &Value) -> Option<bool> {
+pub(crate) fn fp_lt(a: &Value, b: &Value) -> Option<bool> {
     same_format(&[a, b])?;
     Some(order(&decode(a), &decode(b)) == Some(Ordering::Less))
 }
 
 /// `fp.leq`, false on NaN.
-pub fn fp_leq(a: &Value, b: &Value) -> Option<bool> {
+pub(crate) fn fp_leq(a: &Value, b: &Value) -> Option<bool> {
     same_format(&[a, b])?;
     Some(matches!(
         order(&decode(a), &decode(b)),
@@ -259,13 +259,13 @@ pub fn fp_leq(a: &Value, b: &Value) -> Option<bool> {
 
 /// SMT-LIB `=` on two FloatingPoint values: identity of the sort's elements
 /// (one NaN; `-0` and `+0` distinct).
-pub fn same_element(a: &Value, b: &Value) -> Option<bool> {
+pub(crate) fn same_element(a: &Value, b: &Value) -> Option<bool> {
     same_format(&[a, b])?;
     Some(decode(a) == decode(b))
 }
 
 /// One of the seven classification predicates, by SMT-LIB name.
-pub fn classify(name: &str, v: &Value) -> Option<bool> {
+pub(crate) fn classify(name: &str, v: &Value) -> Option<bool> {
     let f = Fmt::of(v)?;
     let x = decode(v);
     let normal_bound = pow2(f.emin());
@@ -285,7 +285,7 @@ pub fn classify(name: &str, v: &Value) -> Option<bool> {
 
 /// Decode `(eb, sb)` IEEE fields given as integers: the value of the `fp`
 /// constructor and of the one-argument `to_fp` over a bit pattern.
-pub fn from_ieee_bits(bits: &BigInt, eb: u32, sb: u32) -> Option<Value> {
+pub(crate) fn from_ieee_bits(bits: &BigInt, eb: u32, sb: u32) -> Option<Value> {
     Fmt::checked(eb, sb)?;
     Value::from_ieee_bv(bits, eb, sb)
 }

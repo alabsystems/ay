@@ -155,7 +155,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     fn propagation_is_unmapped(
         &mut self,
         propagation: &TheoryPropagation,
-        ctx: &dyn ay_sat::SolverContext,
+        ctx: &dyn SolverContext,
     ) -> bool {
         if self.var_for_term(propagation.literal.term).is_some() {
             return false;

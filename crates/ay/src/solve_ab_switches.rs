@@ -183,8 +183,6 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     chc_dump_scalarized: Option<String>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    chc_dump_failed_replay_obligation: Option<String>,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     chc_checksat_dump: Option<String>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     chc_pdr_dump: Option<String>,

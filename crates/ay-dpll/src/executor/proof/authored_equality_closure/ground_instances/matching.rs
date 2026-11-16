@@ -4,7 +4,7 @@
 
 //! Binder tuples for the instance-seeded closure: ground applications of the
 //! authored roots (outside every binder) matched against the applications of
-//! a universal's body. Pure hints: `validate_forall_inst` re-derives every
+//! a universal's body. Pure hints: `validate_forall_inst_with_progress` re-derives every
 //! substitution the closure emits.
 
 use super::*;

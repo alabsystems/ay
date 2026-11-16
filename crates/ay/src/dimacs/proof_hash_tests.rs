@@ -111,7 +111,7 @@ fn the_writing_thread_copies_proof_bytes_but_never_hashes_them() {
     // capacity, which the buffer passes straight through, then more small ones.
     let mut sizes = vec![41; 20_000];
     sizes.push(PROOF_OUTPUT_BUFFER_CAPACITY * 2 + 3);
-    sizes.extend([13; 40_000]);
+    sizes.extend(std::iter::repeat_n(13, 40_000));
     let pieces = pieces_of(&sizes);
     let total: u64 = pieces.iter().map(|piece| piece.len() as u64).sum();
     for fault in [ProofHashFault::None, ProofHashFault::NoWorker] {

@@ -11,6 +11,7 @@
 //! only when available.
 
 use ntest::timeout;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -123,14 +124,26 @@ fn maybe_assert_z3_spacer_unsat(case: Canary, path: &Path) {
 #[timeout(60_000)]
 fn rust_horn_bmc_reduced_unsafe_canaries_emit_unsat_and_certificate_9618() {
     let root = repo_root();
+    let scratch = tempfile::tempdir().expect("create isolated rust-horn canary directory");
     for case in CANARIES {
-        let path = root.join(case.rel_path);
+        let source_path = root.join(case.rel_path);
         assert!(
-            path.is_file(),
+            source_path.is_file(),
             "{}: missing reduced fixture at {}",
             case.id,
-            path.display()
+            source_path.display()
         );
+        let path = scratch.path().join(
+            source_path
+                .file_name()
+                .expect("rust-horn canary fixture has a file name"),
+        );
+        fs::copy(&source_path, &path).unwrap_or_else(|error| {
+            panic!(
+                "{}: copy reduced fixture to isolated directory: {error}",
+                case.id
+            )
+        });
         assert_ay_unsafe_contract(*case, &path);
         maybe_assert_z3_spacer_unsat(*case, &path);
     }

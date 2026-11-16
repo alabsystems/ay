@@ -76,14 +76,15 @@ impl Executor {
         let mut roots = Vec::new();
         let bound = self.independent_gate_query_root_bound()?;
         reserve_counted(&mut roots, bound, scope).ok()?;
-        self.visit_independent_gate_query_roots(
-            || scope.admit(1, 0),
-            |root| {
-                roots.push(root);
-                std::ops::ControlFlow::Continue(())
-            },
-        )
-        .ok()?;
+        let _ = self
+            .visit_independent_gate_query_roots(
+                || scope.admit(1, 0),
+                |root| {
+                    roots.push(root);
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .ok()?;
         // Repeated authored assertions are the same premise, not additional
         // resolution pivots. Keep original order and the SAME paid buffer.
         let mut seen = ay_core::kani_compat::DetHashMap::default();
@@ -136,10 +137,10 @@ impl Executor {
             kind: TheoryLemmaKind::FpGroundEval,
             lia: None,
         });
-        premises.push(ay_core::ProofId(0));
+        premises.push(ProofId(0));
         for &root in &roots {
             scope.admit(1, 0).ok()?;
-            let assumption = ay_core::ProofId(u32::try_from(steps.len()).ok()?);
+            let assumption = ProofId(u32::try_from(steps.len()).ok()?);
             steps.push(ProofStep::Assume(root));
             premises.push(assumption);
         }
@@ -207,7 +208,7 @@ impl Executor {
         let plans = ay_core::kani_compat::DetHashMap::default();
         authored
             .iter()
-            .take(super::MAX_CANDIDATE_CHECKS)
+            .take(MAX_CANDIDATE_CHECKS)
             .find_map(|&root| self.build_fp_instance_refutation(&authored, &plans, root))
     }
 

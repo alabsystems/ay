@@ -44,14 +44,14 @@ pub(crate) struct DivLemma {
 }
 
 /// The row's zero and one words of `2m` bits.
-pub(crate) fn zero_one(p: &mut Proof, m: u32) -> (T, T) {
+pub(crate) fn zero_one(p: &mut Proof<'_>, m: u32) -> (T, T) {
     let zm = p.t.lit(bits::zero(m));
     let onem = p.t.lit(bits::from_u64(1, m));
     (p.t.concat(&[zm, zm]), p.t.concat(&[zm, onem]))
 }
 
 /// `(= ((_ extract n-1 n-1) w) #b1)`.
-pub(crate) fn top_set(p: &mut Proof, w: T) -> T {
+pub(crate) fn top_set(p: &mut Proof<'_>, w: T) -> T {
     let n = p.t.width(w);
     let x = p.t.extract(n - 1, n - 1, w);
     let b1 = p.t.lit(vec![true]);
@@ -59,7 +59,7 @@ pub(crate) fn top_set(p: &mut Proof, w: T) -> T {
 }
 
 /// The zero test of `y`'s bits as the checker's divider spells it.
-pub(crate) fn zero_test(p: &mut Proof, y: T) -> T {
+pub(crate) fn zero_test(p: &mut Proof<'_>, y: T) -> T {
     let ff = p.t.ff;
     let tests: Vec<T> = p.t.bits(y).iter().map(|&b| p.t.eq(b, ff)).collect();
     p.t.and(&tests)
@@ -85,7 +85,7 @@ struct Words {
 }
 
 impl Words {
-    fn new(p: &mut Proof, m: u32, x: T, y: T) -> Self {
+    fn new(p: &mut Proof<'_>, m: u32, x: T, y: T) -> Self {
         let n = 2 * m;
         let q = p.t.mk(Op::Udiv, &[x, y]);
         let r = p.t.mk(Op::Urem, &[x, y]);
@@ -128,7 +128,7 @@ impl Words {
 }
 
 impl DivLemma {
-    pub(crate) fn new(p: &mut Proof, m: u32, dstage: &DivStage, prefix: &str) -> Option<Self> {
+    pub(crate) fn new(p: &mut Proof<'_>, m: u32, dstage: &DivStage, prefix: &str) -> Option<Self> {
         let n = 2 * m;
         let x = p.t.var(&format!("{prefix}x"), Sort::Bv(n));
         let y = p.t.var(&format!("{prefix}y"), Sort::Bv(n));
@@ -148,14 +148,14 @@ impl DivLemma {
 
     /// The instance at the words `x`, `y` split into its clause
     /// `(cl (not (not YZ)) (and E U TOP ZERO))`.
-    pub(crate) fn split_instance(&self, p: &mut Proof, x: T, y: T) -> Option<S> {
+    pub(crate) fn split_instance(&self, p: &mut Proof<'_>, x: T, y: T) -> Option<S> {
         let i = instantiate(p, self.fact, &[x, y])?;
         Some(split_or(p, i))
     }
 
     /// The conjuncts `(cl E)`, `(cl U)`, `(cl TOP)`, `(cl ZERO)` of a split
     /// instance given the step `(cl (not YZ))` of its divisor's zero test.
-    pub(crate) fn conjuncts(p: &mut Proof, split: S, nz: S) -> Option<[S; 4]> {
+    pub(crate) fn conjuncts(p: &mut Proof<'_>, split: S, nz: S) -> Option<[S; 4]> {
         let conj = *p.clause(split).last()?;
         let c = p.derive(&[conj], &[Prem::Step(split), Prem::Step(nz)], &[])?;
         Some([
@@ -168,7 +168,7 @@ impl DivLemma {
 }
 
 /// Under `(not YZ)` (the step `h`), the step `(cl (and E U TOP ZERO))`.
-fn prove(p: &mut Proof, dstage: &DivStage, w: &Words, h: S) -> Option<S> {
+fn prove(p: &mut Proof<'_>, dstage: &DivStage, w: &Words, h: S) -> Option<S> {
     let n = dstage.n;
     let tt = p.t.tt;
     let (xb, yb) = (p.t.bits(w.x), p.t.bits(w.y));
@@ -184,7 +184,7 @@ fn prove(p: &mut Proof, dstage: &DivStage, w: &Words, h: S) -> Option<S> {
     let br = eq_step(p, w.r, rw, "bitblast_urem", &[]);
     // under `(not YZ)` the divider's words are the stage-0 words
     let (q0w, r0w) = (p.t.bb(&q0), p.t.bb(&r0));
-    let same = |p: &mut Proof, out: &[T], stage: &[T]| -> Option<Vec<S>> {
+    let same = |p: &mut Proof<'_>, out: &[T], stage: &[T]| -> Option<Vec<S>> {
         (0..n as usize)
             .map(|i| {
                 let e = p.t.eq(out[i], stage[i]);
@@ -230,7 +230,7 @@ fn prove(p: &mut Proof, dstage: &DivStage, w: &Words, h: S) -> Option<S> {
 /// Under `(not YZ)`: `(cl (or (not XZ) QZ))`. With every dividend bit false,
 /// the first stage's comparison `x < y` holds (the divisor is not zero), and
 /// that stage's quotient is `(ite xlt false ..)` bit for bit.
-fn zero_dividend(p: &mut Proof, w: &Words, quot: &[T], bq: S, h: S) -> Option<S> {
+fn zero_dividend(p: &mut Proof<'_>, w: &Words, quot: &[T], bq: S, h: S) -> Option<S> {
     let (tt, ff) = (p.t.tt, p.t.ff);
     let (xb, yb) = (p.t.bits(w.x), p.t.bits(w.y));
     let stages = udiv_stages(&mut p.t, &xb, &yb);
@@ -284,7 +284,7 @@ fn zero_dividend(p: &mut Proof, w: &Words, quot: &[T], bq: S, h: S) -> Option<S>
 /// Under `(not YZ)`: `(cl (or (not QT) (and YONE XT)))`. The top quotient bit
 /// is `(ite xlt false ..)` at every stage down to the deepest, whose
 /// comparison of `[x_{n-1}, 0..]` with `y` succeeds only for `y <= x_{n-1}`.
-fn top_bit(p: &mut Proof, w: &Words, quot: &[T], bq: S, h: S) -> Option<S> {
+fn top_bit(p: &mut Proof<'_>, w: &Words, quot: &[T], bq: S, h: S) -> Option<S> {
     let n = quot.len();
     let (tt, ff) = (p.t.tt, p.t.ff);
     let (xb, yb) = (p.t.bits(w.x), p.t.bits(w.y));

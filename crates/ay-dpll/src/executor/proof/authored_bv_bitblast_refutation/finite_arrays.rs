@@ -36,15 +36,9 @@ impl Executor {
                     // branch may turn the old broad-frame decline into a blast.
                     match self.ctx.terms.get(term) {
                         TermData::App(Symbol::Named(op), args)
-                            if op == "const-array" && args.len() == 1 =>
-                        {
-                            ()
-                        }
+                            if op == "const-array" && args.len() == 1 => {}
                         TermData::App(Symbol::Named(op), args)
-                            if op == "store" && args.len() == 3 =>
-                        {
-                            ()
-                        }
+                            if op == "store" && args.len() == 3 => {}
                         _ => return false,
                     }
                 }

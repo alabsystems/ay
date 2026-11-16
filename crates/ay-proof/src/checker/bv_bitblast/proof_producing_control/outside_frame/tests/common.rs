@@ -79,10 +79,10 @@ fn common_writes(malformed: bool, wrong_value: bool) -> TestResult<Fixture> {
 #[test]
 fn combined_memory_validation_checks_even_overwritten_common_values() -> TestResult<()> {
     let valid = common_writes(false, false)?;
-    super::super::super::validate(&valid.terms, &[valid.clause], &mut || Ok(())).unwrap();
+    validate(&valid.terms, &[valid.clause], &mut || Ok(())).unwrap();
     for (malformed, wrong) in [(true, false), (false, true)] {
         let f = common_writes(malformed, wrong)?;
-        assert!(super::super::super::validate(&f.terms, &[f.clause], &mut || Ok(())).is_err());
+        assert!(validate(&f.terms, &[f.clause], &mut || Ok(())).is_err());
     }
     Ok(())
 }
@@ -90,7 +90,7 @@ fn combined_memory_validation_checks_even_overwritten_common_values() -> TestRes
 #[test]
 fn combined_memory_validation_honors_cancellation() -> TestResult<()> {
     let f = common_writes(false, false)?;
-    let result = super::super::super::validate(&f.terms, &[f.clause], &mut || {
+    let result = validate(&f.terms, &[f.clause], &mut || {
         Err(ProofCheckError::ResourceLimit)
     });
     assert_eq!(result, Err(Failure::Cancelled));

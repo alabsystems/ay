@@ -920,6 +920,13 @@ const RETAIN_WRONG_RESERVED_ROWS: usize = 8;
 /// while leaving 96 MiB of the 256 MiB total for unvalidated noise.
 const RETAIN_WRONG_RESERVED_BYTES: u64 = 160 * 1024 * 1024;
 
+const _: () = {
+    assert!(RETAIN_WRONG_RESERVED_ROWS > 0);
+    assert!(RETAIN_WRONG_RESERVED_ROWS < RETAIN_MAX_ROWS);
+    assert!(RETAIN_WRONG_RESERVED_BYTES > 0);
+    assert!(RETAIN_WRONG_RESERVED_BYTES < RETAIN_MAX_BYTES);
+};
+
 /// What the sweep has kept, and what it refused to keep.
 #[derive(Debug, Default)]
 struct Retention {
@@ -1789,6 +1796,10 @@ mod tests {
         // good proof, refuses the false one, and exits 1. So the only rule that
         // can catch it is "a verdict from a run that did not finish is not a
         // verdict" — delete that rule and this stub passes both probes.
+        #[expect(
+            clippy::literal_string_with_formatting_args,
+            reason = "the shell fixture requires parameter-expansion braces byte-for-byte"
+        )]
         let exit_code_stub = script(
             "stub-verdict-then-exit1.sh",
             "#!/bin/sh\ncase \"${1:-}\" in --version) echo 'veripb 3.0.2'; exit 0 ;; esac\n\
@@ -1975,18 +1986,14 @@ mod tests {
         // Literals, not the constants under test: a bound compared only to
         // itself is satisfied by widening it, which is how two tests in the
         // previous round passed while proving nothing.
-        let largest_admitted_instance: u64 = 40 * 1024 * 1024;
+        let largest_admitted_instance = 40.0_f64 * 1024.0 * 1024.0;
         let observed_artifact_expansion = 1.84_f64;
-        let largest_pair = (largest_admitted_instance as f64 * observed_artifact_expansion) as u64;
+        let largest_pair = (largest_admitted_instance * observed_artifact_expansion) as u64;
         assert!(
             RETAIN_WRONG_RESERVED_BYTES >= largest_pair,
             "the wrong-answer byte reserve ({RETAIN_WRONG_RESERVED_BYTES}) cannot hold one \
              admitted artifact pair ({largest_pair}); unvalidated noise can still crowd out \
              the evidence this lane exists to keep"
-        );
-        assert!(
-            RETAIN_WRONG_RESERVED_BYTES < RETAIN_MAX_BYTES,
-            "the reserve must leave room for unvalidated evidence too"
         );
     }
 
@@ -2048,17 +2055,9 @@ mod tests {
             (opb, pbp)
         };
 
-        // The reserve must EXIST, and this assertion has to be made against a
-        // LITERAL. Every other assertion below is expressed in terms of
-        // `RETAIN_WRONG_RESERVED_ROWS`, so setting it to 0 leaves them all
-        // trivially true: the loop that proves a `Wrong` row still fits would
-        // run zero times. That is the vacuity failure this lane exists to
-        // refuse, reproduced inside its own test.
-        assert!(
-            RETAIN_WRONG_RESERVED_ROWS > 0 && RETAIN_WRONG_RESERVED_BYTES > 0,
-            "there is no reserve: unvalidated noise can consume the entire budget"
-        );
-        assert!(RETAIN_WRONG_RESERVED_ROWS < RETAIN_MAX_ROWS);
+        // The compile-time invariant above keeps both reserve dimensions
+        // positive and below their totals, so the wrong-row loop below cannot
+        // become vacuous while this behavior test exercises the reservation.
 
         // A whole sweep's worth of checker outage, well past the total cap.
         for row in 0..(RETAIN_MAX_ROWS * 4) {

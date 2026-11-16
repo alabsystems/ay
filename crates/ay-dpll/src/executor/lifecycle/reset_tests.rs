@@ -42,9 +42,15 @@ fn direct_reset_revokes_every_query_artifact() {
     assert!(executor.last_model.is_none());
     assert!(executor.last_sat_certificate.is_none());
     assert!(executor.last_lrat_certificate.is_none());
-    assert!(executor.last_proof_rebuild_originals.is_empty());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
-    assert!(executor.last_proof_expanded_let_sources.is_empty());
+    assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
+    assert_eq!(
+        executor.last_proof_expanded_let_sources,
+        [] as [(TermId, usize, String); 0]
+    );
     assert!(executor.pareto_state.is_none());
     assert!(
         executor.infinitesimal_objectives.is_empty(),
@@ -89,10 +95,13 @@ fn command_reset_assertions_revokes_solve_local_authored_windows() {
         .expect("SMT reset-assertions executes")
         .is_none());
 
-    assert!(executor.ctx.assertions.is_empty());
+    assert_eq!(executor.ctx.assertions, [] as [TermId; 0]);
     assert!(executor.self_check_authored_assertions.is_none());
     assert!(executor.independent_gate_authored_assertions.is_none());
-    assert!(executor.independent_gate_query_roots().unwrap().is_empty());
+    assert_eq!(
+        executor.independent_gate_query_roots().unwrap(),
+        [] as [TermId; 0]
+    );
 }
 
 /// `(reset)` rebuilds every executor field that describes a problem, a query or

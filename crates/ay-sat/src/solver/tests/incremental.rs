@@ -703,7 +703,7 @@ fn test_solve_empty_formula_with_active_scope_selector() {
     let result = solver.solve().into_inner();
     match result {
         SatResult::Sat(model) => {
-            assert!(model.is_empty(), "model should contain only user variables");
+            assert_eq!(model.len(), 0, "model should contain only user variables");
         }
         other => panic!("expected SAT, got {other:?}"),
     }

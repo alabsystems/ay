@@ -122,7 +122,7 @@ fn two_ordinary_lemmas_and_all_four_strict_walks_fit_one_original_owner_without_
         .unwrap();
         assert_eq!(quality.total_steps, 4);
         assert_eq!(quality.hole_count, 0);
-        assert!(output.is_empty());
+        assert_eq!(output, []);
         assert!(owner.work > old.0 && owner.bytes > old.1);
         assert_eq!(terms.entries_snapshot(), source);
     }

@@ -25,7 +25,7 @@ fn matching_key_select_replays_from_the_exact_original_array_definition() {
         )));
         assert_source(&f.terms, &f.roots, &proof, conclusion, after);
         let mut missing_source = f.roots.clone();
-        missing_source.remove(0);
+        let _ = missing_source.remove(0);
         assert!(authenticate(&f.terms, &missing_source, &proof).is_err());
     }
 }

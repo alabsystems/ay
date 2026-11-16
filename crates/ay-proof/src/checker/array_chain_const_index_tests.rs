@@ -94,11 +94,9 @@ fn strict_checks(terms: &mut TermStore, clause: &[TermId]) -> bool {
         lia: None,
     });
     let mut premises = vec![ProofId(0)];
-    let mut next_id: u32 = 1;
-    for negated in negations {
+    for (next_id, negated) in (1_u32..).zip(negations) {
         proof.steps.push(ProofStep::Assume(negated));
         premises.push(ProofId(next_id));
-        next_id += 1;
     }
     proof.steps.push(ProofStep::Step {
         rule: AletheRule::Resolution,

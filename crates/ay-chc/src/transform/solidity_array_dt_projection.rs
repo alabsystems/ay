@@ -33,6 +33,10 @@ pub(crate) struct SolidityArrayDtProjector;
 
 /// Result of attempting the Solidity ADT-array projection.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the transformed problem stays inline without an unmetered allocation that changes problem custody"
+)]
 pub(crate) enum SolidityArrayDtProjectionOutcome {
     /// A new problem with at least one predicate argument projected.
     Projected {

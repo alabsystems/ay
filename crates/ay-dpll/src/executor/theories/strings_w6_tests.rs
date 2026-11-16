@@ -79,7 +79,7 @@ fn push_window_respects_the_length_cap() {
     let long: Vec<char> = std::iter::repeat_n('x', MAX_W4_LEN + 1).collect();
     let mut out: Vec<Vec<char>> = Vec::new();
     w6_push_window(&cur, 0, 2, &long, &mut out);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [Vec<char>; 0]);
 }
 
 #[test]

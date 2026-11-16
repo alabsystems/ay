@@ -36,7 +36,7 @@ fn negative_equality(terms: &TermStore, term: TermId) -> Option<TermId> {
     let TermData::Not(eq) = terms.get(term) else {
         return None;
     };
-    equality(terms, *eq)?;
+    let _ = equality(terms, *eq)?;
     Some(*eq)
 }
 
@@ -56,7 +56,7 @@ fn heads(
                 heads.push(literal);
                 heads.push(negative_equality(terms, literal)?);
             }
-            equality(terms, clause[3])?;
+            let _ = equality(terms, clause[3])?;
             heads.push(clause[3]);
             Some((heads, 0))
         }
@@ -84,13 +84,13 @@ fn heads(
             premises,
             args,
         } if clause.len() == 1 && premises.len() == 2 && args.is_empty() => {
-            equality(terms, clause[0])?;
+            let _ = equality(terms, clause[0])?;
             let mut heads = vec![clause[0]];
             for &id in premises {
                 let [literal] = clauses.get(id.0 as usize)?.as_ref()?.as_slice() else {
                     return None;
                 };
-                equality(terms, *literal)?;
+                let _ = equality(terms, *literal)?;
                 heads.push(*literal);
             }
             Some((heads, 0))
@@ -118,7 +118,7 @@ fn heads(
                 let [literal] = clauses.get(id.0 as usize)?.as_ref()?.as_slice() else {
                     return None;
                 };
-                equality(terms, *literal)?;
+                let _ = equality(terms, *literal)?;
                 heads.push(*literal);
             }
             // validate_cong searches the complete premise vector at each

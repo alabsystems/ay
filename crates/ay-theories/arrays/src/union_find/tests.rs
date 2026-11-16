@@ -120,9 +120,9 @@ fn deterministic_across_rebuild() {
     // clear() starts a fresh era.
     let mut uf3 = build();
     uf3.clear();
-    assert!(uf3.merge_log().is_empty());
+    assert_eq!(uf3.merge_log().len(), 0);
     assert!(!uf3.same_class(t(1), t(2)));
-    assert!(uf3.non_singleton_classes().is_empty());
+    assert_eq!(uf3.non_singleton_classes().len(), 0);
 }
 
 /// The explanation edges, viewed as an undirected relation, must connect

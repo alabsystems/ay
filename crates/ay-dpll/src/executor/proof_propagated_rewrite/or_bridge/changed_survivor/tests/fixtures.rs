@@ -16,7 +16,7 @@ pub(super) struct Fixture {
 }
 
 impl Fixture {
-    pub fn recorded() -> Self {
+    pub(super) fn recorded() -> Self {
         let mut terms = TermStore::new();
         let length = terms.mk_var("length", Sort::bitvec(64));
         let fill = terms.mk_var("fill", Sort::bitvec(8));
@@ -116,7 +116,7 @@ impl Fixture {
         }
     }
 
-    pub fn plan(&mut self, target: TermId, budget: usize) -> Option<(Proof, ProofId)> {
+    pub(super) fn plan(&mut self, target: TermId, budget: usize) -> Option<(Proof, ProofId)> {
         let source_set = self.originals.iter().copied().collect();
         let mut cx = PlanCx::new(
             &source_set,
@@ -136,7 +136,7 @@ impl Fixture {
         assert!(cx.eq_in_progress.is_empty());
         if result.is_none() {
             cx.rollback(0);
-            assert!(cx.chain.steps.is_empty());
+            assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
             assert!(cx.clause_memo.is_empty());
             assert!(cx
                 .eq_memo
@@ -146,7 +146,7 @@ impl Fixture {
         result.map(|id| (cx.chain, id))
     }
 
-    pub fn authenticate(&self, proof: &Proof, conclusion: ProofId, target: TermId) {
+    pub(super) fn authenticate(&self, proof: &Proof, conclusion: ProofId, target: TermId) {
         assert!(
             ay_proof::validate_reachable_assumes_in_problem_scope(proof, &self.originals).is_ok()
         );

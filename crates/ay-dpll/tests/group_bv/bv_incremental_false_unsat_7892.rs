@@ -459,7 +459,7 @@ fn qf_ufbv_incremental_rebuild_model_satisfies_congruence_7892() {
 
     // z3-pin: the emitted witness, asserted back into the original formula,
     // must be consistent (z3 says sat).
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         use std::io::Write;
         let pinned = format!(
             "(set-logic QF_UFBV)\n\
@@ -480,7 +480,7 @@ fn qf_ufbv_incremental_rebuild_model_satisfies_congruence_7892() {
         let mut file = std::fs::File::create(&path).expect("create temp smt2");
         file.write_all(pinned.as_bytes()).expect("write temp smt2");
         drop(file);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,

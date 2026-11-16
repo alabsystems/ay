@@ -23,10 +23,11 @@ fn loaded(end: Instant, sibling: &str) -> Executor {
     let mut exec = Executor::new();
     exec.set_term_memory_limit(Some(128 * 1024 * 1024));
     exec.set_deadline(Some(end));
-    assert!(exec
-        .execute_all(&parse(&source).expect("original roots"))
-        .expect("elaboration")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&parse(&source).expect("original roots"))
+            .expect("elaboration"),
+        [] as [String; 0]
+    );
     exec.begin_external_decision_query(false);
     exec.set_deadline(Some(end));
     let mut model = Model::empty();

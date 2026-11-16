@@ -70,10 +70,13 @@ fn witness_enumerator_returns_nothing_for_the_empty_language() {
     // A failed enumeration is "not found", never "no witness exists" — and it
     // must never fabricate a word.
     let words = find_witnesses_bounded(&[WeRegex::None], None, 8, 4);
-    assert!(words.is_empty());
+    assert_eq!(words, [] as [String; 0]);
     // `want = 0` is a request for nothing, not a request for everything.
     let r = WeRegex::Lit("a".to_string());
-    assert!(find_witnesses_bounded(std::slice::from_ref(&r), None, 4, 0).is_empty());
+    assert_eq!(
+        find_witnesses_bounded(std::slice::from_ref(&r), None, 4, 0),
+        [] as [String; 0]
+    );
 }
 
 #[test]

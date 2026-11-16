@@ -262,11 +262,7 @@ impl Solver {
                                 } else {
                                     0
                                 };
-                                if ext_var < ext_model.len() {
-                                    ext_model[ext_var]
-                                } else {
-                                    false
-                                }
+                                ext_var < ext_model.len() && ext_model[ext_var]
                             })
                             .collect();
                         // Watch diagnostic for unsatisfied clauses (#8485).

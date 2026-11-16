@@ -81,7 +81,7 @@ fn unique_name<'a>(
     index: usize,
     progress: Progress<'_>,
 ) -> Result<(), ProofCheckError> {
-    let levels = add((usize::BITS - names.len().leading_zeros()) as usize, 1)?;
+    let levels = add(names.len().bit_width() as usize, 1)?;
     let comparisons = add(names.len(), 1)?.min(mul(levels, 12)?);
     charge(progress, mul(comparisons, add(name.len(), 1)?)?, 0)?;
     let slots = mul(add(levels, 1)?, 32)?;
@@ -104,7 +104,7 @@ pub(super) fn validate_term_snapshot_with_progress(
     if entries.len() > u32::MAX as usize {
         return invalid(0, "snapshot exceeds TermId capacity", progress);
     }
-    let mut canonical = super::preflight_canonical::CanonicalEntries::new();
+    let mut canonical = preflight_canonical::CanonicalEntries::new();
     for (index, (data, sort)) in entries.iter().enumerate() {
         charge(progress, 1, 0)?;
         validate_sort_with_progress(sort, index, "recorded sort", 0, progress)?;

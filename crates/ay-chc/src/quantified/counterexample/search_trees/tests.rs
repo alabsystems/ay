@@ -39,7 +39,7 @@ fn deadline() -> Instant {
 }
 
 fn check(problem: &QuantifiedChcProblem, tree: &Derivation) {
-    assert!(!tree.clause_indices.is_empty());
+    assert_ne!(tree.clause_indices, [] as [usize; 0]);
     assert_eq!(tree.clause_indices.len(), tree.premise_steps.len());
     let root = tree.clause_indices.len() - 1;
     let mut consumers = vec![0usize; tree.clause_indices.len()];

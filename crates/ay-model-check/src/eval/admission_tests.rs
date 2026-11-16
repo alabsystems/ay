@@ -671,7 +671,7 @@ fn same_evaluator_callback_reentry_declines_before_refcell_lookups() {
             if self.refused.get() {
                 return Err("owner refused".into());
             }
-            if work == 1 && bytes == std::mem::size_of::<(&ModelValue, usize)>() {
+            if work == 1 && bytes == size_of::<(&ModelValue, usize)>() {
                 let remaining = self.trigger_copy.get();
                 if remaining != 0 {
                     self.trigger_copy.set(remaining - 1);

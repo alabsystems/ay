@@ -84,6 +84,10 @@ impl AlethePrinter<'_> {
     /// The canonical-to-surface orientation flips the result with one `symm`.
     /// Anything the schema cannot bridge declines, and the caller keeps its
     /// ordinary fail-closed handling.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact nullary-definition proof schema and traversal ledgers stay explicit"
+    )]
     pub(super) fn nullary_definition_leaf_step(
         &self,
         id: &str,
@@ -164,6 +168,10 @@ impl AlethePrinter<'_> {
     /// carcara 1.1.0 refused it ("could not match term to any of the original
     /// problem premises"); it checks `(step _ (cl (= (not (not m)) m)) :rule
     /// not_simplify)` and refuses `(= (not (not m)) (not m))`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact nullary-definition proof schema and traversal ledgers stay explicit"
+    )]
     pub(super) fn double_negation_step(
         &self,
         id: &str,
@@ -294,6 +302,10 @@ impl AlethePrinter<'_> {
     /// When a swapped operand ALSO names a macro, see
     /// [`Self::swapped_operand_congruence`]. `output` is unchanged whenever
     /// this answers `false`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact equality proof schema and traversal ledgers stay explicit"
+    )]
     pub(super) fn equality_symmetry_step(
         &self,
         id: &str,
@@ -366,6 +378,10 @@ impl AlethePrinter<'_> {
     /// export was REFUSED at the closing resolution ("the printed premises do
     /// not eliminate the printed resolution pivot"); the same document with
     /// this bridge is `valid` to pinned carcara 1.1.0 (git 9a352ee).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact swapped-operand proof schema and traversal ledgers stay explicit"
+    )]
     fn swapped_operand_congruence(
         &self,
         id: &str,

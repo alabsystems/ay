@@ -63,10 +63,19 @@ impl LraSolver {
                         continue;
                     }
                     self.big_bound_seen |= Self::var_has_big_direct_bound(&self.vars[i]);
-                    Self::overlay_direct_bound_for_var(&self.vars[i], &mut self.implied_bounds[i]);
+                    let changed = Self::overlay_direct_bound_for_var(
+                        &self.vars[i],
+                        &mut self.implied_bounds[i],
+                    );
                     self.register_fixed_term_var(var);
-                    // Stamp variable so rows containing it are re-analyzed.
-                    if i < self.var_bound_gen.len() {
+                    // Stamp variable so rows containing it are re-analyzed —
+                    // only when the overlay actually changed the slot, as
+                    // the full-scan path below already does. Row arithmetic
+                    // reads only slot values/strictness, so stamping an
+                    // unchanged slot (a direct bound weaker than the stored
+                    // derived bound) only re-analyzes its rows to identical
+                    // results, defeating the generation skip.
+                    if changed && i < self.var_bound_gen.len() {
                         self.var_bound_gen[i] = cur_gen;
                     }
                     // #8857: A direct-bound change legitimately enables a new

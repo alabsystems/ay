@@ -87,6 +87,37 @@ fn a_zero_allowance_stops_at_the_first_observation() {
     assert!(observe());
 }
 
+#[test]
+fn a_nested_assembly_scope_adds_its_search_work_once() {
+    let spend = |units: u64| ay_core::resource::work().add_sat_work(units, 0);
+    let before = thread_assembly_units();
+    {
+        let _outer = enter_assembly_units();
+        spend(2);
+        {
+            let _nested = enter_assembly_units();
+            spend(3);
+        }
+        assert_eq!(
+            thread_assembly_units(),
+            before,
+            "nothing is added before the outer scope is dropped"
+        );
+    }
+    assert_eq!(thread_assembly_units() - before, 5);
+    spend(4);
+    assert_eq!(
+        thread_assembly_units() - before,
+        5,
+        "work with no scope open adds nothing"
+    );
+    {
+        let _next = enter_assembly_units();
+        spend(1);
+    }
+    assert_eq!(thread_assembly_units() - before, 6);
+}
+
 /// Three `LraFarkas` lemmas with no certificate, each certifiable on its own,
 /// in `exec`'s arena.
 fn three_uncertified_lemmas(exec: &mut crate::Executor) -> ay_core::Proof {
@@ -95,7 +126,7 @@ fn three_uncertified_lemmas(exec: &mut crate::Executor) -> ay_core::Proof {
     let zero = terms.mk_rational(num_rational::BigRational::from_integer(0.into()));
     let mut proof = ay_core::Proof::new();
     for index in 0..3 {
-        let x = terms.mk_var(&format!("observed_x{index}"), Sort::Real);
+        let x = terms.mk_var(format!("observed_x{index}"), Sort::Real);
         let below = terms.mk_lt(x, zero);
         let above = terms.mk_gt(x, zero);
         proof.add_step(ProofStep::TheoryLemma {

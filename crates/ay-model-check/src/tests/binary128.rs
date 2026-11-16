@@ -86,7 +86,7 @@ fn complete_raw_fields_preserve_the_u64_data_envelope_without_granting_arithmeti
         let raw = terms.mk_bitvec(bits, eb + 129);
         let reinterpreted = cast(&mut terms, raw, eb, 129);
         if eb == 64 {
-            assert!(crate::fp::Fp::from_value(&value).is_err());
+            assert!(fp::Fp::from_value(&value).is_err());
         }
         let model = StubModel::new().with(x, value);
         for term in [x, reinterpreted] {

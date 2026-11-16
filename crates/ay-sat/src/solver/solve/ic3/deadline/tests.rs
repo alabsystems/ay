@@ -67,7 +67,7 @@ fn initial_unit_conflict_and_empty_formula_cannot_publish_after_expiry() {
     contradictory.add_clause(vec![Literal::negative(Variable::new(0))]);
     let mut empty = Solver::new(1);
     empty.set_ic3_mode();
-    for mut solver in [contradictory, empty] {
+    for mut solver in std::iter::once(contradictory).chain(std::iter::once(empty)) {
         solver.set_solve_deadline(Some(Instant::now()));
         assert!(matches!(
             solver.solve_incremental_ic3(&[]).into_inner(),

@@ -5,9 +5,7 @@ use super::*;
 use crate::preprocess::{PropagatedEntrySource, PropagatedRewriteRecord};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[path = "../tests/fixtures.rs"]
-mod fixtures;
-use fixtures::Fixture;
+use super::super::tests::fixtures::Fixture;
 
 fn fixture() -> Fixture {
     let mut f = Fixture::new();
@@ -116,7 +114,7 @@ fn exact_retained_cap_succeeds_and_one_more_preserves_every_existing_record() {
         [
             (
                 MAX_STORED_PROPAGATION_RECORDS,
-                MAX_STORED_PROPAGATION_RECORDS * std::mem::size_of::<ArrayUnitDerivation>(),
+                MAX_STORED_PROPAGATION_RECORDS * size_of::<ArrayUnitDerivation>(),
             ),
             (0, 0),
         ]
@@ -135,7 +133,7 @@ fn exact_retained_cap_succeeds_and_one_more_preserves_every_existing_record() {
 
 #[test]
 fn work_byte_and_final_poll_refusals_leave_the_complete_old_state() {
-    let needed = 2 * std::mem::size_of::<ArrayUnitDerivation>();
+    let needed = 2 * size_of::<ArrayUnitDerivation>();
     for (mut work, mut bytes, final_poll, success) in [
         (1usize, needed, true, false),
         (2, needed - 1, true, false),
@@ -169,7 +167,7 @@ fn work_byte_and_final_poll_refusals_leave_the_complete_old_state() {
 fn prior_phase_consumption_is_not_reset_when_the_owned_callback_moves_to_retention() {
     let max_work = PLAN_NODE_BUDGET * MAX_STORED_PROPAGATION_RECORDS;
     let max_bytes = 64 * 1024 * 1024;
-    let needed_bytes = 2 * std::mem::size_of::<ArrayUnitDerivation>();
+    let needed_bytes = 2 * size_of::<ArrayUnitDerivation>();
     for (prior_work, prior_bytes, success) in [
         (max_work - 2, max_bytes - needed_bytes, true),
         (max_work - 1, max_bytes - needed_bytes, false),

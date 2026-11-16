@@ -542,9 +542,7 @@ impl EufSolver<'_> {
                 if args.is_empty() {
                     return None;
                 }
-                let Some((consequent, antecedents)) = args.split_last() else {
-                    return None;
-                };
+                let (consequent, antecedents) = args.split_last()?;
                 let mut all_ante_true = true;
                 for &a in antecedents {
                     match self.derive_bool_term_value(a) {
@@ -817,12 +815,12 @@ impl EufSolver<'_> {
                 for ((_, k), _) in cong.drain() {
                     pool.push(k);
                 }
-                for i in 0..self.func_apps.len() {
-                    let app_term = self.func_apps[i].term_id;
-                    let func_hash = self.func_apps[i].func_hash;
+                for app in &self.func_apps {
+                    let app_term = app.term_id;
+                    let func_hash = app.func_hash;
                     let mut arg_reps = pool.pop().unwrap_or_default();
                     arg_reps.clear();
-                    for &a in &self.func_apps[i].args {
+                    for &a in &app.args {
                         let Ok(r) = sfind(&mut parent, a) else {
                             malformed = true;
                             pool.push(arg_reps);

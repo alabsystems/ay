@@ -33,7 +33,7 @@ pub(crate) enum MappedConflict {
 }
 
 impl MappedConflict {
-    fn from_clause(clause: Vec<Literal>, ctx: &dyn ay_sat::SolverContext) -> Self {
+    fn from_clause(clause: Vec<Literal>, ctx: &dyn SolverContext) -> Self {
         if clause
             .iter()
             .all(|literal| ctx.value(literal.variable()) == Some(!literal.is_positive()))
@@ -226,7 +226,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         &mut self,
         conflict: &[TheoryLit],
         origin: ConflictOrigin,
-        ctx: &dyn ay_sat::SolverContext,
+        ctx: &dyn SolverContext,
     ) -> Option<MappedConflict> {
         self.map_conflict_clause_minting(
             conflict,
@@ -246,7 +246,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         &mut self,
         conflict: &[TheoryLit],
         origin: ConflictOrigin,
-        ctx: &dyn ay_sat::SolverContext,
+        ctx: &dyn SolverContext,
         mint_enabled: bool,
     ) -> Option<MappedConflict> {
         let clause: Vec<Literal> = conflict

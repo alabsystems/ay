@@ -46,7 +46,7 @@ fn hostile_payload_inside_actual_materialization_retires_owned_buffers_and_no_la
         .decision_trace
         .as_mut()
         .unwrap()
-        .write_event(&crate::decision_trace::TraceEvent::Decide { lit_dimacs: 1 })
+        .write_event(&TraceEvent::Decide { lit_dimacs: 1 })
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let called = Arc::clone(&calls);
@@ -77,8 +77,8 @@ fn hostile_payload_inside_actual_materialization_retires_owned_buffers_and_no_la
     );
     assert_eq!(rows(&s), original_rows);
     assert!(s.cold.clause_trace.as_ref().unwrap().proof_work_exhausted());
-    assert!(s.cold.lrat_materialize_hints_buf.is_empty());
-    assert!(s.cold.lrat_level0_unit_materialize_pinned.is_empty());
+    assert_eq!(s.cold.lrat_materialize_hints_buf.len(), 0);
+    assert_eq!(s.cold.lrat_level0_unit_materialize_pinned.len(), 0);
     assert_eq!(s.cold.lrat_level0_unit_materialize_cursor, 0);
     assert!(s.cold.decision_trace.is_none());
     let receipt = owner.usage().unwrap();

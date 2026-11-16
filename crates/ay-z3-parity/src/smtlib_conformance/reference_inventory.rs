@@ -174,6 +174,10 @@ impl SnapshotFile {
     fn semantic_content(&self) -> Result<&str, String> {
         if self.encoding == SourceEncoding::OpaqueByteValues {
             let bytes = self.encoding.raw_bytes(&self.content)?;
+            #[expect(
+                clippy::case_sensitive_file_extension_comparisons,
+                reason = "opaque-byte security admission requires the exact lowercase .tex suffix"
+            )]
             if !self.path.ends_with(".tex") || !opaque_bytes_are_tex_comments(&bytes) {
                 return Err(format!("{} contains opaque non-UTF8 bytes outside ignored TeX comments; semantic decoding is unqualified", self.path));
             }
@@ -1853,6 +1857,15 @@ mod tests {
         let restored: SnapshotFile = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored.validate_bytes().unwrap(), raw);
         assert_eq!(restored, file);
+    }
+
+    #[test]
+    fn uppercase_tex_suffix_does_not_admit_opaque_bytes() {
+        let raw = b"% Slotz\x8ahler\n\\newcommand{\\state}{ready}\n";
+        let mut file = source_file(raw);
+        assert!(file.semantic_content().is_ok());
+        file.path = "Reference/state-machine.TEX".to_string();
+        assert!(file.semantic_content().is_err());
     }
 
     #[test]

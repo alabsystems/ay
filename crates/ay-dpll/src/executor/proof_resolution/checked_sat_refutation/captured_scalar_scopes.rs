@@ -40,7 +40,7 @@ fn prepared(source: &str, expected_roots: usize) -> (Executor, Vec<TermId>) {
     let outputs = executor
         .execute_all(&commands)
         .expect("ordinary authored declarations and assertions execute");
-    assert!(outputs.is_empty());
+    assert_eq!(outputs, [] as [String; 0]);
     let authored = executor.context().assertions.clone();
     assert_eq!(authored.len(), expected_roots);
     (executor, authored)

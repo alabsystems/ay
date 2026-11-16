@@ -79,7 +79,7 @@ impl Fixture {
             let assume = proof.add_assume(assertion, None);
             tail = proof.add_resolution(remaining.clone(), assertion, tail, assume);
         }
-        assert!(remaining.is_empty());
+        assert_eq!(remaining.as_slice(), &[] as &[TermId]);
         SerializableProofBundle::from_proof(&proof, &self.terms, self.assertions.clone())
     }
 }

@@ -49,7 +49,7 @@ pub(super) fn compile(
     };
     let count = compiler.reference.nodes.len();
     let bytes = count
-        .checked_mul(std::mem::size_of::<Vec<Literal>>())
+        .checked_mul(size_of::<Vec<Literal>>())
         .ok_or(ReferenceError::Width)?;
     compiler.reference.storage(count, bytes)?;
     compiler
@@ -78,6 +78,7 @@ pub(super) fn compile(
             return Err(Error::Source);
         }
         let literal = match mode {
+            #[cfg(test)]
             super::RootMode::Assertions => bits[0],
             super::RootMode::NegatedClause => bits[0].negated(),
         };
@@ -91,7 +92,7 @@ pub(super) fn compile(
 impl Compiler<'_, '_, '_> {
     pub(super) fn reserve(&mut self, count: usize) -> Result<Vec<Literal>> {
         let bytes = count
-            .checked_mul(std::mem::size_of::<Literal>())
+            .checked_mul(size_of::<Literal>())
             .ok_or(ReferenceError::Width)?;
         self.reference.storage(count, bytes)?;
         let mut result = Vec::new();
@@ -135,8 +136,8 @@ impl Compiler<'_, '_, '_> {
             .ok_or(ReferenceError::Width)?;
         let bytes = literals
             .len()
-            .checked_mul(std::mem::size_of::<Literal>())
-            .and_then(|n| n.checked_add(std::mem::size_of::<Vec<Literal>>()))
+            .checked_mul(size_of::<Literal>())
+            .and_then(|n| n.checked_add(size_of::<Vec<Literal>>()))
             .ok_or(ReferenceError::Width)?;
         let input_bytes = self
             .input_bytes
@@ -159,8 +160,7 @@ impl Compiler<'_, '_, '_> {
             }
             row.push(literal);
         }
-        self.reference
-            .storage(1, std::mem::size_of::<Vec<Literal>>())?;
+        self.reference.storage(1, size_of::<Vec<Literal>>())?;
         self.cnf
             .clauses
             .try_reserve_exact(1)
@@ -327,7 +327,7 @@ impl Compiler<'_, '_, '_> {
                     self.reference.storage(
                         added,
                         added
-                            .checked_mul(std::mem::size_of::<Literal>())
+                            .checked_mul(size_of::<Literal>())
                             .ok_or(ReferenceError::Width)?,
                     )?;
                     bits.try_reserve_exact(added)

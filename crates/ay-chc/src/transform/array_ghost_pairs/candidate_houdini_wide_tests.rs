@@ -153,7 +153,7 @@ fn aggregate_wide_state_keeps_mandatory_pool_below_global_cap() {
             .certificate
             .ghost_interpretation(predicate.id)
             .expect("sink interpretation");
-        assert!(interpretation.vars.is_empty());
+        assert_eq!(interpretation.vars, [] as [ChcVar; 0]);
         assert_eq!(interpretation.formula, ChcExpr::Bool(false));
     }
 }

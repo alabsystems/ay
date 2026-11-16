@@ -296,16 +296,12 @@ fn should_enable_xor_extension(
     // Preserve those clauses for pure SAT preprocessing instead of switching to
     // extension mode, which disables destructive factor/BVE inprocessing.
     let wide_count = clauses.iter().filter(|c| c.len() >= 4).count();
-    if xor_count.saturating_mul(SPARSE_XOR_WIDE_CNF_XOR_FRACTION_DENOMINATOR)
+    !(xor_count.saturating_mul(SPARSE_XOR_WIDE_CNF_XOR_FRACTION_DENOMINATOR)
         <= total.saturating_mul(SPARSE_XOR_WIDE_CNF_XOR_FRACTION_NUMERATOR)
         && consumed.saturating_mul(SPARSE_XOR_WIDE_CNF_CONSUMED_FRACTION_DENOMINATOR)
             <= total.saturating_mul(SPARSE_XOR_WIDE_CNF_CONSUMED_FRACTION_NUMERATOR)
         && wide_count.saturating_mul(SPARSE_XOR_WIDE_CNF_WIDE_FRACTION_DENOMINATOR)
-            >= total.saturating_mul(SPARSE_XOR_WIDE_CNF_WIDE_FRACTION_NUMERATOR)
-    {
-        return false;
-    }
-    true
+            >= total.saturating_mul(SPARSE_XOR_WIDE_CNF_WIDE_FRACTION_NUMERATOR))
 }
 
 fn selected_sat_variant() -> SolverVariant {

@@ -26,8 +26,8 @@ fn ordinary_none_or_external_tseitin_names_never_authorize_closed_bv_guards() {
     // DR-47: an unlinked External guard is its exact comparator over the
     // shared operand bits, not a gap.
     assert!(!ordinary.has_encoding_gap);
-    assert!(ordinary.pending_condition_links.is_empty());
-    assert!(!ordinary.cache.bv_term_bits.is_empty());
+    assert_eq!(ordinary.pending_condition_links.len(), 0);
+    assert_ne!(ordinary.cache.bv_term_bits.len(), 0);
     let mut names = BTreeMap::new();
     names.insert(guard, 77);
     let mut linked =
@@ -37,7 +37,7 @@ fn ordinary_none_or_external_tseitin_names_never_authorize_closed_bv_guards() {
     assert!(!result.has_encoding_gap);
     assert_eq!(result.pending_condition_links.len(), 1);
     assert_eq!(result.pending_condition_links[0].1, 77);
-    assert!(result.cache.bv_term_bits.is_empty());
+    assert_eq!(result.cache.bv_term_bits.len(), 0);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn seeded_tseitin_names_link_their_guards_and_refuse_every_unnamed_one() {
     seeded.try_encode_bool_condition(guard).unwrap();
     let refused = seeded.finish().unwrap();
     assert!(refused.has_encoding_gap);
-    assert!(refused.cache.bv_term_bits.is_empty());
+    assert_eq!(refused.cache.bv_term_bits.len(), 0);
     // A seeded name links exactly as an External one does.
     let mut names = BTreeMap::new();
     names.insert(guard, 77);
@@ -71,7 +71,7 @@ fn seeded_tseitin_names_link_their_guards_and_refuse_every_unnamed_one() {
     assert!(!result.has_encoding_gap);
     assert_eq!(result.pending_condition_links.len(), 1);
     assert_eq!(result.pending_condition_links[0].1, 77);
-    assert!(result.cache.bv_term_bits.is_empty());
+    assert_eq!(result.cache.bv_term_bits.len(), 0);
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn closed_fp_reinterpretation_and_comparator_export_the_same_full_word_bits() {
         closed.try_encode_bool_condition(guard).unwrap();
         let output = closed.finish().unwrap();
         assert!(!output.has_encoding_gap);
-        assert!(output.pending_condition_links.is_empty());
+        assert_eq!(output.pending_condition_links.len(), 0);
         let a_bits = &output.cache.bv_term_bits[&a];
         assert_eq!(a_bits.len(), width as usize);
         assert_eq!(output.cache.bv_term_bits[&b].len(), width as usize);
@@ -139,7 +139,7 @@ fn malformed_max_extract_indices_refuse_before_overflow_or_bv_cloning() {
     closed.try_encode_bool_condition(guard).unwrap();
     let output = closed.finish().unwrap();
     assert!(output.has_encoding_gap);
-    assert!(output.cache.bv_term_bits.is_empty());
+    assert_eq!(output.cache.bv_term_bits.len(), 0);
 }
 
 #[test]

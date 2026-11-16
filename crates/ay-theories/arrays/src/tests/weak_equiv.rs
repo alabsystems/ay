@@ -46,8 +46,8 @@ fn test_weak_equiv_store_chain_labels() {
     );
 
     let (labels, reasons) = solver.weak_path(c, c).expect("trivial path");
-    assert!(labels.is_empty());
-    assert!(reasons.is_empty());
+    assert_eq!(labels.len(), 0);
+    assert_eq!(reasons.len(), 0);
 }
 
 /// Strong asserted equalities collapse nodes and their literal is carried as

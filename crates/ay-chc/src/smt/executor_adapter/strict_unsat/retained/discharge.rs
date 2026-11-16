@@ -57,7 +57,7 @@ fn discharge(
             return Err(progress.refuse("retained split query allocation refusal"));
         }
     }
-    let config = solver_config(None);
+    let config = solver_config();
     let memory = progress.memory();
     let mut solver = phase_probe::result(Phase::Setup, limit, || {
         progress.check()?;

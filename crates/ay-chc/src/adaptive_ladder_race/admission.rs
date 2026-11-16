@@ -46,8 +46,8 @@ impl InheritedBoundaries {
     pub(super) fn open(&self, token: &CancellationToken) -> bool {
         let now = Instant::now();
         !token.is_cancelled()
-            && !self.solve_deadline.is_some_and(|deadline| now >= deadline)
-            && !self.smt_deadline.is_some_and(|deadline| now >= deadline)
+            && self.solve_deadline.is_none_or(|deadline| now < deadline)
+            && self.smt_deadline.is_none_or(|deadline| now < deadline)
     }
 }
 

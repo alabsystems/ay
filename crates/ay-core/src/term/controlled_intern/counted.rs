@@ -6,6 +6,7 @@
 use super::{checked_term_id, next_entry_stamp, StoreRole, NEXT_TERM_ENTRY_STAMP};
 use crate::original_query::{CountedAdmission, CountedAdmissionError};
 use crate::term::{Constant, Sort, Symbol, TermData, TermEntry, TermId, TermStore};
+use std::mem::size_of;
 
 mod index;
 mod inspection;
@@ -32,11 +33,11 @@ pub use ring::CountedRingBuiltin;
 /// authority. Callback implementations must preserve their original controls
 /// without holding a mutable borrow or lock across arbitrary callbacks.
 pub trait TermConstructionAdmission {
-    /// Charge work and replacement storage to the same original owner.
+    /// Charge logical work and storage against the original owner's ledger.
     fn admit(&self, work: usize, storage: usize) -> std::result::Result<(), CountedAdmissionError>;
-    /// Retain a refusal so subsequent operations cannot renew the allowance.
+    /// Retain the owner's first refusal and return the effective refusal.
     fn refuse(&self, error: CountedAdmissionError) -> CountedAdmissionError;
-    /// Poll the owner without issuing any additional work or storage allowance.
+    /// Recheck the original owner without charging additional work or storage.
     fn check(&self) -> std::result::Result<(), CountedAdmissionError> {
         self.admit(0, 0)
     }
@@ -62,20 +63,20 @@ pub const COUNTED_TERM_WORK_VERSION: u32 = 2;
 /// Closed prime-field operators, separate from the existing BV vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CountedFieldBuiltin {
-    /// Prime-field addition.
+    /// Prime-field addition over two or more operands.
     Add,
-    /// Prime-field multiplication.
+    /// Prime-field multiplication over two or more operands.
     Mul,
-    /// Prime-field additive inverse.
+    /// Prime-field additive negation of one operand.
     Neg,
-    /// Native prime-field bit-sum operation.
+    /// Prime-field weighted bit sum over two or more operands.
     BitSum,
 }
 
 /// Construction refusal is data, never SAT/UNSAT or proof authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CountedTermError {
-    /// The original admission owner refused work, storage or cancellation.
+    /// The original admission owner retained a terminal refusal.
     #[error(transparent)]
     Stopped(#[from] CountedAdmissionError),
     /// The requested representation is outside the constructor vocabulary.
@@ -233,7 +234,7 @@ impl<'store, 'owner, O: TermConstructionAdmission> CountedTermBuilder<'store, 'o
         )
     }
 
-    /// Check and intern a closed prime-field operation over live operands.
+    /// Construct a canonical prime-field application after checking arity and sorts.
     pub fn field_apply(
         &mut self,
         operation: CountedFieldBuiltin,

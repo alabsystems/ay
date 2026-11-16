@@ -57,13 +57,12 @@ impl RelevancyFrontier {
     ) -> Result<()> {
         owner.admit(1, 0)?; // actual per-literal fold
         if let Some(occurrences) = self.occ.get(lit.index()) {
-            for index in 0..occurrences.len() {
+            for &offset in occurrences {
                 // Planning metadata + actual occurrence visit. Each clause
                 // crosses zero at most once per monotone fold phase. Thus the
                 // nested-edge bound is min(sum(candidate lengths), arena words),
                 // not the quadratic sum when many literals share a clause.
                 owner.admit(2, 0)?;
-                let offset = occurrences[index];
                 *edges = edges
                     .saturating_add(s.arena.len_of(offset as usize))
                     .min(s.arena.len());

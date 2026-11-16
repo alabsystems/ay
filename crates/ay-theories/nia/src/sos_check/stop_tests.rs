@@ -10,6 +10,12 @@ use ay_core::{Sort, TheoryResult, TheorySolver};
 use num_bigint::BigInt;
 use std::time::{Duration, Instant};
 
+fn expired_deadline() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("one second before now must be representable for expired-deadline setup")
+}
+
 fn contradiction() -> (TermStore, TermId) {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);
@@ -27,9 +33,9 @@ fn shared_expired_deadline_stops_despite_a_future_solver_deadline() {
     let mut solver = NiaSolver::new(&terms);
     solver.assert_literal(atom, true);
     solver.set_deadline(Instant::now() + Duration::from_secs(60));
-    let guard = Guard::root_child(ChildSpec::new(NodeLabel::Check).with_deadline(
-        DeadlineSource::Fixed(Instant::now() - Duration::from_secs(1)),
-    ));
+    let guard = Guard::root_child(
+        ChildSpec::new(NodeLabel::Check).with_deadline(DeadlineSource::Fixed(expired_deadline())),
+    );
     let _scope = guard.enter();
     assert!(resource::check_stop_requested());
     assert!(matches!(solver.check(), TheoryResult::Unknown));
@@ -74,7 +80,7 @@ fn own_expired_deadline_still_stops_without_a_shared_stop() {
     let (terms, atom) = contradiction();
     let mut solver = NiaSolver::new(&terms);
     solver.assert_literal(atom, true);
-    solver.set_deadline(Instant::now() - Duration::from_secs(1));
+    solver.set_deadline(expired_deadline());
     assert!(!resource::check_stop_requested());
     assert!(matches!(solver.check(), TheoryResult::Unknown));
     assert!(!solver.took_sos_unsat_certificate());

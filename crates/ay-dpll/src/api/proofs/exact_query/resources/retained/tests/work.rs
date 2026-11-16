@@ -90,25 +90,26 @@ fn scoped_export_forwards_exact_legacy_offers_then_cleanup_poll() {
         actual.push((work, bytes));
         Ok(())
     };
-    let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
     let mut consumed = false;
-    assert_eq!(
-        solver
-            .with_last_unsat_retained_bundle_for_exact_query_with_work(
-                &binding,
-                end,
-                &mut work,
-                |bundle, _| {
-                    assert_eq!(bundle.schema(), "ay.proofbundle/v6");
-                    assert!(!bundle.obligation_assertions().is_empty());
-                    consumed = true;
-                    Ok(())
-                },
-            )
-            .unwrap(),
-        Some(())
-    );
-    drop(work);
+    {
+        let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
+        assert_eq!(
+            solver
+                .with_last_unsat_retained_bundle_for_exact_query_with_work(
+                    &binding,
+                    end,
+                    &mut work,
+                    |bundle, _| {
+                        assert_eq!(bundle.schema(), "ay.proofbundle/v6");
+                        assert_ne!(bundle.obligation_assertions(), []);
+                        consumed = true;
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+            Some(())
+        );
+    }
     let mut expected = vec![(8, 0)];
     expected.extend(legacy);
     expected.push((0, 0));
@@ -199,27 +200,28 @@ fn preconsumption_zero_poll_refuses_before_the_user_callback() {
             Ok(())
         }
     };
-    let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
     let mut consumed = false;
-    assert!(matches!(
-        solver.with_last_unsat_retained_bundle_for_exact_query_with_work(
-            &binding,
-            end,
-            &mut work,
-            |_, _| {
-                consumed = true;
-                Ok(())
-            },
-        ),
-        Err(ProofCheckError::ResourceLimit)
-    ));
-    assert_eq!(
-        work.charge(0),
-        Err(QueryError::Interrupted(
-            ay_core::original_query::StopReason::Cancelled
-        ))
-    );
-    drop(work);
+    {
+        let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
+        assert!(matches!(
+            solver.with_last_unsat_retained_bundle_for_exact_query_with_work(
+                &binding,
+                end,
+                &mut work,
+                |_, _| {
+                    consumed = true;
+                    Ok(())
+                },
+            ),
+            Err(ProofCheckError::ResourceLimit)
+        ));
+        assert_eq!(
+            work.charge(0),
+            Err(QueryError::Interrupted(
+                ay_core::original_query::StopReason::Cancelled
+            ))
+        );
+    }
     assert!(!consumed);
     assert_eq!(calls, legacy.len() + 2);
 }

@@ -123,16 +123,18 @@ fn original_remainder_work_and_storage_one_short_are_sticky_before_native_entry(
             ControlFlow::Continue(())
         }
     };
-    let mut funded = WorkBudget::new(10_000_000_000, &mut poll);
-    let plan = source::plan(&terms, &[root], &[], &mut funded).unwrap();
-    drop(funded);
-    let mut short = WorkBudget::new(u64::try_from(plan.gates * 1024 - 1).unwrap(), &mut poll);
-    assert!(matches!(
-        plan.prepay(&mut short),
-        Err(FpAdapterError::Owner(QueryError::Exhausted))
-    ));
-    assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-    drop(short);
+    let plan = {
+        let mut funded = WorkBudget::new(10_000_000_000, &mut poll);
+        source::plan(&terms, &[root], &[], &mut funded).unwrap()
+    };
+    {
+        let mut short = WorkBudget::new(u64::try_from(plan.gates * 1024 - 1).unwrap(), &mut poll);
+        assert!(matches!(
+            plan.prepay(&mut short),
+            Err(FpAdapterError::Owner(QueryError::Exhausted))
+        ));
+        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+    }
     let (permit, bytes) = (Cell::new(false), Cell::new(plan.gates * 4096 - 1));
     let mut admission = |_, cost| {
         if Instant::now() >= end {
@@ -144,14 +146,15 @@ fn original_remainder_work_and_storage_one_short_are_sticky_before_native_entry(
         bytes.set(bytes.get().checked_sub(cost).ok_or(QueryError::Exhausted)?);
         Ok(())
     };
-    let mut short = WorkBudget::with_admission(10_000_000_000, &mut admission);
-    assert!(matches!(
-        plan.prepay(&mut short),
-        Err(FpAdapterError::Owner(QueryError::Exhausted))
-    ));
-    permit.set(true);
-    assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-    drop(short);
+    {
+        let mut short = WorkBudget::with_admission(10_000_000_000, &mut admission);
+        assert!(matches!(
+            plan.prepay(&mut short),
+            Err(FpAdapterError::Owner(QueryError::Exhausted))
+        ));
+        permit.set(true);
+        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+    }
     assert!(Instant::now() < end);
 }
 
@@ -178,7 +181,9 @@ fn original_raw_flag_and_expired_end_remain_refused_after_reset() {
         budget.charge(0),
         Err(QueryError::Interrupted(StopReason::Cancelled))
     );
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let mut deadline = || {
         if Instant::now() >= end {
             ControlFlow::Break(StopReason::Deadline)

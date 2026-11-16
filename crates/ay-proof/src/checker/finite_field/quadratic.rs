@@ -182,10 +182,7 @@ impl Check<'_, '_> {
         let required = vector.len().checked_add(additional)?;
         if required > vector.capacity() {
             let capacity = required.max(vector.capacity().max(2).checked_mul(2)?);
-            self.pay(
-                vector.len(),
-                capacity.checked_mul(std::mem::size_of::<T>())?,
-            )?;
+            self.pay(vector.len(), capacity.checked_mul(size_of::<T>())?)?;
             vector.try_reserve_exact(capacity - vector.len()).ok()?;
         }
         Some(())
@@ -256,8 +253,8 @@ pub(in crate::checker) fn validate(
                     }
                     for i in 1..args.len() {
                         let left = checker.parse(args[i], 0)?;
-                        for j in 0..if equal { 1 } else { i } {
-                            let right = checker.parse(args[j], 0)?;
+                        for right_term in args.iter().take(if equal { 1 } else { i }) {
+                            let right = checker.parse(*right_term, 0)?;
                             let mut poly = [0; 3];
                             for k in 0..3 {
                                 poly[k] = checker.difference(left[k], right[k])?;

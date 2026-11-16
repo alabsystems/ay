@@ -41,7 +41,7 @@ impl Circuit<'_, '_, '_> {
         }
         let mut result = result?;
         let source = self.proof.printer.format_term(term);
-        if !super::super::literal_spelling::prints_alike(&source, &result.equality.left) {
+        if !literal_spelling::prints_alike(&source, &result.equality.left) {
             // The same bounded printed-linear reader used by the offset
             // bridge decides this identity modulo2^width. No DAG reading can
             // authorize a polynomial step over different authored text.

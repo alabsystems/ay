@@ -310,8 +310,7 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         }
         // #8003: ITE condition priority - decide conditions before other atoms.
         if count.is_multiple_of(2) && !self.ite_condition_bitset.is_empty() {
-            for word_idx in 0..self.ite_condition_bitset.len() {
-                let word = self.ite_condition_bitset[word_idx];
+            for (word_idx, word) in self.ite_condition_bitset.iter().copied().enumerate() {
                 if word == 0 {
                     continue;
                 }

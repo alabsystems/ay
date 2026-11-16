@@ -16,9 +16,6 @@ use std::rc::Rc;
 pub(crate) enum Phase {
     Render,
     RenderComplete,
-    Discharge,
-    Serialize,
-    Hash,
     ParseShape,
     ParseBound,
     Setup,
@@ -26,7 +23,6 @@ pub(crate) enum Phase {
     ExactExport,
     Recheck,
     AssumeBinding,
-    Presentation,
     Executor,
     SolverCleanup,
 }
@@ -36,9 +32,6 @@ impl Phase {
         match self {
             Self::Render => "render",
             Self::RenderComplete => "render-complete",
-            Self::Discharge => "discharge",
-            Self::Serialize => "serialize",
-            Self::Hash => "hash",
             Self::ParseShape => "parse-shape",
             Self::ParseBound => "parse-bound",
             Self::Setup => "setup",
@@ -46,7 +39,6 @@ impl Phase {
             Self::ExactExport => "exact-export",
             Self::Recheck => "recheck",
             Self::AssumeBinding => "assume-binding",
-            Self::Presentation => "presentation",
             Self::Executor => "executor",
             Self::SolverCleanup => "solver-cleanup",
         }
@@ -113,14 +105,12 @@ struct Event {
     row: Row,
     outcome: Outcome,
     elapsed_us: u128,
-    // None is the legacy no-deadline route, not a fresh grant.
     remaining_us: Option<u128>,
     rows: usize,
 }
 
 fn deadline(limit: ReplayLimit<'_>) -> Option<Instant> {
     match limit {
-        ReplayLimit::Legacy => None,
         ReplayLimit::Until(deadline) | ReplayLimit::Cancellable { deadline, .. } => Some(deadline),
     }
 }

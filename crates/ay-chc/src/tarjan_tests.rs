@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn empty_graph() {
     let result = tarjan_scc_dense(0, |_| Vec::new());
-    assert!(result.is_empty());
+    assert_eq!(result, [] as [std::vec::Vec<usize>; 0]);
 }
 
 #[test]

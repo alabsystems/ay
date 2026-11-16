@@ -117,7 +117,7 @@ fn finalize(s: &Solver, owner: &CountedAdmission) -> AdmissionResult<Vec<bool>> 
     if missing.is_some()
         || s.first_arena_violation_admitted(
             &internal,
-            crate::solver::preprocess_verify::admitted::ArenaMode::Full,
+            preprocess_verify::admitted::ArenaMode::Full,
             &policy,
         )?
         .is_some()

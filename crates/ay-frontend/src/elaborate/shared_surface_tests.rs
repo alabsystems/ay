@@ -239,9 +239,7 @@ fn interrupted_error_and_caught_panic_leave_no_partial_session_and_clone_is_empt
     assert!(context.shared_surface.0.is_none());
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         context.elaborate_shared_surface(&term, limits(), |context| {
-            if context.shared_surface.0.is_some() {
-                panic!("active attempt fixture")
-            }
+            assert!(context.shared_surface.0.is_none(), "active attempt fixture");
             false
         });
     }));

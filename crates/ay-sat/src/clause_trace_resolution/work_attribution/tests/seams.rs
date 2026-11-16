@@ -171,7 +171,7 @@ fn terminal_empty_synthesis_is_attributed_including_failed_premise_context() {
                 result,
                 Err(ClauseTraceResolutionError::UnitPremisesDoNotRefuteTrace)
             );
-            assert!(state.steps.is_empty());
+            assert_eq!(state.steps.len(), 0);
         }
         let snapshot = meter.attribution.snapshot(meter.consumed_work());
         assert!(meter.consumed_work() > 0);

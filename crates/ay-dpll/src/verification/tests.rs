@@ -2334,19 +2334,13 @@ mod mixed_need_lemmas_verification_tests {
             TheoryLit::new(k_ge_0, true),
         ];
 
-        let mut memo = super::super::dispatch::ConflictSemanticVerifyMemo::default();
-        assert!(super::super::dispatch::verify_conflict_semantic_memoized(
-            &mut memo,
-            &conflict,
-            &terms,
-            &[]
-        )
-        .is_ok());
+        let mut memo = ConflictSemanticVerifyMemo::default();
+        assert!(verify_conflict_semantic_memoized(&mut memo, &conflict, &terms, &[]).is_ok());
         let mut key = conflict.clone();
         key.sort_unstable();
         assert_eq!(
             memo.get(&key).copied(),
-            Some(super::super::dispatch::ConflictSemanticVerdict::Reproved)
+            Some(ConflictSemanticVerdict::Reproved)
         );
     }
 }

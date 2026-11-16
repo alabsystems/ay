@@ -104,7 +104,11 @@ fn worker_capture_is_send_sync_and_preserves_absolute_wall_and_shared_ticks() {
 #[test]
 fn expired_original_owner_skips_lowering_cache_and_validation_without_new_clock() {
     let mut original = guard();
-    original.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+    original.set_deadline(Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset"),
+    ));
     let owner = ExternalInvariantValidationOwner::capture(&original, &configured());
     let calls = AtomicUsize::new(0);
     assert_eq!(

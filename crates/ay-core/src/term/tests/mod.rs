@@ -78,7 +78,7 @@ fn speculative_rollback_is_store_bound_affine_and_prunes_term_sidecars() {
     assert_eq!(store.skolem_id(scratch_quantifier), None);
     assert_eq!(store.quantifier_weight(scratch_quantifier), 1);
     assert_eq!(store.explicit_quantifier_weight(scratch_quantifier), None);
-    assert!(store.quantifier_no_patterns(scratch_quantifier).is_empty());
+    assert_eq!(store.quantifier_no_patterns(scratch_quantifier), &[]);
 
     let replacement = store.mk_var("replacement", Sort::Bool);
     assert_eq!(

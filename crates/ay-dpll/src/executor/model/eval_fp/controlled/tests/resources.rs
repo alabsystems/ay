@@ -78,7 +78,7 @@ fn source_and_remaining_temporary_term_caps_are_cold_checked_without_rearming() 
         let read = executor.begin_external_evaluation_read();
         let visits = Cell::new(0);
         let result = executor.evaluate_fp_term_via_bitblast_controlled(&model, term, &|phase| {
-            if matches!(phase, FpEvalPhase::Concretize(_)) {
+            if matches!(phase, FpEvalPhase::Concretize) {
                 visits.set(visits.get() + 1);
             }
         });

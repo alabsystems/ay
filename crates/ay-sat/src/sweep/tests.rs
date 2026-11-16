@@ -449,7 +449,7 @@ fn simulation_returns_empty_on_no_clauses() {
     let frozen: Vec<u32> = vec![0; 2];
     let sweeper = Sweeper::new(2);
     let classes = sweeper.find_candidates_by_simulation(&clauses, &vals, &frozen);
-    assert!(classes.is_empty(), "No clauses → no candidates");
+    assert_eq!(classes.len(), 0, "No clauses → no candidates");
 }
 
 #[test]

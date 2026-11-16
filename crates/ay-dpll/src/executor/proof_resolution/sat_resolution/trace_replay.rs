@@ -98,9 +98,8 @@ learned={} learned_no_hints={} originals={} untranslatable_entries={} unmapped_m
 /// pathological BOOKKEEPING, e.g. pointer-safe-5) does not apply to a
 /// replay that starts only after the verdict is decided.
 fn reconstruction_step_budget(configured: Option<u64>, trace_entries: u32) -> Option<u64> {
-    configured.map(|budget| {
-        budget.max(u64::from(trace_entries).saturating_mul(RECONSTRUCTION_STEPS_PER_TRACE_ENTRY))
-    })
+    let budget = configured?;
+    Some(budget.max(u64::from(trace_entries).saturating_mul(RECONSTRUCTION_STEPS_PER_TRACE_ENTRY)))
 }
 
 impl Executor {
@@ -205,8 +204,7 @@ impl Executor {
         }
 
         let result = manager.process_trace(&trace, proof);
-        note.untranslatable_entries =
-            u32::try_from(manager.untranslatable_entries()).unwrap_or(u32::MAX);
+        note.untranslatable_entries = manager.untranslatable_entries();
         let trust_count = manager.trust_fallback_count();
         if trust_count > 0 {
             tracing::warn!(

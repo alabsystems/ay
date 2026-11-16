@@ -35,7 +35,7 @@ fn public_view_borrows_checked_steps_through_public_interfaces() {
     let root = query_view(&validated);
     assert_eq!(root.clause_index(), 0);
     let premises: &[usize] = root.premises();
-    assert!(premises.is_empty());
+    assert_eq!(premises, &[] as &[usize]);
     let missing: Option<&SmtValue> = root.source_binding("absent");
     assert!(missing.is_none());
     assert_eq!(root.source_bindings().count(), 0);

@@ -56,8 +56,8 @@ fn no_seed_still_has_a_final_cancellation_boundary() {
         .reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true)
         .expect("no seed is an ordinary incomplete reconstruction");
     assert!(!actual.complete);
-    assert!(actual.steps.is_empty());
-    assert!(actual.empty_hints.is_empty());
+    assert_eq!(actual.steps.len(), 0);
+    assert_eq!(actual.empty_hints.len(), 0);
     every_reconstruction_poll(&solver, &limits);
 }
 

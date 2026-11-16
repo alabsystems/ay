@@ -15,16 +15,18 @@ fn fixture() -> Executor {
     let mut exec = Executor::new();
     // A proof request re-arms parsed retention. Set the explicit memory policy
     // afterwards, before any authored assertion can retain a surface.
-    assert!(exec
-        .execute_all(&ay_frontend::parse("(set-option :produce-proofs true)").unwrap())
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&ay_frontend::parse("(set-option :produce-proofs true)").unwrap())
+            .unwrap(),
+        [] as [String; 0]
+    );
     exec.set_retain_parsed_assertions(false);
-    assert!(exec
-        .execute_all(&ay_frontend::parse(source).unwrap())
-        .unwrap()
-        .is_empty());
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(
+        exec.execute_all(&ay_frontend::parse(source).unwrap())
+            .unwrap(),
+        [] as [String; 0]
+    );
+    assert_eq!(exec.ctx.assertions_parsed(), []);
     exec.begin_public_solve(false);
     exec.bind_unsat_query_assumptions(&[]);
     let left = exec.ctx.symbol_info("left").unwrap().term.unwrap();
@@ -94,7 +96,7 @@ fn surface_less_seal_copies_exact_inventory_and_selected_direct_roots() {
     assert_eq!(scope.len(), 3);
     assert_eq!(exec.ctx.assertions.len(), 4);
     assert_eq!(scope.as_slice(), &exec.ctx.assertions[1..]);
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(exec.ctx.assertions_parsed(), []);
     assert!(exec
         .current_checked_finite_enum_proof()
         .unwrap()

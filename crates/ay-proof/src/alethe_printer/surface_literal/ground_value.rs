@@ -158,7 +158,7 @@ mod tests {
         let mut terms = TermStore::new();
         let three = terms.mk_int(BigInt::from(3));
         let minus_four = terms.mk_int(BigInt::from(-4));
-        let x = terms.mk_var("x", ay_core::Sort::Int);
+        let x = terms.mk_var("x", Sort::Int);
         assert!(ground_value_steps(&terms, "t", "(abs -4)", "3", three).is_none());
         assert!(ground_value_steps(&terms, "t", "(div -7 2)", "(- 4)", minus_four).is_none());
         assert!(ground_value_steps(&terms, "t", "(+ x 0)", "x", x).is_none());

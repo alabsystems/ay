@@ -578,6 +578,10 @@ enum UfliaSplitArm {
 /// existed the backstop hard-coded `solve_uf_lia`, which is why the Real lanes
 /// (`solve_uf_lra`, `solve_uf_nra`) could not opt into it at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "the Uf prefix names the exact solver pipeline each verification lane must rerun"
+)]
 pub(in crate::executor) enum PostSplitVerifyLane {
     /// EUF + LIA (`solve_uf_lia`) — the historical hard-coded lane.
     UfLia,
@@ -8813,7 +8817,7 @@ impl Executor {
                 Sort::Int if value.is_integer() => {
                     merged
                         .lia_model
-                        .get_or_insert_with(|| ay_lia::LiaModel {
+                        .get_or_insert_with(|| LiaModel {
                             values: Default::default(),
                         })
                         .values

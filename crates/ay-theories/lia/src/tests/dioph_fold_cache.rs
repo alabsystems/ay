@@ -143,7 +143,10 @@ fn d2_caches_survive_a_pop_that_keeps_their_fold() {
     assert!(solver.dioph_fold_reasons_live());
     solver.revalidate_dioph_caches(false);
     assert_eq!(solver.dioph_cached_modular_gcds, gcds_before);
-    assert!(!solver.dioph_cached_fold_reasons.is_empty());
+    assert_ne!(
+        solver.dioph_cached_fold_reasons.as_slice(),
+        &[] as &[TheoryLit]
+    );
 }
 
 #[test]

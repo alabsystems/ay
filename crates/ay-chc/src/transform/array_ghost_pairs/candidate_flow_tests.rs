@@ -18,8 +18,9 @@ use crate::transform::array_ghost_pairs::candidate::{
     query_anchored_ghost_candidates, query_anchored_ghost_candidates_controlled,
     QueryAnchoredGhostCandidate, MAX_PROPAGATED_CANDIDATES,
 };
+use crate::transform::array_ghost_pairs::candidate_houdini::QueryAnchoredSeal;
 use crate::transform::array_ghost_pairs::{
-    recheck_ghost_pair_certificate, try_query_anchored_and_seal, GhostPairSpec, QueryAnchoredSeal,
+    recheck_ghost_pair_certificate, try_query_anchored_and_seal, GhostPairSpec,
 };
 use crate::transform::{ArrayGhostPairTransformer, Transformer};
 use crate::{

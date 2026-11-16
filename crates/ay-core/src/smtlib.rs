@@ -149,10 +149,8 @@ fn quote_symbol_owned(name: &str, owner: admitted::Owner<'_>) -> String {
             return String::new();
         }
         for character in name.chars() {
-            if matches!(character, '|' | '\\') {
-                if !quoted.character('\\') {
-                    return String::new();
-                }
+            if matches!(character, '|' | '\\') && !quoted.character('\\') {
+                return String::new();
             }
             if !quoted.character(character) {
                 return String::new();

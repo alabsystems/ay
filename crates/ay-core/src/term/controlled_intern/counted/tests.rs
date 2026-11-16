@@ -257,7 +257,7 @@ fn counted_exact_integer_literals_share_the_native_typed_interner() {
     let existing = store.mk_int(wide.clone());
     let x = store.mk_var("integer_x", Sort::Int);
     let one = store.mk_int(1.into());
-    let sum = store.mk_app_structural(Symbol::named("+"), &[x, one], Sort::Int);
+    let sum = store.mk_app_structural(Symbol::named("+"), [x, one], Sort::Int);
     let mut builder = CountedTermBuilder::new(&mut store, &original).unwrap();
     assert_eq!(builder.integer(&wide).unwrap(), existing);
     for value in [BigInt::from(0), -wide] {

@@ -47,7 +47,7 @@ struct GuardedUf {
 fn guarded_uf(triggered: bool) -> GuardedUf {
     let mut s = Solver::new(Logic::All);
     let _ = s.try_set_option("produce-unsat-cores", "true");
-    s.set_timeout(Some(std::time::Duration::from_millis(30_000)));
+    s.set_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = s.try_set_option("rlimit", "1200000");
     let y = s.declare_const("y", Sort::Int);
     let f1 = s.declare_fun("f1", &[Sort::Int], Sort::Int);

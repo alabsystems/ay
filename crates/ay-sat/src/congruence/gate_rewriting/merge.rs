@@ -199,12 +199,8 @@ impl CongruenceClosure {
                         // folded through the shared, trust-checked parity step.
                         parity_flip =
                             ay_sat_congruence_core::xor_accumulate_parity(parity_flip, true);
-                        return false;
                     }
-                    if v < 0 {
-                        return false;
-                    }
-                    true
+                    v == 0
                 });
                 Self::reduce_xor_input_pairs(&mut gate_inputs[gi], uf, &mut parity_flip);
 

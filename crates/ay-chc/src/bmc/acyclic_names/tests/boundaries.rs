@@ -82,7 +82,7 @@ fn exact_depth_limit_refuses_input_and_expanded_output_without_partial_substitut
     let mut substitutions = DetHashMap::default();
     substitutions.insert("b".to_owned(), ChcExpr::Bool(true));
     let accepted = names.substitute(&expression, &substitutions).unwrap();
-    assert!(accepted.vars().is_empty());
+    assert_eq!(accepted.vars(), [] as [ChcVar; 0]);
     substitutions.insert("b".to_owned(), nested(ChcExpr::Bool(true), 1));
     assert!(names.substitute(&expression, &substitutions).is_none());
     assert!(names.stopped());

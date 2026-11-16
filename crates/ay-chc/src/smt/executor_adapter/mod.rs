@@ -45,11 +45,11 @@ pub(super) use logic_detection::{
 pub(crate) use model_parsing::parse_model_into;
 pub(crate) use replay_cancellation::ReplayCancellation;
 pub(crate) use replay_limit::ReplayLimit;
+#[cfg(test)]
+pub(crate) use strict_unsat::smtlib_strict_unsat_cert_via_executor_until;
 pub(crate) use strict_unsat::{
-    check_plain_unsat_retained_native_with_progress,
-    smtlib_strict_unsat_cert_native_only_with_limit, smtlib_strict_unsat_cert_via_executor,
-    smtlib_strict_unsat_cert_via_executor_until, smtlib_strict_unsat_cert_via_executor_with_limit,
-    BoundRetainedProof, BoundRetainedProofBytes, RetainedReplayProgress, StrictUnsatCert,
+    check_plain_unsat_native_with_limit, check_plain_unsat_retained_native_with_progress,
+    BoundRetainedProofBytes, RetainedReplayProgress,
 };
 
 // Re-export test-visible helpers (tests.rs uses super::*).
@@ -976,10 +976,10 @@ pub(super) fn dv_unknown_retry_enabled() -> bool {
 /// The split is nonetheless kept honest: `InternalLemma` may be declared ONLY
 /// where CHC search re-derives its published claim from scratch. Every channel
 /// on which raw `"unsat"` BECOMES the published claim stays `Published`, including
-/// `check_unsat_smtlib_via_executor` (the ghost-pair quantified certification
-/// fallback), `smtlib_first_verdict_via_executor` (the checked-replay
-/// obligation re-execution), and the strict-unsat-cert obligation lane, none
-/// of which may ever be relabelled without re-auditing what backs their claim.
+/// `smtlib_first_verdict_via_executor_until` (the ghost-pair quantified
+/// certification and checked-replay obligation re-execution) and the
+/// strict-unsat-cert obligation lane, none of which may ever be relabelled
+/// without re-auditing what backs their claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExecutorQueryRole {
     /// The verdict is (or becomes) a published claim.
@@ -1045,14 +1045,29 @@ pub(crate) fn new_search_executor() -> ay_dpll::Executor {
     executor_in_posture(verdict_only::search_sheds_proof_cycle())
 }
 
-/// The executor of the raw SMT-LIB script channels
-/// ([`check_unsat_smtlib_via_executor`],
-/// [`smtlib_first_verdict_via_executor_with_limit`]). Their `unsat` can be
-/// the published claim (the ghost-pair quantified certification, the
-/// `--strict-proofs` checked replay), so it takes the process posture alone:
-/// a [`ScopedVerdictOnlySearch`] on this thread does not reach it.
+/// The executor of the raw SMT-LIB script channel
+/// ([`smtlib_first_verdict_via_executor_with_limit`], including its absolute
+/// deadline wrapper). Its `unsat` can be the published claim (the ghost-pair
+/// quantified certification, the `--strict-proofs` checked replay), so it
+/// takes the process posture alone: a [`ScopedVerdictOnlySearch`] on this
+/// thread does not reach it.
 fn new_script_executor() -> ay_dpll::Executor {
     executor_in_posture(false)
+}
+
+/// Test seam for assigning a query role without exposing an unbounded
+/// production entry point.
+#[cfg(test)]
+fn execute_commands_via_executor(
+    commands: &[ay_frontend::Command],
+    role: ExecutorQueryRole,
+) -> Result<Vec<String>, ()> {
+    execute_commands_via_executor_with_limits(
+        commands,
+        role,
+        ExecutorResourceLimits::default(),
+        new_script_executor,
+    )
 }
 
 /// A search executor in the process posture, shedding the proof cycle in
@@ -1072,20 +1087,6 @@ fn executor_in_posture(verdict_only: bool) -> ay_dpll::Executor {
     exec
 }
 
-/// [`execute_commands_via_executor_with_limits`] for a raw SMT-LIB script
-/// channel ([`new_script_executor`]), unlimited.
-fn execute_commands_via_executor(
-    commands: &[ay_frontend::Command],
-    role: ExecutorQueryRole,
-) -> Result<Vec<String>, ()> {
-    execute_commands_via_executor_with_limits(
-        commands,
-        role,
-        ExecutorResourceLimits::default(),
-        new_script_executor,
-    )
-}
-
 /// Execute `commands` on a fresh executor from `new_executor`: the search
 /// constructor ([`new_search_executor`]) for the `ChcExpr` query channels,
 /// the script constructor ([`new_script_executor`]) for the raw SMT-LIB ones.
@@ -1093,7 +1094,7 @@ fn execute_commands_via_executor_with_limits(
     commands: &[ay_frontend::Command],
     role: ExecutorQueryRole,
     limits: ExecutorResourceLimits<'_>,
-    new_executor: fn() -> ay_dpll::Executor,
+    new_executor: impl FnOnce() -> ay_dpll::Executor,
 ) -> Result<Vec<String>, ()> {
     let memory = ReplayMemory::capture(limits.term_memory_limit);
     let inherited = crate::smt::deadline::current_lane_token();
@@ -1201,79 +1202,78 @@ fn trace_executor_phases(
     );
 }
 
-/// Run a raw SMT-LIB script through the ay-dpll executor and return `true`
-/// only when the first output is literally `unsat`.
-///
-/// Used by the ghost-pair quantified certification fallback
-/// (`transform::array_ghost_pairs::certify`), whose discharge queries contain
-/// explicit `forall` assertions that have no `ChcExpr` representation. The
-/// executor's `unsat` verdict is trusted here exactly as it is trusted by
-/// `check_sat_via_executor` above (same engine, same proof pipeline); any
-/// parse error, execution error, panic, `sat`, or `unknown` returns `false`
-/// (fail-closed).
-pub(crate) fn check_unsat_smtlib_via_executor(smt: &str) -> bool {
-    let memory = ReplayMemory::capture(None);
-    if memory.check().is_none() {
-        return false;
-    }
-    let commands = match ay_frontend::parse(smt) {
-        Ok(commands) => commands,
-        Err(error) => {
-            tracing::debug!("executor_adapter: quantified script parse error: {error}");
-            return false;
-        }
-    };
-    let result = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
-        Ok(outputs) => outputs.first().map(String::as_str) == Some("unsat"),
-        Err(()) => false,
-    };
-    drop(commands);
-    memory.check().is_some() && result
+/// Deterministic verdict of the closed, ground SAT oracle used by constant-fold
+/// differential tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CountedOracleVerdict {
+    /// The independent executor model gate confirmed the asserted closed ground proposition.
+    Confirmed,
+    /// The executor proved the asserted closed ground proposition false.
+    Disagreed,
+    /// Parsing, execution, publication, or a deterministic resource bound refused.
+    Refused,
 }
 
-/// Run a raw SMT-LIB script through the ay-dpll executor with an optional
-/// wall-clock timeout and return the first verdict output (`sat` / `unsat` /
-/// `unknown`), or `None` on parse error, execution error, or ay panic.
-///
-/// Used by the CHC checked-replay pass (`proof_metadata::replay_check`) to
-/// re-execute digest-bound certificate obligation queries on a fresh executor.
-/// The timeout is injected as a prepended `(set-option :timeout <ms>)` command
-/// rather than by editing the obligation text, so the hashed artifact bytes
-/// stay exactly what was emitted; a timeout can only degrade a definite
-/// verdict to `unknown` (never flip sat/unsat), so the injection cannot change
-/// what the obligation proves. Fail-closed like
-/// [`check_unsat_smtlib_via_executor`].
-pub(crate) fn smtlib_first_verdict_via_executor(
-    smt: &str,
-    timeout: Option<std::time::Duration>,
-) -> Option<String> {
-    let memory = ReplayMemory::capture(None);
-    memory.check()?;
-    let script_with_timeout;
-    let effective_script = match timeout {
-        Some(timeout) if !timeout.is_zero() => {
-            let ms = u64::try_from(timeout.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1);
-            script_with_timeout = format!("(set-option :timeout {ms})\n{smt}");
-            script_with_timeout.as_str()
+#[cfg(test)]
+fn classify_counted_oracle_output(output: Result<Vec<String>, ()>) -> CountedOracleVerdict {
+    match output.as_deref() {
+        Ok([result]) if result == "sat" => CountedOracleVerdict::Confirmed,
+        Ok([result]) if result == "unsat" => CountedOracleVerdict::Disagreed,
+        _ => CountedOracleVerdict::Refused,
+    }
+}
+
+#[cfg(test)]
+fn run_counted_oracle_commands(
+    commands: &[ay_frontend::Command],
+    conflicts: u64,
+    decisions: u64,
+) -> CountedOracleVerdict {
+    const TERM_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
+
+    classify_counted_oracle_output(execute_commands_via_executor_with_limits(
+        commands,
+        ExecutorQueryRole::Published,
+        ExecutorResourceLimits {
+            deadline: None,
+            term_memory_limit: Some(TERM_MEMORY_LIMIT),
+            cancellation: None,
+        },
+        || {
+            let mut executor = new_script_executor();
+            executor.set_random_seed(0);
+            executor.set_resource_limit(Some(conflicts));
+            executor.set_decision_limit(Some(decisions));
+            executor.set_ground_budget_enabled(false);
+            executor
+        },
+    ))
+}
+
+/// Check one canonical closed ground BV assertion with fixed, deterministic
+/// solver effort. Unknown/resource exhaustion is refusal, never disagreement.
+#[cfg(test)]
+pub(crate) fn check_ground_sat_smtlib_via_counted_executor(smt: &str) -> CountedOracleVerdict {
+    let Ok(commands) = ay_frontend::parse(smt) else {
+        return CountedOracleVerdict::Refused;
+    };
+    match commands.as_slice() {
+        [ay_frontend::Command::SetLogic(logic), ay_frontend::Command::Assert(_), ay_frontend::Command::CheckSat]
+            if logic == "QF_BV" =>
+        {
+            run_counted_oracle_commands(&commands, 1, 1)
         }
-        _ => smt,
-    };
-    let commands = match ay_frontend::parse(effective_script) {
-        Ok(commands) => commands,
-        Err(error) => {
-            tracing::debug!("executor_adapter: replay obligation parse error: {error}");
-            return None;
-        }
-    };
-    let result = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
-        Ok(outputs) => outputs.first().cloned(),
-        Err(()) => None,
-    };
-    drop(commands);
-    memory.check()?;
-    result
+        _ => CountedOracleVerdict::Refused,
+    }
+}
+
+/// Finite test oracle for raw quantified scripts; production callers use the
+/// bounded script channel directly.
+#[cfg(test)]
+pub(crate) fn check_unsat_smtlib_via_executor(smt: &str) -> bool {
+    let deadline = Instant::now() + std::time::Duration::from_mins(1);
+    smtlib_first_verdict_via_executor_until(smt, deadline, None).as_deref() == Some("unsat")
 }
 
 /// Execute a generated SMT-LIB obligation under one absolute wall-clock
@@ -2107,6 +2107,7 @@ impl SmtContext {
 /// Combines all expressions into a single `(and ...)` assertion and runs it
 /// through the executor. Returns `IncrementalCheckResult` matching the caller's
 /// expected return type.
+#[cfg(test)]
 pub(crate) fn check_sat_conjunction_via_executor(
     exprs: &[ChcExpr],
     propagated_equalities: &FxHashMap<String, i128>,
@@ -2429,10 +2430,9 @@ mod array_lambda_executor_tests {
             collect_uninterpreted_function_declarations_for_exprs([&lambda]).unwrap();
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0].name, "f");
-        assert!(
-            collect_uninterpreted_function_applications_for_exprs([&lambda])
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            collect_uninterpreted_function_applications_for_exprs([&lambda]).unwrap(),
+            [] as [ChcExpr; 0]
         );
     }
 

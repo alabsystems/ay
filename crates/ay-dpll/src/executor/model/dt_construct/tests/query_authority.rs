@@ -146,7 +146,7 @@ fn tester_under_authored_disjunction_is_not_a_hard_literal() {
             .expect("fixture has tester applications"),
     );
     assert!(builder.info[&root].forced.is_none());
-    assert!(builder.info[&root].excluded.is_empty());
+    assert_eq!(builder.info[&root].excluded, [] as [String; 0]);
 }
 
 #[test]

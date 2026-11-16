@@ -41,7 +41,7 @@ impl Check<'_, '_> {
                     ((u64::from(row.terms[i].1) + u64::from(coefficient)) % u64::from(p)) as u32;
                 if sum == 0 {
                     self.pay(row.terms.len() - i, 0)?;
-                    row.terms.remove(i);
+                    let _ = row.terms.remove(i);
                 } else {
                     row.terms[i].1 = sum;
                 }
@@ -54,7 +54,7 @@ impl Check<'_, '_> {
                     let capacity = row.terms.capacity().max(2).checked_mul(2)?;
                     self.pay(
                         row.terms.len(),
-                        capacity.checked_mul(std::mem::size_of::<(TermId, u32)>())?,
+                        capacity.checked_mul(size_of::<(TermId, u32)>())?,
                     )?;
                     row.terms
                         .try_reserve_exact(capacity - row.terms.len())

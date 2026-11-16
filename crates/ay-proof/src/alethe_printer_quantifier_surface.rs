@@ -128,7 +128,7 @@ impl Budget<'_> {
         }
         // The borrowed scanner may allocate one field slice per input byte.
         // Charge that worst-case vector and its scans before entering it.
-        let per_byte = std::mem::size_of::<&str>().checked_add(8)?;
+        let per_byte = size_of::<&str>().checked_add(8)?;
         self.spend(u64::try_from(text.len().checked_mul(per_byte)?).ok()?)
     }
 
@@ -144,7 +144,7 @@ impl Budget<'_> {
         if self.progress.is_none() {
             return Some(());
         }
-        self.spend(u64::try_from(count.checked_mul(std::mem::size_of::<Sexp<'_>>())?).ok()?)
+        self.spend(u64::try_from(count.checked_mul(size_of::<Sexp<'_>>())?).ok()?)
     }
 
     fn admit_literals(&mut self, left: &str, right: &str) -> Option<()> {

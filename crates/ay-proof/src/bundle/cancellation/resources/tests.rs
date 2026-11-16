@@ -4,12 +4,10 @@
 use super::*;
 use ay_core::AletheRule;
 
-#[path = "../tests/fixtures.rs"]
-mod fixtures;
-#[path = "../tests/oracle.rs"]
-mod oracle;
 mod refusal;
 
+use super::super::super::cancellation_fixtures as fixtures;
+use super::super::oracle;
 use fixtures::{contradiction, datatype, skolem};
 
 fn assert_same(
@@ -28,7 +26,7 @@ fn assert_same(
 
 fn trace(bundle: &SerializableProofBundle) -> Vec<(usize, usize)> {
     let mut charges = Vec::new();
-    crate::re_check_bundle_strict_with_resource_control(bundle, &mut |work, bytes| {
+    re_check_bundle_strict_with_resource_control(bundle, &mut |work, bytes| {
         charges.push((work, bytes));
         true
     })
@@ -99,7 +97,7 @@ fn real_boolean_datatype_and_skolem_proofs_keep_results_and_legacy_checkpoints()
     let duplicate = contradiction(true);
     let charges = trace(&duplicate);
     assert!(
-        charges.contains(&(4, 4 * std::mem::size_of::<TermId>())),
+        charges.contains(&(4, 4 * size_of::<TermId>())),
         "the owning assumption vector must be prepaid, including duplicate slots"
     );
     let result = bounded(&duplicate, totals(&charges)).unwrap();

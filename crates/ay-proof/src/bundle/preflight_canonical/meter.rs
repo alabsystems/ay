@@ -27,7 +27,7 @@ impl<'a> CanonicalMeter<'a> {
 
     pub(super) fn map_lookup(&mut self, entries: usize) -> Result<(), ProofCheckError> {
         // BTree's fixed-width u64 keys have no payload-dependent comparison.
-        let levels = add((usize::BITS - entries.leading_zeros()) as usize, 1)?;
+        let levels = add(entries.bit_width() as usize, 1)?;
         self.charge(mul(levels, 12)?, 0)
     }
 
@@ -35,7 +35,7 @@ impl<'a> CanonicalMeter<'a> {
         // alloc's B=6 node has 11 keys and 12 edges. A split can allocate one
         // sibling per level plus a root. This prices actual own-table height
         // conservatively; no assumption relates bucket count to live terms.
-        let nodes = add((usize::BITS - entries.leading_zeros()) as usize, 2)?;
+        let nodes = add(entries.bit_width() as usize, 2)?;
         let slots = mul(nodes, 32)?;
         self.charge(slots, mul(slots, add(size_of::<T>(), size_of::<usize>())?)?)
     }

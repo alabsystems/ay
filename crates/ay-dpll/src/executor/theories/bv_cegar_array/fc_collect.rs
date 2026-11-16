@@ -22,7 +22,7 @@ impl Executor {
     pub(in crate::executor) fn collect_cross_equality_pairs(
         terms: &mut TermStore,
         assertions: &[TermId],
-        mut subst: Option<&mut crate::preprocess::VariableSubstitution>,
+        subst: Option<&mut crate::preprocess::VariableSubstitution>,
     ) -> Vec<(TermId, TermId, TermId, Option<TermId>)> {
         let mut candidates: Vec<(TermId, TermId, TermId, Option<TermId>)> = Vec::new();
         let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();

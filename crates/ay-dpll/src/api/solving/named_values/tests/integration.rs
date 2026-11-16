@@ -49,7 +49,10 @@ fn public_named_values_extract_parsed_scalars_and_reject_stale_models() {
         ]
     );
     assert_eq!(solver.terms().len(), size);
-    assert!(solver.try_get_named_values(&[]).unwrap().is_empty());
+    assert_eq!(
+        solver.try_get_named_values(&[]).unwrap(),
+        [] as [ModelValue; 0]
+    );
     assert!(solver.try_get_named_values(&["y", "missing"]).is_err());
     solver.parse_smtlib2("(assert false)").unwrap();
     assert!(matches!(

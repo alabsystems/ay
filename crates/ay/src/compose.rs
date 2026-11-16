@@ -174,7 +174,7 @@ fn install_stage_child_reaper() {
     let _ = std::thread::Builder::new()
         .name("ay-compose-signals".to_string())
         .spawn(move || {
-            for raw_signal in &mut signals {
+            if let Some(raw_signal) = (&mut signals).into_iter().next() {
                 kill_live_stage_child();
                 let _ = io::stdout().flush();
                 let _ = io::stderr().flush();
@@ -1603,14 +1603,14 @@ mod tests {
     fn budget_deadlines_never_exceed_the_total() {
         let started = Instant::now();
         let budget = ComposeBudget::new(started, 1_200_000, 1_500_000, 2_000);
-        assert_eq!(budget.stage2_wall, Duration::from_millis(1_498_000));
-        assert_eq!(budget.stage1_wall, Duration::from_millis(1_205_000));
+        assert_eq!(budget.stage2_wall, Duration::from_secs(1_498));
+        assert_eq!(budget.stage1_wall, Duration::from_secs(1_205));
         assert!(budget.stage1_wall <= budget.stage2_wall);
 
         // A first stage that asks for the whole budget is clamped, not honoured.
         let budget = ComposeBudget::new(started, 1_500_000, 1_500_000, 2_000);
-        assert_eq!(budget.stage1_wall, Duration::from_millis(1_498_000));
-        assert_eq!(budget.stage2_wall, Duration::from_millis(1_498_000));
+        assert_eq!(budget.stage1_wall, Duration::from_secs(1_498));
+        assert_eq!(budget.stage2_wall, Duration::from_secs(1_498));
     }
 
     #[test]
@@ -1679,7 +1679,7 @@ mod tests {
         // PIDs are of children this test ran and reaped: fixed numbers can be
         // live processes on a busy host, and the sweep rightly spares those.
         let dead_pid = || {
-            let mut child = std::process::Command::new("true")
+            let mut child = Command::new("true")
                 .spawn()
                 .expect("spawn a short-lived child");
             let pid = child.id();

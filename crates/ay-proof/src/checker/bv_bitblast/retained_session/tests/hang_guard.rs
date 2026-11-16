@@ -9,7 +9,7 @@ use super::*;
 #[test]
 fn a_far_caller_deadline_never_outlasts_the_producer_hang_guard() {
     let before = Instant::now();
-    let limits = attempt_limits(before + Duration::from_secs(86_400));
+    let limits = attempt_limits(before + Duration::from_hours(24));
     let after = Instant::now();
     let end = limits.resolution.deadline.expect("attempt deadline");
     assert!(end >= before + PRODUCER_HANG_GUARD && end <= after + PRODUCER_HANG_GUARD);
@@ -26,7 +26,7 @@ fn a_far_caller_deadline_never_outlasts_the_producer_hang_guard() {
 fn a_hang_guard_stop_is_a_resource_refusal_and_a_caller_stop_a_cancellation() {
     let deadline = || MeteredBridgeError::Bridge(BridgeError::Deadline);
     let pending = Instant::now() + Duration::from_secs(60);
-    let passed = Instant::now() - Duration::from_secs(1);
+    let passed = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     assert_eq!(
         bridge_error(ProofId(0), deadline(), pending),
         ProofCheckError::ResourceLimit

@@ -402,18 +402,3 @@ fn caller_binding_mismatch_is_still_rejected_when_progress_continues() {
             .contains("do not match the supplied replay evidence"));
     }
 }
-
-#[test]
-fn worker_retains_original_absolute_start_instead_of_granting_a_new_budget() {
-    let run = truth_run();
-    let binding = binding(&run, Format::GroundDerivationV1);
-    let start = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
-    let budget = Duration::from_secs(1);
-    let mut callback = || ground_export::within_budget(&start, budget);
-    let mut progress = ground_export::ReplayProgress::new(&mut callback);
-    assert_interrupted(run.run_checked_replay_with_control(
-        binding,
-        ReplayLimit::Until(replay_deadline(start, budget).unwrap()),
-        &mut progress,
-    ));
-}

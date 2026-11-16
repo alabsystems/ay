@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(dag.original_clauses.len(), clauses.len());
         assert_eq!(dag.num_vars, num_vars);
         let last = dag.derived.last().expect("has steps");
-        assert!(last.clause.is_empty(), "terminates at the empty clause");
+        assert_eq!(last.clause.len(), 0, "terminates at the empty clause");
         assert_eq!(dag.empty_clause_id, last.id);
         // Every derived step carries its unit-propagation hint chain.
         assert!(dag.derived.iter().all(|s| !s.rup_hints.is_empty()));

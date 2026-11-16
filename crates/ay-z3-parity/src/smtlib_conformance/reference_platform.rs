@@ -106,6 +106,10 @@ impl Platform {
             return Err("conformance library identities need remeasurement for this Z3 pin".into());
         }
         let archive = value(&format!("Z3_ASSET_{}", self.row()))?;
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "the pinned release asset name requires the exact lowercase .zip suffix"
+        )]
         if !archive.starts_with("z3-5.3.3-")
             || !archive.ends_with(".zip")
             || !archive

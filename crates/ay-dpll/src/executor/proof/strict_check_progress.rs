@@ -134,7 +134,7 @@ pub(in crate::executor) fn executor_stop_signals_asserted(executor: &Executor) -
 /// [`MAX_CHECK_WORK`]. So the `EqDiffVar` commit gate now prices a typed
 /// verdict against nothing but the envelope that produced it, and what still
 /// reverts is unchanged: `ResourceLimit` and `Cancelled`.
-
+///
 /// Run one strict check under the executor's active solve controls and one
 /// aggregate, checked-arithmetic resource envelope.
 pub(super) fn check_with_executor_progress(

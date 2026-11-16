@@ -765,7 +765,7 @@ impl ChcProblem {
         let mut stack = vec![expression];
         while let Some(current) = stack.pop() {
             if !crate::expr::dag::children(current).is_empty()
-                && !seen.insert(current as *const ChcExpr)
+                && !seen.insert(std::ptr::from_ref::<ChcExpr>(current))
             {
                 continue;
             }
@@ -897,7 +897,7 @@ impl ChcProblem {
                 else {
                     return Err(malformed("concat"));
                 };
-                Some(left.checked_add(right).unwrap_or(u32::MAX))
+                Some(left.saturating_add(right))
             }
             ChcOp::BvZeroExtend(extension) | ChcOp::BvSignExtend(extension) => {
                 let [arg] = args else {
@@ -906,7 +906,7 @@ impl ChcProblem {
                 let ChcSort::BitVec(width) = arg.sort() else {
                     return Err(malformed("bitvector extension"));
                 };
-                Some(width.checked_add(*extension).unwrap_or(u32::MAX))
+                Some(width.saturating_add(*extension))
             }
             ChcOp::BvRepeat(repetitions) => {
                 let [arg] = args else {
@@ -915,7 +915,7 @@ impl ChcProblem {
                 let ChcSort::BitVec(width) = arg.sort() else {
                     return Err(malformed("bitvector repeat"));
                 };
-                Some(width.checked_mul(*repetitions).unwrap_or(u32::MAX))
+                Some(width.saturating_mul(*repetitions))
             }
             ChcOp::BvExtract(hi, lo) => {
                 let [arg] = args else {
@@ -947,7 +947,8 @@ impl ChcProblem {
         let mut seen: FxHashSet<*const ChcExpr> = FxHashSet::default();
         let mut stack = vec![expr];
         while let Some(expr) = stack.pop() {
-            if !crate::expr::dag::children(expr).is_empty() && !seen.insert(expr as *const ChcExpr)
+            if !crate::expr::dag::children(expr).is_empty()
+                && !seen.insert(std::ptr::from_ref::<ChcExpr>(expr))
             {
                 continue;
             }
@@ -995,7 +996,7 @@ impl ChcProblem {
         let mut stack = vec![expr];
         while let Some(current) = stack.pop() {
             if !crate::expr::dag::children(current).is_empty()
-                && !seen.insert(current as *const ChcExpr)
+                && !seen.insert(std::ptr::from_ref::<ChcExpr>(current))
             {
                 continue;
             }

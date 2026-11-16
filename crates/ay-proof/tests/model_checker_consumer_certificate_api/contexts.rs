@@ -130,7 +130,8 @@ fn public_typed_context_authenticates_unused_members_and_rejects_wrong_signature
         )
     };
     assert_eq!(check(&terms).unwrap().resolution_count, 1);
-    terms.mk_app(Symbol::named("consumer_unit"), [positive], carrier);
+    let _invalid_constructor_application =
+        terms.mk_app(Symbol::named("consumer_unit"), [positive], carrier);
     assert!(matches!(
         check(&terms),
         Err(ProofCheckError::InvalidDatatypeSignatureContext { .. })

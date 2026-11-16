@@ -25,7 +25,7 @@ fn run(entries: &[(TermData, Sort)]) -> Result<(), ProofCheckError> {
 fn compare(extra: (TermData, Sort), valid: bool) {
     let mut values = entries();
     values.push(extra);
-    let old = crate::bundle::validate_term_snapshot_legacy(&values);
+    let old = validate_term_snapshot_legacy(&values);
     let new = run(&values);
     assert_eq!(old.is_ok(), valid, "old={old:?}");
     assert_eq!(new.is_ok(), valid, "new={new:?}");
@@ -43,7 +43,7 @@ fn positional_shapes_preserve_legacy_acceptance() {
         (TermData::Not(TermId(0)), Sort::Bool),
         (TermData::Ite(TermId(0), TermId(2), TermId(3)), Sort::Int),
         (
-            TermData::Let(vec![("".into(), TermId(2))], TermId(3)),
+            TermData::Let(vec![(String::new(), TermId(2))], TermId(3)),
             Sort::Int,
         ),
         (
@@ -56,7 +56,7 @@ fn positional_shapes_preserve_legacy_acceptance() {
         ),
         (
             TermData::Forall(
-                vec![("".into(), Sort::Int)],
+                vec![(String::new(), Sort::Int)],
                 TermId(0),
                 vec![vec![], vec![TermId(2)]],
             ),

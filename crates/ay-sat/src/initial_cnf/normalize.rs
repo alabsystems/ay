@@ -43,7 +43,7 @@ impl Scratch {
                 }
                 tautology |= last.variable() == literal.variable();
             }
-            owner.admit(1, std::mem::size_of::<Literal>())?;
+            owner.admit(1, size_of::<Literal>())?;
             self.literals[written] = literal;
             written += 1;
             previous = Some(literal);
@@ -103,7 +103,7 @@ fn swap(
     right: usize,
     owner: &CountedAdmission,
 ) -> Result<()> {
-    owner.admit(2, 2 * std::mem::size_of::<Literal>())?;
+    owner.admit(2, 2 * size_of::<Literal>())?;
     literals.swap(left, right);
     Ok(())
 }

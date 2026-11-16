@@ -4,6 +4,8 @@
 //! Birth-identified process-group observation for owned child supervision.
 
 use std::io;
+#[cfg(target_os = "macos")]
+use std::mem::{size_of, size_of_val};
 
 const MAX_GROUP_MEMBERS: usize = 16_384;
 
@@ -18,7 +20,7 @@ impl std::fmt::Display for CensusMemberDisappeared {
 impl std::error::Error for CensusMemberDisappeared {}
 
 pub(crate) fn census_member_disappeared() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, CensusMemberDisappeared)
+    io::Error::other(CensusMemberDisappeared)
 }
 
 /// An incomplete observation, never an empty-group or zero-RSS witness.
@@ -117,7 +119,7 @@ pub fn process_group_sample(group: u32) -> io::Result<ProcessGroupSample> {
     if count < 0 {
         return Err(io::Error::last_os_error());
     }
-    if count as usize >= capacity || count as usize % size_of::<i32>() != 0 {
+    if count as usize >= capacity || !(count as usize).is_multiple_of(size_of::<i32>()) {
         return Err(io::Error::other(
             "process group membership exceeds observation bound",
         ));

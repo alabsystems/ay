@@ -94,14 +94,6 @@ use normalize::fold_surface_with_progress;
 /// (step t0.l (cl (not (< y 2.5)) (< y (/ 5.0 2.0))) :rule la_generic :args (1 1))
 /// (step t0 (cl (< y (/ 5.0 2.0))) :rule resolution :premises (t0.l t0.f))
 /// ```
-pub(super) fn render_folded_linear_implication(
-    id: impl std::fmt::Display,
-    surface: &str,
-    canonical: &str,
-) -> (Option<String>, usize) {
-    render_folded_linear_implication_with_progress(id, surface, canonical, &mut |_| true)
-}
-
 pub(super) fn render_folded_linear_implication_with_progress(
     id: impl std::fmt::Display,
     surface: &str,
@@ -180,8 +172,7 @@ impl AlethePrinter<'_> {
         {
             return false;
         }
-        let Some(charge) = super::bounds::canonical_rendering_work_upper_bound(self.terms, term)
-        else {
+        let Some(charge) = bounds::canonical_rendering_work_upper_bound(self.terms, term) else {
             return false;
         };
         if !self.admit_emission_work(charge) {
@@ -245,6 +236,10 @@ impl AlethePrinter<'_> {
     /// * the surface names an annotation, a `let` or a binder;
     /// * another override re-spells a strict descendant or a strict ancestor
     ///   of the bridge ROOT ([`document_spelling`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact authored/canonical proof schema and traversal ledgers stay explicit"
+    )]
     pub(super) fn boolean_fold_step(
         &self,
         id: &str,
@@ -346,6 +341,10 @@ impl AlethePrinter<'_> {
     /// * `cong` under a shared `not`, recursively (`(= (> x 3) false)` folds to
     ///   `(not (> x 3))` over the canonical `(not (< 3 x))`);
     /// * otherwise the rest of the equivalence engine.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact authored/canonical proof schema and traversal ledgers stay explicit"
+    )]
     fn fold_remainder(
         &self,
         id: &str,

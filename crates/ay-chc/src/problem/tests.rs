@@ -1177,7 +1177,10 @@ mod clause_simplification_tests {
         assert_eq!(problem.pruned_false_query_ids().len(), 1);
         assert_eq!(obligations.len(), 1);
         assert_eq!(obligations[0].id().source_query_ordinal(), 1);
-        assert!(obligations[0].problem().pruned_false_query_ids().is_empty());
+        assert_eq!(
+            obligations[0].problem().pruned_false_query_ids(),
+            [] as [ChcPrunedQueryObligationId; 0]
+        );
         assert_eq!(obligations[0].problem().pruned_false_query_count(), 0);
         obligations[0]
             .problem()

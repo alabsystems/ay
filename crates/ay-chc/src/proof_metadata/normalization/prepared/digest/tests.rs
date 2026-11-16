@@ -62,17 +62,18 @@ fn consume(
 
 fn totals(source: &ChcProblem) -> (u64, usize) {
     let (mut units, mut bytes) = (0u64, 0usize);
-    let mut sink = |work: usize, storage: usize| {
-        units = units.checked_add(work as u64).unwrap();
-        bytes = bytes.checked_add(storage).unwrap();
-        Ok(())
-    };
-    let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
-    prepare_normalized_chc_input_with_work(source, &mut work)
-        .unwrap()
-        .with_sha256(|_, _, _, _| Ok(()))
-        .unwrap();
-    drop(work);
+    {
+        let mut sink = |work: usize, storage: usize| {
+            units = units.checked_add(work as u64).unwrap();
+            bytes = bytes.checked_add(storage).unwrap();
+            Ok(())
+        };
+        let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
+        prepare_normalized_chc_input_with_work(source, &mut work)
+            .unwrap()
+            .with_sha256(|_, _, _, _| Ok(()))
+            .unwrap();
+    }
     (units, bytes)
 }
 
@@ -122,7 +123,7 @@ fn exact_canonical_bytes_and_consumer_line_normalizer_have_identical_digest() {
         .with_work(|work| {
             prepare_normalized_chc_input_with_work(&source, work)?.with_sha256(
                 |actual, bytes, hex, _| {
-                    assert!(std::ptr::eq(actual, &source));
+                    assert!(std::ptr::eq(actual, &raw const source));
                     let normalized = consumer_normalize(bytes);
                     assert_eq!(bytes, normalized);
                     assert_eq!(hex, format!("{:x}", Sha256::digest(normalized.as_bytes())));
@@ -155,20 +156,21 @@ fn block_round_offer_totals_match_the_closed_source_recurrence() {
     for length in [0, 1, 55, 56, 63, 64, 65, 120, 128, 256] {
         let input = vec![0u8; length];
         let (mut units, mut storage) = (0usize, 0usize);
-        let mut sink = |work: usize, bytes: usize| {
-            units += work;
-            storage += bytes;
-            Ok(())
-        };
-        let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
-        super::consume(
-            &ChcProblem::new(),
-            std::str::from_utf8(&input).unwrap(),
-            &mut work,
-            |_, _, _, _| Ok(()),
-        )
-        .unwrap();
-        drop(work);
+        {
+            let mut sink = |work: usize, bytes: usize| {
+                units += work;
+                storage += bytes;
+                Ok(())
+            };
+            let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
+            super::consume(
+                &ChcProblem::new(),
+                std::str::from_utf8(&input).unwrap(),
+                &mut work,
+                |_, _, _, _| Ok(()),
+            )
+            .unwrap();
+        }
         let (full, tail) = (length / 64, length % 64);
         let extra = usize::from(tail >= 56);
         assert_eq!(units, 36_160 + 30_304 * full + 24 * tail + 28_752 * extra);

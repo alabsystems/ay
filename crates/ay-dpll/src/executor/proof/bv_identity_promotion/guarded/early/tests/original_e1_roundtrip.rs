@@ -132,7 +132,10 @@ fn original_e1_exit0_roundtrips_root_and_generated_negative_under_existing_limit
         executor.early_ground_memory_terms_print_faithfully(&[root, negative]),
         "generated proof negation must compose the exact child roundtrip without raising source depth"
     );
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
     assert!(executor.last_proof().is_none());
 }
 
@@ -147,8 +150,11 @@ fn original_pair() -> (Executor, FrontendTerm, TermId, TermId) {
 }
 
 fn no_authority(executor: &Executor) {
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
-    assert!(executor.last_proof_rebuild_originals.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
+    assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
     assert!(executor.last_proof().is_none());
     assert!(executor.last_unsat_certificate.is_none());
 }
@@ -277,7 +283,11 @@ fn full_negative_render_payload_and_existing_stop_controls_remain_bounded() {
         let (mut executor, root, negative) = small_pair("");
         match control {
             0 => executor.set_interrupt(Arc::new(AtomicBool::new(true))),
-            1 => executor.set_deadline(Some(Instant::now() - Duration::from_secs(1))),
+            1 => executor.set_deadline(Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("fixture instant supports a one-second past deadline"),
+            )),
             _ => executor.set_term_memory_limit(Some(0)),
         }
         assert!(!executor.early_ground_memory_terms_print_faithfully(&[root, negative]));
@@ -300,9 +310,9 @@ fn canonical_payload_and_distinct_node_limits_include_the_generated_shell() {
     assert!(executor
         .ground_surface_render_budget(&[root], &overrides)
         .is_some());
-    assert!(!executor
+    assert!(executor
         .ground_surface_render_budget(&[root, negative], &overrides)
-        .is_some());
+        .is_none());
     no_authority(&executor);
 
     let mut executor = Executor::new();

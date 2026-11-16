@@ -134,22 +134,23 @@ impl Solver {
                 // learned clauses are already minimal.
                 p.counter(self.stats.ibcl_skipped_short_chain, 1)?;
                 self.stats.ibcl_skipped_short_chain += 1;
-            } else if {
-                p.work(chain_len)?;
-                !self.conflict.resolution_chain_prefix_has_pivots(chain_len)
-            } {
-                // Future extraction must fail closed unless every direct 1UIP
-                // reason step has both a non-zero clause ID and a pivot literal.
-                p.counter(self.stats.ibcl_skipped_missing_pivots, 1)?;
-                self.stats.ibcl_skipped_missing_pivots += 1;
             } else {
-                p.counter(self.stats.ibcl_attempts, 1)?;
-                self.stats.ibcl_attempts += 1;
-                // Future: compute interpolant here and compare size.
-                // if interpolant_clause.len() < clause_size {
-                //     self.stats.ibcl_improvements += 1;
-                //     // Replace learned clause with interpolant
-                // }
+                p.work(chain_len)?;
+                let has_pivots = self.conflict.resolution_chain_prefix_has_pivots(chain_len);
+                if !has_pivots {
+                    // Future extraction must fail closed unless every direct 1UIP
+                    // reason step has both a non-zero clause ID and a pivot literal.
+                    p.counter(self.stats.ibcl_skipped_missing_pivots, 1)?;
+                    self.stats.ibcl_skipped_missing_pivots += 1;
+                } else {
+                    p.counter(self.stats.ibcl_attempts, 1)?;
+                    self.stats.ibcl_attempts += 1;
+                    // Future: compute interpolant here and compare size.
+                    // if interpolant_clause.len() < clause_size {
+                    //     self.stats.ibcl_improvements += 1;
+                    //     // Replace learned clause with interpolant
+                    // }
+                }
             }
         }
         Ok(())

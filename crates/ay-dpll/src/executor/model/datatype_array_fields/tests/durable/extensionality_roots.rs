@@ -7,9 +7,9 @@ use super::*;
 #[test]
 fn exact_extensionality_root_requires_current_provenance_and_polarity() {
     let mut fixture = build_fixture();
-    let roots = fixture
+    let evidence = fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&fixture.model)
+        .collect_demanded_datatype_array_extensionality(&fixture.model)
         .expect("current exact extensionality provenance authenticates");
     let entry = fixture
         .executor
@@ -18,14 +18,14 @@ fn exact_extensionality_root_requires_current_provenance_and_polarity() {
         .first()
         .expect("fixture emitted the outer extensionality witness")
         .clone();
-    assert!(roots.contains(&entry.not_sel_eq));
+    assert!(evidence.roots.contains(&entry.not_sel_eq));
 
     let mut missing = fixture.model.clone();
     missing.term_to_var.remove(&entry.eq_term);
     assert!(fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&missing)
-        .is_none());
+        .collect_demanded_datatype_array_extensionality(&missing)
+        .is_some_and(|evidence| evidence.roots.is_empty() && evidence.cells.is_empty()));
     let mut wrong = fixture.model.clone();
     let eq_var = *wrong
         .term_to_var
@@ -34,8 +34,8 @@ fn exact_extensionality_root_requires_current_provenance_and_polarity() {
     wrong.sat_model[eq_var] = true;
     assert!(fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&wrong)
-        .is_none());
+        .collect_demanded_datatype_array_extensionality(&wrong)
+        .is_some_and(|evidence| evidence.roots.is_empty() && evidence.cells.is_empty()));
 
     reject_forged_and_oversized_shadow(&mut fixture, &entry);
     reject_reincarnated_shadow_entry(&mut fixture);
@@ -53,16 +53,11 @@ fn undemanded_emission_grants_neither_roots_nor_cells() {
         } else {
             model.term_to_var.remove(&entry.eq_term);
         }
-        // The requested-witness validator keeps its existing strict contract.
-        assert!(fixture
-            .executor
-            .authenticated_datatype_array_extensionality(&model)
-            .is_none());
         let evidence = fixture
             .executor
             .collect_demanded_datatype_array_extensionality(&model)
             .expect("unselected emission contributes no evidence");
-        assert!(evidence.roots.is_empty());
+        assert_eq!(evidence.roots, [] as [TermId; 0]);
         assert!(evidence.cells.is_empty());
     }
 }
@@ -79,12 +74,12 @@ fn append_unassigned_emission(
         .executor
         .ctx
         .terms
-        .mk_var(&format!("{label}-left"), sort.clone());
+        .mk_var(format!("{label}-left"), sort.clone());
     let rhs = fixture
         .executor
         .ctx
         .terms
-        .mk_var(&format!("{label}-right"), sort);
+        .mk_var(format!("{label}-right"), sort);
     let equality = fixture.executor.ctx.terms.mk_eq(lhs, rhs);
     // The maintained eager producer scans syntactic negations even when they
     // are not asserted or encoded into this model. Use that real producer,
@@ -109,7 +104,7 @@ fn demanded_collection_retains_active_evidence_and_excludes_mixed_undemanded_row
     let mut fixture = build_fixture();
     let expected = fixture
         .executor
-        .authenticated_datatype_array_extensionality(&fixture.model)
+        .collect_demanded_datatype_array_extensionality(&fixture.model)
         .unwrap();
     let unassigned = append_unassigned_emission(&mut fixture, "unassigned-emission");
     let assigned_true = append_unassigned_emission(&mut fixture, "true-emission");
@@ -132,10 +127,6 @@ fn demanded_collection_retains_active_evidence_and_excludes_mixed_undemanded_row
     }
     assert!(!evidence.roots.contains(&unassigned.not_sel_eq));
     assert!(!evidence.roots.contains(&assigned_true.not_sel_eq));
-    assert!(fixture
-        .executor
-        .authenticated_datatype_array_extensionality(&fixture.model)
-        .is_none());
 }
 
 #[test]
@@ -271,7 +262,7 @@ fn reject_forged_and_oversized_shadow(
     ));
     assert!(fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&fixture.model)
+        .collect_demanded_datatype_array_extensionality(&fixture.model)
         .is_none());
 
     fixture.executor.array_ext_shadow = original.clone();
@@ -282,7 +273,7 @@ fn reject_forged_and_oversized_shadow(
     ];
     assert!(fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&fixture.model)
+        .collect_demanded_datatype_array_extensionality(&fixture.model)
         .is_none());
     fixture.executor.array_ext_shadow = original;
 }
@@ -306,6 +297,6 @@ fn reject_reincarnated_shadow_entry(fixture: &mut Fixture) {
     fixture.executor.ctx.terms.rollback_to(checkpoint);
     assert!(fixture
         .executor
-        .authenticated_datatype_array_extensionality_roots(&fixture.model)
+        .collect_demanded_datatype_array_extensionality(&fixture.model)
         .is_none());
 }

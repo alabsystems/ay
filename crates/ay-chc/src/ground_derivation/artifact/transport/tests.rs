@@ -203,36 +203,38 @@ fn serialization_failure_remains_distinct_from_mismatch_and_refusal() {
 #[test]
 fn sticky_io_refusal_is_not_retryable_or_reclassified() {
     let mut calls = 0;
-    let mut progress = || {
-        calls += 1;
-        false
-    };
-    let mut control = GroundValidationControl::new(&mut progress);
-    let mut reader = ProgressReader {
-        bytes: b"{}",
-        position: 0,
-        until_poll: 0,
-        control: &mut control,
-    };
-    let mut byte = [0];
-    for _ in 0..2 {
+    {
+        let mut progress = || {
+            calls += 1;
+            false
+        };
+        let mut control = GroundValidationControl::new(&mut progress);
+        {
+            let mut reader = ProgressReader {
+                bytes: b"{}",
+                position: 0,
+                until_poll: 0,
+                control: &mut control,
+            };
+            let mut byte = [0];
+            for _ in 0..2 {
+                assert_eq!(
+                    reader
+                        .read(&mut byte)
+                        .expect_err("refused I/O must stop")
+                        .kind(),
+                    io::ErrorKind::Other
+                );
+            }
+        }
+        assert!(control.is_stopped());
         assert_eq!(
-            reader
-                .read(&mut byte)
-                .expect_err("refused I/O must stop")
-                .kind(),
-            io::ErrorKind::Other
+            parse_envelope::<TextFixture>(b"invalid JSON", &mut control)
+                .expect_err("sticky stop precedes malformed input")
+                .reason,
+            Reason::Interrupted
         );
     }
-    drop(reader);
-    assert!(control.is_stopped());
-    assert_eq!(
-        parse_envelope::<TextFixture>(b"invalid JSON", &mut control)
-            .expect_err("sticky stop precedes malformed input")
-            .reason,
-        Reason::Interrupted
-    );
-    drop(control);
     assert_eq!(calls, 1);
 }
 

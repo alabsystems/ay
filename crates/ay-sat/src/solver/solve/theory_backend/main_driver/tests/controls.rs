@@ -151,7 +151,7 @@ fn selected_maintenance_refuses_before_mutation_without_switching_defaults() {
             before
         );
         assert_eq!(rows(&s), original);
-        assert!(s.trail.is_empty());
+        assert_eq!(s.trail.len(), 0);
         refused(&s, &owner);
     }
 }

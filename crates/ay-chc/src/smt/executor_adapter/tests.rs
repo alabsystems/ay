@@ -7,7 +7,83 @@
 use super::*;
 use crate::expr::eval_array_select;
 use crate::{ChcDtConstructor, ChcDtSelector, ChcSort, ChcVar};
+use std::fmt::Write as _;
 use std::sync::Arc;
+
+#[test]
+fn counted_ground_sat_oracle_distinguishes_confirmation_disagreement_and_refusal() {
+    assert_eq!(
+        check_ground_sat_smtlib_via_counted_executor(
+            "(set-logic QF_BV)\n(assert (= #b1 #b1))\n(check-sat)\n",
+        ),
+        CountedOracleVerdict::Confirmed,
+    );
+    assert_eq!(
+        check_ground_sat_smtlib_via_counted_executor(
+            "(set-logic QF_BV)\n(assert (= #b1 #b0))\n(check-sat)\n",
+        ),
+        CountedOracleVerdict::Disagreed,
+    );
+
+    // All eight clauses on three independent BV1 atoms. No atom is a unit,
+    // and every assignment falsifies one clause, so this cannot settle before
+    // the nonroot conflict/decision checkpoint.
+    let mut nonroot_conflict = String::from(
+        "(set-logic QF_BV)\n\
+         (declare-const x (_ BitVec 1))\n\
+         (declare-const y (_ BitVec 1))\n\
+         (declare-const z (_ BitVec 1))\n",
+    );
+    for mask in 0..8 {
+        let literals = ["x", "y", "z"]
+            .iter()
+            .enumerate()
+            .map(|(bit, name)| {
+                let atom = format!("(= {name} #b1)");
+                if mask & (1 << bit) == 0 {
+                    atom
+                } else {
+                    format!("(not {atom})")
+                }
+            })
+            .collect::<Vec<_>>();
+        writeln!(nonroot_conflict, "(assert (or {}))", literals.join(" ")).unwrap();
+    }
+    nonroot_conflict.push_str("(check-sat)\n");
+    let nonroot_conflict =
+        ay_frontend::parse(&nonroot_conflict).expect("counted nonroot-conflict fixture parses");
+    assert_eq!(
+        run_counted_oracle_commands(&nonroot_conflict, 0, 0),
+        CountedOracleVerdict::Refused,
+    );
+    assert_eq!(
+        run_counted_oracle_commands(&nonroot_conflict, 64, 64),
+        CountedOracleVerdict::Disagreed,
+    );
+
+    assert_eq!(
+        classify_counted_oracle_output(Ok(vec!["unknown".to_string()])),
+        CountedOracleVerdict::Refused,
+    );
+    assert_eq!(
+        classify_counted_oracle_output(Ok(Vec::new())),
+        CountedOracleVerdict::Refused,
+    );
+    assert_eq!(
+        classify_counted_oracle_output(Err(())),
+        CountedOracleVerdict::Refused,
+    );
+    assert_eq!(
+        check_ground_sat_smtlib_via_counted_executor(
+            "(set-logic QF_BV)\n\
+             (set-option :rlimit 1)\n\
+             (assert (= #b1 #b1))\n\
+             (check-sat)\n",
+        ),
+        CountedOracleVerdict::Refused,
+    );
+}
+
 /// Test helper: call term_body_to_smt_value with empty DT ctor set.
 fn tv(term: &ay_frontend::Term) -> Option<SmtValue> {
     term_body_to_smt_value(term, &FxHashSet::default())
@@ -2304,19 +2380,14 @@ fn test_emit_uf_aliases_nested_chain_byte_and_work_boundaries_are_exact() {
     )
     .unwrap();
     let exact_bytes = unbounded.len();
-    let legacy = aliases
-        .iter()
-        .map(|alias| {
-            let quoted_alias = quote_symbol(&alias.alias);
-            format!(
-                "(declare-const {} {})\n(assert (= {} {}))\n",
-                quoted_alias,
-                sort_to_smtlib(&alias.application.sort()),
-                quoted_alias,
-                InvariantModel::expr_to_smtlib(&alias.application),
-            )
-        })
-        .collect::<String>();
+    let mut legacy = String::new();
+    for alias in &aliases {
+        let quoted_alias = quote_symbol(&alias.alias);
+        let sort = sort_to_smtlib(&alias.application.sort());
+        let application = InvariantModel::expr_to_smtlib(&alias.application);
+        writeln!(&mut legacy, "(declare-const {quoted_alias} {sort})").unwrap();
+        writeln!(&mut legacy, "(assert (= {quoted_alias} {application}))").unwrap();
+    }
     assert_eq!(
         unbounded, legacy,
         "the bounded iterative writer must preserve the established alias wire format"

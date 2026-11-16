@@ -196,7 +196,7 @@ impl Executor {
         &self,
         objective_index: usize,
         obj: &ay_frontend::Objective,
-    ) -> std::result::Result<String, String> {
+    ) -> Result<String, String> {
         {
             if self.unavailable_objectives.contains(&objective_index) {
                 // A lex predecessor with no attainable optimum — unbounded

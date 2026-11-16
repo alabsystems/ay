@@ -178,8 +178,8 @@ fn export_frame_update(branches: (&str, &str)) -> Result<String, AlethePrintErro
 /// instance is confined to its `forall_inst` by the `ite` lift, so the `ite1`
 /// reads the canonical `ite` it was verified over. At ad60a0707 the authored
 /// equality was the instance's text document-wide and pinned carcara refused
-/// `t7` of the frame fixture's document: "term '(= (select snew 0) (ite (= 0
-/// 1) val (select s 0)))' is of the wrong form, expected '(ite phi_1 phi_2
+/// `t7` of the frame fixture's document: "term '(= (select snew 0) (ite
+/// (= 0 1) val (select s 0)))' is of the wrong form, expected '(ite phi_1 phi_2
 /// phi_3)'".
 #[test]
 fn an_authored_ite_instance_is_confined_and_its_ite1_reads_the_canonical_ite() {

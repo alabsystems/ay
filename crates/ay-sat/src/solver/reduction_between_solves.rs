@@ -909,7 +909,7 @@ mod tests {
             }
         }
 
-        assert!(!ic3_lemma_offsets.is_empty());
+        assert_ne!(ic3_lemma_offsets.len(), 0);
         let before = count_active_learned_clauses(&solver);
 
         solver.cold.incremental_solve_count = IC3_GC_MIN_SOLVES;

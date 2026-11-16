@@ -45,7 +45,7 @@ pub(super) fn occurrences(
                         && terms.sort(*x) == terms.sort(id)
                         && terms.sort(*d) == terms.sort(id)
                     {
-                        control.admit(work, 1, std::mem::size_of::<(TermId, TermId, u32)>())?;
+                        control.admit(work, 1, size_of::<(TermId, TermId, u32)>())?;
                         out.try_reserve(1).ok()?;
                         out.push((id, *d, bits.width));
                     }

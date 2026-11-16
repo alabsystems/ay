@@ -196,7 +196,9 @@ fn stopped_caller_clock_channels_and_term_memory_never_scan_or_search_hints() {
             config.external_cancellation_token = Some(parent);
         }
         let until = if case == 0 {
-            Instant::now() - Duration::from_secs(1)
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports a one-second offset")
         } else {
             deadline()
         };

@@ -44,9 +44,10 @@ fn cloned_scalar_and_array_variables_cross_old_sort_charge_without_hiding_occurr
         assert_eq!(collector.expr_nodes, count);
         assert_eq!(collector.name_bytes, count);
         assert_eq!(collector.checked_variable_sorts.len(), 1);
-        assert!(collect_dt_declarations_for_exprs(roots.iter())
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            collect_dt_declarations_for_exprs(roots.iter()).unwrap(),
+            [] as [(&str, &[ChcDtConstructor]); 0]
+        );
     }
 }
 
@@ -100,7 +101,7 @@ fn differing_same_name_sort_shapes_are_checked_not_globally_rejected() {
         assert_eq!(collector.sort_nodes, before + additional);
         assert!(std::ptr::eq(
             collector.checked_variable_sorts["x"],
-            &first.sort
+            &raw const first.sort
         ));
     }
 }
@@ -315,7 +316,7 @@ fn self_recursive_snapshots_with_fresh_tail_metadata_are_compared_not_cached() {
     assert_eq!(collector.definitions.len(), 1);
     assert!(std::ptr::eq(
         collector.checked_variable_sorts["x"],
-        &first.sort
+        &raw const first.sort
     ));
     assert!(matches!(
         collector.visit_variable(&third),
@@ -456,7 +457,6 @@ fn admission_still_refuses_a_deep_chain_and_a_huge_tree() {
     // 2^23 - 1 tree nodes from 23 distinct nodes: the tree cap guards the
     // unmemoised helpers that run after admission.
     let huge = doubling_chain(22);
-    assert!((1usize << 23) - 1 > MAX_EXECUTOR_TREE_NODES);
     assert!(matches!(
         collect_dt_declarations_for_expr(&[], &huge),
         Err(DatatypeDeclarationError::ResourceLimit(
@@ -507,9 +507,10 @@ fn tree_cap_binds_executor_admission_but_not_the_uf_surface_walk() {
         ))
     ));
     assert!(collect_dt_declarations_for_exprs([&root, &root]).is_ok());
-    assert!(collect_uninterpreted_function_declarations(&root)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        collect_uninterpreted_function_declarations(&root).unwrap(),
+        [] as [UninterpretedFunctionDeclaration; 0]
+    );
 }
 
 #[test]
@@ -518,9 +519,10 @@ fn uf_surface_and_sort_scans_walk_each_distinct_node_once() {
     // tree cap; they now finish and agree with a structural answer.
     let sum = doubling_chain(20);
     let root = ChcExpr::le(ChcExpr::Int(0), (*sum).clone());
-    assert!(collect_uninterpreted_function_declarations(&root)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        collect_uninterpreted_function_declarations(&root).unwrap(),
+        [] as [UninterpretedFunctionDeclaration; 0]
+    );
     assert!(expr_sort_has(&root, |sort| matches!(sort, ChcSort::Int)));
     assert!(!expr_sort_has(&root, |sort| matches!(sort, ChcSort::Real)));
     assert_eq!(

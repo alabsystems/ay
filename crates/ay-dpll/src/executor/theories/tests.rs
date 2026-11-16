@@ -118,7 +118,7 @@ fn test_array_axiom_result_struct() {
         clauses: Vec::new(),
         num_vars: 0,
     };
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses, [] as [ay_core::CnfClause; 0]);
     assert_eq!(result.num_vars, 0);
 }
 

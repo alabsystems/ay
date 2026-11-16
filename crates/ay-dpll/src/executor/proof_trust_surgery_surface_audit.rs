@@ -39,8 +39,7 @@ pub(in crate::executor) use limits::{
 };
 pub(in crate::executor) use limits::{
     live_proof_rendering_is_static, surface_source_is_bounded, surface_source_work,
-    surface_source_work_probe, surface_sources_have_bounded_work, term_child_count,
-    ProofSourcePass, ProofSourceWorkEnvelope,
+    surface_sources_have_bounded_work, term_child_count, ProofSourcePass, ProofSourceWorkEnvelope,
 };
 pub(in crate::executor) use limits::{surface_source_work_probe_as, SurfaceWorkModel};
 use limits::{MAX_REQUIREMENT_BYTES, MAX_SURFACE_DEPTH};

@@ -7,7 +7,6 @@
 
 use super::*;
 use crate::literal::Literal;
-use crate::solver::indep_support::*;
 
 fn lit(v: i32) -> Literal {
     if v > 0 {
@@ -123,7 +122,7 @@ fn indep_support_is_inert_on_a_gate_free_cnf() {
         "a gate-free CNF must not install a decision restriction"
     );
     s.install_indep_support();
-    assert!(s.indep_support.is_empty());
+    assert_eq!(s.indep_support.len(), 0);
 }
 
 /// The whitelist restricts decisions and NEVER signals SAT: with every

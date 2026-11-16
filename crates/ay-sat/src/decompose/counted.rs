@@ -8,7 +8,7 @@ use ay_core::original_query::CountedAdmission;
 impl Decompose {
     /// Construct the normal initial state under the invocation's original owner.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         let num_lits = checked_double(owner, num_vars)?;
         Ok(Self {
             dfs: try_vec_with(owner, num_lits, |_| DfsEntry::default())?,

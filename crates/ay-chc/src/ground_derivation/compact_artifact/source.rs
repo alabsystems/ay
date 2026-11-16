@@ -14,7 +14,7 @@ use ay_core::kani_compat::DetHashSet;
 
 pub(super) fn hashes(
     problem: &ChcProblem,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<(&'static str, String, String)> {
     admit_identity(problem, owner)?;
     controlled(owner, |control| {
@@ -29,7 +29,7 @@ pub(super) fn hashes(
     })
 }
 
-pub(super) fn admit_identity(problem: &ChcProblem, owner: &mut Owner) -> Result<()> {
+pub(super) fn admit_identity(problem: &ChcProblem, owner: &mut Owner<'_>) -> Result<()> {
     compact::validate_source(problem, owner).map_err(native_error)?;
     let mut pricing = Pricing {
         owner,

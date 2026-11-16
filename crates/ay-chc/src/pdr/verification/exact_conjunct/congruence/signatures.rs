@@ -21,7 +21,11 @@ impl Signature {
     }
 }
 
-pub(super) fn rebuild(arena: &Arena, classes: &mut Classes, owner: &mut Owner) -> Result<bool> {
+pub(super) fn rebuild(
+    arena: &Arena<'_>,
+    classes: &mut Classes,
+    owner: &mut Owner<'_>,
+) -> Result<bool> {
     let mut table: HashMap<u64, Vec<(Signature, usize)>> = HashMap::new();
     let mut changed = false;
     for id in 0..arena.len() {
@@ -58,10 +62,10 @@ pub(super) fn rebuild(arena: &Arena, classes: &mut Classes, owner: &mut Owner) -
 }
 
 fn signature(
-    arena: &Arena,
+    arena: &Arena<'_>,
     id: usize,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<Signature>> {
     let node = arena.node(id);
     Ok(Some(match &node.key {

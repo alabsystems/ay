@@ -36,6 +36,7 @@ pub(crate) fn complement_relation(
         mask,
         nodes: 0,
         work: 0,
+        metadata_work: 0,
         scale_constant_products: false,
         accept_elaborated_shifts: false,
     };
@@ -53,7 +54,7 @@ pub(crate) fn complement_relation(
             let TermData::App(Symbol::Named(op), args) = terms.get(atom) else {
                 continue;
             };
-            if op != "bvxor" {
+            if op != "bvxor" || terms.is_declared_function(op) {
                 continue;
             }
             let [a, b] = args.as_slice() else { return None };

@@ -7,17 +7,17 @@
 #![cfg(test)]
 
 use super::*;
-use ay_core::time::Instant;
-use std::time::Duration;
 
 #[test]
 fn validation_precancellation_precedes_malformed_bytes_for_both_formats() {
+    let allowed = Cell::new(true);
     let calls = Cell::new(0);
     let mut callback = || {
         calls.set(calls.get() + 1);
-        calls.get() != 1
+        allowed.get()
     };
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = live_progress(&mut callback);
+    allowed.set(false);
     for format in [Format::GroundDerivationV1, Format::GroundDerivationV2] {
         assert_interrupted(validate_ground(
             &ChcProblem::new(),
@@ -25,23 +25,26 @@ fn validation_precancellation_precedes_malformed_bytes_for_both_formats() {
             b"{",
             &mut progress,
         ));
-        assert_eq!(
-            calls.get(),
-            1,
-            "the second format cannot revive refused progress"
-        );
+        let stopped_at = calls.get();
+        assert!(!progress.poll());
+        assert_eq!(calls.get(), stopped_at);
     }
 }
 
 #[test]
 fn every_validation_boundary_preserves_refusal_over_malformed_diagnostics() {
     for format in [Format::GroundDerivationV1, Format::GroundDerivationV2] {
+        let armed = Cell::new(false);
         let total = Cell::new(0);
         let mut callback = || {
+            if !armed.get() {
+                return true;
+            }
             total.set(total.get() + 1);
             true
         };
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
+        armed.set(true);
         let error = validate_ground(&ChcProblem::new(), format, b"{", &mut progress)
             .expect_err("live malformed bytes remain invalid");
         assert!(error.to_string().contains("malformed_envelope"));
@@ -51,12 +54,17 @@ fn every_validation_boundary_preserves_refusal_over_malformed_diagnostics() {
             "must reach the validator and post-work admission"
         );
         for stop_at in 1..=total.get() {
+            let armed = Cell::new(false);
             let calls = Cell::new(0);
             let mut callback = || {
+                if !armed.get() {
+                    return true;
+                }
                 calls.set(calls.get() + 1);
                 calls.get() != stop_at
             };
-            let mut progress = ReplayProgress::new(&mut callback);
+            let mut progress = live_progress(&mut callback);
+            armed.set(true);
             assert_interrupted(validate_ground(
                 &ChcProblem::new(),
                 format,
@@ -77,7 +85,7 @@ fn export_and_validation_do_not_receive_independent_allowances() {
         calls.set(calls.get() + 1);
         allowance.get()
     };
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = live_progress(&mut callback);
     let plan = select_plan(
         Some(Format::GroundDerivationV1),
         |_, _| Ok(Some(b"{".to_vec())),
@@ -105,41 +113,10 @@ fn export_and_validation_do_not_receive_independent_allowances() {
 }
 
 #[test]
-fn absolute_budget_is_not_reset_by_export_or_validation_entry() {
-    let now = Instant::now();
-    let earlier = now
-        .checked_sub(Duration::from_secs(5))
-        .expect("test clock represents a past start");
-    for (start, budget) in [(now, Duration::ZERO), (earlier, Duration::from_secs(1))] {
-        let mut callback = || within_budget(&start, budget);
-        let mut progress = ReplayProgress::new(&mut callback);
-        assert_interrupted(select_plan(
-            Some(Format::SmtlibV1),
-            |_, _| panic!("expired absolute budget must prevent export"),
-            || panic!("expired absolute budget must prevent fallback"),
-            &mut progress,
-        ));
-        for format in [Format::GroundDerivationV1, Format::GroundDerivationV2] {
-            assert_interrupted(validate_ground(
-                &ChcProblem::new(),
-                format,
-                b"{",
-                &mut progress,
-            ));
-        }
-    }
-}
-
-#[test]
 fn ground_validation_refuses_smt_format_without_trying_an_artifact_parser() {
-    let calls = Cell::new(0);
-    let mut callback = || {
-        calls.set(calls.get() + 1);
-        true
-    };
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut callback = || true;
+    let mut progress = live_progress(&mut callback);
     let error = validate_ground(&ChcProblem::new(), Format::SmtlibV1, b"{", &mut progress)
         .expect_err("a ground plan cannot relabel its evidence as SMT-LIB");
     assert!(error.to_string().contains("labels evidence as SMT-LIB"));
-    assert_eq!(calls.get(), 1, "only the entry allowance is checked");
 }

@@ -54,7 +54,9 @@ fn expired_caller_clock_precancelled_channels_and_zero_term_memory_never_search(
         let parent = CancellationToken::new();
         let mut config = configured();
         let until = if case == 0 {
-            Instant::now() - Duration::from_secs(1)
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports a one-second offset")
         } else {
             deadline()
         };

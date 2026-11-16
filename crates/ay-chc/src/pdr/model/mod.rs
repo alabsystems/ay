@@ -126,7 +126,7 @@ pub struct InvariantModel {
     /// the quantified `forall i. I'(args, i, select(arr, i))` denoted by the
     /// certificate — it has no quantifier-free `ChcExpr` representation, so
     /// `interpretations` is intentionally EMPTY. The certificate can only be
-    /// constructed by `GhostPairCertificate::certify_and_seal`, which runs the
+    /// constructed by `GhostPairCertificate::certify_and_seal_with_term_memory_limit`, which runs the
     /// full instantiation-based per-rule discharge on the original clauses;
     /// downstream Safe gates re-check it via `recheck_ghost_pair_certificate`
     /// instead of the quantifier-free `verify_model_*` paths.

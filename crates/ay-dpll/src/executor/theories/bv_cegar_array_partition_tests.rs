@@ -2,13 +2,9 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::{
-    generate_fc_axiom_clauses, CegarArrayBuild, CegarArrayCheck, Executor, FcAuditLits,
-    FcConcreteSelect,
-};
-use crate::executor::theories::ChainSpend;
+use super::{CegarArrayBuild, CegarArrayCheck, Executor, FcAuditLits, FcConcreteSelect};
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{Sort, TermId, TermStore};
+use ay_core::{Sort, TermId};
 use ay_sat::{SatResult, Solver as SatSolver};
 use num_bigint::BigInt;
 use std::collections::BTreeMap;

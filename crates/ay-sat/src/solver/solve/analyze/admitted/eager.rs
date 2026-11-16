@@ -117,7 +117,7 @@ fn reserve_push_sequence<T>(
 ) -> AdmissionResult<()> {
     let mut capacity = values.capacity();
     let mut len = values.len();
-    let element = std::mem::size_of::<T>();
+    let element = size_of::<T>();
     for _ in 0..pushes {
         owner.admit(1, 0)?;
         len = len

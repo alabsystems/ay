@@ -23,6 +23,7 @@
 //! unproved steps.
 
 use ntest::timeout;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
@@ -78,11 +79,14 @@ pub(super) fn verdict_lines(stdout: &str) -> Vec<String> {
 /// [`strict_one_shot_past_its_own_deadline_keeps_the_publication_contract`]
 /// covers the deadline arm deterministically.
 pub(super) fn without_script_timeout(script: &str) -> String {
-    script
+    let mut filtered = String::new();
+    for line in script
         .lines()
         .filter(|line| !line.trim_start().starts_with("(set-option :timeout "))
-        .map(|line| format!("{line}\n"))
-        .collect()
+    {
+        writeln!(&mut filtered, "{line}").expect("writing to a String cannot fail");
+    }
+    filtered
 }
 
 /// What external-codegen's one-shot argv published for one script.

@@ -77,14 +77,14 @@ impl LiaFarkasTemplateSurface {
 
 /// Oracle backend of the Spacer lane (`DESIGN_spacer_pob_lemma_pipeline.md` §3.4).
 ///
-/// `Session` (R4) routes the lane's queries through the per-predicate
-/// `PredicatePropSolver::check_lits` adapter (contract A-5); it degrades to
-/// `Legacy` while `PdrSolver::incremental_pdr_enabled()` is `false`.
+/// `Session` records the requested incremental route. The current oracle
+/// retains the legacy query path, and the selection degrades to `Legacy` while
+/// `PdrSolver::incremental_pdr_enabled()` is `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleBackend {
     /// Non-incremental `SmtContext` verdicts + proxied assumption cores (D1).
     Legacy,
-    /// Rung-5 Horn session through `check_lits` (R4).
+    /// Rung-5 incremental-session route label (R4).
     Session,
 }
 

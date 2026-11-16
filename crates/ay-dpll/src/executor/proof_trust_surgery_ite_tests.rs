@@ -104,7 +104,7 @@ fn ite_farkas_plan_prunes_irrelevant_bool_support() {
         .plan_provenance_farkas_implication(source, &[irrelevant], conclusion)
         .expect("linear implication should ignore the Bool support");
 
-    assert!(lemma.supports.is_empty());
+    assert_eq!(lemma.supports, [] as [ay_core::TermId; 0]);
     assert_eq!(lemma.clause.len(), 2);
     assert_eq!(lemma.farkas.coefficients.len(), 2);
     assert!(lemma

@@ -125,7 +125,7 @@ fn printed_chain<'a>(
             current,
             "store",
             3,
-            super::super::authored_assume::MAX_EQUIVALENCE_BYTES,
+            authored_assume::MAX_EQUIVALENCE_BYTES,
         ) else {
             return Some((current, entries));
         };
@@ -169,7 +169,7 @@ impl AlethePrinter<'_> {
         let mut cursor = canonical_term;
         let mut stores = 0;
         loop {
-            if !self.admit_emission_work((5 * std::mem::size_of::<TermId>()) as u64) {
+            if !self.admit_emission_work((5 * size_of::<TermId>()) as u64) {
                 return None;
             }
             spend_node(remaining_nodes)?;
@@ -208,16 +208,14 @@ impl AlethePrinter<'_> {
         }
         let input = surface.len().checked_add(canonical.len())?;
         let scan = input
-            .checked_mul(MAX_STORE_PERMUTATION_CHAIN + 1 + 2 * (std::mem::size_of::<String>() + 2))?
-            .checked_add(2 * MAX_STORE_PERMUTATION_CHAIN * 5 * std::mem::size_of::<&str>())?;
+            .checked_mul(MAX_STORE_PERMUTATION_CHAIN + 1 + 2 * (size_of::<String>() + 2))?
+            .checked_add(2 * MAX_STORE_PERMUTATION_CHAIN * 5 * size_of::<&str>())?;
         if !self.admit_emission_work(u64::try_from(scan).ok()?) {
             return None;
         }
         // Capture census visits at most the fully expanded canonical text's
         // node count; reserve its work/slots before the existing bounded walk.
-        let capture = canonical
-            .len()
-            .checked_mul(std::mem::size_of::<TermId>() + 2)?;
+        let capture = canonical.len().checked_mul(size_of::<TermId>() + 2)?;
         if !self.admit_emission_work(u64::try_from(capture).ok()?)
             || term_mentions_symbol(self.terms, canonical_term, EXT_CHOICE_BINDER)
         {
@@ -236,11 +234,7 @@ impl AlethePrinter<'_> {
             printer: self,
             text: String::new(),
         };
-        output.admit_copy(
-            target
-                .len()
-                .checked_mul(std::mem::size_of::<LiteralIndex>())?,
-        )?;
+        output.admit_copy(target.len().checked_mul(size_of::<LiteralIndex>())?)?;
         let mut values = Vec::with_capacity(target.len());
         for (index, _) in &target {
             let TermData::App(Symbol::Named(head), args) = self.terms.get(cursor) else {
@@ -276,9 +270,7 @@ impl AlethePrinter<'_> {
         }
         // Byte comparisons may scan the complete fields for each pairing.
         output.admit_copy(input.checked_mul(target.len().checked_mul(target.len())?)?)?;
-        output.admit_copy(
-            (source.len() + target.len()).checked_mul(std::mem::size_of::<PrintedEntry>())?,
-        )?;
+        output.admit_copy((source.len() + target.len()).checked_mul(size_of::<PrintedEntry>())?)?;
         let mut left = Vec::with_capacity(source.len());
         output.admit_copy(target.len())?;
         let mut used = vec![false; target.len()];
@@ -317,8 +309,7 @@ impl AlethePrinter<'_> {
         output.admit_copy(
             pairs
                 .checked_mul(
-                    std::mem::size_of::<((String, String), (String, String, String))>()
-                        .checked_add(8)?,
+                    size_of::<((String, String), (String, String, String))>().checked_add(8)?,
                 )?
                 .checked_mul(4)?
                 .checked_add(64)?,

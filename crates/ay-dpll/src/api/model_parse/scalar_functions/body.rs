@@ -122,7 +122,7 @@ impl<'a> Writer<'a, '_> {
         }
         self.budget.charge(
             arguments.len(),
-            arguments.len().checked_mul(std::mem::size_of::<Scalar>())?,
+            arguments.len().checked_mul(size_of::<Scalar>())?,
         )?;
         let mut sorts = Vec::new();
         sorts.try_reserve_exact(arguments.len()).ok()?;

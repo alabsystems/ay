@@ -7,12 +7,15 @@ pub(in super::super) fn shared(
     solver: &ArraySolver<'_>,
     values: &HashMap<TermId, String>,
     model: &ArrayModel,
-    members: &[TermId],
-    bases: &[TermId],
-    unwritten: &[(String, String)],
-    chains: &[Chain<'_>],
+    sources: DefaultSources<'_, '_>,
     work: &mut WorkBudget<'_>,
 ) -> Result<(Option<String>, bool), QueryError> {
+    let DefaultSources {
+        members,
+        bases,
+        unwritten,
+        chains,
+    } = sources;
     let mut result: Option<String> = None;
     let mut conflict = false;
     for &term in members.iter().chain(bases) {

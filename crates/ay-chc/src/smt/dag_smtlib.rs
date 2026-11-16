@@ -256,10 +256,7 @@ impl<'a> DagWalk<'a> {
         }
         self.enter(root, 0, caps)?;
         let mut stack: Vec<(&'a ChcExpr, usize)> = vec![(root, 0)];
-        loop {
-            let Some(top) = stack.last_mut() else {
-                break;
-            };
+        while let Some(top) = stack.last_mut() {
             let node: &'a ChcExpr = top.0;
             let kids = children(node);
             if top.1 < kids.len() {

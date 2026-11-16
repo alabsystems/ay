@@ -30,7 +30,7 @@ fn actual_redistribution_reserves_multiple_destinations_and_preserves_duplicate_
         values.push(actual.pop_counted(&owner).unwrap());
     }
     assert_eq!(values, expected);
-    assert!(owner.usage().unwrap().storage_admitted > std::mem::size_of::<[usize; 33]>());
+    assert!(owner.usage().unwrap().storage_admitted > size_of::<[usize; 33]>());
     assert!(
         actual
             .buckets
@@ -85,7 +85,7 @@ fn counted_push_and_pop_match_ordinary_for_every_u32_radix_bucket() {
     while !ordinary.is_empty() {
         assert_eq!(actual.pop_counted(&owner).unwrap(), ordinary.pop());
     }
-    assert!(actual.is_empty());
+    assert_eq!(actual.len(), 0);
 }
 
 #[test]

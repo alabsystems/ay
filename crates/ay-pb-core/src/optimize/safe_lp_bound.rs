@@ -3243,7 +3243,9 @@ mod tests {
         );
         let point = point.expect("LP point");
         assert_eq!(point.len(), n as usize);
-        for group in point.chunks_exact(5) {
+        let (groups, remainder) = point.as_chunks::<5>();
+        assert_eq!(remainder, &[] as &[f64]);
+        for group in groups {
             assert!(
                 group.iter().sum::<f64>() >= 2.0 - 1e-7,
                 "each disjoint cover must be satisfied by the advisory point"
@@ -3386,7 +3388,9 @@ mod tests {
             "deduplicated disjoint pair floors must recover the exact value 16"
         );
         let high_point = high_point.expect("high-row point");
-        for pair in high_point.chunks_exact(2) {
+        let (pairs, remainder) = high_point.as_chunks::<2>();
+        assert_eq!(remainder, &[] as &[f64]);
+        for pair in pairs {
             assert!(pair.iter().sum::<f64>() >= 1.0 - 1e-7);
         }
     }

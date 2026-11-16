@@ -238,8 +238,8 @@ impl Solver {
                 } else {
                     None
                 };
-                let reimplied = if self.chrono_enabled {
-                    if let Some(lambda_ref) = lambda_entry {
+                let reimplied = self.chrono_enabled
+                    && if let Some(lambda_ref) = lambda_entry {
                         // Check if the lambda clause is still active and makes
                         // the literal unit at target_level.
                         if self.arena.is_active(lambda_ref.0 as usize) {
@@ -311,10 +311,7 @@ impl Solver {
                         }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
 
                 if !reimplied {
                     if save_phases {
@@ -353,9 +350,7 @@ impl Solver {
                     // `!self.chrono_enabled` leg keeps the old unconditional
                     // store: `lambda_entry` is forced to `None` in that case
                     // and carries no information about the array.
-                    if !self.chrono_enabled {
-                        self.lambda[var.index()] = None;
-                    } else if lambda_entry.is_some() {
+                    if !self.chrono_enabled || lambda_entry.is_some() {
                         self.lambda[var.index()] = None;
                     }
                     // (#8482, #8496) Removed variables can appear on the

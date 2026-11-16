@@ -96,7 +96,7 @@ fn fresh_owner(num_vars: usize) -> CompactionScratch {
 
 fn assert_clean(owner: &CompactionScratch) {
     assert!(owner.assign.iter().all(Option::is_none));
-    assert!(owner.touched.is_empty());
+    assert_eq!(owner.touched.len(), 0);
 }
 
 enum Sweep {

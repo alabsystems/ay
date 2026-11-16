@@ -817,7 +817,7 @@ fn clause_sort_work(len: usize) -> Result<usize, ResolutionValidationError> {
     if len <= 1 {
         return Ok(len);
     }
-    let passes = (usize::BITS - (len - 1).leading_zeros()) as usize;
+    let passes = (len - 1).bit_width() as usize;
     checked_resource_mul(
         len,
         checked_resource_add(passes, 1, ResolutionValidationResource::Work)?,

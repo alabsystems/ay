@@ -26,7 +26,7 @@ fn value(array: ChcExpr, index: i128, model: &DetHashMap<String, SmtValue>) -> O
 #[test]
 fn free_capture_substitution_reaches_environment() {
     let expression = captured().substitute(&[(variable("x"), ChcExpr::Int(7))]);
-    assert!(expression.vars().is_empty());
+    assert_eq!(expression.vars(), [] as [ChcVar; 0]);
     assert_eq!(
         value(expression, 3, &DetHashMap::default()),
         Some(SmtValue::Int(10))
@@ -61,7 +61,7 @@ fn parallel_capture_substitution_does_not_substitute_inserted_values() {
 fn sort_changing_capture_substitution_is_rejected_by_converter() {
     let expression = captured().substitute(&[(variable("x"), ChcExpr::Bool(true))]);
     let mut context = SmtContext::new();
-    context.convert_expr(&expression);
+    let _ = context.convert_expr(&expression);
     assert!(context.conversion_budget_exceeded());
 }
 

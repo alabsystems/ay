@@ -54,7 +54,7 @@ const SYMBOLIC_ACCUMULATOR: &str = r#"
 
 /// Regression test for Gap C (#7912): algebraic invariant synthesis must validate
 /// its model before returning Safe. The portfolio now has a debug_assert calling
-/// validate_safe_query_only() as defense-in-depth.
+/// `validate_safe_query_only_pre_translated()` as defense-in-depth.
 ///
 /// This test exercises the algebraic synthesis path end-to-end via the adaptive
 /// portfolio, confirming it returns Safe on a problem with polynomial closed forms.

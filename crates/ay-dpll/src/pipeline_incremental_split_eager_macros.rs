@@ -1312,9 +1312,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     }
                                     _islp_installed_theory_lemmas.extend(lemmas.iter().cloned());
                                     continue;
-
-                                    // All atoms already known — fall through to accept model.
-                                    $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager fallthrough-accept L1096"));
                                 }
                                 _ => {
                                     // NeedSplit/NeedDisequalitySplit/NeedExpressionSplit:

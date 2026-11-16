@@ -132,7 +132,7 @@ impl Tally {
 /// sum); `w_max >= 1` makes `p >= 1`.
 fn levels(w_max: Weight) -> u32 {
     debug_assert!(w_max >= 1);
-    Weight::BITS - w_max.leading_zeros()
+    w_max.bit_width()
 }
 
 /// Clause count of one merge node over sorted vectors of lengths `a` and `b`

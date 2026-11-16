@@ -6,6 +6,7 @@
 
 use super::super::super::guard_nodes::ShareOf;
 use super::super::super::Executor;
+use crate::executor::theories::solve_harness::TheoryModels;
 use crate::executor_types::{Result, SolveResult};
 use crate::preprocess::PreprocessingPass;
 // #8529: Use deterministic hash sets in all builds.
@@ -2817,7 +2818,10 @@ mod rollback_artifact_tests {
 
         executor.clear_dt_lazy_rebuildable_term_indexes();
 
-        assert!(executor.cached_store_eqs.is_empty());
+        assert_eq!(
+            executor.cached_store_eqs,
+            [] as [(TermId, TermId, TermId, TermId, TermId); 0]
+        );
         assert_eq!(executor.store_eq_scan_hwm, 0);
         assert!(executor.cached_select_indices_by_array.is_empty());
         assert_eq!(executor.select_index_scan_hwm, 0);

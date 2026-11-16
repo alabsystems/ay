@@ -371,8 +371,8 @@ fn test_factor_ternary_matrix() {
             5,
             "factoring must add 2 dividers + 3 quotient clauses"
         );
-        assert!(!result.to_delete.is_empty());
-        assert!(!result.new_clauses.is_empty());
+        assert_ne!(result.to_delete.len(), 0);
+        assert_ne!(result.new_clauses.len(), 0);
         assert_eq!(result.extension_vars_needed, 1);
 
         // Wave 1: verify structured application data matches flattened result.

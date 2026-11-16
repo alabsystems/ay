@@ -47,7 +47,7 @@ fn binary_output_precharge_refuses_before_reserving_or_writing_any_prefix() {
     let mut codec = Codec::new(&control);
     codec.decoded_bytes = MAX_OUTPUT - output_bytes + 1;
     assert!(codec.write_big_bitvec(&value, width, width).is_none());
-    assert!(codec.text.is_empty());
+    assert_eq!(codec.text, "");
     assert_eq!(codec.text.capacity(), 0);
     let mut codec = Codec::new(&control);
     codec.decoded_bytes = MAX_OUTPUT - output_bytes;
@@ -62,7 +62,7 @@ fn binary_output_precharge_refuses_before_reserving_or_writing_any_prefix() {
         .unwrap();
     let mut codec = Codec::new(&control);
     assert!(codec.write_big_bitvec(&value, width, width).is_none());
-    assert!(codec.text.is_empty());
+    assert_eq!(codec.text, "");
     assert_eq!(codec.text.capacity(), 0);
     assert!(control.poll().is_none());
 }

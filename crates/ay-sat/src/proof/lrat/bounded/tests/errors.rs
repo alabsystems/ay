@@ -158,7 +158,7 @@ fn caught_callback_panic_poisoned_record_and_typed_retry_refusal() {
         });
     }))
     .is_err());
-    assert!(!writer.get_ref().is_empty());
+    assert_ne!(writer.get_ref().len(), 0);
     assert!(writer.has_io_error());
     assert_eq!(writer.added_count(), 0);
     let error = writer

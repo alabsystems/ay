@@ -80,8 +80,11 @@ fn every_engine_attachment_poll_refusal_preserves_metadata_and_stays_terminal() 
 #[test]
 fn retained_config_tokens_cancel_attachment_without_changing_verified_result() {
     let parent = CancellationToken::new();
-    let mut pdr = PdrConfig::default();
-    pdr.cancellation_token = Some(parent.child());
+    let base = PdrConfig::default();
+    let pdr = PdrConfig {
+        cancellation_token: Some(parent.child()),
+        ..base
+    };
     let bmc = BmcConfig::default().with_cancellation(parent.child());
     let tokens = [
         pdr.cancellation_token.clone(),

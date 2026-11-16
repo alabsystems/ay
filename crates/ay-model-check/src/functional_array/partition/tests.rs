@@ -5,6 +5,7 @@ use super::*;
 use crate::ArrayValue;
 use ay_core::original_query::{FiniteAdmissionGrant, OriginalAdmission, QueryError};
 use ay_core::time::Instant;
+use ay_core::Sort;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ fn base(default: u64, cells: &[(u64, u64)]) -> Arc<ArraySnapshot> {
             default: bv(default, 8),
             store: cells.iter().map(|&(k, v)| (bv(k, 64), bv(v, 8))).collect(),
         },
-        &ay_core::Sort::array(ay_core::Sort::bitvec(64), ay_core::Sort::bitvec(8)),
+        &Sort::array(Sort::bitvec(64), Sort::bitvec(8)),
         &mut 1_000_000,
     )
     .expect("complete typed fixture")
@@ -77,18 +78,14 @@ fn bool_and_full_bv128_cells_use_complete_borrowed_values() {
     let end = Instant::now() + Duration::from_secs(20);
     let owner = owner(end, 1_000_000, 128 * 1024 * 1024);
     for (sort, a, b) in [
+        (Sort::Bool, ModelValue::Bool(false), ModelValue::Bool(true)),
         (
-            ay_core::Sort::Bool,
-            ModelValue::Bool(false),
-            ModelValue::Bool(true),
-        ),
-        (
-            ay_core::Sort::bitvec(128),
+            Sort::bitvec(128),
             ModelValue::bitvec(0.into(), 128),
-            ModelValue::bitvec((num_bigint::BigInt::from(1u8) << 127) + 123, 128),
+            ModelValue::bitvec((BigInt::from(1u8) << 127) + 123, 128),
         ),
     ] {
-        let sort = ay_core::Sort::array(ay_core::Sort::bitvec(64), sort);
+        let sort = Sort::array(Sort::bitvec(64), sort);
         let dst = ArraySnapshot::finite(
             ArrayValue {
                 default: a,

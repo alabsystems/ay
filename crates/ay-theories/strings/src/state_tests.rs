@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 #[test]
 fn new_state_is_empty() {
     let state = SolverState::new();
-    assert!(state.disequalities().is_empty());
+    assert_eq!(state.disequalities(), &[] as &[(TermId, TermId, TheoryLit)]);
     assert_eq!(state.eqc_info.len(), 0);
 }
 
@@ -148,7 +148,7 @@ fn reset_clears_everything() {
     state.register_term(&terms, s);
     state.reset();
 
-    assert!(state.disequalities().is_empty());
+    assert_eq!(state.disequalities(), &[] as &[(TermId, TermId, TheoryLit)]);
     assert_eq!(state.eqc_info.len(), 0);
 }
 

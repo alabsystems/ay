@@ -16,7 +16,7 @@ fn a_wide_root_refuses_before_any_child_copy_or_debit() {
     let printer = AlethePrinter::new(&terms);
     let mut walk = SpellingWalk::new(&printer, MAX_DOCUMENT_SPELLING_NODES);
     assert!(!walk.push_children(root));
-    assert!(walk.stack.is_empty());
+    assert_eq!(walk.stack, []);
     assert_eq!(walk.edges, 0);
     assert_eq!(printer.work_used(), 0);
 }
@@ -31,7 +31,7 @@ fn repeated_shared_edges_cannot_escape_the_queue_cap() {
     assert!(walk.push_children(repeated));
     walk.stack.clear();
     assert!(!walk.push_children(repeated));
-    assert!(walk.stack.is_empty());
+    assert_eq!(walk.stack, []);
     assert_eq!(walk.edges, 20);
 }
 
@@ -43,7 +43,7 @@ fn work_refusal_precedes_queue_reservation() {
     let printer = AlethePrinter::new_with_overrides_and_budget(&terms, None, Some(0));
     let mut walk = SpellingWalk::new(&printer, 32);
     assert!(!walk.push_children(root));
-    assert!(walk.stack.is_empty());
+    assert_eq!(walk.stack, []);
     assert_eq!(walk.stack.capacity(), 0);
 }
 

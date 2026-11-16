@@ -108,6 +108,7 @@ pub(super) fn semantic_witness(owner: &str) -> Option<&'static SemanticWitness> 
         .find_map(|(name, witness)| (*name == owner).then_some(witness))
 }
 
+#[cfg(test)]
 pub(super) fn semantic_owner_names() -> impl Iterator<Item = &'static str> {
     SEMANTIC_INPUTS.iter().map(|(name, _)| *name)
 }

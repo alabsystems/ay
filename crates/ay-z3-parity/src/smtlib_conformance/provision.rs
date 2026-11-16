@@ -6,10 +6,8 @@
 //! independently checked before a path is returned to the qualification run.
 
 use super::*;
-use sha2::Digest as _;
 use std::ffi::OsString;
 use std::io;
-use std::io::Read as _;
 
 #[derive(Clone, Copy)]
 pub(super) enum NetworkAccess {
@@ -22,7 +20,7 @@ const MAX_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 // Complete verification reads every extracted query and every archive, rather
 // than sampling. Four hours allows a slow single-worker full-population pass
 // while retaining a finite wall deadline on storage or parser stalls.
-const CORPUS_PHASE_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+const CORPUS_PHASE_TIMEOUT: Duration = Duration::from_hours(4);
 const CORPUS_MANIFEST_LIMIT: u64 = 1024 * 1024 * 1024;
 const CORPUS_COMPLETION_PREFIX: &str = "AY_OFFICIAL_CORPUS_VERIFIED ";
 
@@ -246,7 +244,7 @@ fn manifest_digest(path: &Path) -> Result<String, String> {
     }
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
     loop {
         let count = file
             .read(&mut buffer)
@@ -547,8 +545,8 @@ fn corpus_phase_with_admission(
     })();
     receipt.passed = result.is_ok();
     receipt.error = result.as_ref().err().cloned();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
     let path = directory.join(format!(
@@ -1165,6 +1163,10 @@ mod tests {
             NetworkAccess::Offline,
         )
         .unwrap();
+        #[expect(
+            clippy::literal_string_with_formatting_args,
+            reason = "HEAD^{tree} is Git revision syntax with literal braces"
+        )]
         let tree = git(&resources, &destination, &["rev-parse", "HEAD^{tree}"]).unwrap();
         let tree = std::str::from_utf8(&tree).unwrap().trim();
         git(

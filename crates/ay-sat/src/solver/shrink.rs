@@ -55,27 +55,6 @@ fn sort_shrink_entries(entries: &mut [(u32, usize, usize)]) {
 }
 
 impl Solver {
-    /// Return true if block-level shrinking has an actual same-level block to
-    /// inspect among the non-UIP learned literals.
-    ///
-    /// If every non-UIP learned literal is at a distinct decision level, the
-    /// shrink path cannot find a block UIP. The existing singleton-block path
-    /// keeps each literal without recursive minimization, so the scratch setup,
-    /// entry sort, and cleanup are avoidable in that case.
-    #[inline]
-    pub(super) fn learned_clause_has_repeated_non_uip_level(
-        &mut self,
-        learned_count: usize,
-    ) -> bool {
-        match self.repeated_level_admitted(
-            learned_count,
-            &conflict_analysis_minimize::admitted::Ordinary,
-        ) {
-            Ok(repeated) => repeated,
-            Err(never) => match never {},
-        }
-    }
-
     /// Shrink and minimize the learned clause in a single pass (`shrink=3`).
     ///
     /// Matches the Kissat/CaDiCaL `shrink=3` architecture:

@@ -29,7 +29,7 @@ impl Drop for ObserverDrop {
 #[test]
 fn entry_interior_and_final_poll_hostile_payloads_retire_last_owner_without_escape() {
     let _ = ay_core::misc_cli_flags();
-    let (polls, _, healthy) = super::resources::observed(usize::MAX);
+    let (polls, _, healthy) = resources::observed(usize::MAX);
     drop(healthy.unwrap());
     for trigger in [1, polls / 2, polls] {
         let armed = Arc::new(AtomicBool::new(false));

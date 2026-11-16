@@ -274,13 +274,9 @@ impl Original {
     }
 
     fn boolean_stop(&self, stop: Option<&CheckStop>) -> bool {
-        let refused =
-            stop.is_some_and(
-                |stop| match std::panic::catch_unwind(AssertUnwindSafe(|| stop())) {
-                    Ok(stopped) => stopped,
-                    Err(_) => true,
-                },
-            );
+        let refused = stop.is_some_and(|stop| {
+            std::panic::catch_unwind(AssertUnwindSafe(|| stop())).unwrap_or(true)
+        });
         if refused {
             self.record(Kind::Inconclusive);
         }

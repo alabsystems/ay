@@ -11,10 +11,10 @@ fn addition_offset_words_share_carries_after_constant_reassociation() {
         let x = terms.mk_var("offset_x", Sort::bitvec(width));
         let y = terms.mk_var("offset_y", Sort::bitvec(width));
         let c = terms.mk_bitvec(7.into(), width);
-        let cx = terms.mk_app(Symbol::named("bvadd"), &[c, x], Sort::bitvec(width));
-        let left = terms.mk_app(Symbol::named("bvadd"), &[cx, y], Sort::bitvec(width));
-        let xy = terms.mk_app(Symbol::named("bvadd"), &[x, y], Sort::bitvec(width));
-        let right = terms.mk_app(Symbol::named("bvadd"), &[xy, c], Sort::bitvec(width));
+        let cx = terms.mk_app(Symbol::named("bvadd"), [c, x], Sort::bitvec(width));
+        let left = terms.mk_app(Symbol::named("bvadd"), [cx, y], Sort::bitvec(width));
+        let xy = terms.mk_app(Symbol::named("bvadd"), [x, y], Sort::bitvec(width));
+        let right = terms.mk_app(Symbol::named("bvadd"), [xy, c], Sort::bitvec(width));
         let printer = AlethePrinter::new(&terms);
         let mut proof = PackedProof::new(&printer, ProofId(7)).unwrap();
         let mut circuit = Circuit::new(&mut proof);

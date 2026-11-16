@@ -1410,7 +1410,7 @@ impl Solver {
         {
             kissat_probe_interval(
                 self.arena.irredundant_count() as u64,
-                u64::from(self.cold.inprobe_phases),
+                self.cold.inprobe_phases,
             )
         } else {
             delta

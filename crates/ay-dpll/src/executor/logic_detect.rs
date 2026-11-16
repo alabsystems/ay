@@ -378,8 +378,8 @@ impl Executor {
             && !assertion_features.has_nonlinear_int
             && !assertion_features.has_nonlinear_real
             && matches!(category, LogicCategory::QfUfnia)
-            && !(assertion_features.has_int_div_mod
-                && !self.int_div_mod_terms_have_known_zero_or_constant_divisors(assertions))
+            && (!assertion_features.has_int_div_mod
+                || self.int_div_mod_terms_have_known_zero_or_constant_divisors(assertions))
         {
             category = LogicCategory::from_logic(assertion_features.infer_logic())
                 .align_linear_arithmetic_sorts(&assertion_features)

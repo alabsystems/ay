@@ -56,10 +56,7 @@ fn captured_modern_boolean_boxing_has_a_checked_readable_model() {
         assert!(details.result.was_model_validated(), "{details:?}");
         assert!(details.result.has_sat_emission_witness(), "{details:?}");
         assert!(details.accept_for_consumer().expect("checked SAT").is_sat());
-        assert!(!solver
-            .try_get_model_str()
-            .expect("published model")
-            .is_empty());
+        assert_ne!(solver.try_get_model_str().expect("published model"), "");
         for root in roots {
             assert!(
                 matches!(solver.try_get_value(root), Ok(ModelValue::Bool(true))),
@@ -93,7 +90,7 @@ fn captured_positive_update_obligation_keeps_its_checked_refutation() {
         let core = solver
             .try_get_unsat_core()
             .expect("original hypothesis names");
-        assert!(!core.is_empty());
+        assert_ne!(core, [] as [String; 0]);
         assert!(core
             .iter()
             .all(|name| (0..28).any(|i| name == &format!("qh{i}"))));

@@ -203,14 +203,20 @@ fn upstream_external_token_is_terminal_unknown_without_a_fresh_owner() {
 #[test]
 fn spent_original_solve_deadline_refuses_restatement() {
     let (mut solver, cache) = prepared(PdrConfig::default());
-    solver.solve_deadline = Some(ay_core::time::Instant::now() - Duration::from_millis(1));
+    solver.solve_deadline = Some(
+        ay_core::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("fixture instant supports a one-millisecond offset"),
+    );
     refuses(&solver, &cache, candidate());
 }
 
 #[test]
 fn spent_enclosing_smt_deadline_refuses_restatement() {
     let (solver, cache) = prepared(PdrConfig::default());
-    let spent = ay_core::time::Instant::now() - Duration::from_millis(1);
+    let spent = ay_core::time::Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("fixture instant supports a one-millisecond offset");
     let _scope = crate::smt::ScopedSmtDeadline::install_until(spent);
     refuses(&solver, &cache, candidate());
 }

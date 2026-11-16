@@ -32,7 +32,7 @@ pub(crate) fn longest_path_at_least(root: &ChcExpr, limit: usize) -> bool {
         if !has_children(node) {
             return Some(0);
         }
-        let key = node as *const ChcExpr;
+        let key = std::ptr::from_ref::<ChcExpr>(node);
         if let Some(h) = memo.get(&key) {
             return (depth + h < limit).then_some(*h);
         }
@@ -100,7 +100,7 @@ pub(crate) fn walk_distinct_preorder(
         if has_children(node) {
             if plain_pops > 0 {
                 plain_pops -= 1;
-            } else if !seen.insert(node as *const ChcExpr) {
+            } else if !seen.insert(std::ptr::from_ref::<ChcExpr>(node)) {
                 continue;
             }
         }
@@ -265,7 +265,7 @@ impl<P: Fn(&ChcExpr) -> bool, D: Fn(&ChcExpr) -> bool> SubtreeAnyVia<P, D> {
         if !(self.descend)(node) || !has_children(node) {
             return false;
         }
-        let key = node as *const ChcExpr;
+        let key = std::ptr::from_ref::<ChcExpr>(node);
         if let Some(&known) = self.memo.get(&key) {
             return known;
         }
@@ -326,7 +326,7 @@ impl<P: Fn(&ChcExpr) -> bool> SubtreeAny<P> {
         if !has_children(node) {
             return false;
         }
-        let key = node as *const ChcExpr;
+        let key = std::ptr::from_ref::<ChcExpr>(node);
         if let Some(&known) = self.memo.get(&key) {
             return known;
         }
@@ -359,7 +359,7 @@ fn tree_stats(
     node: &ChcExpr,
     memo: &mut FxHashMap<*const ChcExpr, (u128, usize)>,
 ) -> (u128, usize) {
-    let key = node as *const ChcExpr;
+    let key = std::ptr::from_ref::<ChcExpr>(node);
     if let Some(&known) = memo.get(&key) {
         return known;
     }

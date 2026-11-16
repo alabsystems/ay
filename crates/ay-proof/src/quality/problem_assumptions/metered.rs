@@ -15,7 +15,7 @@ type Progress<'a> = &'a mut dyn FnMut(usize, usize) -> bool;
 type AuthoredIte = (TermId, TermId, TermId);
 
 fn lookup(entries: usize, progress: Progress<'_>) -> Result<(), ProofCheckError> {
-    let levels = checked_add_usize((usize::BITS - entries.leading_zeros()) as usize, 1)?;
+    let levels = checked_add_usize(entries.bit_width() as usize, 1)?;
     let comparisons = checked_add_usize(entries, 1)?.min(checked_mul_usize(levels, 12)?);
     charge_progress(progress, comparisons, 0)
 }
@@ -33,7 +33,7 @@ fn insert_allowed(
     // root. alloc's B=6 nodes have 11 keys/12 edges; fixed-width TermIds carry
     // no recursive comparison or hash payload. No new cardinality cap.
     lookup(allowed.len(), progress)?;
-    let nodes = checked_add_usize((usize::BITS - allowed.len().leading_zeros()) as usize, 2)?;
+    let nodes = checked_add_usize(allowed.len().bit_width() as usize, 2)?;
     let slots = checked_mul_usize(nodes, 32)?;
     charge_progress(
         progress,

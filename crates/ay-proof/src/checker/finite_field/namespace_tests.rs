@@ -42,19 +42,19 @@ fn fixture(case: Case, registration: Registration) -> (TermStore, Vec<TermId>, O
     };
     let roots = match case {
         Case::Equality => vec![
-            terms.mk_app(Symbol::Named("=".into()), &[x, zero], Sort::Bool),
-            terms.mk_app(Symbol::Named("=".into()), &[x, one], Sort::Bool),
+            terms.mk_app(Symbol::Named("=".into()), [x, zero], Sort::Bool),
+            terms.mk_app(Symbol::Named("=".into()), [x, one], Sort::Bool),
         ],
         Case::Conjunction => {
             let eq = terms.mk_eq(x, zero);
             let no = terms.mk_bool(false);
-            vec![terms.mk_app(Symbol::Named(name.into()), &[eq, no], Sort::Bool)]
+            vec![terms.mk_app(Symbol::Named(name.into()), [eq, no], Sort::Bool)]
         }
         _ => {
             let app = terms.mk_app(Symbol::Named(name.into()), &args, Sort::FiniteField(field));
             vec![
-                terms.mk_app(Symbol::Named("=".into()), &[app, one], Sort::Bool),
-                terms.mk_app(Symbol::Named("=".into()), &[x, zero], Sort::Bool),
+                terms.mk_app(Symbol::Named("=".into()), [app, one], Sort::Bool),
+                terms.mk_app(Symbol::Named("=".into()), [x, zero], Sort::Bool),
             ]
         }
     };
@@ -110,7 +110,7 @@ fn check(
     });
     for &root in roots {
         let assume = proof.add_assume(root, None);
-        clause.remove(0);
+        let _ = clause.remove(0);
         prior = proof.add_resolution(clause.clone(), root, assume, prior);
     }
     crate::check_proof_strict_with_context_and_progress(

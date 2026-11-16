@@ -19,7 +19,7 @@ fn test_replay_trace_round_trip_empty() {
     let mut reader = ReplayTraceReader::open(&path).unwrap();
     assert_eq!(reader.num_vars(), 10);
     let events = reader.read_all().unwrap();
-    assert!(events.is_empty());
+    assert_eq!(events.len(), 0);
 }
 
 #[test]

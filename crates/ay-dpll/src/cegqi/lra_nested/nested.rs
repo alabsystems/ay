@@ -39,13 +39,17 @@
 //!
 //! Results are HINTS: a caller publishes only through an independent route.
 
+use std::cmp::Reverse;
+
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore};
 
 use super::approx::{dag_size, Approximator, NInstance};
 use super::caps::MAX_SELECT_WORK;
+#[cfg(test)]
+pub(crate) use super::nested_run::TraceStep;
 use super::nested_run::SLOW_CALLS;
-pub(crate) use super::nested_run::{NestedCaps, NestedRun, NestedStats, TraceStep};
+pub(crate) use super::nested_run::{NestedCaps, NestedRun, NestedStats};
 use super::ntree::{Kind, NestedTree};
 use super::select::{select_tuple_for, tuple_terms};
 use super::session::NestedSeed;
@@ -54,6 +58,7 @@ use super::{
 };
 
 /// Entries kept in the search trace.
+#[cfg(test)]
 const MAX_TRACE: usize = 512;
 /// Query DAG size above which `approx_max` stops counting.
 const DAG_STAT_LIMIT: usize = 1 << 22;
@@ -85,6 +90,7 @@ struct Search<'t> {
     all_ce: Vec<TermId>,
     approx: Approximator,
     stats: NestedStats,
+    #[cfg(test)]
     trace: Vec<TraceStep>,
     round: usize,
     /// A TOP node logged an instance since this round's main query was
@@ -114,6 +120,7 @@ fn free_vars(terms: &TermStore, roots: &[TermId]) -> Vec<TermId> {
 }
 
 impl Search<'_> {
+    #[cfg(test)]
     fn note(&mut self, step: TraceStep) {
         if self.trace.len() < MAX_TRACE {
             self.trace.push(step);
@@ -137,7 +144,7 @@ impl Search<'_> {
         self.stats.oracle_ms = self.stats.oracle_ms.saturating_add(ms);
         let slow = &mut self.stats.slow_calls;
         slow.push((node, ms, size));
-        slow.sort_by(|a, b| b.1.cmp(&a.1));
+        slow.sort_by_key(|entry| Reverse(entry.1));
         slow.truncate(SLOW_CALLS);
         answer
     }
@@ -179,12 +186,15 @@ impl Search<'_> {
         query.push(target);
         let targets = free_vars(host.terms(), &[phi]);
         let answer = self.ask(host, node, &query, &targets);
-        let sat = matches!(answer, OracleAnswer::Sat(_));
-        self.note(TraceStep::Check {
-            node,
-            context: context.is_some(),
-            sat,
-        });
+        #[cfg(test)]
+        {
+            let sat = matches!(answer, OracleAnswer::Sat(_));
+            self.note(TraceStep::Check {
+                node,
+                context: context.is_some(),
+                sat,
+            });
+        }
         match answer {
             OracleAnswer::Unsat => Ok(None),
             OracleAnswer::Unknown => Err(QlraDecline::OracleUnknown),
@@ -225,6 +235,7 @@ impl Search<'_> {
                     }
                     self.exact[node] = true;
                     self.stats.exact_nodes += 1;
+                    #[cfg(test)]
                     self.note(TraceStep::Exact { node });
                     return Ok(Progress::Exact);
                 }
@@ -297,6 +308,7 @@ impl Search<'_> {
         if self.stats.instances >= self.caps.instances {
             return Err(QlraDecline::Cap("cap-instances"));
         }
+        #[cfg(test)]
         self.note(TraceStep::Instance {
             node,
             tuple: instance.tuple.clone(),
@@ -368,6 +380,7 @@ impl Search<'_> {
             self.top_logged = false;
             let main = self.main_query(host)?;
             let answer = self.ask(host, usize::MAX, &main, &[]);
+            #[cfg(test)]
             self.note(TraceStep::Main {
                 sat: matches!(answer, OracleAnswer::Sat(_)),
             });
@@ -466,6 +479,7 @@ pub(crate) fn solve_nested_seeded(
         all_ce,
         approx: Approximator::default(),
         stats: NestedStats::default(),
+        #[cfg(test)]
         trace: Vec::new(),
         round: 0,
         top_logged: false,
@@ -480,6 +494,7 @@ pub(crate) fn solve_nested_seeded(
         outcome,
         main,
         stats: search.stats,
+        #[cfg(test)]
         trace: search.trace,
         gamma: search.gamma,
         exact: search.exact,

@@ -214,7 +214,7 @@ fn test_solve_pb_respects_pretriggered_flag() {
     .expect("solve should succeed");
 
     assert_eq!(solution.solution.status, PbStatus::Unknown);
-    assert!(solution.solution.assignment.is_empty());
+    assert_eq!(solution.solution.assignment.as_slice(), &[] as &[bool]);
     assert!(solution.solution.objective.is_none());
     assert!(
         output.is_empty(),
@@ -1069,7 +1069,7 @@ fn test_project_wbo_solution_fails_closed_on_short_solved_witness() {
     let projected = project_wbo_solution(transformed_solution, &wbo);
 
     assert_eq!(projected.status, PbStatus::Unknown);
-    assert!(projected.assignment.is_empty());
+    assert_eq!(projected.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(projected.objective, None);
 }
 
@@ -1086,7 +1086,7 @@ fn test_exact_wbo_solution_fails_closed_on_short_solved_witness() {
     let exact = exact_wbo_solution_from_assignment(&wbo, PbStatus::Satisfiable, &[true], Some(4));
 
     assert_eq!(exact.status, PbStatus::Unknown);
-    assert!(exact.assignment.is_empty());
+    assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(exact.objective, None);
 }
 
@@ -1095,7 +1095,7 @@ fn test_native_optimization_projection_fails_closed_on_short_model() {
     let result = pb_cdcl_optimization_result_to_solution(PbCdclResult::Optimal(vec![true], 3), 2);
 
     assert_eq!(result.status, PbStatus::Unknown);
-    assert!(result.assignment.is_empty());
+    assert_eq!(result.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(result.objective, None);
 }
 
@@ -1104,7 +1104,7 @@ fn test_exact_optimization_incumbent_fails_closed_on_short_model() {
     let exact = exact_optimization_incumbent(&[], 2, PbStatus::Satisfiable, 9, &[true]);
 
     assert_eq!(exact.status, PbStatus::Unknown);
-    assert!(exact.assignment.is_empty());
+    assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(exact.objective, None);
 }
 
@@ -1144,7 +1144,7 @@ fn test_exact_optimization_incumbent_fails_closed_on_infeasible_model() {
         exact_optimization_incumbent(&constraints, 2, PbStatus::Satisfiable, 0, &[false, false]);
 
     assert_eq!(exact.status, PbStatus::Unknown);
-    assert!(exact.assignment.is_empty());
+    assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(exact.objective, None);
 }
 
@@ -1215,7 +1215,7 @@ fn test_exact_incumbent_from_model_drops_dominated_before_verification() {
             &[true, false],
         );
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -1257,7 +1257,7 @@ fn test_exact_incumbent_from_model_infeasible_cannot_advance_filter() {
     );
 
     assert_eq!(exact.status, PbStatus::Unknown);
-    assert!(exact.assignment.is_empty());
+    assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(exact.objective, None);
 }
 
@@ -1350,7 +1350,7 @@ fn test_cache_optimization_incumbent_without_witness_drops_sat_state() {
         .clone()
         .expect("incumbent should be stored");
     assert_eq!(stored.status, PbStatus::Unknown);
-    assert!(stored.assignment.is_empty());
+    assert_eq!(stored.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(stored.objective, None);
 }
 
@@ -1370,7 +1370,7 @@ fn test_cache_optimization_incumbent_without_witness_drops_stale_assignment() {
         .clone()
         .expect("incumbent should be stored");
     assert_eq!(stored.status, PbStatus::Unknown);
-    assert!(stored.assignment.is_empty());
+    assert_eq!(stored.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(stored.objective, None);
 }
 
@@ -1399,7 +1399,7 @@ fn test_cache_optimization_incumbent_zero_var_empty_model_is_valid_witness() {
         .clone()
         .expect("incumbent should be stored");
     assert_eq!(stored.status, PbStatus::Satisfiable);
-    assert!(stored.assignment.is_empty());
+    assert_eq!(stored.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(stored.objective, Some(0));
 }
 
@@ -2602,7 +2602,7 @@ fn test_solve_pb_optimization_respects_budget_consumed_by_parse() {
     .expect("solve should succeed");
 
     assert_eq!(solution.solution.status, PbStatus::Unknown);
-    assert!(solution.solution.assignment.is_empty());
+    assert_eq!(solution.solution.assignment.as_slice(), &[] as &[bool]);
     assert!(solution.solution.objective.is_none());
     assert!(
         output.is_empty(),
@@ -2957,7 +2957,7 @@ fn decision_sat_gate_fails_closed_on_infeasible_model() {
         PbStatus::Unknown,
         "an infeasible model claimed SAT must fail-closed to UNKNOWN"
     );
-    assert!(gated.assignment.is_empty());
+    assert_eq!(gated.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(gated.objective, None);
 }
 

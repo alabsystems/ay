@@ -265,13 +265,15 @@ fn add_commutes_width8_solver_backed_validates() {
         .iter()
         .all(|s| matches!(s.rule, ResRule::Resolution)));
     // Final step is the empty clause.
-    assert!(proof
-        .refutation
-        .steps
-        .last()
-        .expect("non-empty refutation")
-        .clause
-        .is_empty());
+    assert_eq!(
+        proof
+            .refutation
+            .steps
+            .last()
+            .expect("non-empty refutation")
+            .clause,
+        []
+    );
     // The two sides must NOT have fused: there are distinct LhsOut and RhsOut
     // vars, so this is the real-width path, not the operand-sharing shortcut.
     let lhs = proof

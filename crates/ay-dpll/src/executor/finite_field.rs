@@ -110,8 +110,8 @@ impl Executor {
         // Nested completion/checker facilities inherit the same sticky
         // original callback; a consumed one-shot stop cannot revive fallback.
         let _nested = owner.enter_nested();
-        let mut budget = field_work.budget();
-        let plan = match frontend::inspect(self, roots, &fence, &mut owner, &mut budget) {
+        let budget = field_work.budget();
+        let plan = match frontend::inspect(self, roots, &fence, &mut owner, budget) {
             Ok(frontend::Inspection::Free) => return None,
             Ok(frontend::Inspection::Field(plan)) => plan,
             Ok(frontend::Inspection::Unsupported) => {
@@ -145,7 +145,7 @@ impl Executor {
                 &self.ctx.terms,
                 roots,
                 &seen,
-                &mut budget,
+                budget,
                 &mut |work, bytes| {
                     owner.pay(work, 0).is_ok()
                         && self.poll_evaluation_stop().is_ok()
@@ -168,7 +168,7 @@ impl Executor {
                         self.check_field_refutation(
                             roots,
                             FieldCertificate::Linear(multipliers),
-                            &mut budget,
+                            budget,
                             &arena,
                             &mut owner,
                         )
@@ -186,7 +186,7 @@ impl Executor {
                         &self.ctx.terms,
                         roots,
                         &seen,
-                        &mut budget,
+                        budget,
                         &mut |work, bytes| {
                             owner.pay(work, 0).is_ok()
                                 && self.poll_evaluation_stop().is_ok()
@@ -205,7 +205,7 @@ impl Executor {
                                 self.check_field_refutation(
                                     roots,
                                     FieldCertificate::Quadratic,
-                                    &mut budget,
+                                    budget,
                                     &arena,
                                     &mut owner,
                                 )
@@ -219,7 +219,7 @@ impl Executor {
                             &self.ctx.terms,
                             roots,
                             &seen,
-                            &mut budget,
+                            budget,
                             &mut |work, bytes| {
                                 owner.pay(work, 0).is_ok()
                                     && self.poll_evaluation_stop().is_ok()
@@ -238,7 +238,7 @@ impl Executor {
                                     self.check_field_refutation(
                                         roots,
                                         FieldCertificate::Univariate,
-                                        &mut budget,
+                                        budget,
                                         &arena,
                                         &mut owner,
                                     )
@@ -252,7 +252,7 @@ impl Executor {
                                 &self.ctx.terms,
                                 roots,
                                 &seen,
-                                &mut budget,
+                                budget,
                                 &mut |work, bytes| {
                                     let Some(total) = ideal_bytes.checked_add(bytes) else {
                                         owner.refuse(UnknownOrigin::DeterministicResourceBudget);
@@ -276,7 +276,7 @@ impl Executor {
                                         self.check_field_refutation(
                                             roots,
                                             FieldCertificate::Ideal,
-                                            &mut budget,
+                                            budget,
                                             &arena,
                                             &mut owner,
                                         )
@@ -306,23 +306,23 @@ impl Executor {
                 }
             };
             let mut rows = Vec::new();
-            if frontend::reserve(&mut rows, candidate.len(), &mut owner, &mut budget).is_err() {
+            if frontend::reserve(&mut rows, candidate.len(), &mut owner, budget).is_err() {
                 let _ = self.should_abort_theory_loop();
                 return Some(SolveResult::Unknown);
             }
             for (term, value, field) in candidate {
-                if frontend::pay(&mut owner, &mut budget, 1, 0).is_err() {
+                if frontend::pay(&mut owner, budget, 1, 0).is_err() {
                     let _ = self.should_abort_theory_loop();
                     return Some(SolveResult::Unknown);
                 }
                 rows.push((term, FieldScalar::Field { value, field }));
             }
-            let Some(model) = self.make_field_model(&rows, &mut budget, &mut owner) else {
+            let Some(model) = self.make_field_model(&rows, budget, &mut owner) else {
                 let _ = self.should_abort_theory_loop();
                 return Some(SolveResult::Unknown);
             };
             return Some(
-                self.check_field_candidate(model, roots, &mut budget, &mut owner)
+                self.check_field_candidate(model, roots, budget, &mut owner)
                     .unwrap_or_else(|| {
                         let _ = self.should_abort_theory_loop();
                         SolveResult::Unknown
@@ -334,12 +334,12 @@ impl Executor {
                 return Some(SolveResult::Unknown);
             }
             let mut rows = Vec::new();
-            if frontend::reserve(&mut rows, vars.len(), &mut owner, &mut budget).is_err() {
+            if frontend::reserve(&mut rows, vars.len(), &mut owner, budget).is_err() {
                 let _ = self.should_abort_theory_loop();
                 return Some(SolveResult::Unknown);
             }
             for &(t, p) in &vars {
-                if frontend::pay(&mut owner, &mut budget, 1, 0).is_err() {
+                if frontend::pay(&mut owner, budget, 1, 0).is_err() {
                     let _ = self.should_abort_theory_loop();
                     return Some(SolveResult::Unknown);
                 }
@@ -355,12 +355,11 @@ impl Executor {
                 };
                 rows.push((t, scalar));
             }
-            let Some(model) = self.make_field_model(&rows, &mut budget, &mut owner) else {
+            let Some(model) = self.make_field_model(&rows, budget, &mut owner) else {
                 let _ = self.should_abort_theory_loop();
                 return Some(SolveResult::Unknown);
             };
-            if let Some(result) = self.check_field_candidate(model, roots, &mut budget, &mut owner)
-            {
+            if let Some(result) = self.check_field_candidate(model, roots, budget, &mut owner) {
                 return Some(result);
             }
         }
@@ -378,7 +377,7 @@ impl Executor {
             self.check_field_refutation(
                 roots,
                 FieldCertificate::Exhaustive,
-                &mut budget,
+                budget,
                 &arena,
                 &mut owner,
             )
@@ -453,14 +452,14 @@ impl Executor {
         }
         let step_count = n.checked_mul(2)?.checked_add(1)?;
         u32::try_from(step_count).ok()?;
-        let steps = step_count.checked_mul(std::mem::size_of::<ay_core::ProofStep>())?;
+        let steps = step_count.checked_mul(size_of::<ProofStep>())?;
         let clauses = pairs
             .checked_add(n.checked_mul(2)?)?
-            .checked_mul(std::mem::size_of::<TermId>())?;
+            .checked_mul(size_of::<TermId>())?;
         let mut retained = steps
             .checked_add(clauses)?
             .checked_add(match &certificate {
-                FieldCertificate::Linear(_) => n.checked_mul(std::mem::size_of::<u32>())?,
+                FieldCertificate::Linear(_) => n.checked_mul(size_of::<u32>())?,
                 FieldCertificate::Quadratic
                 | FieldCertificate::Univariate
                 | FieldCertificate::Ideal
@@ -693,7 +692,7 @@ fn reserve_eval_values(
         return Some(());
     }
     let target = values.capacity().checked_mul(2)?.max(8);
-    let width = std::mem::size_of::<(TermId, EvalValue)>().checked_mul(8)?;
+    let width = size_of::<(TermId, EvalValue)>().checked_mul(8)?;
     let bytes = target.checked_mul(width)?.checked_add(4096)?;
     eval_pay(work, progress, values.len().checked_add(target)?, bytes)?;
     values
@@ -742,7 +741,7 @@ fn eval(
         TermData::Const(_) | TermData::Var(..) => &[],
         _ => return None,
     };
-    let bytes = args.len().checked_mul(std::mem::size_of::<EvalValue>())?;
+    let bytes = args.len().checked_mul(size_of::<EvalValue>())?;
     eval_pay(work, poll, args.len(), bytes)?;
     let mut children = Vec::new();
     children
@@ -752,7 +751,7 @@ fn eval(
     let excess = children
         .capacity()
         .checked_sub(args.len())?
-        .checked_mul(std::mem::size_of::<EvalValue>())?;
+        .checked_mul(size_of::<EvalValue>())?;
     eval_pay(work, poll, 0, excess)?;
     for &a in args {
         children.push(eval(terms, a, values, work, attempt, poll, depth + 1)?);
@@ -874,7 +873,7 @@ mod tests {
             plain = executor
                 .ctx
                 .terms
-                .mk_app(Symbol::named("and"), &[plain, t], Sort::Bool);
+                .mk_app(Symbol::named("and"), [plain, t], Sort::Bool);
         }
         assert_eq!(executor.ctx.terms.finite_field_presence(plain), Some(false));
         assert!(executor.try_finite_field(&[plain]).is_none());
@@ -885,7 +884,7 @@ mod tests {
         let root = executor
             .ctx
             .terms
-            .mk_app(Symbol::named("="), &[sum, x], Sort::Bool);
+            .mk_app(Symbol::named("="), [sum, x], Sort::Bool);
         assert_eq!(executor.try_finite_field(&[root]), Some(SolveResult::Sat));
         let model = executor.last_model.as_ref().unwrap();
         assert_eq!(executor.evaluate_term(model, root), EvalValue::Bool(true));
@@ -900,13 +899,13 @@ mod tests {
             let x = executor
                 .ctx
                 .terms
-                .mk_var(&format!("x{i}"), Sort::FiniteField(field));
+                .mk_var(format!("x{i}"), Sort::FiniteField(field));
             let value = executor.ctx.terms.mk_finite_field(i, field);
             roots.push(
                 executor
                     .ctx
                     .terms
-                    .mk_app(Symbol::named("="), &[x, value], Sort::Bool),
+                    .mk_app(Symbol::named("="), [x, value], Sort::Bool),
             );
         }
         assert_eq!(executor.try_finite_field(&roots), Some(SolveResult::Sat));
@@ -922,7 +921,7 @@ mod tests {
         let zero = exec.ctx.terms.mk_finite_field(0, field);
         exec.ctx
             .terms
-            .mk_app(Symbol::named("="), &[x, zero], Sort::Bool)
+            .mk_app(Symbol::named("="), [x, zero], Sort::Bool)
     }
 
     #[test]
@@ -987,18 +986,18 @@ mod tests {
             let root = if arithmetic {
                 let malformed = executor.ctx.terms.mk_app(
                     Symbol::named("ff.add"),
-                    &[x, y],
+                    [x, y],
                     Sort::FiniteField(field),
                 );
                 executor
                     .ctx
                     .terms
-                    .mk_app(Symbol::named("="), &[malformed, x], Sort::Bool)
+                    .mk_app(Symbol::named("="), [malformed, x], Sort::Bool)
             } else {
                 executor
                     .ctx
                     .terms
-                    .mk_app(Symbol::named("="), &[x, y], Sort::Bool)
+                    .mk_app(Symbol::named("="), [x, y], Sort::Bool)
             };
             let before = executor.ctx.terms.snapshot_stamp();
             assert!(executor.try_finite_field(&[root]).unwrap().is_unknown());

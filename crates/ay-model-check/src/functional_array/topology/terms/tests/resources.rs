@@ -171,7 +171,7 @@ fn closed_empty_range_cannot_skip_invalid_offset_or_source_capture() {
 fn closed_conversion_zeros_work_and_bytes_shortage_stay_refused_on_same_sink() {
     let root = byte(7, &[(1, 2)]);
     let mut baseline = Sink::new();
-    convert(&root, &mut TermStore::new(), &mut baseline);
+    let _ = convert(&root, &mut TermStore::new(), &mut baseline);
     let paid_work = 1_000_000_000 - baseline.work;
     let paid_bytes = 1_000_000_000 - baseline.bytes;
     for (work, bytes) in [
@@ -233,7 +233,7 @@ fn closed_conversion_final_poll_withholds_id_after_scratch_disposal() {
         .topology(&mut work, &mut || false)
         .expect("borrowed fixture");
     let mut calls = 0;
-    topology
+    let _ = topology
         .try_to_term_with_progress(&mut TermStore::new(), &mut |_, _| {
             calls += 1;
             true

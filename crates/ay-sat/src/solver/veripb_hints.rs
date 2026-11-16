@@ -88,7 +88,7 @@ pub(crate) struct VeripbHintState {
     /// variable and the clause (`veripb_probe_hints_through`).
     pub(super) decision_reason: Option<(usize, ClauseRef)>,
     /// Hints for clauses derived outside conflict analysis (`veripb_derived.rs`).
-    pub(super) derived: super::veripb_derived::VeripbDerivedState,
+    pub(super) derived: veripb_derived::VeripbDerivedState,
 }
 
 /// Why a learned clause went out without hints.
@@ -359,7 +359,6 @@ impl Solver {
         let manager = self.proof_manager.as_mut().ok_or(HintFail::EmitFailed)?;
         manager
             .emit_add_veripb_rup(&st.scratch, &st.ids)
-            .map(|_| ())
             .map_err(|_| HintFail::EmitFailed)
     }
 }

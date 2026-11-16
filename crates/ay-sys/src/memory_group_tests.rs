@@ -191,9 +191,19 @@ fn shedding_cancels_the_fattest_lane_and_forces_its_unwind() {
     let fat_scope = enter_memory_group(Arc::clone(&fat));
     charge_current_for_testing(HUGE + 2);
     assert!(!current_memory_group_over_hard_limit());
-    assert!(memory_group_census()
+    let census = memory_group_census();
+    assert!(census
         .iter()
         .any(|usage| usage.label == "fat" && usage.live_bytes > 0));
+    let fat_at = census
+        .iter()
+        .position(|usage| usage.label == "fat")
+        .expect("fat lane is in the census");
+    let thin_at = census
+        .iter()
+        .position(|usage| usage.label == "thin")
+        .expect("thin lane is in the census");
+    assert!(fat_at < thin_at, "the fattest lane is listed first");
 
     let shed = shed_fattest_memory_group(HUGE, 1).expect("the fat lane is shed");
     assert_eq!(shed.label, "fat");

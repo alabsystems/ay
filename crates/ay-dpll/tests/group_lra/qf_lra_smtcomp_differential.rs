@@ -14,9 +14,9 @@
 //!
 //! Part of #4919, #6277.
 
+use crate::common::z3::{check_z3_or_skip, run_z3_file};
 use crate::common::{
-    check_z3_or_skip, count_real_declarations, run_executor_file_with_timeout, run_z3_file,
-    workspace_path, SolverOutcome,
+    count_real_declarations, run_executor_file_with_timeout, workspace_path, SolverOutcome,
 };
 use anyhow::Result;
 use ntest::timeout;

@@ -69,7 +69,7 @@ pub(super) fn recognize<'a>(
     .matrix(*body)
 }
 
-impl<'a, 'b, 'm> Probe<'a, 'b, 'm> {
+impl<'a> Probe<'a, '_, '_> {
     fn node(&mut self, term: TermId) -> Option<&'a TermData> {
         self.admission.pay(128, 0).ok()?;
         if (term.0 as usize) >= self.exec.ctx.terms.len() {

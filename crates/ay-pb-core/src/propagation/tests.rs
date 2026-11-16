@@ -1383,16 +1383,16 @@ fn test_unit_cardinality_native_lits_follow_watch_swaps() {
         .expect("cardinality should be added");
 
     {
-        assert!(prop.constraints[cid].native_lits.is_empty());
+        assert_eq!(prop.constraints[cid].native_lits.as_slice(), &[] as &[i64]);
     }
     assert_eq!(prop.assign_literal(-1, 1), PropResult::Ok);
     {
-        assert!(prop.constraints[cid].native_lits.is_empty());
+        assert_eq!(prop.constraints[cid].native_lits.as_slice(), &[] as &[i64]);
     }
 
     prop.unassign_literal(1);
     {
-        assert!(prop.constraints[cid].native_lits.is_empty());
+        assert_eq!(prop.constraints[cid].native_lits.as_slice(), &[] as &[i64]);
     }
 }
 
@@ -2388,7 +2388,7 @@ fn test_event_buckets_keep_unmatched_literal_events() {
 
     assert_eq!(prop.constraints[cid].slack, 0);
     assert!(bucket_of(&prop, 2).contains(&(cid, live_epoch)));
-    assert!(bucket_of(&prop, 1).is_empty());
+    assert_eq!(bucket_of(&prop, 1).as_slice(), &[] as &[(usize, u32)]);
 }
 
 #[test]
@@ -2435,7 +2435,10 @@ fn test_event_buckets_skip_stale_epoch_after_counting_conversion() {
     // all-unassigned exact value 2, not 4 (the stale-epoch double restore).
     assert_eq!(prop.rebuild_count(), rebuilds_before);
     assert_eq!(prop.constraints[cid].slack, 2);
-    assert!(prop.falsified_watch_events[lit2_idx].is_empty());
+    assert_eq!(
+        prop.falsified_watch_events[lit2_idx].as_slice(),
+        &[] as &[(usize, u32)]
+    );
 }
 
 #[test]

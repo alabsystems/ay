@@ -93,7 +93,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::cp_replay::self_check_pol_only_weighted_objective_floor as self_check;
@@ -177,7 +177,7 @@ fn recover(instance: &PbInstance) -> Option<Handshake> {
     let ids = veripb_input_row_ids(instance).ok()?;
     let mut rows: Vec<Row> = Vec::with_capacity(instance.constraints.len());
     let mut edge_uses: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut slack_seen: BTreeMap<u32, ()> = BTreeMap::new();
+    let mut slack_seen: BTreeSet<u32> = BTreeSet::new();
     let mut rhs_total: i128 = 0;
     for (index, constraint) in instance.constraints.iter().enumerate() {
         if constraint.rel != PbRel::Eq || constraint.rhs < 0 {
@@ -205,7 +205,7 @@ fn recover(instance: &PbInstance) -> Option<Handshake> {
             }
         }
         let slack = slack?;
-        if slack_seen.insert(slack, ()).is_some() {
+        if !slack_seen.insert(slack) {
             return None;
         }
         rhs_total = rhs_total.checked_add(constraint.rhs)?;

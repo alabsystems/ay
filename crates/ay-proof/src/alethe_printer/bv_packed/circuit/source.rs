@@ -26,9 +26,8 @@ pub(super) fn preflight(printer: &AlethePrinter<'_>, root: TermId) -> Option<()>
         match printer.terms.sort(term) {
             Sort::Bool => (),
             Sort::BitVec(sort) if sort.width > 0 && sort.width <= MAX_WIDTH as u32 => (),
-            Sort::Array(shape) if matches!((&shape.index_sort, &shape.element_sort), (Sort::BitVec(i), Sort::BitVec(v)) if i.width > 0 && i.width <= MAX_WIDTH as u32 && v.width > 0 && v.width <= MAX_WIDTH as u32) => {
-                ()
-            }
+            Sort::Array(shape) if matches!((&shape.index_sort, &shape.element_sort), (Sort::BitVec(i), Sort::BitVec(v)) if i.width > 0 && i.width <= MAX_WIDTH as u32 && v.width > 0 && v.width <= MAX_WIDTH as u32) =>
+                {}
             _ => return None,
         }
         match printer.terms.get(term) {

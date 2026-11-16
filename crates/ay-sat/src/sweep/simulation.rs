@@ -119,6 +119,7 @@ impl Sweeper {
     /// Signed literal convention matches the existing probe code: each class
     /// member is the literal (positive or negative) whose polarity dominated
     /// the simulation signature (popcount > 32).
+    #[cfg(test)]
     pub(super) fn find_candidates_by_simulation(
         &self,
         clauses: &ClauseArena,

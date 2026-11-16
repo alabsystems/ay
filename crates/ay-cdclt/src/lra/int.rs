@@ -30,7 +30,7 @@ impl LraPlugin {
     /// branch). `None` when this round branches.
     pub(super) fn cuts(&mut self, ctx: &mut Ctx<'_>) -> Option<Vec<Lemma>> {
         self.fractional_rounds += 1;
-        if self.fractional_rounds % GOMORY_PERIOD != 0 || self.cuts_added >= MAX_CUTS {
+        if !self.fractional_rounds.is_multiple_of(GOMORY_PERIOD) || self.cuts_added >= MAX_CUTS {
             return None;
         }
         let cuts = self.bracket(ctx.terms(), |lra| lra.gomory_term_cuts(CUTS_PER_ROUND));

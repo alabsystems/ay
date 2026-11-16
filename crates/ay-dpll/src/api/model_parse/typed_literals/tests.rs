@@ -63,7 +63,10 @@ fn ordered_batch_preserves_exact_wide_bits_and_equivalent_literal_spellings() {
             },
         ]
     );
-    assert!(ModelValue::decode_typed_literals(&[]).unwrap().is_empty());
+    assert_eq!(
+        ModelValue::decode_typed_literals(&[]).unwrap(),
+        [] as [ModelValue; 0]
+    );
 }
 
 #[test]

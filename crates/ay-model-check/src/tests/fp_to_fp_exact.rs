@@ -45,7 +45,7 @@ fn fp_to_fp_exact_numeric_halfway_all_modes_and_signs() {
                     panic!("conversion refused")
                 };
                 assert!(
-                    crate::fp::same_element(&actual, &exact(negative, 127, u8::from(up).into())),
+                    fp::same_element(&actual, &exact(negative, 127, u8::from(up).into())),
                     "{mode} {delta} {negative}"
                 );
             }
@@ -87,7 +87,7 @@ fn fp_to_fp_exact_integer_signed_unsigned_and_sparse_word() {
     ] {
         let result = operation(&mut terms, input, "RNE", name, 8, 200);
         assert!(
-            matches!(evaluate_term(&terms,&model,result), EvalOutcome::Value(actual) if crate::fp::same_element(&actual,&expected))
+            matches!(evaluate_term(&terms,&model,result), EvalOutcome::Value(actual) if fp::same_element(&actual,&expected))
         );
     }
     let invalid = operation(&mut terms, integer, "RNE", "to_fp_unsigned", 8, 200);
@@ -111,7 +111,7 @@ fn fp_to_fp_exact_format_conversion_preserves_specials_and_low_bits() {
         let model = StubModel::new().with(x, value.clone());
         let result = operation(&mut terms, x, "RNE", "to_fp", 8, 200);
         assert!(
-            matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if crate::fp::same_element(&actual,&value))
+            matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if fp::same_element(&actual,&value))
         );
     }
     let source = exact(false, 127, (BigUint::from(1u8) << 198usize) + 1u8);
@@ -126,7 +126,7 @@ fn fp_to_fp_exact_format_conversion_preserves_specials_and_low_bits() {
     )
     .unwrap();
     assert!(
-        matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if crate::fp::same_element(&actual,&expected))
+        matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if fp::same_element(&actual,&expected))
     );
 }
 
@@ -241,7 +241,7 @@ fn fp_to_fp_exact_integer_real_carrier_and_malformed_rational() {
     let result = operation(&mut terms, x, "RNE", "to_fp", 8, 200);
     let model = StubModel::new().with(x, ModelValue::Int(4.into()));
     assert!(
-        matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if crate::fp::same_element(&actual,&exact(false,129,0u8.into())))
+        matches!(evaluate_term(&terms,&model,result),EvalOutcome::Value(actual) if fp::same_element(&actual,&exact(false,129,0u8.into())))
     );
     for denominator in [0, -1] {
         let malformed = StubModel::new().with(

@@ -6,7 +6,7 @@
 use super::*;
 use crate::portfolio::PreprocessSummary;
 use crate::transform::ClauseInliner;
-use crate::{CancellationToken, ChcParser, ClauseHead};
+use crate::{CancellationToken, ChcParser, ClauseHead, PredicateId};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -84,7 +84,10 @@ fn original_parsed_preprocessed_survivors_close_without_model_enumeration() {
     assert_eq!(definitions.len(), 2);
     let mut sizes = Vec::new();
     for definition in &definitions {
-        assert!(definition.body.predicates.is_empty());
+        assert_eq!(
+            definition.body.predicates,
+            [] as [(PredicateId, Vec<ChcExpr>); 0]
+        );
         let ClauseHead::Predicate(_, arguments) = &definition.head else {
             unreachable!()
         };

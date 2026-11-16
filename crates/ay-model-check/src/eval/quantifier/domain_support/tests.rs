@@ -91,7 +91,7 @@ fn guarded_quantifier_support_differential_checks_comparisons_and_polarity() {
         }
     }
     let atoms = formulas.clone();
-    for pair in atoms.chunks_exact(2) {
+    for pair in atoms.as_chunks::<2>().0 {
         for operator in ["and", "or", "=>"] {
             formulas.push(boolean_app(&mut terms, operator, pair));
         }

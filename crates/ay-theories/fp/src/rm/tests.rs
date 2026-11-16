@@ -221,11 +221,7 @@ fn an_unpinned_mode_ranges_over_exactly_the_five_modes() {
         solver.add_clause(CnfClause::unit(if set { bit } else { -bit }));
     }
     let mut seen = Vec::new();
-    loop {
-        let model = match solve_fp_result(&solver) {
-            SatResult::Sat(model) => model,
-            _ => break,
-        };
+    while let SatResult::Sat(model) = solve_fp_result(&solver) {
         let mode = rm_bits
             .decode(|lit| Some(extract_lit(&model, lit)))
             .expect("the bits are one of the five codes");

@@ -26,10 +26,9 @@ const MAX_EMITTED_STEPS: usize = 16_384;
 pub(super) struct ClosureEmitter<'c> {
     pub(super) closure: &'c GroundClosure,
     pub(super) facts: &'c FactBase,
-    pub(super) read_chains: &'c super::read_chain::ReadChainState,
-    pub(super) packings: &'c super::packing::PackingState,
-    pub(super) read_index_units:
-        DetHashMap<(TermId, TermId), super::read_chain_emit::ReadIndexUnit>,
+    pub(super) read_chains: &'c read_chain::ReadChainState,
+    pub(super) packings: &'c packing::PackingState,
+    pub(super) read_index_units: DetHashMap<(TermId, TermId), read_chain_emit::ReadIndexUnit>,
     pub(super) proof: Proof,
     /// Unconditional Boolean constants shared only within this candidate.
     pub(super) offset_constants: [Option<ProofId>; 2],
@@ -50,7 +49,7 @@ impl<'c> ClosureEmitter<'c> {
             read_index_units: DetHashMap::default(),
             proof: Proof::new(),
             offset_constants: [None; 2],
-            disjunction_work: super::goal::MAX_GOAL_WORK,
+            disjunction_work: goal::MAX_GOAL_WORK,
             edge_units: DetHashMap::default(),
             fact_units: DetHashMap::default(),
             assumed: DetHashMap::default(),

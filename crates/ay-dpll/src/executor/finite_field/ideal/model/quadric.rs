@@ -102,19 +102,19 @@ impl Ring<'_, '_> {
         for column in 0..n {
             self.pay(1, 0)?;
             let mut pivot = None;
-            for i in column..n {
+            for (i, row) in form.quadratic.iter().enumerate().skip(column) {
                 self.pay(1, 0)?;
-                if form.quadratic[i][i] != 0 {
+                if row[i] != 0 {
                     pivot = Some(i);
                     break;
                 }
             }
             if pivot.is_none() {
                 let mut pair = None;
-                'cross: for i in column..n {
-                    for j in i + 1..n {
+                'cross: for (i, row) in form.quadratic.iter().enumerate().skip(column) {
+                    for (j, coefficient) in row.iter().enumerate().skip(i + 1) {
                         self.pay(1, 0)?;
-                        if form.quadratic[i][j] != 0 {
+                        if *coefficient != 0 {
                             pair = Some((i, j));
                             break 'cross;
                         }
@@ -178,9 +178,9 @@ impl Ring<'_, '_> {
             rank = column + 1;
         }
         let mut linear_coordinate = None;
-        for i in rank..n {
+        for (i, coefficient) in form.linear.iter().enumerate().skip(rank) {
             self.pay(1, 0)?;
-            if form.linear[i] != 0 {
+            if *coefficient != 0 {
                 linear_coordinate = Some(i);
                 break;
             }
@@ -328,7 +328,7 @@ mod tests {
         let mut terms = TermStore::new();
         let field = FiniteFieldSort::new(65537).unwrap();
         let variables: Vec<_> = (0..3)
-            .map(|i| terms.mk_var(&format!("x{i}"), Sort::FiniteField(field)))
+            .map(|i| terms.mk_var(format!("x{i}"), Sort::FiniteField(field)))
             .collect();
         let mut fuel = 1_000_000;
         let mut ring = Ring {
@@ -396,7 +396,7 @@ mod tests {
             let mut terms = TermStore::new();
             let field = FiniteFieldSort::new(p).unwrap();
             let variables: Vec<_> = (0..3)
-                .map(|i| terms.mk_var(&format!("x{i}"), Sort::FiniteField(field)))
+                .map(|i| terms.mk_var(format!("x{i}"), Sort::FiniteField(field)))
                 .collect();
             for mut encoded in 0..p.pow(10) {
                 let mut c = [0; 10];
@@ -443,9 +443,9 @@ mod tests {
             for i in 0..=row {
                 linear[i] = ((u64::from(linear[i]) + 2 * u64::from(a) * u64::from(shift))
                     % u64::from(p)) as u32;
-                for j in i..=row {
-                    let multiplier = if i == j { 1 } else { 2 };
-                    q[i][j] = (q[i][j] + multiplier * a) % p;
+                for (offset, coefficient) in q[i][i..=row].iter_mut().enumerate() {
+                    let multiplier = if offset == 0 { 1 } else { 2 };
+                    *coefficient = (*coefficient + multiplier * a) % p;
                 }
             }
         }
@@ -471,7 +471,7 @@ mod tests {
             let mut terms = TermStore::new();
             let field = FiniteFieldSort::new(p).unwrap();
             let variables: Vec<_> = (0..4)
-                .map(|i| terms.mk_var(&format!("x{i}"), Sort::FiniteField(field)))
+                .map(|i| terms.mk_var(format!("x{i}"), Sort::FiniteField(field)))
                 .collect();
             for rank in 0..=4 {
                 for target in 0..p {
@@ -510,7 +510,7 @@ mod tests {
         let mut terms = TermStore::new();
         let field = FiniteFieldSort::new(65537).unwrap();
         let variables: Vec<_> = (0..4)
-            .map(|i| terms.mk_var(&format!("x{i}"), Sort::FiniteField(field)))
+            .map(|i| terms.mk_var(format!("x{i}"), Sort::FiniteField(field)))
             .collect();
         let mut total = 0usize;
         let mut bytes = 0usize;

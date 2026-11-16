@@ -9,6 +9,9 @@ mod complete;
 mod order;
 mod propagate;
 
+type ScalarSignature = (u8, u32);
+type ArraySignature = (ScalarSignature, ScalarSignature);
+
 pub(super) struct Plan {
     pub(super) members: Vec<TermId>,
     pub(super) ends: Vec<usize>,
@@ -58,7 +61,7 @@ impl Plan {
     }
 }
 
-fn scalar(source: &Sort, work: &mut WorkBudget<'_>) -> Result<(u8, u32), QueryError> {
+fn scalar(source: &Sort, work: &mut WorkBudget<'_>) -> Result<ScalarSignature, QueryError> {
     work.charge(1)?;
     match source {
         Sort::Bool => Ok((0, 0)),
@@ -73,7 +76,7 @@ fn signature(
     solver: &ArraySolver<'_>,
     term: TermId,
     work: &mut WorkBudget<'_>,
-) -> Result<((u8, u32), (u8, u32)), QueryError> {
+) -> Result<ArraySignature, QueryError> {
     scan::live(solver, term, work)?;
     let Sort::Array(sort) = solver.terms.sort(term) else {
         return Err(work.refuse_exhaustion());

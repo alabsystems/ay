@@ -68,7 +68,7 @@ fn guarded_unit_authentication_uses_the_shared_budget_without_resetting_it() {
                 "the exact shared allowance is exhausted"
             );
         } else {
-            assert!(cx.chain.steps.is_empty());
+            assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
         }
         assert!(!shared.charge(0, 0), "observed refusal stays sticky");
         let mut retry = PlanCx::new(&set, &f.roots, &f.records, &f.entries, &[], false)
@@ -78,7 +78,7 @@ fn guarded_unit_authentication_uses_the_shared_budget_without_resetting_it() {
         }
         .plan_array_unit_base(&mut retry, unit)
         .is_none());
-        assert!(retry.chain.steps.is_empty());
+        assert_eq!(retry.chain.steps, [] as [ProofStep; 0]);
     }
     let mut missing = PlanCx::new(&set, &f.roots, &f.records, &f.entries, &[], false)
         .with_array_units(&f.units, &allow);
@@ -88,7 +88,7 @@ fn guarded_unit_authentication_uses_the_shared_budget_without_resetting_it() {
     }
     .plan_array_unit_base(&mut missing, unit)
     .is_none());
-    assert!(missing.chain.steps.is_empty());
+    assert_eq!(missing.chain.steps, [] as [ProofStep; 0]);
 }
 
 #[test]

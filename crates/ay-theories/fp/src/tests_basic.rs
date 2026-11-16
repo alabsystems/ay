@@ -134,7 +134,7 @@ fn test_cnf_generation() {
     let _ = solver.bitblast_is_nan(x);
 
     let clauses = solver.clauses();
-    assert!(!clauses.is_empty());
+    assert_ne!(clauses.len(), 0);
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn test_arithmetic_special_cases() {
     let fp_y = solver.get_fp(y);
 
     let _ = solver.make_add(&fp_x, &fp_y, RoundingMode::RNE);
-    assert!(!solver.clauses().is_empty());
+    assert_ne!(solver.clauses().len(), 0);
 
     let _ = solver.make_mul(&fp_x, &fp_y, RoundingMode::RTZ);
     let _ = solver.make_div(&fp_x, &fp_y, RoundingMode::RTP);
@@ -264,20 +264,23 @@ fn test_fp_reset_clears_term_to_fp_cache_pr_9028_regression() {
     // Force bit-blast of x and y (populates term_to_fp).
     let _ = solver.bitblast_is_nan(x);
     let _ = solver.bitblast_is_nan(y);
-    assert!(
-        !solver.term_to_fp().is_empty(),
+    assert_ne!(
+        solver.term_to_fp().len(),
+        0,
         "term_to_fp must have entries before reset"
     );
 
     <FpSolver<'_> as ay_core::TheorySolver>::reset(&mut solver);
 
-    assert!(
-        solver.term_to_fp().is_empty(),
+    assert_eq!(
+        solver.term_to_fp().len(),
+        0,
         "reset() must clear term_to_fp — otherwise stale FP decompositions would \
          leak across incremental calls (Z3 PR #9028 bug class)"
     );
-    assert!(
-        solver.bv_term_bits().is_empty(),
+    assert_eq!(
+        solver.bv_term_bits().len(),
+        0,
         "reset() must clear bv_term_bits (fixed in #8619) — otherwise stale \
          BV-to-CNF mappings would leak (Z3 PR #9028 bug class)"
     );

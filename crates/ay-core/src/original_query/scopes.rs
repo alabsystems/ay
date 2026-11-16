@@ -4,12 +4,12 @@
 //! Flat declaration/scope history, with no scope-vector bulk copies or clears.
 
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub(super) struct Scopes {
     depth: usize,
-    entries: BTreeMap<(usize, DeclId), ()>,
+    entries: BTreeSet<(usize, DeclId)>,
 }
 
 impl Scopes {
@@ -24,7 +24,7 @@ impl Scopes {
             DeclarationLifetime::Global => 0,
         };
         work.tree(self.entries.len())?;
-        if self.entries.insert((scope, id), ()).is_some() {
+        if !self.entries.insert((scope, id)) {
             return Err(QueryError::Invalid("repeated declaration scope record"));
         }
         Ok(())
@@ -57,7 +57,7 @@ impl Scopes {
             .ok_or(QueryError::Invalid("scope underflow"))?;
         loop {
             work.tree(self.entries.len())?;
-            let Some((&(scope, _), _)) = self.entries.last_key_value() else {
+            let Some(&(scope, _)) = self.entries.last() else {
                 break;
             };
             if scope <= depth {
@@ -75,7 +75,7 @@ impl Scopes {
         work: &mut WorkBudget<'_>,
     ) -> Result<(), QueryError> {
         work.tree(self.entries.len())?;
-        let ((_, id), _) = self
+        let (_, id) = self
             .entries
             .pop_last()
             .ok_or(QueryError::Invalid("missing scope record"))?;
@@ -113,19 +113,19 @@ impl Scopes {
             | ResetAssertionsPolicy::ClearDepthRetainDeclarations => {
                 loop {
                     work.tree(self.entries.len())?;
-                    let Some((&(scope, _), _)) = self.entries.last_key_value() else {
+                    let Some(&(scope, _)) = self.entries.last() else {
                         break;
                     };
                     if scope == 0 {
                         break;
                     }
                     work.tree(self.entries.len())?;
-                    let ((_, id), _) = self
+                    let (_, id) = self
                         .entries
                         .pop_last()
                         .ok_or(QueryError::Invalid("missing scope record"))?;
                     work.tree(self.entries.len())?;
-                    if self.entries.insert((0, id), ()).is_some() {
+                    if !self.entries.insert((0, id)) {
                         return Err(QueryError::Invalid("duplicate flattened scope record"));
                     }
                 }

@@ -61,7 +61,7 @@ fn every_callback_refusal_is_terminal_and_only_complete_rounds_remain() {
         true
     })
     .unwrap();
-    assert!(expected.is_empty());
+    assert_eq!(expected, [] as [ChcExpr; 0]);
     assert!((10..4000).contains(&calls));
     for ordinal in 1..=calls {
         let mut actual = input.clone();

@@ -242,6 +242,10 @@ fn integer_array_fallback_shares_source_entry_and_payload_budgets() {
 
     // Source visits and value entries share the same allowance, rather than
     // each receiving MAX_WORK independently.
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the work-cap fixture intentionally shares one immutable zero node to isolate edge accounting"
+    )]
     let middle_default = ChcExpr::Op(ChcOp::Add, vec![Arc::new(ChcExpr::Int(0)); MAX_WORK / 2]);
     let middle_source = ChcExpr::const_array(ChcSort::Int, middle_default);
     let a = stored(0, Vec::new());
@@ -253,6 +257,10 @@ fn integer_array_fallback_shares_source_entry_and_payload_budgets() {
     assert_eq!(integer_array_equality(&lhs, &rhs, &a, &b), Some(false));
     assert_eq!(integer_array_equality(&middle_source, &rhs, &a, &b), None);
 
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the work-cap fixture intentionally shares one immutable zero node to isolate edge accounting"
+    )]
     let wide_default = ChcExpr::Op(ChcOp::Add, vec![Arc::new(ChcExpr::Int(0)); MAX_WORK]);
     let wide_source = ChcExpr::const_array(ChcSort::Int, wide_default);
     assert_eq!(

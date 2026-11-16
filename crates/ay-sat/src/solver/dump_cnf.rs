@@ -85,6 +85,7 @@ pub enum DumpCnfVerdict {
 /// Accounting for one preprocessed-CNF dump.
 #[derive(Debug, Clone)]
 pub struct DumpCnfReport {
+    /// Result of preprocessing before the CNF was written.
     pub verdict: DumpCnfVerdict,
     /// `maxvar` as written in the `p cnf` header. This is
     /// `max(source maxvar, largest emitted external var)` — the SOURCE

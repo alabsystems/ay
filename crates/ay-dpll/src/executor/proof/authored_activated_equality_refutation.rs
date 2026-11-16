@@ -67,7 +67,7 @@ impl Budget<'_> {
             return Some(());
         }
         let capacity = needed.max(values.capacity().checked_mul(2)?).max(4);
-        let bytes = capacity.checked_mul(std::mem::size_of::<T>())?;
+        let bytes = capacity.checked_mul(size_of::<T>())?;
         self.charge(values.len().checked_add(1)?, bytes.checked_add(64)?)?;
         values
             .try_reserve_exact(capacity.checked_sub(values.len())?)

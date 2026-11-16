@@ -10,6 +10,9 @@ mod resources;
 pub use resources::re_check_bundle_strict_with_resource_control;
 
 #[cfg(test)]
+#[path = "cancellation/tests/oracle.rs"]
+mod oracle;
+#[cfg(test)]
 mod tests;
 
 type Progress<'a> = &'a mut dyn FnMut(usize, usize) -> bool;
@@ -215,11 +218,7 @@ fn reconstruct_checked_schema(
         let bytes = identity
             .len()
             .checked_mul(2)
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    16 * (std::mem::size_of::<String>() + std::mem::size_of::<usize>()),
-                )
-            })
+            .and_then(|bytes| bytes.checked_add(16 * (size_of::<String>() + size_of::<usize>())))
             .ok_or(ProofCheckError::ResourceLimit)?;
         let work = identity
             .len()
@@ -312,7 +311,7 @@ fn collect_assumptions(
         }
     }
     let bytes = count
-        .checked_mul(std::mem::size_of::<TermId>())
+        .checked_mul(size_of::<TermId>())
         .ok_or(ProofCheckError::ResourceLimit)?;
     charge(progress, count, bytes)?;
     let mut assumptions = Vec::new();

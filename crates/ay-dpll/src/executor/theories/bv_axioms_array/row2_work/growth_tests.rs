@@ -24,14 +24,14 @@ fn symbolic_chain(depth: usize, reads: usize) -> Chain {
     let mut arrays = vec![base];
     let mut array = base;
     for position in 0..depth {
-        let index = terms.mk_var(&format!("store-index-{position}"), Sort::bitvec(64));
+        let index = terms.mk_var(format!("store-index-{position}"), Sort::bitvec(64));
         array = terms.mk_store(array, index, value);
         arrays.push(array);
     }
     let mut indices = Vec::new();
     let mut roots = Vec::new();
     for position in 0..reads {
-        let index = terms.mk_var(&format!("read-index-{position}"), Sort::bitvec(64));
+        let index = terms.mk_var(format!("read-index-{position}"), Sort::bitvec(64));
         roots.push(terms.mk_select(array, index));
         indices.push(index);
     }
@@ -69,7 +69,7 @@ fn check_chain_work(depth: usize, count: usize) {
     assert_eq!(stats.max_new_selects, count);
     assert_eq!(output.reads.added_roots(), count * depth);
     assert_eq!(&chain.roots[..count], &initial_roots);
-    assert!(chain.executor.ctx.assertions.is_empty());
+    assert_eq!(chain.executor.ctx.assertions, [] as [TermId; 0]);
     let root_set: HashSet<_> = chain.roots.iter().copied().collect();
     assert_eq!(root_set.len(), count * (depth + 1));
     let before = chain.executor.ctx.terms.len();
@@ -140,7 +140,7 @@ fn a_later_index_reactivates_an_already_discovered_and_used_store() {
     assert_eq!(output.stats.ite_jobs, 2);
     assert_eq!(output.stats.row2_jobs, 2);
     assert_eq!(output.stats.rounds, 3);
-    assert!(executor.ctx.assertions.is_empty());
+    assert_eq!(executor.ctx.assertions, [] as [TermId; 0]);
 }
 
 #[test]
@@ -183,6 +183,6 @@ fn deeply_nested_observation_roots_use_iterative_discovery() {
     assert_eq!(output.stats.max_new_selects, 0);
     assert_eq!((output.stats.ite_jobs, output.stats.row2_jobs), (0, 0));
     assert_eq!(output.reads.added_roots(), 0);
-    assert!(roots.is_empty());
+    assert_eq!(roots, [] as [TermId; 0]);
     assert_eq!(executor.ctx.assertions, vec![root]);
 }

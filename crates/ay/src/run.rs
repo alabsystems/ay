@@ -266,27 +266,27 @@ fn may_use_ungated_solver_route(gates: ResultGateRequests) -> bool {
 enum SmtUnsatProofPosture {
     /// No proof configuration: no certificate, so nothing to wait for.
     #[default]
-    NoCertificate,
+    Absent,
     /// Only the synthesized default certificate (`<input>.alethe`). It is
     /// best-effort unless strict proofs are requested, in either spelling.
-    DefaultCertificate,
+    SynthesizedDefault,
     /// An explicit proof file, an artifact envelope or a firewall Lean
     /// directory: every UNSAT waits for its publication transaction.
-    RequiredCertificate,
+    Required,
 }
 
 impl SmtUnsatProofPosture {
     fn of(proof: Option<&ProofConfig>) -> Self {
         match proof {
-            None => Self::NoCertificate,
+            None => Self::Absent,
             Some(proof)
                 if !proof.synthesized_default
                     || proof.artifact_path.is_some()
                     || crate::FIREWALL_LEAN_DIR.get().is_some() =>
             {
-                Self::RequiredCertificate
+                Self::Required
             }
-            Some(_) => Self::DefaultCertificate,
+            Some(_) => Self::SynthesizedDefault,
         }
     }
 
@@ -296,11 +296,11 @@ impl SmtUnsatProofPosture {
     /// strict predicate (`strict_request`), never read apart from it.
     fn holds_unsat(self, script_strict: bool) -> bool {
         match self {
-            Self::NoCertificate => false,
-            Self::DefaultCertificate => {
+            Self::Absent => false,
+            Self::SynthesizedDefault => {
                 crate::strict_request::strict_proofs_requested(script_strict)
             }
-            Self::RequiredCertificate => true,
+            Self::Required => true,
         }
     }
 }
@@ -777,7 +777,7 @@ impl SmtTranscriptState {
             public_verdict_from_executor: false,
             decision_trace_publication: DecisionTracePublication::Pending,
             result_certification_rejected: false,
-            unsat_proof_posture: SmtUnsatProofPosture::NoCertificate,
+            unsat_proof_posture: SmtUnsatProofPosture::Absent,
             query_script_strict: false,
             pending_unsat_output: None,
             default_certificate_created: Cell::new(false),
@@ -1539,14 +1539,12 @@ fn smt_quoted_reason_detail(message: &str) -> String {
     const MAX_DETAIL_CHARS: usize = 200;
 
     let mut body = String::with_capacity(message.len() + 2);
-    let mut chars = 0usize;
     let mut truncated = false;
-    for ch in message.chars() {
+    for (chars, ch) in message.chars().enumerate() {
         if chars >= MAX_DETAIL_CHARS {
             truncated = true;
             break;
         }
-        chars += 1;
         match ch {
             '"' => body.push_str("\"\""),
             c if c.is_control() => body.push(' '),
@@ -5960,10 +5958,10 @@ mod tests {
             ProofConfig::new_default("/tmp/default.alethe".to_string(), ProofFormat::Alethe);
         assert_eq!(
             SmtUnsatProofPosture::of(Some(&default)),
-            SmtUnsatProofPosture::DefaultCertificate
+            SmtUnsatProofPosture::SynthesizedDefault
         );
         assert!(required_smt_unsat_publication(Some(&default), true));
-        assert!(SmtUnsatProofPosture::DefaultCertificate.holds_unsat(true));
+        assert!(SmtUnsatProofPosture::SynthesizedDefault.holds_unsat(true));
 
         let explicit = ProofConfig::from_path("/tmp/explicit.alethe".to_string());
         let enveloped = default
@@ -5972,15 +5970,12 @@ mod tests {
         for required in [&explicit, &enveloped] {
             assert_eq!(
                 SmtUnsatProofPosture::of(Some(required)),
-                SmtUnsatProofPosture::RequiredCertificate
+                SmtUnsatProofPosture::Required
             );
             assert!(required_smt_unsat_publication(Some(required), false));
         }
 
-        assert_eq!(
-            SmtUnsatProofPosture::of(None),
-            SmtUnsatProofPosture::NoCertificate
-        );
+        assert_eq!(SmtUnsatProofPosture::of(None), SmtUnsatProofPosture::Absent);
         assert!(!required_smt_unsat_publication(None, true));
     }
 
@@ -5989,7 +5984,7 @@ mod tests {
     #[test]
     fn a_query_answered_under_the_in_script_option_holds_its_unsat_back() {
         let mut transcript = SmtTranscriptState::new();
-        transcript.unsat_proof_posture = SmtUnsatProofPosture::DefaultCertificate;
+        transcript.unsat_proof_posture = SmtUnsatProofPosture::SynthesizedDefault;
         transcript.query_script_strict = true;
         transcript.record_public_verdict(PublicVerdict::Unsat);
         assert!(transcript.query_strict_proofs_requested());
@@ -8724,14 +8719,14 @@ fn unsat_publication_without_artifact_authority(
     }
     let cause = "a command earlier in this problem failed, and no certificate may embed source that failed continued execution";
     match SmtUnsatProofPosture::of(Some(proof_config)) {
-        SmtUnsatProofPosture::DefaultCertificate => AletheProofPublication::RejectToUnknown {
+        SmtUnsatProofPosture::SynthesizedDefault => AletheProofPublication::RejectToUnknown {
             reason: "(incomplete proof-publication-failed)".to_string(),
             diagnostic: format!(
                 "strict proof mode rejected UNSAT because {} cannot be published: {cause}",
                 proof_config.path
             ),
         },
-        SmtUnsatProofPosture::RequiredCertificate | SmtUnsatProofPosture::NoCertificate => {
+        SmtUnsatProofPosture::Required | SmtUnsatProofPosture::Absent => {
             AletheProofPublication::Fatal(format!(
                 "{}, but it cannot be published: {cause}",
                 required_certificate_request(proof_config)
@@ -9717,7 +9712,7 @@ fn repl_surface(stdin_tty: bool, incremental: bool) -> ReplSurface {
         stdin_tty,
         io::stdout().is_terminal(),
         incremental,
-        super::Z3_MODE_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+        Z3_MODE_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         std::env::var_os("AY_PLAIN_REPL").is_some_and(|v| !v.is_empty() && v != "0"),
     )
 }

@@ -81,7 +81,7 @@ fn checked(name: &str, input: &str) -> (Executor, Proof) {
         .expect("the actual checker-facing document validates in its declared source scope");
     assert!(!text.contains("(declare-"));
     assert!(!text.contains(":rule hole") && !text.contains(":rule trust"));
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof().is_none());
     println!(
         "direct-read-chain {name}: steps={} ROW={} checked_offsets={} exported_bytes={}",
@@ -101,7 +101,7 @@ fn refused(name: &str, input: &str) {
     let (mut exec, root) = prepared(input);
     assert!(exec.early_ground_closure_memory_candidate(root).is_none());
     assert!(exec.last_proof().is_none());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     retain(name, input, None);
 }
 
@@ -412,7 +412,7 @@ fn direct_read_chain_scope_stamp_and_emission_step_limit_are_enforced() {
     assert!(exec
         .emit_ground_read_chain(&mut emitter, edge, literal, 0, witness)
         .is_none());
-    assert!(emitter.proof.steps.is_empty());
+    assert_eq!(emitter.proof.steps, [] as [ProofStep; 0]);
     exec.execute_all(&parse("(pop 1)").unwrap()).unwrap();
     assert!(
         !search.read_chains.current(&exec.ctx),
@@ -466,7 +466,7 @@ fn direct_read_chain_missing_guard_and_forged_value_are_strictly_rejected() {
             })
             .unwrap();
         if missing_guard {
-            row.remove(0);
+            let _ = row.remove(0);
         } else {
             let conclusion = *row.last().unwrap();
             let (read, _) = decode_eq_local(&exec.ctx.terms, conclusion).unwrap();
@@ -822,7 +822,7 @@ fn all_skipped_chain_reaches_an_older_aliased_store_with_checked_index_transport
             )) >= 1
         );
         assert!(intrinsic_count(&proof, AletheRule::BvOffsetSpinesV1) >= 1);
-        assert!(exec.last_proof_raw_original_assertions.is_empty());
+        assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     }
 }
 
@@ -917,10 +917,7 @@ fn opaque_guarded_fallthrough(omit: Option<usize>, wrong: Option<usize>) -> Stri
         guards = next;
     }
     text.push_str(&format!("(assert {})\n(check-sat)\n", guards[0]));
-    text.replace(
-        "\n", "
-",
-    )
+    text
 }
 
 #[test]

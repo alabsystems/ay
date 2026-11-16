@@ -15,8 +15,8 @@ fn batch_get_values_matches_single_get_value_with_epsilons() {
     let x = terms.mk_var("x", Sort::Real);
     let y = terms.mk_var("y", Sort::Real);
     let unregistered = terms.mk_var("w", Sort::Real);
-    let zero = terms.mk_rational(num_rational::BigRational::zero());
-    let one = terms.mk_rational(num_rational::BigRational::one());
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(BigRational::one());
     // Strict bounds force ε-carrying assignments (x = 0 + ε).
     let x_pos = terms.mk_gt(x, zero);
     let y_pos = terms.mk_gt(y, zero);
@@ -42,8 +42,8 @@ fn batch_get_values_matches_single_get_value_with_epsilons() {
     }
     let xv = batch[0].clone().expect("x registered");
     let yv = batch[1].clone().expect("y registered");
-    assert!(xv > num_rational::BigRational::zero());
-    assert!(yv > num_rational::BigRational::zero());
-    assert!(xv + yv < num_rational::BigRational::one());
+    assert!(xv > BigRational::zero());
+    assert!(yv > BigRational::zero());
+    assert!(xv + yv < BigRational::one());
     assert_eq!(batch[3], None, "unregistered term has no value");
 }

@@ -5,8 +5,7 @@
 //! Lifetime and ownership controls for the actual printed-clause ledger.
 use super::super::AlethePrinter;
 use super::{
-    atom_id, rc_text_bytes, PrintedClause, ATOM_SLOT_MASK, MAX_ATOM_GENERATION,
-    MAX_RECORDED_PRINTED_BYTES,
+    atom_id, PrintedClause, ATOM_SLOT_MASK, MAX_ATOM_GENERATION, MAX_RECORDED_PRINTED_BYTES,
 };
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermStore};
 
@@ -79,19 +78,21 @@ fn retirement_frees_only_last_owned_text_and_keeps_metadata_charged() {
     let first = printer
         .record_interned_clause(&[atom.clone(), atom.clone()])
         .unwrap();
-    let second = printer.record_interned_clause(&[atom.clone()]).unwrap();
+    let second = printer
+        .record_interned_clause(std::slice::from_ref(&atom))
+        .unwrap();
     let initial = printer.printed_clause_bytes.get();
     printer.release_printed_atoms(first);
     assert_eq!(
         printer.printed_clause_bytes.get(),
-        initial - 2 * std::mem::size_of::<u32>()
+        initial - 2 * size_of::<u32>()
     );
     assert!(printer.printed_atom_texts(&second).is_some());
     let stale = second[0];
     printer.release_printed_atoms(second);
     assert_eq!(
         printer.printed_clause_bytes.get(),
-        initial - 3 * std::mem::size_of::<u32>() - super::OwnedText::cost(atom.len()).unwrap()
+        initial - 3 * size_of::<u32>() - super::OwnedText::cost(atom.len()).unwrap()
     );
     assert!(
         printer.printed_clause_bytes.get() > 0,
@@ -124,7 +125,7 @@ fn external_text_owners_prevent_refunds_and_generation_wrap_never_aliases() {
     printer.release_printed_atoms(ids);
     assert_eq!(
         printer.printed_clause_bytes.get(),
-        before - std::mem::size_of::<u32>()
+        before - size_of::<u32>()
     );
     assert!(printer.printed_clause_atom_index.borrow().is_empty());
     let held = printer.printed_clause_bytes.get();
@@ -168,8 +169,12 @@ fn disjoint_large_opposite_polarity_clauses_fit_without_a_lifetime_cap_increase(
         let atom = format!("p{index}{}", "x".repeat(512 * 1024));
         let negative = format!("(not {atom})");
         cumulative += atom.len() + negative.len();
-        let positive = printer.record_interned_clause(&[atom.clone()]).unwrap();
-        let negative_ids = printer.record_interned_clause(&[negative.clone()]).unwrap();
+        let positive = printer
+            .record_interned_clause(std::slice::from_ref(&atom))
+            .unwrap();
+        let negative_ids = printer
+            .record_interned_clause(std::slice::from_ref(&negative))
+            .unwrap();
         assert_ne!(positive[0], negative_ids[0]);
         let texts = vec![
             printer.printed_atom_texts(&positive).unwrap(),

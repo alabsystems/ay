@@ -23,6 +23,11 @@ pub(super) fn validate_declaration_context(
 
 /// Constructors, selectors, and exact `is-<constructor>` testers share one
 /// case-sensitive term namespace. Datatype names occupy a separate namespace.
+/// A name is its raw symbol text, so the empty name of the SMT-LIB symbol `||`
+/// is ordinary here (its derived tester is `is-`) and no name is tested for
+/// emptiness: names are refused as duplicates within their namespace, as
+/// selector lists for an undeclared constructor, or, through
+/// `insert_declaration_term_symbol`, as cross-role ambiguities.
 pub(super) fn validate_declaration_context_with_progress(
     bundle: &SerializableProofBundle,
     progress: Progress<'_>,
@@ -34,10 +39,10 @@ pub(super) fn validate_declaration_context_with_progress(
     let mut term_symbols = HashMap::default();
     for (datatype, constructors) in &bundle.datatype_declarations {
         meter.charge(1, 0)?;
-        if datatype.is_empty() || !meter.insert_name(&mut datatype_names, datatype)? {
+        if !meter.insert_name(&mut datatype_names, datatype)? {
             meter.diagnostic(&[datatype])?;
             return Err(malformed_bundle(format!(
-                "datatype declaration name {datatype:?} is empty or duplicated"
+                "datatype declaration name {datatype:?} is duplicated"
             )));
         }
         if constructors.is_empty() {
@@ -48,10 +53,10 @@ pub(super) fn validate_declaration_context_with_progress(
         }
         for constructor in constructors {
             meter.charge(1, 0)?;
-            if constructor.is_empty() || !meter.insert_name(&mut constructor_names, constructor)? {
+            if !meter.insert_name(&mut constructor_names, constructor)? {
                 meter.diagnostic(&[constructor])?;
                 return Err(malformed_bundle(format!(
-                    "constructor declaration name {constructor:?} is empty or duplicated"
+                    "constructor declaration name {constructor:?} is duplicated"
                 )));
             }
             insert_declaration_term_symbol(
@@ -87,12 +92,6 @@ pub(super) fn validate_declaration_context_with_progress(
         }
         for selector in selectors {
             meter.charge(1, 0)?;
-            if selector.is_empty() {
-                meter.diagnostic(&[selector, constructor])?;
-                return Err(malformed_bundle(format!(
-                    "selector name {selector:?} for constructor {constructor:?} is empty"
-                )));
-            }
             insert_declaration_term_symbol(&mut term_symbols, selector, "a selector", &mut meter)?;
         }
     }

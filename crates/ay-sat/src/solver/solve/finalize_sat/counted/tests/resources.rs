@@ -111,7 +111,11 @@ fn expired_original_deadline_cannot_be_renewed_for_model_validation() {
     let mut s = assigned();
     let admission = CountedAdmission::new(
         FiniteAdmissionGrant::new(1_000_000, 1_000_000),
-        Some(ay_core::time::Instant::now() - std::time::Duration::from_secs(1)),
+        Some(
+            ay_core::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        ),
         Arc::new(|| false),
     )
     .unwrap();

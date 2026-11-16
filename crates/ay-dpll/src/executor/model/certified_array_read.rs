@@ -307,13 +307,11 @@ impl Executor {
                 return None;
             }
             match read.resolve(self, model, term) {
-                Ok(None) => {
-                    return match read.owns(self, model, term) {
-                        Ok(false) => Some(Ok(None)),
-                        _ => Some(Err(())),
-                    }
-                }
-                Err(()) => return Some(Err(())),
+                Ok(None) => match read.owns(self, model, term) {
+                    Ok(false) => Some(Ok(None)),
+                    _ => Some(Err(())),
+                },
+                Err(()) => Some(Err(())),
                 Ok(Some(value)) => {
                     if super::dt_model::scoped_term_binding_active() {
                         return Some(Err(()));

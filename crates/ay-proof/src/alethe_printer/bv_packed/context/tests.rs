@@ -10,7 +10,7 @@ fn publish(name: &str, problem: &str) {
         context.process_command(&command).unwrap();
     }
     let parsed = context.assertions_parsed()[0].clone();
-    let root = super::super::aggregate_tests::raw_fixture_term(&mut context, &parsed);
+    let root = aggregate_tests::raw_fixture_term(&mut context, &parsed);
     let negated = context.terms.mk_not_raw(root);
     assert!(
         context_identity(&context.terms, &[negated], &mut |_, _| true)
@@ -82,7 +82,7 @@ fn context_missing_guards_wrong_branches_and_overrides_decline() {
             context.process_command(&command).unwrap();
         }
         let parsed = context.assertions_parsed()[0].clone();
-        let root = super::super::aggregate_tests::raw_fixture_term(&mut context, &parsed);
+        let root = aggregate_tests::raw_fixture_term(&mut context, &parsed);
         let negated = context.terms.mk_not_raw(root);
         let result = context_identity(&context.terms, &[negated], &mut |_, _| true).unwrap();
         assert_eq!(result.is_some(), expected);

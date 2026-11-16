@@ -302,7 +302,7 @@ fn test_collect_farkas_lemmas_finds_annotated_steps() {
 fn test_collect_farkas_lemmas_empty_proof() {
     let proof = Proof::new();
     let farkas_ids = collect_farkas_lemmas(&proof);
-    assert!(farkas_ids.is_empty());
+    assert_eq!(farkas_ids, [] as [ay_core::ProofId; 0]);
 }
 
 /// #6484: Test that `extract_interpolant_from_precomputed_farkas` can produce a valid
@@ -380,7 +380,7 @@ fn test_collect_farkas_lemmas_no_farkas_annotations() {
     });
 
     let farkas_ids = collect_farkas_lemmas(&proof);
-    assert!(farkas_ids.is_empty());
+    assert_eq!(farkas_ids, [] as [ay_core::ProofId; 0]);
 }
 
 /// #6484: Test that split_literals partitioning produces an interpolant from

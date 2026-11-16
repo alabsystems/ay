@@ -26,7 +26,11 @@ fn variable(name: &str, sort: ChcSort) -> ChcExpr {
 }
 
 fn prove(body: &ChcExpr, head: &ChcExpr) -> Result<bool> {
-    entails(body, head, &mut Owner::capture().expect("original owner"))
+    entails(
+        body,
+        head,
+        &mut Owner::<'_>::capture().expect("original owner"),
+    )
 }
 
 #[test]

@@ -81,10 +81,7 @@ impl Solver {
         let mut budget = SignatureBudget::default();
         budget.names(names)?;
         let mut expected = Vec::new();
-        budget.charge(
-            0,
-            names.len() * std::mem::size_of::<(&str, &[Sort], &Sort)>(),
-        )?;
+        budget.charge(0, names.len() * size_of::<(&str, &[Sort], &Sort)>())?;
         expected
             .try_reserve_exact(names.len())
             .map_err(|_| invalid("request allocation refused"))?;
@@ -98,7 +95,7 @@ impl Solver {
                 arguments.len(),
                 arguments
                     .len()
-                    .checked_mul(std::mem::size_of::<Sort>())
+                    .checked_mul(size_of::<Sort>())
                     .ok_or_else(|| invalid("signature size overflow"))?,
             )?;
             budget.sort(result)?;

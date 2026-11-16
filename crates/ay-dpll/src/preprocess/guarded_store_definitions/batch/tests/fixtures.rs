@@ -3,15 +3,15 @@
 
 use super::*;
 
-pub(super) struct Fixture {
-    pub(super) terms: TermStore,
-    pub(super) roots: Vec<TermId>,
-    pub(super) variable: TermId,
-    pub(super) guards: [TermId; 2],
-    pub(super) activation: TermId,
-    pub(super) cover: TermId,
-    pub(super) aliases: [TermId; 2],
-    pub(super) stores: [TermId; 2],
+pub(in crate::preprocess::guarded_store_definitions::batch) struct Fixture {
+    pub(in crate::preprocess::guarded_store_definitions::batch) terms: TermStore,
+    pub(in crate::preprocess::guarded_store_definitions::batch) roots: Vec<TermId>,
+    pub(in crate::preprocess::guarded_store_definitions::batch) variable: TermId,
+    pub(in crate::preprocess::guarded_store_definitions::batch) guards: [TermId; 2],
+    pub(in crate::preprocess::guarded_store_definitions::batch) activation: TermId,
+    pub(in crate::preprocess::guarded_store_definitions::batch) cover: TermId,
+    pub(in crate::preprocess::guarded_store_definitions::batch) aliases: [TermId; 2],
+    pub(in crate::preprocess::guarded_store_definitions::batch) stores: [TermId; 2],
 }
 
 pub(super) fn app(terms: &mut TermStore, name: &str, args: &[TermId]) -> TermId {
@@ -19,7 +19,7 @@ pub(super) fn app(terms: &mut TermStore, name: &str, args: &[TermId]) -> TermId 
 }
 
 impl Fixture {
-    pub(super) fn new(width: u32) -> Self {
+    pub(in crate::preprocess::guarded_store_definitions::batch) fn new(width: u32) -> Self {
         let mut terms = TermStore::new();
         let fill = terms.mk_bitvec(3.into(), width);
         let base = terms.mk_const_array(Sort::Bool, fill);
@@ -69,7 +69,9 @@ impl Fixture {
         }
     }
 
-    pub(super) fn discover(&mut self) -> Option<GuardedStoreBatch> {
+    pub(in crate::preprocess::guarded_store_definitions::batch) fn discover(
+        &mut self,
+    ) -> Option<GuardedStoreBatch> {
         discover(&mut self.terms, &self.roots, &mut |_, _| true)
     }
 

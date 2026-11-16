@@ -103,7 +103,7 @@ fn replay(script: &str) -> (Option<bool>, u64) {
         .expect("the renderer's header");
     let mut solver = Solver::try_new(Logic::All).expect("solver");
     let assertions = solver.parse_smtlib2(body).expect("parse");
-    assert!(!assertions.is_empty());
+    assert_ne!(assertions, [] as [ay_dpll::Term; 0]);
     drop(assertions);
     // A wall backstop only; the assertions below are on verdicts and counted
     // work.

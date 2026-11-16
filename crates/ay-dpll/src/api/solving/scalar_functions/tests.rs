@@ -32,7 +32,7 @@ fn requests_use_parsed_source_signatures_without_native_handles_or_term_growth()
     assert_eq!(requests[1].2, &Sort::bitvec(136));
     assert!(std::ptr::eq(
         requests[1].2,
-        &solver
+        &raw const solver
             .executor
             .context()
             .symbol_info("f with space")

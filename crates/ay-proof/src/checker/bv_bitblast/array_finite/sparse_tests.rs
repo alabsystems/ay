@@ -323,12 +323,12 @@ fn sparse_consistency_builders_run_only_after_existing_admission() {
         .unwrap()
         .saturating_add(lowerer.count_bv_nodes(&right).unwrap())
         .saturating_add(6);
-    let limit = super::super::MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES;
+    let limit = MAX_PROOF_PRODUCING_CONSTRUCTED_EXPR_NODES;
     lowerer.constructed_expr_nodes = limit - nodes + 1;
     let before = lowerer.constructed_expr_nodes;
     let mut constraints = Vec::new();
     assert!(lowerer
-        .push_sparse_read_constraint(&mut constraints, nodes, &build)
+        .push_sparse_read_constraint(&mut constraints, nodes, build)
         .is_err());
     assert!(
         !built.get(),
@@ -339,14 +339,14 @@ fn sparse_consistency_builders_run_only_after_existing_admission() {
 
     let mut oversized = ProofProducingLowerer::new(&terms, deadline());
     assert!(oversized
-        .push_sparse_read_constraint(&mut constraints, usize::MAX, &build)
+        .push_sparse_read_constraint(&mut constraints, usize::MAX, build)
         .is_err());
     assert!(!built.get() && constraints.is_empty() && oversized.resource_exhausted);
 
     let mut exact = ProofProducingLowerer::new(&terms, deadline());
     exact.constructed_expr_nodes = limit - nodes;
     exact
-        .push_sparse_read_constraint(&mut constraints, nodes, &build)
+        .push_sparse_read_constraint(&mut constraints, nodes, build)
         .unwrap();
     assert!(built.get() && constraints.len() == 1);
     assert_eq!(exact.constructed_expr_nodes, limit);
@@ -358,7 +358,7 @@ fn sparse_consistency_builders_run_only_after_existing_admission() {
     cancelled.keep_going = Some(&mut stop);
     let mut withheld = Vec::new();
     assert!(cancelled
-        .push_sparse_read_constraint(&mut withheld, nodes, &build)
+        .push_sparse_read_constraint(&mut withheld, nodes, build)
         .is_err());
     assert!(!built.get() && withheld.is_empty() && cancelled.cancelled);
     assert!(

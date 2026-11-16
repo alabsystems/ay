@@ -187,8 +187,8 @@ fn lazy64_advances_past_applied_alias_work_without_a_noop_loop() {
     for n in 0..128 {
         let array = f.terms.mk_var(format!("alias_{n}"), make_array_sort());
         let read = f.terms.mk_select(array, j);
-        f.terms.mk_eq(array, f.stored);
-        f.terms.mk_eq(read, f.base_read);
+        let _ = f.terms.mk_eq(array, f.stored);
+        let _ = f.terms.mk_eq(read, f.base_read);
     }
     let mut solver = ArraySolver::new(&f.terms);
     solver.populate_caches();
@@ -215,12 +215,10 @@ fn held_original_interrupt_prevents_candidate_queue_materialization() {
     let f = fixture(true);
     let mut solver = ArraySolver::new(&f.terms);
     solver.populate_caches();
-    solver.set_interrupt(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        true,
-    )));
+    solver.set_interrupt(Arc::new(AtomicBool::new(true)));
     solver.generate_lazy_row2_axioms();
     solver.generate_all_lazy_row2_axioms();
-    assert!(solver.pending_axioms.is_empty());
+    assert_eq!(solver.pending_axioms.as_slice(), &[] as &[PendingAxiom]);
     assert!(solver.row2_down_work.is_empty());
     assert!(matches!(solver.check(), TheoryResult::Unknown));
 }

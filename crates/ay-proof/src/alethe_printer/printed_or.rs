@@ -393,7 +393,10 @@ mod tests {
             assert!(read(rendered).is_empty(), "{rendered}");
         }
         // And a rule named `or_pos` is not `or`.
-        assert!(read("(step t1 (cl (not (or a b)) a) :rule or_pos :args (0))").is_empty());
+        assert_eq!(
+            read("(step t1 (cl (not (or a b)) a) :rule or_pos :args (0))"),
+            []
+        );
     }
 
     #[test]

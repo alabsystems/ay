@@ -337,8 +337,8 @@ pub(super) struct Model {
     functional_arrays: Option<functional_arrays::FunctionalArrayModel>,
     /// Conservative DATA charge for directly constructed scalar candidates.
     /// Carries no execution callback or SAT authority across public reads.
-    _scalar_candidate_memory: Option<std::sync::Arc<evaluation_copies::RetainedEvaluationMemory>>,
-    construction_owner: Option<std::sync::Arc<construction_owner::ModelConstructionOwner>>,
+    _scalar_candidate_memory: Option<Arc<evaluation_copies::RetainedEvaluationMemory>>,
+    construction_owner: Option<Arc<construction_owner::ModelConstructionOwner>>,
 }
 
 mod construction_owner;
@@ -729,7 +729,7 @@ impl Executor {
     ) -> EvalValue {
         let _copies = evaluation_copies::retain();
         if !evaluation_copies::validate(self)
-            || !evaluation_copies::pay(1, 2 * std::mem::size_of::<EvalValue>())
+            || !evaluation_copies::pay(1, 2 * size_of::<EvalValue>())
             || !evaluation_copies::validate(self)
             || self.evaluation_stop_origin().is_some()
             || (eval_guard::depth() == 0 && self.poll_evaluation_stop().is_err())

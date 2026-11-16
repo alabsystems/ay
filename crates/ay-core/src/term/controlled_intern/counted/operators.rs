@@ -138,7 +138,7 @@ fn infer_sorts(
     args: &[&Sort],
     owner: &dyn TermConstructionAdmission,
 ) -> Result<Sort> {
-    use CountedBuiltin::*;
+    use CountedBuiltin::{And, Distinct, Eq, Iff, Implies, Ite, Not, Or, Select, Store, Xor};
     match (op, args) {
         (Not, [Sort::Bool]) | (Implies | Xor | Iff, [Sort::Bool, Sort::Bool]) => Ok(Sort::Bool),
         (And | Or, args) if args.len() >= 2 => {
@@ -167,7 +167,12 @@ fn infer_sorts(
 }
 
 fn infer_bv(op: CountedBuiltin, args: &[&Sort]) -> Result<Sort> {
-    use CountedBuiltin::*;
+    use CountedBuiltin::{
+        BvAShr, BvAdd, BvAnd, BvComp, BvConcat, BvExtract, BvLShr, BvMul, BvNand, BvNeg, BvNor,
+        BvNot, BvOr, BvRepeat, BvRotateLeft, BvRotateRight, BvSDiv, BvSGe, BvSGt, BvSLe, BvSLt,
+        BvSMod, BvSRem, BvShl, BvSignExtend, BvSub, BvUDiv, BvUGe, BvUGt, BvULe, BvULt, BvURem,
+        BvXnor, BvXor, BvZeroExtend,
+    };
     let invalid = || CountedTermError::InvalidInput;
     let width = match args {
         [Sort::BitVec(a)] => a.width,
@@ -243,7 +248,13 @@ pub(super) fn term(
 }
 
 fn symbol(op: CountedBuiltin) -> (&'static str, Option<(usize, [u32; 2])>) {
-    use CountedBuiltin::*;
+    use CountedBuiltin::{
+        And, BvAShr, BvAdd, BvAnd, BvComp, BvConcat, BvExtract, BvLShr, BvMul, BvNand, BvNeg,
+        BvNor, BvNot, BvOr, BvRepeat, BvRotateLeft, BvRotateRight, BvSDiv, BvSGe, BvSGt, BvSLe,
+        BvSLt, BvSMod, BvSRem, BvShl, BvSignExtend, BvSub, BvUDiv, BvUGe, BvUGt, BvULe, BvULt,
+        BvURem, BvXnor, BvXor, BvZeroExtend, Distinct, Eq, Iff, Implies, Ite, Not, Or, Select,
+        Store, Xor,
+    };
     let name = match op {
         Not => "not",
         And => "and",

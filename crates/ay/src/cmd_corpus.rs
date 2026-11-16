@@ -6547,7 +6547,7 @@ depends_on = ["dependency"]
             .iter()
             .find(|asset| asset.name == "target")
             .unwrap();
-        assert!(target.groups.is_empty());
+        assert_eq!(target.groups.as_slice(), &[] as &[String]);
         assert_eq!(target.dependencies, ["dependency"]);
         assert_eq!(target.local_layout.destination.declared, "target");
         assert_eq!(
@@ -7088,7 +7088,10 @@ manifest = "responses.csv"
         assert!(format!("{error:#}").contains("normalized repository-relative path"));
         assert!(!directory.path().join("outside.cnf").exists());
         assert!(!directory.path().join("corpus").exists());
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
 
         fs::write(
             directory.path().join("responses.csv"),
@@ -7860,7 +7863,10 @@ depends_on = ["dependency"]
 
         let plan = build_archive_safety_plan(&members, ArchiveSymlinkPolicy::RejectAbsolute)
             .expect("safe relative in-archive link must pass");
-        assert!(plan.symlink_rewrites.is_empty());
+        assert_eq!(
+            plan.symlink_rewrites.as_slice(),
+            &[] as &[ArchiveSymlinkRewrite]
+        );
     }
 
     #[test]
@@ -8038,7 +8044,10 @@ depends_on = ["dependency"]
 
         assert!(format!("{error:#}").contains("SHA256 mismatch"));
         assert_eq!(fs::read(&destination).unwrap(), b"last-good");
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8056,7 +8065,10 @@ depends_on = ["dependency"]
 
         assert!(format!("{error:#}").contains("size mismatch"));
         assert_eq!(fs::read(&destination).unwrap(), b"last-good");
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8187,7 +8199,10 @@ depends_on = ["dependency"]
                 "a materialized symlink must be rejected without following it"
             );
         }
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[cfg(unix)]
@@ -8233,7 +8248,10 @@ depends_on = ["dependency"]
         let error = verify_local_corpus(&corpus, true)
             .expect_err("a changed materialized symlink target must be rejected");
         assert!(format!("{error:#}").contains("different-target"));
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8264,7 +8282,10 @@ depends_on = ["dependency"]
         let error = verify_local_corpus(&corpus, true)
             .expect_err("missing materialized ZIP entry must be rejected");
         assert!(format!("{error:#}").contains("missing nested/input.smt2"));
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8291,7 +8312,10 @@ depends_on = ["dependency"]
             fs::read_to_string(destination.join("atsp/model.mzn")).unwrap(),
             "model"
         );
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8321,7 +8345,10 @@ depends_on = ["dependency"]
             fs::read_to_string(destination.join("keep.txt")).unwrap(),
             "last-good"
         );
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8347,7 +8374,10 @@ depends_on = ["dependency"]
                 fs::read_to_string(destination.join("keep.txt")).unwrap(),
                 "last-good"
             );
-            assert!(corpus_work_directories(directory.path()).is_empty());
+            assert_eq!(
+                corpus_work_directories(directory.path()).as_slice(),
+                &[] as &[PathBuf]
+            );
         }
     }
 
@@ -8391,7 +8421,10 @@ depends_on = ["dependency"]
             !directory.path().join("PB24").exists(),
             "archive roots must not spill into the destination parent"
         );
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     #[test]
@@ -8436,7 +8469,10 @@ depends_on = ["dependency"]
         assert!(!destination.join("PB24").exists());
         assert!(!destination.join("PB25").exists());
         assert!(!destination.join("stale-from-previous-run").exists());
-        assert!(corpus_work_directories(directory.path()).is_empty());
+        assert_eq!(
+            corpus_work_directories(directory.path()).as_slice(),
+            &[] as &[PathBuf]
+        );
     }
 
     // ---------- Round-trip ----------
@@ -9009,7 +9045,10 @@ depends_on = ["a"]
     fn chc_fixture_list_empty_for_missing_dir() {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("does-not-exist");
-        assert!(chc_fixture_list(&missing).unwrap().is_empty());
+        assert_eq!(
+            chc_fixture_list(&missing).unwrap().as_slice(),
+            &[] as &[String]
+        );
     }
 
     #[test]

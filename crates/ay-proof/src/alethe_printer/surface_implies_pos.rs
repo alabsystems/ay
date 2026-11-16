@@ -118,7 +118,7 @@ impl AlethePrinter<'_> {
             )
             .ok_or_else(|| invalid(id, "implication clause lacks its raw negated gate"))?;
         let mut actual = clause.to_vec();
-        actual.remove(gate);
+        let _ = actual.remove(gate);
         let mut expected = operands.clone();
         actual.sort_unstable();
         expected.sort_unstable();

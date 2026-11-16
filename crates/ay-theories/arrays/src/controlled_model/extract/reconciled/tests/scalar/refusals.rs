@@ -15,7 +15,7 @@ fn orphan_scalar_vertices_still_refuse_in_both_cache_states() {
             source.build_equiv_class_cache();
         }
         refused(&source, &values, end);
-        assert!(source.eq_adj[&fixture.indices[0]].is_empty());
+        assert_eq!(source.eq_adj[&fixture.indices[0]].len(), 0);
     }
 }
 
@@ -50,7 +50,7 @@ fn stale_false_assignment_or_forged_external_reason_is_terminal() {
         let mut source = fixture.solver();
         if external {
             source.eq_adj.get_mut(&fixture.reads[0]).unwrap()[0].1 = TermId::SENTINEL;
-            assert!(source.external_eqs.is_empty());
+            assert_eq!(source.external_eqs.len(), 0);
         } else {
             source.assigns.insert(fixture.roots[1], false);
             assert!(!source.assign_dirty); // Deliberately malformed current-origin fixture.

@@ -10,6 +10,24 @@ const DECL: &str = "(set-logic ALL)
 (declare-fun f (Int) Int) (declare-fun R (Int Int) Bool)
 (declare-fun v () (_ BitVec 2))";
 
+#[test]
+fn an_unchecked_rule_is_refused_before_metering_or_allocating_a_label() {
+    let terms = TermStore::new();
+    let printer = AlethePrinter::new(&terms);
+    let meter = Meter::new(&printer);
+    let mut derivation = Derivation::new(ProofId(7), meter);
+    let before_work = printer.work_used();
+
+    assert_eq!(derivation.step("p", "invented_rule", &[]), None);
+    assert_eq!(derivation.output, "");
+    assert_eq!(printer.work_used(), before_work);
+    assert_eq!(
+        derivation.step("p", "trans", &[]).as_deref(),
+        Some("t7.subst.0")
+    );
+    assert_eq!(derivation.output, "(step t7.subst.0 (cl p) :rule trans)\n");
+}
+
 fn raw(context: &mut ay_frontend::Context, term: &ay_frontend::Term) -> TermId {
     use ay_frontend::Term;
     let inferred = context.elaborate_surface_subterm(term).unwrap();

@@ -72,7 +72,7 @@ fn transferred_original_ids_and_bypassed_original_events_are_refused() {
     assert!(pending
         .prepare_counted_add(1, &[pos(0)], true, &[], &owner)
         .is_err());
-    assert!(pending.is_empty());
+    assert_eq!(pending.len(), 0);
     assert!(!pending.original_control().unwrap().open());
     assert!(owner.check().is_err());
 }

@@ -69,7 +69,7 @@ fn bvfp_external_style_self_check_still_refuses_the_unsupported_surface() {
     assert!(solver.check_sat().is_unknown());
     assert_eq!(
         solver.unknown_reason(),
-        Some(crate::UnknownReason::SelfCheckRejected)
+        Some(UnknownReason::SelfCheckRejected)
     );
     assert!(solver.export_last_unsat_bundle().is_none());
 }

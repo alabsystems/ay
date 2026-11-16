@@ -114,7 +114,7 @@ impl Solver {
             stopped.set(requested);
             requested
         };
-        let result = self.solve_with_assumptions_interruptible_raw(assumptions, &stop);
+        let result = self.solve_with_assumptions_interruptible_raw(assumptions, stop);
         let final_result = if matches!(result, AssumeResult::Unknown) {
             // Keep an actual writer/chain/authority failure's exact priority.
             // A later callback must not reclassify an already refused result.

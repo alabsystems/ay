@@ -24,7 +24,7 @@ fn fixture(extra: &str) -> Executor {
     executor
 }
 
-fn inspect_primary_trace(trace: &ay_sat::ClauseTrace) {
+fn inspect_primary_trace(trace: &ClauseTrace) {
     assert!(!trace.proof_work_exhausted() && !trace.is_truncated());
     assert!(trace.original_clauses().count() > 0);
     ay_sat::validate_clause_trace_resolution(
@@ -158,7 +158,7 @@ fn cleanup_fixture(expected: &SolveResult) -> Executor {
 fn run_cleanup_control(
     expected: SolveResult,
     refusal: Option<usize>,
-) -> (usize, Option<crate::executor_types::UnknownOrigin>) {
+) -> (usize, Option<UnknownOrigin>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     let mut executor = cleanup_fixture(&expected);

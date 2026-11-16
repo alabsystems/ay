@@ -118,6 +118,7 @@ fn binders(
 ///
 /// A violated precondition REJECTS, so a wrong step costs completeness, never
 /// soundness.
+#[cfg(test)]
 pub(crate) fn validate_qnt_join(
     terms: &TermStore,
     step: ProofId,

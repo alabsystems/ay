@@ -417,6 +417,10 @@ impl<'a> BvSolver<'a> {
     }
 }
 
+#[cfg(test)]
+#[path = "tests/division_carry/cnf.rs"]
+mod cnf_test_support;
+
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;

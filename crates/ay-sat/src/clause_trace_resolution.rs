@@ -917,7 +917,7 @@ pub fn validate_clause_trace_resolution_interruptible(
 ) -> Result<ValidatedClauseTraceResolution, ClauseTraceResolutionError> {
     validate_clause_trace_resolution_interruptible_impl(trace, num_vars, &[], limits, should_stop)
         .map(|(resolution, unit_premises)| {
-            debug_assert!(unit_premises.is_empty());
+            debug_assert_eq!(unit_premises.len(), 0);
             resolution
         })
 }
@@ -1570,7 +1570,7 @@ mod tests {
         .expect("(not p), (p or q), and (not q) have an exact unit refutation");
         assert_eq!(validated.unit_premises(), &[neg(0)]);
         assert_eq!(validated.dag().derived.len(), 1);
-        assert!(validated.dag().derived[0].clause.is_empty());
+        assert_eq!(validated.dag().derived[0].clause.len(), 0);
         assert_eq!(validated.dag().derived[0].rup_hints, vec![1, 2]);
 
         let error = validate_clause_trace_resolution_with_unit_premises_interruptible(

@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 use crate::quantified::QuantifiedChcResult;
 use crate::ChcSort;
 use ntest::timeout;
 
 mod functions;
 mod native;
-#[path = "../render/tests/oracle.rs"]
-mod oracle;
 
 fn control(token: &CancellationToken) -> SourceControl<'_> {
     SourceControl::new(Instant::now() + Duration::from_secs(30), token)
@@ -85,7 +84,7 @@ fn independent_text_oracle_checks_complete_same_assignment_pins() {
         &control(&token),
     )
     .unwrap();
-    assert!(oracle::models(&inconsistent).is_empty());
+    assert_eq!(oracle::models(&inconsistent), [] as [std::vec::Vec<u64>; 0]);
     // Another satisfying assignment is semantically valid but not the retained
     // witness: byte identity must still reject this replacement during recheck.
     let alternative = assignment(&rendered, &[2, 3, 2, 3]);

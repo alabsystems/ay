@@ -180,7 +180,7 @@ impl RecoveryAdmission {
             owner: self,
             armed: true,
         };
-        let guarded = u64::try_from(work).ok().is_some_and(|work| {
+        let guarded = u64::try_from(work).is_ok_and(|work| {
             self.0
                 .guard
                 .as_ref()
@@ -279,14 +279,12 @@ fn walk_eval_value_copy(
     pay: &mut impl FnMut(usize, usize) -> bool,
 ) -> bool {
     use super::EvalValue;
-    if depth > 32 || !pay(1, std::mem::size_of::<EvalValue>()) {
+    if depth > 32 || !pay(1, size_of::<EvalValue>()) {
         return false;
     }
     let payload = match value {
         EvalValue::Bool(_) | EvalValue::Unknown => 1,
-        EvalValue::FiniteField { .. } => {
-            std::mem::size_of::<u32>() + std::mem::size_of::<ay_core::FiniteFieldSort>()
-        }
+        EvalValue::FiniteField { .. } => size_of::<u32>() + size_of::<ay_core::FiniteFieldSort>(),
         EvalValue::Element(value) | EvalValue::String(value) => value.len(),
         EvalValue::Rational(value) if matches!(policy, CopyPayloads::Native) => {
             if !pay_rational_copy(value, pay) {
@@ -310,7 +308,7 @@ fn walk_eval_value_copy(
             bits
         }
         EvalValue::Complex { real, imaginary } => {
-            if !pay(2, 2 * std::mem::size_of::<(&EvalValue, usize)>()) {
+            if !pay(2, 2 * size_of::<(&EvalValue, usize)>()) {
                 return false;
             }
             if !walk_eval_value_copy(real, depth + 1, policy, pay)
@@ -321,10 +319,7 @@ fn walk_eval_value_copy(
             0
         }
         EvalValue::Seq(values) => {
-            let Some(bytes) = values
-                .len()
-                .checked_mul(std::mem::size_of::<(&EvalValue, usize)>())
-            else {
+            let Some(bytes) = values.len().checked_mul(size_of::<(&EvalValue, usize)>()) else {
                 return false;
             };
             if !pay(values.len(), bytes) {
@@ -351,10 +346,7 @@ fn walk_eval_value_copy(
         }
         EvalValue::Algebraic(_) | EvalValue::Fp(_) => return false,
     };
-    if !pay(payload, payload) {
-        return false;
-    }
-    true
+    pay(payload, payload)
 }
 
 fn pay_rational_copy(
@@ -381,7 +373,7 @@ fn pay_rational_copy(
     };
     let Some(bytes) = bits
         .max(limb_bytes)
-        .checked_add(std::mem::size_of::<num_rational::BigRational>())
+        .checked_add(size_of::<num_rational::BigRational>())
     else {
         return false;
     };
@@ -444,7 +436,7 @@ pub(super) fn fp_copy_payload_bytes(value: &ay_fp::FpModelValue) -> Option<usize
     let occupied = exponent_bits.checked_add(fraction_bits)?;
     usize::try_from(occupied.div_ceil(64))
         .ok()?
-        .checked_mul(4 * std::mem::size_of::<u64>())?
+        .checked_mul(4 * size_of::<u64>())?
         .checked_add(4096)
 }
 
@@ -457,7 +449,7 @@ enum Field<'a> {
 impl Field<'_> {
     fn bits(self) -> u64 {
         match self {
-            Self::Native(value) => u64::from(u128::BITS - value.leading_zeros()),
+            Self::Native(value) => u64::from(value.bit_width()),
             Self::Exact(value) => value.bits(),
         }
     }
@@ -673,9 +665,8 @@ mod tests {
             value: field.modulus() - 1,
             field,
         };
-        let copy_bytes = std::mem::size_of::<EvalValue>()
-            + std::mem::size_of::<u32>()
-            + std::mem::size_of::<ay_core::FiniteFieldSort>();
+        let copy_bytes =
+            size_of::<EvalValue>() + size_of::<u32>() + size_of::<ay_core::FiniteFieldSort>();
         for (bytes, expected) in [(copy_bytes - 1, false), (copy_bytes, true)] {
             let admission = RecoveryAdmission::new(100, bytes, None, Box::new(|| false));
             let retained = admission.clone();
@@ -873,7 +864,7 @@ mod tests {
         .unwrap();
         exec.last_model = Some(Model::empty());
         let roots = exec.independent_gate_query_roots().unwrap();
-        assert!(!roots.is_empty());
+        assert_ne!(roots, [] as [ay_core::TermId; 0]);
         assert_eq!(exec.problem_has_array(), Ok(true));
         let _scope = RecoveryScope::enter(&exec, 0, 0).unwrap();
         assert_eq!(

@@ -80,6 +80,6 @@ fn assert_cache(actual: &FpEncodingCache, expected: &FpEncodingCache) {
     assert_eq!(actual.ieee_nan_encodings, expected.ieee_nan_encodings);
     assert_eq!(actual.rm_terms, expected.rm_terms);
     // This pure FMA fixture admits no conversion site or missing cache field.
-    assert!(actual.to_bv_unspec_sites.is_empty());
-    assert!(expected.to_bv_unspec_sites.is_empty());
+    assert_eq!(actual.to_bv_unspec_sites.len(), 0);
+    assert_eq!(expected.to_bv_unspec_sites.len(), 0);
 }

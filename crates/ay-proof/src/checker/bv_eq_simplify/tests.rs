@@ -88,7 +88,7 @@ fn literal_truth_and_wraparound_keep_the_exact_width() {
         let correct = claim(&mut terms, literal_test, false);
         assert!(accepted(&terms, correct));
         // The public literal constructor canonicalizes the entire integer.
-        let wrap = terms.mk_bitvec((num_bigint::BigInt::from(1u8) << width).into(), width);
+        let wrap = terms.mk_bitvec(num_bigint::BigInt::from(1u8) << width, width);
         let equal_residues = eq(&mut terms, wrap, b);
         let wrong = claim(&mut terms, equal_residues, false);
         assert!(!accepted(&terms, wrong));

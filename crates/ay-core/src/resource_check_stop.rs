@@ -133,7 +133,6 @@ fn install(installed: Installed) -> CheckStopScope {
 /// This only borrows the original stop authority through an Arc; it grants no
 /// resources. Create and drop a new local scope on the receiving thread.
 /// Transfer/enter the appropriate GuardTree node separately for work owned by it.
-#[must_use]
 pub fn current_check_stop() -> Result<Option<CheckStop>, CheckStopCaptureError> {
     CHECK_STOP
         .try_with(|cell| {

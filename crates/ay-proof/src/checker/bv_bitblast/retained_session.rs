@@ -242,23 +242,24 @@ impl<'proof, 'wire> RetainedSession<'proof, 'wire> {
         progress: &mut dyn FnMut(usize, usize) -> bool,
     ) -> Result<Vec<RetainedStepPayload>, ProofCheckError> {
         let mut control = Control::new(self.original_deadline(), progress);
-        let Self {
-            credits,
-            operation: _,
-            output,
-            failed,
-            ..
-        } = self;
-        let result = if failed {
-            drop(credits);
-            drop(output);
-            Err(ProofCheckError::ResourceLimit)
-        } else {
-            match credits.finish() {
-                Ok(()) => Ok(output),
-                Err(_) => {
-                    drop(output);
-                    Err(ProofCheckError::ResourceLimit)
+        let result = {
+            let Self {
+                credits,
+                operation: _,
+                output,
+                failed,
+                ..
+            } = self;
+            if failed {
+                drop(output);
+                Err(ProofCheckError::ResourceLimit)
+            } else {
+                match credits.finish() {
+                    Ok(()) => Ok(output),
+                    Err(_) => {
+                        drop(output);
+                        Err(ProofCheckError::ResourceLimit)
+                    }
                 }
             }
         };

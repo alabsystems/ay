@@ -27,7 +27,10 @@ const MAX_DEPTH: usize = 128;
 
 /// The caller captures `Owner` before source inspection and retains it through
 /// artifact transport and final publication. No deadline/allowance is minted.
-pub(crate) fn derive(problem: &ChcProblem, owner: &mut Owner) -> Result<Option<CompactDerivation>> {
+pub(crate) fn derive(
+    problem: &ChcProblem,
+    owner: &mut Owner<'_>,
+) -> Result<Option<CompactDerivation>> {
     let result = (|| {
         owner.admit(1, 0)?;
         if problem.has_stripped_body_forall() {
@@ -46,7 +49,7 @@ pub(crate) fn derive(problem: &ChcProblem, owner: &mut Owner) -> Result<Option<C
 fn candidate(
     problem: &ChcProblem,
     path: &[usize],
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<CompactDerivation>> {
     let variables = variables::Variables::new(problem, path, owner)?;
     let projection = project::Projection::new(problem, path, &variables, owner)?;
@@ -75,7 +78,7 @@ fn candidate(
     Ok(Some(derivation))
 }
 
-fn reserve<T>(items: &mut Vec<T>, count: usize, owner: &mut Owner) -> Result<()> {
+fn reserve<T>(items: &mut Vec<T>, count: usize, owner: &mut Owner<'_>) -> Result<()> {
     let bytes = count
         .checked_mul(std::mem::size_of::<T>())
         .ok_or(Error::Resource)?;
@@ -86,7 +89,7 @@ fn reserve<T>(items: &mut Vec<T>, count: usize, owner: &mut Owner) -> Result<()>
     Ok(())
 }
 
-fn text(source: &str, owner: &mut Owner) -> Result<String> {
+fn text(source: &str, owner: &mut Owner<'_>) -> Result<String> {
     owner.admit(source.len(), source.len())?;
     let mut result = String::new();
     if result.try_reserve(source.len()).is_err() {

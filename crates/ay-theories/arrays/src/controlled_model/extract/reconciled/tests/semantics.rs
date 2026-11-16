@@ -97,8 +97,7 @@ fn fresh_and_cached_lifo_classes_preserve_last_rank_tie_and_map_layout() {
         let winner = class
             .iter()
             .copied()
-            .filter(|&t| t == fixture.alias || t == fixture.stores[1] || t == fixture.stores[2])
-            .last()
+            .rfind(|&t| t == fixture.alias || t == fixture.stores[1] || t == fixture.stores[2])
             .unwrap();
         assert_eq!(
             output.array_values[&fixture.missing],
@@ -137,7 +136,7 @@ fn full_text_cells_and_read_poison_remain_local_under_class_propagation() {
     let original = owner(end, 1_000_000, 128 << 20);
     let output = run(&solver, &values, &original);
     same(&output, &solver.extract_model(&values));
-    assert!(output.array_values[&fixture.bases[0]].stores.is_empty());
+    assert_eq!(output.array_values[&fixture.bases[0]].stores.len(), 0);
     assert!(output.read_conflicted.contains(&fixture.bases[0]));
     assert!(!output.read_conflicted.contains(&fixture.alias));
     assert_eq!(

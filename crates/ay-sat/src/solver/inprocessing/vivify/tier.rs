@@ -4,7 +4,7 @@
 
 //! Per-tier vivification processing loop.
 
-use super::super::super::mutate::{DeleteResult, ReasonPolicy, ReplaceResult};
+use super::super::super::mutate::{DeleteResult, ReplaceResult};
 use super::super::super::*;
 use super::super::VivifyTierRun;
 #[cfg(feature = "jit")]

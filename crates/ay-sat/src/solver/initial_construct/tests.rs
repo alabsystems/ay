@@ -59,13 +59,8 @@ fn real_constructor_installs_originals_ids_and_binary_watches() {
 fn real_constructor_preserves_variable_buffers_and_clause_id_capacity_policy() {
     for n in [0, 1, 3, 17] {
         let original = owner(10_000_000, 10_000_000);
-        let counted = Solver::build_with_hint(
-            n,
-            None,
-            Some(13),
-            &super::super::construction::Counted(&original),
-        )
-        .unwrap();
+        let counted =
+            Solver::build_with_hint(n, None, Some(13), &construction::Counted(&original)).unwrap();
         let ordinary = Solver::with_clause_hint(n, 13);
         assert_eq!(counted.vals, ordinary.vals);
         assert_eq!(counted.vals.capacity(), ordinary.vals.capacity());

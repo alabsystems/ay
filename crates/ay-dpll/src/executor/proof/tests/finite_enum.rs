@@ -94,11 +94,12 @@ fn finite_enum_internal_certificate_does_not_require_parsed_retention() {
     let commands = parse(&direct_finite_enum_assertions_only()).expect("parse direct enum roots");
     let mut exec = Executor::new();
     exec.set_retain_parsed_assertions(false);
-    assert!(exec
-        .execute_all(&commands)
-        .expect("install direct enum roots")
-        .is_empty());
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(
+        exec.execute_all(&commands)
+            .expect("install direct enum roots"),
+        [] as [String; 0]
+    );
+    assert_eq!(exec.ctx.assertions_parsed(), []);
     exec.begin_public_solve(false);
     exec.bind_unsat_query_assumptions(&[]);
 
@@ -232,7 +233,7 @@ fn oversized_finite_enum_exception_is_internal_strict_and_second_build_stable() 
     assert!(exec
         .try_export_last_proof_alethe_for_problem_scope_to(&mut stale_output)
         .is_none());
-    assert!(stale_output.is_empty());
+    assert_eq!(stale_output, [] as [u8; 0]);
     assert!(exec.get_proof().contains("proof was not generated"));
 
     // Result invalidation retires a newly recorded detector candidate together
@@ -281,7 +282,7 @@ fn binary_distinct_special_proof_is_internal_only_and_all_alethe_exports_decline
             AlethePrintError::UnavailableAuthenticatedSurface { .. }
         )))
     ));
-    assert!(output.is_empty());
+    assert_eq!(output, [] as [u8; 0]);
 }
 
 #[test]

@@ -22,8 +22,11 @@ mod tests;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::executor) enum FpEvalPhase {
-    Concretize(TermId),
+    Concretize,
+    #[cfg(test)]
     Construction(FpBuildProgress),
+    #[cfg(not(test))]
+    Construction,
     Namespace,
     ClauseTransfer,
     SatLoad,
@@ -32,6 +35,20 @@ pub(in crate::executor) enum FpEvalPhase {
     SatReturned,
     Decode,
     Cleanup,
+}
+
+impl FpEvalPhase {
+    fn construction(progress: FpBuildProgress) -> Self {
+        #[cfg(test)]
+        {
+            Self::Construction(progress)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = progress;
+            Self::Construction
+        }
+    }
 }
 
 struct Control<'a> {
@@ -182,7 +199,7 @@ impl Executor {
         control.poll(Some(terms))?;
         let mut should_stop = |progress| {
             control
-                .phase(Some(terms), FpEvalPhase::Construction(progress))
+                .phase(Some(terms), FpEvalPhase::construction(progress))
                 .is_err()
         };
         let mut fp = FpConstruction::new(solver, &mut should_stop)

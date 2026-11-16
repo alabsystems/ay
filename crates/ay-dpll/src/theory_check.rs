@@ -491,7 +491,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
                             self.theory_minimize_lits_removed += removed as u64
                         }
                         theory_inference::ConflictClauseReduction::Tautology
-                        | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                        | theory_inference::ConflictClauseReduction::AllocationRefused => {
                             self.theory_unknown_count += 1;
                             self.emit_theory_check_event(
                                 "consistency",
@@ -653,7 +653,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
                         removed += count
                     }
                     theory_inference::ConflictClauseReduction::Tautology
-                    | crate::theory_inference::ConflictClauseReduction::AllocationRefused => {
+                    | theory_inference::ConflictClauseReduction::AllocationRefused => {
                         self.theory_unknown_count += 1;
                         self.emit_theory_check_event(
                             "consistency",

@@ -102,10 +102,10 @@ fn bit_width(val: i128) -> usize {
     if val <= 0 {
         return 1;
     }
-    // `val` is i128 (128 bits): use i128::BITS, not a hardcoded 64. With 64 here,
-    // a small positive i128 (leading_zeros ~125) underflows `64 - lz` to a huge
-    // usize, making the adder allocate billions of bits (OOM).
-    (i128::BITS - val.leading_zeros()) as usize
+    // Derive the width from the positive i128 value, not a hardcoded 64. With
+    // `64 - leading_zeros`, a small value underflows to a huge usize and makes
+    // the adder allocate billions of bits (OOM).
+    val.cast_unsigned().bit_width() as usize
 }
 
 /// Adds all binary numbers using a balanced tree of ripple-carry adders.

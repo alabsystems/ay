@@ -52,6 +52,22 @@
 //! step (4a)) declines a re-decision whose allowance it spent. With no
 //! allowance open, an observation is one thread-local add and never stops
 //! anything.
+//!
+//! # Search work inside assembly
+//!
+//! [`thread_assembly_units`] is a second per-thread count, of search work
+//! units (`ay_core::resource::thread_work_units`, split-loop round trips
+//! plus CDCL conflicts). `Executor::build_unsat_proof` holds an
+//! [`enter_assembly_units`] scope for its extent: the scope reads the units
+//! when it is entered and, when it is dropped, adds their growth since then
+//! to the count. Only a scope entered while no counting scope was open on
+//! its thread counts, so an assembly a nested solve runs inside another is
+//! counted once, as part of the outermost one. The count therefore grows
+//! only when an outermost scope is dropped, and the difference of two
+//! readings is the whole search work of the outermost assemblies that ended
+//! between them; one still open at the later reading is not in it. Work
+//! another thread runs is not counted here. The partition rescue reads the
+//! count for its per-component statistics (`partition_rescue.rs`).
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -62,6 +78,12 @@ thread_local! {
     /// The [`OBSERVED`] reading past which the tightest open allowance is
     /// spent; `None` while no allowance is open.
     static SPENT_PAST: Cell<Option<u64>> = const { Cell::new(None) };
+    /// Search work units this thread spent inside its outermost proof
+    /// assembly scopes that have ended (been dropped); monotone.
+    static ASSEMBLY_UNITS: Cell<u64> = const { Cell::new(0) };
+    /// Whether an [`AssemblyUnitsScope`] that counts is open on this thread:
+    /// the depth guard that keeps a nested assembly from being counted twice.
+    static ASSEMBLY_OPEN: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Assembly observations made on this thread so far; monotone. The
@@ -145,6 +167,52 @@ pub(in crate::executor) fn enter_allowance(observations: u64) -> AllowanceScope 
     AllowanceScope {
         outer,
         entered_at,
+        _not_send: PhantomData,
+    }
+}
+
+/// Search work units (`ay_core::resource::thread_work_units`) this thread
+/// spent inside its outermost UNSAT proof assembly scopes that have ended;
+/// monotone. It grows when an outermost [`enter_assembly_units`] scope is
+/// dropped, by the units spent while that scope was open, so the difference
+/// of two readings is the whole search work of the outermost assemblies that
+/// ended between them, any spent before the earlier reading included; one
+/// still open at the later reading is not counted.
+pub(in crate::executor) fn thread_assembly_units() -> u64 {
+    ASSEMBLY_UNITS.try_with(Cell::get).unwrap_or(u64::MAX)
+}
+
+/// One proof assembly's hold on [`thread_assembly_units`]: dropping it adds
+/// the search work units this thread spent since it was entered, when it is
+/// the scope that counts. Bound to the thread that entered it.
+#[must_use = "the assembly's search work is counted when this scope is dropped"]
+pub(in crate::executor) struct AssemblyUnitsScope {
+    /// The `thread_work_units` reading at entry, for the scope that found no
+    /// counting scope open on its thread; `None` for a nested one.
+    entered_at: Option<u64>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for AssemblyUnitsScope {
+    fn drop(&mut self) {
+        let Some(entered_at) = self.entered_at else {
+            return;
+        };
+        let spent = ay_core::resource::thread_work_units().saturating_sub(entered_at);
+        let _ = ASSEMBLY_UNITS.try_with(|units| units.set(units.get().saturating_add(spent)));
+        let _ = ASSEMBLY_OPEN.try_with(|open| open.set(false));
+    }
+}
+
+/// Open the count of one proof assembly's search work on this thread, for
+/// [`thread_assembly_units`]. A scope entered while a counting one is open
+/// counts nothing: the open one's reading already covers its work.
+pub(in crate::executor) fn enter_assembly_units() -> AssemblyUnitsScope {
+    let counts = ASSEMBLY_OPEN
+        .try_with(|open| !open.replace(true))
+        .unwrap_or(false);
+    AssemblyUnitsScope {
+        entered_at: counts.then(ay_core::resource::thread_work_units),
         _not_send: PhantomData,
     }
 }

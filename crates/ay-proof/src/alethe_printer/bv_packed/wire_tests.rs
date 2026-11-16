@@ -4,6 +4,20 @@
 use super::*;
 use ay_core::TermStore;
 
+#[test]
+fn named_step_refuses_an_unchecked_rule_without_publishing_or_spending_work() {
+    let terms = TermStore::new();
+    let printer = AlethePrinter::new(&terms);
+    let mut proof = PackedProof::with_prefix(&printer, "p".into(), "__ay_wire_rule_")
+        .expect("fresh proof namespace");
+    let before_work = printer.work_used();
+    let before_output = proof.out.clone();
+
+    assert_eq!(proof.named_step("p.0", "p", "invented_rule", &[], ""), None);
+    assert_eq!(proof.out, before_output);
+    assert_eq!(printer.work_used(), before_work);
+}
+
 fn concat_bits(terms: &mut TermStore, bits: &[TermId]) -> TermId {
     if bits.len() == 1 {
         return bits[0];

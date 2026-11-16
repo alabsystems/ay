@@ -971,7 +971,7 @@ mod tests {
         let outcome = run_wcsp_transfer(&mut view, Some(expired), None).expect("transfer must run");
         // No work done: c0 = 0 (still a sound floor), empty trail, no fixpoint claim.
         assert_eq!(outcome.c0, 0);
-        assert!(outcome.trail.is_empty());
+        assert_eq!(outcome.trail.as_slice(), &[] as &[WcspProjection]);
         assert!(!outcome.fixpoint);
     }
 
@@ -986,7 +986,7 @@ mod tests {
         let flag = AtomicBool::new(true);
         let outcome = run_wcsp_transfer(&mut view, None, Some(&flag)).expect("transfer must run");
         assert_eq!(outcome.c0, 0);
-        assert!(outcome.trail.is_empty());
+        assert_eq!(outcome.trail.as_slice(), &[] as &[WcspProjection]);
         assert!(!outcome.fixpoint);
     }
 

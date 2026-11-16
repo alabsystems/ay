@@ -436,7 +436,7 @@ impl Solver {
             }
         }
         let id = self.resolve_term("independent_closed_fp", term).ok()?;
-        let ay_core::Sort::FloatingPoint(expected_eb, expected_sb) = self.terms().sort(id) else {
+        let Sort::FloatingPoint(expected_eb, expected_sb) = self.terms().sort(id) else {
             return None;
         };
         let (expected_eb, expected_sb) = (*expected_eb, *expected_sb);

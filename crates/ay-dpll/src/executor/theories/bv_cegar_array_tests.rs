@@ -114,7 +114,7 @@ fn fc_refinement_checks_linear_edges_in_dense_alias_group() {
     build.pair_attempts = 0;
     assert!(Executor::new().append_fc_group_refinement(&group, &HashSet::default(), &mut build,));
     assert_eq!(build.pair_attempts, 0);
-    assert!(build.clauses.is_empty());
+    assert_eq!(build.clauses, [] as [Vec<ay_sat::Literal>; 0]);
 }
 
 #[test]

@@ -6,7 +6,7 @@ use super::*;
 use crate::api::{Logic, ModelValue, Sort};
 
 fn arm_post_result_panic(solver: &Solver) {
-    PANIC_AFTER_SOLVE.with(|armed| armed.set(Some(solver as *const Solver as usize)));
+    PANIC_AFTER_SOLVE.with(|armed| armed.set(Some(std::ptr::from_ref(solver) as usize)));
 }
 
 fn assert_caught_panic<T>(result: Result<T, SolverError>) {

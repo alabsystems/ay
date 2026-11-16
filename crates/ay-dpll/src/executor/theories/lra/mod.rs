@@ -14,6 +14,7 @@ use crate::preprocess::{FlattenAnd, NormalizeArithSom, PreprocessingPass};
 use crate::PhaseTimer;
 
 use super::super::Executor;
+use super::solve_harness::TheoryModels;
 use super::MAX_SPLITS_LRA;
 
 #[allow(clippy::panic)]
@@ -1088,7 +1089,7 @@ impl Executor {
 
 /// A Bool-sorted uninterpreted constant (`(declare-const b Bool)`): a leaf of
 /// the Boolean skeleton that no theory interprets.
-pub(crate) fn is_bool_constant(terms: &ay_core::TermStore, term: TermId) -> bool {
+pub(crate) fn is_bool_constant(terms: &TermStore, term: TermId) -> bool {
     terms.sort(term) == &ay_core::Sort::Bool
         && matches!(terms.get(term), ay_core::TermData::Var(..))
 }

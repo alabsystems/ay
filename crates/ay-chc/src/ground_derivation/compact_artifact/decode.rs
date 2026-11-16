@@ -8,7 +8,7 @@ use num_bigint::BigUint;
 
 pub(super) fn derivation(
     envelope: &wire::Envelope,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<CompactDerivation> {
     let mut arena = Arena::new();
     for (index, node) in envelope.nodes.iter().enumerate() {
@@ -79,7 +79,7 @@ pub(super) fn derivation(
     })
 }
 
-fn decode_node(node: &wire::Node, index: usize, owner: &mut Owner) -> Result<ValueNode> {
+fn decode_node(node: &wire::Node, index: usize, owner: &mut Owner<'_>) -> Result<ValueNode> {
     Ok(match node {
         wire::Node::Bool { value } => {
             admit(owner, 1, 128)?;

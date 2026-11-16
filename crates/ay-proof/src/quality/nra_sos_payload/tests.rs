@@ -77,7 +77,7 @@ fn nra_sos_authentication_can_cancel_before_root_allocation() {
         ),
         Err(ProofCheckError::ResourceLimit)
     ));
-    assert!(pending.is_empty());
+    assert_eq!(pending, []);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn nra_sos_authentication_caps_payload_before_cloning_roots() {
         ),
         Err(ProofCheckError::ResourceLimit)
     ));
-    assert!(pending.is_empty());
+    assert_eq!(pending, []);
 }
 
 #[test]
@@ -107,8 +107,7 @@ fn nra_sos_public_authentication_rejects_forged_root_without_panicking() {
         clause,
         certificate,
     }]);
-    let result =
-        crate::authenticate_premise_clauses_strict_with_context(&proof, &terms, None, None, &[]);
+    let result = authenticate_premise_clauses_strict_with_context(&proof, &terms, None, None, &[]);
     assert!(matches!(
         result,
         Err(ProofCheckError::InvalidTheoryLemma { .. })
@@ -128,9 +127,9 @@ fn nra_sos_semantic_charge_uses_dynamic_checker_meter() {
         fp_assignments: 0,
         order_assignments: 0,
     };
-    assert_eq!(super::super::step_clause_len(&step), 1);
+    assert_eq!(step_clause_len(&step), 1);
     assert_eq!(
-        super::super::strict_semantic_charge(&step, payload, SemanticChargeClass::General)
+        strict_semantic_charge(&step, payload, SemanticChargeClass::General)
             .expect("actual checker work is separately debited"),
         (0, 0)
     );

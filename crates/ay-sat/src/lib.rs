@@ -6,7 +6,7 @@
 // function/module boundary carrying their local invariant.
 #![deny(unsafe_code)]
 // Fallible allocation of the cold solver tail; no raw allocation/unsafe escape.
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 // SAT solvers use many domain acronyms (BCE, BVE, VSIDS, HTR, CDCL, etc.).
 #![allow(clippy::upper_case_acronyms)]
 

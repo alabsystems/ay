@@ -28,7 +28,9 @@ pub(super) fn original_raw_callback_and_expired_end_refusals_remain_sticky() {
         budget.charge(0),
         Err(QueryError::Interrupted(StopReason::Cancelled))
     );
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let mut deadline = || {
         if Instant::now() >= end {
             ControlFlow::Break(StopReason::Deadline)
@@ -58,10 +60,11 @@ pub(super) fn native_branch_progress_and_final_admission_refuse_on_same_owner() 
         calls.set(calls.get() + 1);
         ControlFlow::Continue(())
     };
-    let mut budget = WorkBudget::new(10_000_000_000, &mut count);
-    assert!(lower_fp_clause(&terms, &[root], &[], &namespace, &mut budget).is_ok());
-    let final_call = calls.get();
-    drop(budget);
+    let final_call = {
+        let mut budget = WorkBudget::new(10_000_000_000, &mut count);
+        assert!(lower_fp_clause(&terms, &[root], &[], &namespace, &mut budget).is_ok());
+        calls.get()
+    };
     let calls = Cell::new(0usize);
     let mut final_stop = || {
         calls.set(calls.get() + 1);

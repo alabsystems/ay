@@ -5,14 +5,6 @@ use super::{Instant, ReplayCancellation, ReplayLimit, ReplayLimitRefusal};
 use std::{cell::Cell, time::Duration};
 
 #[test]
-fn diagnostic_legacy_admission_does_not_add_a_clock_observation() {
-    assert_eq!(
-        ReplayLimit::Legacy.check_diagnostic_with_clock(&mut || panic!("legacy clock sample")),
-        Ok(())
-    );
-}
-
-#[test]
 fn diagnostic_entry_cancellation_precedes_clock_and_expiry() {
     let token = crate::CancellationToken::new();
     let cancellation = ReplayCancellation::new(&token);
@@ -70,7 +62,9 @@ fn diagnostic_expiry_precedes_postclock_cancel_without_changing_observation_orde
 #[test]
 fn diagnostic_owner_intersection_preserves_both_ceilings_with_one_sample() {
     let now = Instant::now();
-    let past = now - Duration::from_secs(1);
+    let past = now
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let future = now + Duration::from_secs(60);
     for (limit, owner, expected) in [
         (
@@ -84,17 +78,11 @@ fn diagnostic_owner_intersection_preserves_both_ceilings_with_one_sample() {
             Err(ReplayLimitRefusal::OriginalDeadline),
         ),
         (
-            ReplayLimit::Legacy,
-            Some(past),
-            Err(ReplayLimitRefusal::OriginalDeadline),
-        ),
-        (
             ReplayLimit::Until(now),
             Some(now),
             Err(ReplayLimitRefusal::OriginalDeadline),
         ),
         (ReplayLimit::Until(future), Some(future), Ok(())),
-        (ReplayLimit::Legacy, Some(future), Ok(())),
     ] {
         let samples = Cell::new(0);
         let actual = limit.check_diagnostic_with_clock_and_owner(

@@ -147,10 +147,7 @@ impl TacticModelConverter {
             }
         }
         owner
-            .admit(
-                1,
-                std::mem::size_of::<Witness>() + 2 * std::mem::size_of::<usize>(),
-            )
+            .admit(1, size_of::<Witness>() + 2 * size_of::<usize>())
             .map_err(|_| refused(owner))?;
         let result = Self {
             source: Arc::clone(&self.source),
@@ -329,7 +326,7 @@ fn confirm(
                     .map(|value| ay_model_check::ModelValue::Bool(*value));
             }
             let &(_, _, field) = self.rows.fields.iter().find(|row| row.0 == id)?;
-            self.owner.admit(1, std::mem::size_of::<u64>()).ok()?;
+            self.owner.admit(1, size_of::<u64>()).ok()?;
             match self.model.field_values.get(key)? {
                 ModelValue::FiniteField {
                     value,

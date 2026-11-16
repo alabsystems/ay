@@ -10,7 +10,7 @@ pub(super) struct Meter<'a, 'terms> {
 }
 
 impl<'a, 'terms> Meter<'a, 'terms> {
-    pub fn new(printer: &'a AlethePrinter<'terms>) -> Self {
+    pub(super) fn new(printer: &'a AlethePrinter<'terms>) -> Self {
         Self {
             printer,
             remaining: MAX_WORK,
@@ -18,7 +18,7 @@ impl<'a, 'terms> Meter<'a, 'terms> {
         }
     }
 
-    pub fn spend(&mut self, work: u64) -> Option<()> {
+    pub(super) fn spend(&mut self, work: u64) -> Option<()> {
         self.printer.charge(work);
         self.remaining = self.remaining.checked_sub(work)?;
         (!self.printer.work_budget_exhausted()).then_some(())
@@ -34,7 +34,7 @@ pub(super) struct Node {
 }
 
 impl Node {
-    pub fn parse(text: &str, depth: usize, meter: &mut Meter<'_, '_>) -> Option<Self> {
+    pub(super) fn parse(text: &str, depth: usize, meter: &mut Meter<'_, '_>) -> Option<Self> {
         meter.nodes = meter.nodes.checked_sub(1)?;
         meter.spend((text.len().checked_mul(3)? + 64) as u64)?;
         if depth > MAX_DEPTH {
@@ -73,12 +73,12 @@ impl Node {
         })
     }
 
-    pub fn copy(&self, meter: &mut Meter<'_, '_>) -> Option<Self> {
+    pub(super) fn copy(&self, meter: &mut Meter<'_, '_>) -> Option<Self> {
         meter.spend(self.storage as u64)?;
         Some(self.clone())
     }
 
-    pub fn atom(text: &str, meter: &mut Meter<'_, '_>) -> Option<Self> {
+    pub(super) fn atom(text: &str, meter: &mut Meter<'_, '_>) -> Option<Self> {
         meter.spend((text.len() + 64) as u64)?;
         Some(Self {
             text: text.to_owned(),
@@ -88,7 +88,7 @@ impl Node {
         })
     }
 
-    pub fn app(head: &str, args: Vec<Self>, meter: &mut Meter<'_, '_>) -> Option<Self> {
+    pub(super) fn app(head: &str, args: Vec<Self>, meter: &mut Meter<'_, '_>) -> Option<Self> {
         let bytes = args
             .iter()
             .try_fold(head.len() + 2, |n, a| n.checked_add(a.text.len() + 1))?;
@@ -115,7 +115,7 @@ impl Node {
         })
     }
 
-    pub fn unary(&self, head: &str) -> Option<&Self> {
+    pub(super) fn unary(&self, head: &str) -> Option<&Self> {
         (self.head.as_deref() == Some(head) && self.args.len() == 1).then(|| &self.args[0])
     }
 }

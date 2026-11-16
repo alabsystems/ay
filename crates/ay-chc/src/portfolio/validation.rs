@@ -587,6 +587,7 @@ impl PortfolioSolver {
     /// Query-only pre-check that translates an engine-space model itself.
     /// The acceptance pipeline uses [`validate_safe_query_only_pre_translated`]
     /// with a shared translation.
+    #[cfg(test)]
     pub(super) fn validate_safe_query_only(&self, model: &InvariantModel) -> SafePrecheckResult {
         let translated_model = self.back_translator.translate_validity(model.clone());
         self.validate_safe_query_only_pre_translated(&translated_model)
@@ -686,6 +687,7 @@ impl PortfolioSolver {
     /// `enable_preprocessing: false` and therefore an identity translator)
     /// replay transform-space metadata against the original problem and
     /// demote valid Unsafe results to Unknown (heap__swaparray-class, FM2b).
+    #[cfg(test)]
     pub(super) fn validate_unsafe_translating(
         &self,
         cex: &crate::pdr::Counterexample,
@@ -694,7 +696,7 @@ impl PortfolioSolver {
             .map_err(|rejection| rejection.reason)
     }
 
-    /// Bounded variant of [`validate_unsafe_translating`](Self::validate_unsafe_translating)
+    /// Bounded variant of [`Self::validate_unsafe_translating_with_timeout`]
     /// for the parallel receive loop's EAGER validation of witness-less Unsafe
     /// results.
     ///
@@ -837,7 +839,8 @@ impl PortfolioSolver {
     }
 
     /// Re-validate a counterexample before wrapping it in `VerifiedChcResult`;
-    /// returns the one that passed (to wrap), see [`Self::validate_unsafe_translating`].
+    /// returns the one that passed (to wrap), see
+    /// [`Self::validate_unsafe_translating_with_timeout`].
     ///
     /// This is used at the public verified-result boundary. Both acceptance-time
     /// and verified-result-time validation are now always-on (#8585).

@@ -4,7 +4,6 @@
 //! Repeated, population-bound performance qualification. Scoreboard's ordinary
 //! zero exit means no detected contradiction, not replacement or domination.
 use super::*;
-use sha2::Digest as _;
 mod measurements;
 #[cfg(test)]
 use measurements::assess;
@@ -115,10 +114,10 @@ pub(super) fn check(args: &[String]) -> Result<i32, String> {
         profile: &loaded.contract.profile.id,
         campaign: &loaded.contract.campaign_id,
         contract_sha256: &loaded.sha256,
-        corpus_sha256: &corpus_sha,
-        cli_sha256: &executable.sha256,
-        ay_sha256: &library.sha256,
-        z3_sha256: &reference.sha256,
+        corpus_manifest_sha256: &corpus_sha,
+        ay_executable_sha256: &executable.sha256,
+        ay_library_sha256: &library.sha256,
+        z3_library_sha256: &reference.sha256,
     };
     let directory = receipt_path
         .parent()
@@ -142,10 +141,10 @@ struct ReplayBinding<'a> {
     profile: &'a str,
     campaign: &'a str,
     contract_sha256: &'a str,
-    corpus_sha256: &'a str,
-    cli_sha256: &'a str,
-    ay_sha256: &'a str,
-    z3_sha256: &'a str,
+    corpus_manifest_sha256: &'a str,
+    ay_executable_sha256: &'a str,
+    ay_library_sha256: &'a str,
+    z3_library_sha256: &'a str,
 }
 
 fn replay(
@@ -160,10 +159,10 @@ fn replay(
         || receipt.profile != binding.profile
         || receipt.campaign != binding.campaign
         || receipt.contract_sha256 != binding.contract_sha256
-        || receipt.corpus_manifest_sha256 != binding.corpus_sha256
-        || receipt.ay_executable_sha256 != binding.cli_sha256
-        || receipt.ay_library_sha256 != binding.ay_sha256
-        || receipt.z3_library_sha256 != binding.z3_sha256
+        || receipt.corpus_manifest_sha256 != binding.corpus_manifest_sha256
+        || receipt.ay_executable_sha256 != binding.ay_executable_sha256
+        || receipt.ay_library_sha256 != binding.ay_library_sha256
+        || receipt.z3_library_sha256 != binding.z3_library_sha256
     {
         return Err("domination receipt scope or authenticated identity mismatch".to_string());
     }
@@ -194,9 +193,9 @@ fn replay(
         campaign.record(
             artifact.exit_code,
             report,
-            binding.cli_sha256,
-            binding.ay_sha256,
-            binding.z3_sha256,
+            binding.ay_executable_sha256,
+            binding.ay_library_sha256,
+            binding.z3_library_sha256,
         )?;
     }
     let actual = campaign.finish()?;
@@ -613,10 +612,10 @@ mod tests {
             profile: "fixture",
             campaign: "fixture-campaign",
             contract_sha256: CONTRACT,
-            corpus_sha256: CORPUS,
-            cli_sha256: CLI,
-            ay_sha256: AY,
-            z3_sha256: Z3,
+            corpus_manifest_sha256: CORPUS,
+            ay_executable_sha256: CLI,
+            ay_library_sha256: AY,
+            z3_library_sha256: Z3,
         }
     }
 
@@ -678,6 +677,22 @@ mod tests {
         receipt.assessment.slower_files = 0;
         receipt.scoreboards[1].exit_code = 1;
         assert!(replay(&receipt, directory.path(), &population, &binding()).is_err());
+    }
+
+    #[test]
+    fn replay_rejects_corpus_manifest_digest_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut receipt = persisted_receipt(directory.path());
+        receipt.corpus_manifest_sha256 = "0".repeat(64);
+        let error = replay(
+            &receipt,
+            directory.path(),
+            &[performance_file("f", 1)],
+            &binding(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("authenticated identity mismatch"), "{error}");
     }
 
     #[test]

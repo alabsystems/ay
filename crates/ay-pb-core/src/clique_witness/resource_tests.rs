@@ -4,9 +4,10 @@
 
 use super::*;
 use std::fmt::Write;
+use std::sync::Mutex;
 use std::time::Duration;
 
-static OBSERVED: std::sync::Mutex<Option<Vec<std::thread::ThreadId>>> = std::sync::Mutex::new(None);
+static OBSERVED: Mutex<Option<Vec<std::thread::ThreadId>>> = Mutex::new(None);
 
 pub(super) fn observe_worker() {
     if let Some(observed) = OBSERVED.lock().expect("observations").as_mut() {
@@ -47,9 +48,14 @@ fn nested_clique_search_finishes_with_all_original_spares_retained() {
         return;
     }
     let compute = ay_sys::compute_budget::ComputeScope::enter().expect("caller");
-    let mut retained = Vec::new();
+    // Ownership, not inspection, exhausts the spare compute units through this scope.
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+    )]
+    let mut _retained_units = Vec::new();
     while let Some(unit) = compute.try_extra().expect("probe") {
-        retained.push(unit);
+        _retained_units.push(unit);
     }
     let instance = forced_zero_instance();
     assert!(clique_arm_matches(&instance));

@@ -197,7 +197,7 @@ fn build_witness_regex_empty_language_falls_back_to_pad() {
 #[test]
 fn regexes_default_empty_so_flags_off_checks_are_noops() {
     let c = cons();
-    assert!(c.regexes.is_empty());
+    assert_eq!(c.regexes, [] as [WeRegex; 0]);
     assert!(Executor::value_satisfies_constraints("aaa", Some(3), &c));
 }
 
@@ -208,7 +208,7 @@ fn regexes_default_empty_so_flags_off_checks_are_noops() {
 #[test]
 fn forbidden_defaults_empty_so_flags_off_checks_are_noops() {
     let c = cons();
-    assert!(c.forbidden.is_empty());
+    assert_eq!(c.forbidden, [] as [String; 0]);
     // The default fill is 'a'; with no forbidden needle it must stay accepted,
     // so the flags-off materializer is byte-identical.
     assert!(Executor::value_satisfies_constraints("aaa", Some(3), &c));

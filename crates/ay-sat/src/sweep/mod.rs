@@ -87,6 +87,7 @@ pub struct SweepStats {
     pub kitten_partition_refinements: u64,
     /// Kitten solves and propagations spent by `sweep_with_kitten`.
     pub kitten_solves: u64,
+    /// Kitten propagations spent by `sweep_with_kitten`.
     pub kitten_propagations: u64,
     /// Number of random simulation rounds executed.
     pub simulation_rounds: u64,

@@ -29,10 +29,12 @@ fn scratch_laden_executor() -> (Executor, Vec<TermId>) {
     )
     .expect("prune fixture parses");
     let mut executor = Executor::new();
-    assert!(executor
-        .execute_all(&commands)
-        .expect("prune fixture executes")
-        .is_empty());
+    assert_eq!(
+        executor
+            .execute_all(&commands)
+            .expect("prune fixture executes"),
+        [] as [String; 0]
+    );
     let roots = executor.ctx.assertions.clone();
     assert_eq!(roots.len(), 1, "the fixture asserts exactly one root");
     let a = executor.ctx.terms.mk_var("prune_a", Sort::Int);

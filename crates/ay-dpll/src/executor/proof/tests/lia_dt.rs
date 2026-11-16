@@ -206,7 +206,7 @@ fn test_qf_dt_concrete_tester_evaluation_is_strict_checkable() {
             "#,
         )
         .unwrap();
-        assert!(exec.execute_all(&declarations).unwrap().is_empty());
+        assert_eq!(exec.execute_all(&declarations).unwrap(), [] as [String; 0]);
 
         let color = Sort::Uninterpreted("Color".to_string());
         let actual = exec.ctx.terms.mk_var(actual_ctor, color);
@@ -265,7 +265,7 @@ fn test_qf_dt_injected_exhaustive_axiom_is_typed_and_strict_checkable() {
     "#;
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     exec.proof_tracker.enable();
     let result = exec.solve_dt().expect("solve_dt must not error");
     assert!(result.is_unsat(), "tester-coverage conflict must be UNSAT");
@@ -318,7 +318,7 @@ fn test_dt_emitted_exhaustive_and_reconstruct_axioms_match_their_validators() {
     "#;
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     let base: ay_core::kani_compat::DetHashSet<TermId> =
         exec.ctx.assertions.iter().copied().collect();
     let axioms = exec.dt_selector_axioms(&base);
@@ -407,7 +407,7 @@ fn test_qf_dt_mined_acyclicity_units_promote_and_pass_strict_check() {
     }
     let commands = parse(&input).unwrap();
     let mut exec = Executor::new();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     exec.proof_tracker.enable();
     let result = exec.solve_dt().expect("solve_dt must not error");
     assert!(result.is_unsat(), "the case-split cycles must be UNSAT");

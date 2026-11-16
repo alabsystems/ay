@@ -47,7 +47,7 @@ impl Fixture {
     }
 }
 
-fn orient<'a, 'p>(_: &mut Blaster<'a, 'p>, roots: &[SRef]) -> Option<SRef> {
+fn orient(_: &mut Blaster<'_, '_>, roots: &[SRef]) -> Option<SRef> {
     roots.first()?.not()
 }
 

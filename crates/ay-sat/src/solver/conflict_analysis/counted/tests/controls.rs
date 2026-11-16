@@ -140,7 +140,7 @@ fn completed_result_stays_private_when_original_cancellation_arrives_at_finish()
         .begin_counted_standard_analysis(reference)
         .unwrap()
         .unwrap();
-    assert!(!scope.learned_clause().is_empty());
+    assert_ne!(scope.learned_clause().len(), 0);
     cancel.store(true, Ordering::SeqCst);
     assert_eq!(scope.finish(), Err(SatUnknownReason::Interrupted));
     cancel.store(false, Ordering::SeqCst);

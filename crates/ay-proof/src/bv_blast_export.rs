@@ -1450,7 +1450,7 @@ pub(crate) fn blast_shift_with_cancellation(
     let saturate_fill = if matches!(op, BvOp::Ashr) { sign } else { zero };
 
     // ceil(log2(n)) control bits cover every in-range shift amount 0..n-1.
-    let log2_n = (u32::BITS - (n as u32 - 1).leading_zeros()) as usize;
+    let log2_n = (n as u32 - 1).bit_width() as usize;
     let mut current = Vec::with_capacity(a_bits.len());
     for &bit in a_bits {
         shift_poll(keep_going)?;

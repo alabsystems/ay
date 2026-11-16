@@ -25,10 +25,9 @@ fn actual_strict_payload() -> (ChcCheckedReplayObligation, SealedReplayObligatio
     )
     .expect("fixture must acquire a real exact-query certificate and strict recheck");
     let bundle = serde_json::to_vec(&cert.bundle).unwrap();
-    let alethe = cert.alethe.map(String::into_bytes);
     let record = crate::ChcObligationStrictCert::new_bundle(
         cert.bundle.schema.clone(),
-        alethe.as_deref().map(crate::proof_metadata::sha256_hex),
+        None,
         crate::proof_metadata::sha256_hex(&bundle),
         "verified",
     );
@@ -44,7 +43,7 @@ fn actual_strict_payload() -> (ChcCheckedReplayObligation, SealedReplayObligatio
         &obligation,
         query.as_bytes().to_vec(),
         Some(bundle),
-        alethe,
+        None,
     )
     .unwrap();
     (obligation, payload)

@@ -339,7 +339,7 @@ fn arena_append_metadata_and_replacement_each_retire_sealed_authority() {
         let mut executor = sealed();
         match mutation {
             0 => {
-                executor.ctx.terms.mk_var("late", CoreSort::Real);
+                let _ = executor.ctx.terms.mk_var("late", CoreSort::Real);
             }
             1 => {
                 let stamp = executor.ctx.terms.snapshot_stamp();
@@ -364,7 +364,7 @@ fn rollback_generation_retires_identical_retained_term_contents() {
     let entries = executor.ctx.terms.entries_snapshot();
     let checkpoint = executor.ctx.terms.rollback_checkpoint();
     // No scratch handle escapes or is retained by the proof/state.
-    executor
+    let _ = executor
         .ctx
         .terms
         .mk_var("discarded_scratch", CoreSort::Real);

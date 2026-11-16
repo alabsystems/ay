@@ -67,14 +67,14 @@ fn branch_polarities_never_grant_an_unconditional_equation() {
     let true_implication = terms.mk_not_raw(implication);
     let ite = terms.mk_ite_raw(q, not_equality, equality);
     for clause in [equality, true_or, false_and, true_implication, ite] {
-        assert!(hypothesis_equalities(&terms, &[clause]).is_empty());
+        assert_eq!(hypothesis_equalities(&terms, &[clause]), Vec::new());
     }
     let forced = boolean(&mut terms, "or", &[not_equality, q]);
     assert_eq!(hypothesis_equalities(&terms, &[forced]), vec![(a, b)]);
     let named_not = boolean(&mut terms, "not", &[equality]);
     assert_eq!(hypothesis_equalities(&terms, &[named_not]), vec![(a, b)]);
     let double_not = boolean(&mut terms, "not", &[named_not]);
-    assert!(hypothesis_equalities(&terms, &[double_not]).is_empty());
+    assert_eq!(hypothesis_equalities(&terms, &[double_not]), Vec::new());
 }
 
 #[test]

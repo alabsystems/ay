@@ -469,7 +469,7 @@ impl Executor {
             self.ctx.assertions.clone(),
             roots,
             map.clone(),
-            std::collections::HashMap::default(),
+            HashMap::default(),
         ));
         map
     }
@@ -490,10 +490,9 @@ impl Executor {
             return hit;
         }
         // The walk does not touch this cache, so no borrow is held across
-        // it; insert under a fresh borrow afterwards. (This shape also
-        // keeps `Executor: Send` — the memo used to be an
-        // `Rc<RefCell<..>>` cloned out of the cache borrow, which broke
-        // ay-milp's `assert_send::<BabSession>()` contract.)
+        // it; insert under a fresh borrow afterwards. This shape also keeps
+        // `Executor: Send`: the memo used to be an `Rc<RefCell<_>>` cloned
+        // out of the cache borrow, which broke ay-milp's session contract.
         let occurs = self.symbol_occurs_under_quantifier(name);
         if let Some((_, _, _, memo)) = self.uf_authored_apps_cache.borrow_mut().as_mut() {
             memo.insert(name.to_string(), occurs);

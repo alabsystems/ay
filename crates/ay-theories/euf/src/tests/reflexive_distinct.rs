@@ -19,7 +19,7 @@ fn identical_distinct_arguments_need_only_the_distinct_literal() {
         };
         let distinct = store.mk_app(Symbol::named("distinct"), args, Sort::Bool);
         let mut euf = EufSolver::new(&store);
-        assert!(euf.explain(a, a).is_empty());
+        assert_eq!(euf.explain(a, a), Vec::<TheoryLit>::new());
         euf.assert_literal(distinct, true);
         let TheoryResult::Unsat(reasons) = euf.check() else {
             panic!("identical arguments contradict an asserted distinct");

@@ -421,9 +421,7 @@ impl NiaSolver<'_> {
             // function is an admission test for enumerating a bounded domain,
             // and a range too wide to compute is exactly a domain too wide to
             // enumerate. Saturating would hand the loop below a fabricated size.
-            let Some(range) = hi.checked_sub(lo).and_then(|d| d.checked_add(1)) else {
-                return None;
-            };
+            let range = hi.checked_sub(lo).and_then(|d| d.checked_add(1))?;
             if range <= 0 {
                 // Empty range — already handled by LRA
                 return None;

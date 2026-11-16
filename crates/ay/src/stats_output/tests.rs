@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use std::fmt::Write as _;
 
 #[test]
 fn test_to_json_contains_required_fields() {
@@ -328,11 +329,13 @@ fn group_comments_are_terminal_only() {
     assert!(terminal.contains("  ; search\n"), "{terminal}");
     assert!(terminal.starts_with("(:statistics\n") && terminal.ends_with(')'));
     // The labels are the only difference: strip them and the two agree.
-    let stripped: String = terminal
+    let mut stripped = String::new();
+    for line in terminal
         .lines()
         .filter(|line| !line.trim_start().starts_with(';'))
-        .map(|line| format!("{line}\n"))
-        .collect();
+    {
+        writeln!(&mut stripped, "{line}").expect("writing to a String cannot fail");
+    }
     assert_eq!(
         stripped.trim_end_matches('\n'),
         piped.trim_end_matches('\n')

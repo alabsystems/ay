@@ -184,7 +184,7 @@ fn source_degree_and_variable_caps_are_enforced() {
     );
     let mut clause = Vec::new();
     for index in 0..9 {
-        let variable = terms.mk_var(&format!("v{index}"), Sort::Real);
+        let variable = terms.mk_var(format!("v{index}"), Sort::Real);
         let assertion = terms.mk_ge(variable, zero);
         clause.push(terms.mk_not_raw(assertion));
     }

@@ -168,7 +168,7 @@ fn comparator_work_is_added_once_without_new_storage_or_a_renewed_caller_grant()
 fn all_original_deadlines_apply_before_decode_or_inventory_comparison() {
     let bytes = mismatched_bytes();
     for first in 0..3 {
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         let (mut outer, mut inner, mut deadline) = (limits(), wire(), end());
         match first {
             0 => deadline = expired,

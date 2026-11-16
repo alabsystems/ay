@@ -10,8 +10,8 @@
 /// 1. Implementing `IncrementalSubsystem` for the type
 /// 2. Adding the field to this macro (and whether it's `Option<T>` or direct)
 ///
-/// The macro dispatches push/pop/reset to all subsystems uniformly,
-/// eliminating the 4×N shotgun surgery pattern.
+/// The macro dispatches push/pop/drop to all subsystems uniformly, eliminating
+/// the repeated per-subsystem surgery pattern.
 macro_rules! for_each_incremental_subsystem {
     // Push: init-or-get for Option fields, call directly for non-Option.
     (push $self:expr, $n:expr) => {{
@@ -78,22 +78,6 @@ macro_rules! for_each_incremental_subsystem {
             ok &= popped;
         }
         ok
-    }};
-    // Reset: if-let for Option fields, call directly for non-Option.
-    (reset $self:expr) => {{
-        if let Some(ref mut s) = $self.incr_bv_state {
-            s.reset();
-        }
-        if let Some(ref mut s) = $self.incr_fp_state {
-            s.reset();
-        }
-        if let Some(ref mut s) = $self.incr_theory_state {
-            s.reset();
-        }
-        if let Some(ref mut s) = $self.quantifier_manager {
-            s.reset();
-        }
-        $self.proof_tracker.reset();
     }};
     // Drop: set Option fields to None, reset non-Option fields.
     // Used by ResetAssertions which discards all state.

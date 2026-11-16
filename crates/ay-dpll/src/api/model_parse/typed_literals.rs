@@ -3,13 +3,11 @@
 
 //! Closed typed value data, without native-model or solver provenance.
 
-use super::typed::Decoder;
+use super::{admission, typed::Decoder};
 use crate::api::types::ModelValue;
 use ay_core::Sort;
 use ay_frontend::sexp::parse_sexp;
 
-#[path = "get_value/admission.rs"]
-mod admission;
 mod storage;
 
 const MAX_LITERALS: usize = 4096;
@@ -32,7 +30,7 @@ fn preflight(input: &[(&str, &Sort)], decoder: &mut Decoder<'_>) -> Option<()> {
     }
     decoder.reserve_literal_resources(
         input.len(),
-        input.len().checked_mul(std::mem::size_of::<ModelValue>())?,
+        input.len().checked_mul(size_of::<ModelValue>())?,
     )?;
     let mut admission = admission::Admission::new();
     for (text, sort) in input {

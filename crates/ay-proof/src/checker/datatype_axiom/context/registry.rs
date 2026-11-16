@@ -3,6 +3,18 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Exact declaration namespaces; every owning insertion is charged first.
+//!
+//! An identity is the raw SMT-LIB symbol text, so the empty text of the quoted
+//! symbol `||` is an identity like any other: no check here tests a name for
+//! emptiness. The name-based refusals here are a duplicate signature, datatype
+//! or constructor name (`collect_signatures`, `collect_constructors`); a
+//! selector list for an undeclared or already listed constructor
+//! (`collect_selectors`); a cross-role ambiguity between constructors, derived
+//! `is-<constructor>` testers and selectors (`insert_expected`); and a member
+//! table that differs from the declarations (`validate_exact_members`).
+//! Outside this module, `signatures::validate_declared` and
+//! `terms::validate_occurrences` hold every member, the empty one included, to
+//! its exact typed signature.
 
 use super::{
     BTreeMap, BTreeSet, ContextMeter, DatatypeDecls, DatatypeMemberSignature, DatatypeSignatureMap,
@@ -16,9 +28,6 @@ pub(super) fn collect_signatures<'a>(
     let mut signatures = BTreeMap::new();
     for signature in source {
         meter.charge(1, 0)?;
-        if signature.identity.is_empty() {
-            return meter.invalid("datatype member signature has an empty identity", &[]);
-        }
         // Even an unused signature belongs to the authority surface. Reject
         // excessive depth before later recursive sort equality can inspect it.
         for sort in &signature.argument_sorts {
@@ -44,9 +53,6 @@ fn insert_expected(
     expected: &mut BTreeSet<String>,
     meter: &mut ContextMeter<'_>,
 ) -> Result<(), ProofCheckError> {
-    if name.is_empty() {
-        return meter.invalid("datatype member identity is empty", &[]);
-    }
     meter.insert::<String, ()>(name, expected.len())?;
     let owned = meter.copy_name(name)?;
     if !expected.insert(owned) {
@@ -64,26 +70,19 @@ pub(super) fn collect_constructors<'a>(
     let mut carriers = BTreeMap::new();
     for (datatype, constructors) in declarations {
         meter.insert::<&str, ()>(datatype, datatypes.len())?;
-        if datatype.is_empty() || !datatypes.insert(datatype.as_str()) {
-            return meter.invalid(
-                "datatype declaration name is empty or duplicated",
-                &[datatype],
-            );
+        if !datatypes.insert(datatype.as_str()) {
+            return meter.invalid("datatype declaration name is duplicated", &[datatype]);
         }
         if constructors.is_empty() {
             return meter.invalid("datatype has no constructors", &[datatype]);
         }
         for constructor in constructors {
             meter.insert::<&str, &str>(constructor, carriers.len())?;
-            if constructor.is_empty()
-                || carriers
-                    .insert(constructor.as_str(), datatype.as_str())
-                    .is_some()
+            if carriers
+                .insert(constructor.as_str(), datatype.as_str())
+                .is_some()
             {
-                return meter.invalid(
-                    "constructor declaration name is empty or duplicated",
-                    &[constructor],
-                );
+                return meter.invalid("constructor declaration name is duplicated", &[constructor]);
             }
             insert_expected(constructor, expected, meter)?;
             let tester = meter.tester(constructor)?;

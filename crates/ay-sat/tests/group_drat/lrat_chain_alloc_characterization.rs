@@ -102,7 +102,7 @@ fn solve_with_lrat(dimacs: &str) -> String {
         .take_proof_writer()
         .expect("proof writer should exist");
     let proof = String::from_utf8(writer.into_vec().expect("proof flush")).expect("Valid UTF-8");
-    assert!(!proof.is_empty(), "LRAT proof must not be empty");
+    assert_ne!(proof.len(), 0, "LRAT proof must not be empty");
     proof
 }
 

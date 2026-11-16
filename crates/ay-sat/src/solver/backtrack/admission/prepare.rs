@@ -62,7 +62,7 @@ pub(super) fn transaction(
     if target == 0 && matches!(lane, Lane::Standard { .. }) {
         // Root cursor's partition_point plus its final predicate check.
         let len = s.cold.lrat_level0_unit_materialize_pinned.len();
-        owner.admit((usize::BITS - len.leading_zeros()) as usize + 1, 0)?;
+        owner.admit(len.bit_width() as usize + 1, 0)?;
     }
     debug_postconditions(s, owner)
 }

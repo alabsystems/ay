@@ -36,9 +36,9 @@ fn authentic_array_read_leaves_keep_exact_store_owner_and_unasserted_obligations
         let mut encoder = CountedBvEncoder::with_array_reads(&terms, &closure).unwrap();
         assert!(std::ptr::eq(
             encoder.array_read_obligations().unwrap(),
-            &closure
+            &raw const closure
         ));
-        assert!(encoder.clauses().unwrap().is_empty());
+        assert_eq!(encoder.clauses().unwrap(), &[] as &[CnfClause]);
         assert!(closure
             .steps()
             .iter()

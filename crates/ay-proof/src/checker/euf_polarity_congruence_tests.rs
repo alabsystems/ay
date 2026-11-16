@@ -182,10 +182,8 @@ fn realizable(nodes: &[Node], class: &[usize], truth: &[bool]) -> bool {
                     return false;
                 }
             }
-            Node::Not(inner) => {
-                if truth[index] == truth[*inner] {
-                    return false;
-                }
+            Node::Not(inner) if truth[index] == truth[*inner] => {
+                return false;
             }
             _ => {}
         }

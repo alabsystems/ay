@@ -313,12 +313,10 @@ impl Builder<'_> {
             TermData::Exists(b, body, _) => (Kind::Exists, b, body),
             _ => return Err(NestedTreeDecline::Connective),
         };
-        loop {
-            let next = match (kind, self.terms.get(body)) {
-                (Kind::Forall, TermData::Forall(b, inner, _))
-                | (Kind::Exists, TermData::Exists(b, inner, _)) => (b.clone(), *inner),
-                _ => break,
-            };
+        while let (Kind::Forall, TermData::Forall(b, inner, _))
+        | (Kind::Exists, TermData::Exists(b, inner, _)) = (kind, self.terms.get(body))
+        {
+            let next = (b.clone(), *inner);
             if next
                 .0
                 .iter()

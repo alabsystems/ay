@@ -499,7 +499,7 @@ fn self_check_rejects_a_dropped_summand() {
             .expect("a combine line");
         let body = lines[index];
         let cut = body.find(" * +").expect("a summand");
-        let trimmed = format!("{} ;", &body[..cut - 2].trim_end());
+        let trimmed = format!("{} ;", body[..cut - 2].trim_end());
         let mut out = lines.clone();
         out[index] = &trimmed;
         format!("{}\n", out.join("\n"))

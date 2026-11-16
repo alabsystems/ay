@@ -74,7 +74,7 @@ pub(crate) fn validate_order_ite_tautology(
     let mut seen = Vec::new();
     let mut variables = Vec::new();
     for &literal in clause {
-        validate_fragment(terms, literal, 0, &mut seen, &mut variables).map_err(&invalid)?;
+        validate_fragment(terms, literal, 0, &mut seen, &mut variables).map_err(invalid)?;
     }
     variables.sort_unstable();
     variables.dedup();

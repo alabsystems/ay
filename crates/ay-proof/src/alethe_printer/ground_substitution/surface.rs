@@ -12,7 +12,7 @@ pub(super) struct Clause {
 }
 
 impl Clause {
-    pub fn render(
+    pub(super) fn render(
         printer: &AlethePrinter<'_>,
         clause: &[TermId],
         meter: &mut Meter<'_, '_>,
@@ -52,7 +52,7 @@ impl Clause {
         Some(result)
     }
 
-    pub fn node(&self, index: usize) -> &Node {
+    pub(super) fn node(&self, index: usize) -> &Node {
         self.changed[index]
             .as_ref()
             .unwrap_or(&self.canonical[index])
@@ -62,7 +62,7 @@ impl Clause {
 impl Derivation<'_, '_> {
     /// A spelling change is a checked equality followed by Boolean resolution.
     /// No override is installed inside the native substitution derivation.
-    pub fn fact_as(&mut self, source: &str, target: &str, premise: &str) -> Option<String> {
+    pub(super) fn fact_as(&mut self, source: &str, target: &str, premise: &str) -> Option<String> {
         self.meter.spend(premise.len() as u64)?;
         if self.same(source, target)? {
             return Some(premise.to_owned());
@@ -72,8 +72,8 @@ impl Derivation<'_, '_> {
         // Precharge the comparator's full node allowance, including alternate
         // equality orientations, against this derivation's aggregate budget.
         self.meter
-            .spend(super::super::quantifier_surface::MAX_SURFACE_NODES as u64)?;
-        if !super::super::quantifier_surface::printed_terms_alpha_equivalent(source, target) {
+            .spend(quantifier_surface::MAX_SURFACE_NODES as u64)?;
+        if !quantifier_surface::printed_terms_alpha_equivalent(source, target) {
             return None;
         }
         let equality = self.eq(source, target, "refl", &[])?;

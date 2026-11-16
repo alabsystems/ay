@@ -159,6 +159,10 @@ fn addition_commutativity_is_refuted_without_a_hole() {
 #[test]
 fn every_supported_family_is_rendered_and_never_holed() {
     // (family name, expected rule, builder)
+    #[expect(
+        clippy::type_complexity,
+        reason = "the test table's family/rule/builder schema is deliberately explicit"
+    )]
     let cases: Vec<(&str, &str, fn(&mut Fixture) -> TermId)> = vec![
         ("add", "bitblast_add", |f| {
             let a = f.bv("a", 4);
@@ -476,10 +480,9 @@ fn the_divider_circuit_computes_unsigned_quotient_and_remainder() {
                     acc | u32::from(value(&circuit, *bit, &inputs, memo)) << i
                 })
             };
-            let (want_q, want_r) = if divisor == 0 {
-                (255, dividend)
-            } else {
-                (dividend / divisor, dividend % divisor)
+            let (want_q, want_r) = match dividend.checked_div(divisor) {
+                Some(quotient) => (quotient, dividend % divisor),
+                None => (255, dividend),
             };
             assert_eq!(read(&quot, &mut memo), want_q, "{dividend} / {divisor}");
             assert_eq!(read(&rem, &mut memo), want_r, "{dividend} % {divisor}");

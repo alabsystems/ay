@@ -21,6 +21,7 @@ pub use bv_support_memo::{
     theory_lemma_bv_arithmetic_lowering_supported_within_solve, BvSupportDeclines,
 };
 mod bv_ult_zero;
+mod clean_bitvec_rules;
 mod closed_guard;
 mod complete_blast;
 mod confined_forall_instance;
@@ -57,6 +58,7 @@ pub use guarded_row_expansion::checked_guarded_row_expansion_lowering_supported;
 #[path = "alethe_printer_la_generic_surface.rs"]
 mod la_generic_surface;
 mod let_assume_confinement;
+mod let_substitution;
 mod mul_overflow_cert;
 mod negated_exists;
 mod urem_bound;
@@ -64,6 +66,8 @@ pub use mul_overflow_cert::{
     mul_overflow_division_lowering_supported, recognize_mul_overflow_division,
 };
 pub use urem_bound::checked_urem_bound_lowering_supported;
+mod wire_rule;
+use wire_rule::CheckableRule;
 #[cfg(test)]
 #[path = "alethe_printer_negation_shell_assume_tests.rs"]
 mod negation_shell_assume_tests;
@@ -424,12 +428,12 @@ struct LetAssumeBridgePlan {
     levels: Vec<(Vec<(String, String)>, String)>,
     innermost_body: String,
     eliminated: String,
-    substituted: String,
+    substitution_matches: bool,
 }
 
 impl LetAssumeBridgePlan {
     fn is_certified(&self) -> bool {
-        self.substituted == self.eliminated
+        self.substitution_matches
     }
 }
 
@@ -2048,16 +2052,18 @@ impl<'a> AlethePrinter<'a> {
         // self-reference would make the substitution disagree with the context
         // carcara composes, so fall back to the hole arm rather than emit a
         // `refl` the checker rejects.
-        let substituted = if printed_let_bindings_are_simple(&levels) {
-            expand_printed_lets(&levels, &innermost_body)
-        } else {
-            String::new()
-        };
+        let substitution_matches =
+            let_substitution::matches(&levels, &innermost_body, &eliminated, |work| {
+                self.admit_emission_work(work as u64)
+            });
+        if self.work_budget_exhausted() {
+            return None;
+        }
         Some(LetAssumeBridgePlan {
             levels,
             innermost_body,
             eliminated,
-            substituted,
+            substitution_matches,
         })
     }
 
@@ -2066,12 +2072,12 @@ impl<'a> AlethePrinter<'a> {
             levels,
             innermost_body,
             eliminated,
-            substituted,
+            substitution_matches,
         } = self.plan_let_assume_bridge(term, surface)?;
 
         let mut out = String::new();
         let _ = std::fmt::Write::write_fmt(&mut out, format_args!("(assume {id}.a {surface})\n"));
-        if substituted == eliminated {
+        if substitution_matches {
             // Certified arm: the authored spelling survives elimination
             // unchanged, so the equivalence is a real `refl` under the `let`
             // context. Anchors nest outermost-first and only the INNERMOST
@@ -2098,7 +2104,7 @@ impl<'a> AlethePrinter<'a> {
             let _ = std::fmt::Write::write_fmt(
                 &mut out,
                 format_args!(
-                    "(step {refl_id} (cl (= {innermost_body} {substituted})) :rule refl)\n"
+                    "(step {refl_id} (cl (= {innermost_body} {eliminated})) :rule refl)\n"
                 ),
             );
             // Close the subproofs innermost-first. Each `let` step concludes
@@ -2112,7 +2118,7 @@ impl<'a> AlethePrinter<'a> {
                 let _ = std::fmt::Write::write_fmt(
                     &mut out,
                     format_args!(
-                        "(step {level_id} (cl (= {level_surface} {substituted})) :rule let)\n"
+                        "(step {level_id} (cl (= {level_surface} {eliminated})) :rule let)\n"
                     ),
                 );
             }
@@ -6473,75 +6479,10 @@ impl<'a> AlethePrinter<'a> {
         args: &[TermId],
     ) -> Result<String, AlethePrintError> {
         if matches!(rule, ay_core::AletheRule::BvReconstructV1) {
-            crate::checker::bv_reconstruct::validate(
-                self.terms,
-                id,
-                clause,
-                premises.len(),
-                args.len(),
-                &mut |_, _| true,
-            )
-            .map_err(|error| AlethePrintError::InvalidSurfaceStep {
-                id,
-                reason: error.to_string(),
-            })?;
-            let clause_str = self.format_clause(clause);
-            if dialect::current() == dialect::AletheDialect::PinnedCarcara {
-                return Ok(format!("(step {id} {clause_str} :rule hole)"));
-            }
-            let wire_overrides = self.judgement_overrides();
-            if !crate::bv_reconstruct_step_lowering_supported(
-                dialect::current(),
-                self.terms,
-                clause,
-                premises.len(),
-                args.len(),
-                wire_overrides.as_ref(),
-            ) {
-                return Err(AlethePrintError::InvalidSurfaceStep {
-                    id,
-                    reason: "BV reconstruction equality changed under surface rewriting"
-                        .to_string(),
-                });
-            }
-            dialect::note_clean_only(dialect::CleanOnlySpelling::BvReconstructV1);
-            return Ok(format!("(step {id} {clause_str} :rule bv_reconstruct_v1)"));
+            return clean_bitvec_rules::format_bv_reconstruct(self, id, clause, premises, args);
         }
         if matches!(rule, ay_core::AletheRule::BvOffsetSpinesV1) {
-            crate::checker::bv_offset_spines::validate(
-                self.terms,
-                id,
-                clause,
-                premises.len(),
-                args.len(),
-                &mut |_, _| true,
-            )
-            .map_err(|error| AlethePrintError::InvalidSurfaceStep {
-                id,
-                reason: error.to_string(),
-            })?;
-            let clause_str = self.format_clause(clause);
-            if dialect::current() == dialect::AletheDialect::PinnedCarcara {
-                return Ok(format!("(step {id} {clause_str} :rule hole)"));
-            }
-            let wire_overrides = self.judgement_overrides();
-            if !crate::bv_offset_spines_step_lowering_supported(
-                dialect::current(),
-                self.terms,
-                clause,
-                premises.len(),
-                args.len(),
-                wire_overrides.as_ref(),
-            ) {
-                return Err(AlethePrintError::InvalidSurfaceStep {
-                    id,
-                    reason: "BV offset spine equality changed under surface rewriting".to_string(),
-                });
-            }
-            dialect::note_clean_only(dialect::CleanOnlySpelling::BvOffsetSpinesV1);
-            return Ok(format!(
-                "(step {id} {clause_str} :rule eq_simplify_bv_offset_spines)"
-            ));
+            return clean_bitvec_rules::format_bv_offset_spines(self, id, clause, premises, args);
         }
         if matches!(rule, ay_core::AletheRule::EqSimplify) {
             crate::checker::bv_eq_simplify::validate(
@@ -8480,7 +8421,7 @@ impl<'a> AlethePrinter<'a> {
             if !printed_head_symbol(&candidate).is_some_and(|head| heads.contains(&head.as_str())) {
                 continue;
             }
-            if !sources.iter().any(|seen| *seen == candidate) {
+            if !sources.contains(&candidate) {
                 sources.push(candidate);
             }
         }
@@ -8832,7 +8773,7 @@ impl<'a> AlethePrinter<'a> {
                                     // negation this template already applies.
                                     let reversed = surface_order_reversal(op).filter(|reversed| {
                                         let negated = format!("(not {reversed})");
-                                        printed.iter().any(|lit| *lit == negated)
+                                        printed.contains(&negated)
                                     });
                                     if printed.iter().any(|lit| lit == &s) {
                                         (s.clone(), s)
@@ -10521,6 +10462,10 @@ fn printed_equality_flip(literal: &str) -> Option<String> {
 /// caller's decline — for any other difference: this must never invent a
 /// pairing, only recognise the one the checker's own `eq_symmetric` rule
 /// justifies.
+#[expect(
+    clippy::type_complexity,
+    reason = "the return pair exposes exact per-leaf targets and explicit bridge pairs"
+)]
 fn match_printed_leaves_to_tail(
     leaves: &[String],
     tail: &[String],
@@ -10662,81 +10607,6 @@ fn peel_printed_lets(s: &str) -> Option<(Vec<PrintedLetLevel>, String)> {
     } else {
         Some((levels, current))
     }
-}
-
-/// Textually replace whole-token occurrences of each bound name by its value.
-///
-/// Token boundaries are the s-expression delimiters (parens / whitespace) with
-/// `|quoted symbols|` treated as atomic, so a binding named `?v_1` never
-/// rewrites the inside of `?v_12` or of a quoted symbol.
-fn substitute_printed_tokens(text: &str, bindings: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut token = String::new();
-    let mut in_quote = false;
-    let flush = |token: &mut String, out: &mut String| {
-        if token.is_empty() {
-            return;
-        }
-        match bindings.iter().find(|(name, _)| name == token) {
-            Some((_, value)) => out.push_str(value),
-            None => out.push_str(token),
-        }
-        token.clear();
-    };
-    for c in text.chars() {
-        match c {
-            '|' => {
-                in_quote = !in_quote;
-                token.push(c);
-            }
-            _ if in_quote => token.push(c),
-            '(' | ')' => {
-                flush(&mut token, &mut out);
-                out.push(c);
-            }
-            c if c.is_whitespace() => {
-                flush(&mut token, &mut out);
-                out.push(c);
-            }
-            _ => token.push(c),
-        }
-    }
-    flush(&mut token, &mut out);
-    out
-}
-
-/// `true` when a peeled `let` chain can be expanded by plain token
-/// substitution: no name is bound at two levels (shadowing), and no level's
-/// binding VALUES mention a name that same level binds (SMT-LIB `let` binds in
-/// PARALLEL, so such an occurrence refers to an outer symbol, not the binding).
-fn printed_let_bindings_are_simple(levels: &[PrintedLetLevel]) -> bool {
-    let mut seen: Vec<&str> = Vec::new();
-    for (bindings, _) in levels {
-        for (name, _) in bindings {
-            if seen.contains(&name.as_str()) {
-                return false;
-            }
-            seen.push(name.as_str());
-        }
-        for (_, value) in bindings {
-            let rewritten = substitute_printed_tokens(value, bindings);
-            if rewritten != *value {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Fully expand a peeled `let` chain: substitute innermost bindings first so
-/// that an inner binding value mentioning an outer variable is itself expanded
-/// by the outer pass.
-fn expand_printed_lets(levels: &[PrintedLetLevel], innermost_body: &str) -> String {
-    let mut expanded = innermost_body.to_string();
-    for (bindings, _) in levels.iter().rev() {
-        expanded = substitute_printed_tokens(&expanded, bindings);
-    }
-    expanded
 }
 
 /// Fully expanded view of a PRINTED `and`/`or` nesting.

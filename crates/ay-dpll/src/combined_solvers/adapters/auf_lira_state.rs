@@ -31,7 +31,7 @@ pub(crate) enum SplitLoopReads {
     EverySolver,
 }
 
-impl<'a> AufLiraSolver<'a> {
+impl AufLiraSolver<'_> {
     /// The same solver with the split loop reading `reads`.
     pub(crate) fn split_loop_reading(mut self, reads: SplitLoopReads) -> Self {
         self.split_loop_reads = reads;

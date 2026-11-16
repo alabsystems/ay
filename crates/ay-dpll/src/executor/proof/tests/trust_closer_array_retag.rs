@@ -81,7 +81,7 @@ fn trust_lemma_resolution_is_linear_in_the_number_of_leaves() {
     let mut terms = TermStore::new();
     let mut proof = Proof::new();
     for index in 0..LEAVES {
-        let leaf = terms.mk_var(&format!("p{index}"), Sort::Bool);
+        let leaf = terms.mk_var(format!("p{index}"), Sort::Bool);
         let leaf = if index % 2 == 0 {
             leaf
         } else {

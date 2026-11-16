@@ -52,7 +52,7 @@ impl ModelConstructionOwner {
         pay_metadata(exec, 0, 0).ok()?;
         let metadata = Self::metadata_bytes;
         let memory_refusal = || {
-            attempt.record_stop(crate::executor_types::UnknownOrigin::MemoryBudget);
+            attempt.record_stop(UnknownOrigin::MemoryBudget);
             None
         };
         let Some(bound) = exec.independent_gate_query_root_bound() else {
@@ -101,21 +101,22 @@ impl ModelConstructionOwner {
         }
         #[cfg(test)]
         let mut metadata_steps = 0usize;
-        exec.visit_independent_gate_query_roots(
-            || {
-                pay_metadata(exec, 1, 0)?;
-                #[cfg(test)]
-                {
-                    metadata_steps = metadata_steps.saturating_add(1);
-                }
-                Ok::<_, UnknownOrigin>(())
-            },
-            |root| {
-                roots.push(root);
-                ControlFlow::Continue(())
-            },
-        )
-        .ok()?;
+        let _ = exec
+            .visit_independent_gate_query_roots(
+                || {
+                    pay_metadata(exec, 1, 0)?;
+                    #[cfg(test)]
+                    {
+                        metadata_steps = metadata_steps.saturating_add(1);
+                    }
+                    Ok::<_, UnknownOrigin>(())
+                },
+                |root| {
+                    roots.push(root);
+                    ControlFlow::Continue(())
+                },
+            )
+            .ok()?;
         pay_metadata(exec, 0, 0).ok()?;
         Some(Self {
             original_attempt,
@@ -132,9 +133,9 @@ impl ModelConstructionOwner {
 
     fn metadata_bytes(capacity: usize) -> Option<usize> {
         capacity
-            .checked_mul(std::mem::size_of::<TermId>())
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
-            .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
+            .checked_mul(size_of::<TermId>())
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+            .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
     }
 
     #[cfg(test)]
@@ -521,14 +522,6 @@ impl<'a> ModelConstructionRead<'a> {
         })
     }
 
-    pub(super) fn model(&self) -> &'a Model {
-        self.model
-    }
-
-    pub(super) fn evaluate(&self, term: TermId) -> super::EvalValue {
-        self.exec.evaluate_term_source_validated(self.model, term)
-    }
-
     pub(super) fn finish(self) -> Result<(), String> {
         // Plain source/model fields cannot change while these immutable borrows
         // live. Resource controls remain live and must cross the closing fence.
@@ -808,7 +801,7 @@ mod tests {
         assert_eq!(exec.ctx.terms.len(), before);
         assert_eq!(
             exec.evaluation_stop_origin(),
-            Some(crate::executor_types::UnknownOrigin::MemoryBudget)
+            Some(UnknownOrigin::MemoryBudget)
         );
     }
 
@@ -1052,7 +1045,7 @@ mod tests {
     fn root_collection_propagates_budget_refusal_without_empty_obligations() {
         let (exec, _) = fixture();
         let expected = exec.independent_gate_query_roots().unwrap();
-        assert!(!expected.is_empty());
+        assert_ne!(expected, [] as [TermId; 0]);
         let _scope = super::super::recovery_admission::RecoveryScope::enter(&exec, 0, 0).unwrap();
         assert_eq!(
             exec.independent_gate_query_roots(),
@@ -1107,10 +1100,11 @@ mod tests {
             after - before < 100_000,
             "batch validation is not roots times symbols: {before} -> {after}"
         );
-        for index in 0..500 {
+        assert_eq!(values.len(), 500);
+        for (index, model_value) in values.iter().enumerate() {
             let expected = num_bigint::BigInt::from(index);
             assert!(
-                matches!(&values[index], crate::api::ModelValue::Int(value) if value == &expected)
+                matches!(model_value, crate::api::ModelValue::Int(value) if value == &expected)
             );
             assert!(
                 matches!(map.get(&format!("model_owner_x{index}")), Some(crate::api::ModelValue::Int(value)) if value == &expected)

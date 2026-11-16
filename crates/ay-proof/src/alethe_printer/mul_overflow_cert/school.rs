@@ -45,14 +45,14 @@ pub(crate) struct School {
     pub(crate) zh: T,
 }
 
-fn padded(p: &Proof, bits: &[T], w: u32) -> Vec<T> {
+fn padded(p: &Proof<'_>, bits: &[T], w: u32) -> Vec<T> {
     let mut v = bits.to_vec();
     v.resize(w as usize, p.t.ff);
     v
 }
 
 impl Ctx {
-    pub(crate) fn new(p: &mut Proof, row: Row, prefix: &str) -> Option<Self> {
+    pub(crate) fn new(p: &mut Proof<'_>, row: Row, prefix: &str) -> Option<Self> {
         let m = row.m;
         let (n, nn) = (2 * m, 4 * m);
         let dbl_nn = ShiftLemma::doubling(p, nn, &format!("{prefix}d{nn}_"))?;
@@ -122,24 +122,24 @@ impl Ctx {
     }
 
     /// `bb(bits(t) ++ F*n)`: a `2m`-bit term zero-extended to the wide ring.
-    pub(crate) fn zw(&self, p: &mut Proof, t: T) -> T {
+    pub(crate) fn zw(&self, p: &mut Proof<'_>, t: T) -> T {
         let b = p.t.bits(t);
         let pb = padded(p, &b, 4 * self.row.m);
         p.t.bb(&pb)
     }
 
-    pub(crate) fn shift_nn_n(&self, p: &mut Proof, b: &[T]) -> Option<S> {
+    pub(crate) fn shift_nn_n(&self, p: &mut Proof<'_>, b: &[T]) -> Option<S> {
         double_shift(p, &self.sh_nn_m, b)
     }
 
-    pub(crate) fn shift_nn_m(&self, p: &mut Proof, b: &[T]) -> Option<S> {
+    pub(crate) fn shift_nn_m(&self, p: &mut Proof<'_>, b: &[T]) -> Option<S> {
         self.sh_nn_m.inst(p, b)
     }
 
     /// `(= Zw (bvadd (bvmul 2^k Zhi) Zlo))` where `Zw`'s bits are `Zlo`'s then `Zhi`'s.
     pub(crate) fn limb_split(
         &self,
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         zw: T,
         zhi: T,
         zlo: T,
@@ -160,7 +160,7 @@ impl Ctx {
     }
 
     /// `(= Z(prod) (bvmul ZX ZY))` and `(not (bvult c0 prod))` for a limb product.
-    fn prod_lift(&self, p: &mut Proof, prod: T, xb: &[T], yb: &[T]) -> Option<(S, S)> {
+    fn prod_lift(&self, p: &mut Proof<'_>, prod: T, xb: &[T], yb: &[T]) -> Option<(S, S)> {
         let n = self.row.n();
         let (fact, v0, w0) = self.lift.run(p, xb, yb)?;
         let mut bl = Blaster::new(&[], &[]);
@@ -205,7 +205,7 @@ impl Ctx {
 
 impl Ctx {
     /// `(= CB (@bbterm c))` for `CB = (ite c #b1 #b0)`.
-    fn cb_fact(&self, p: &mut Proof) -> Option<S> {
+    fn cb_fact(&self, p: &mut Proof<'_>) -> Option<S> {
         let (c, cb) = (self.row.c, self.row.cb);
         let cbw = p.t.bb(&[c]);
         let mut out = Vec::new();
@@ -239,7 +239,7 @@ impl Ctx {
     }
 
     /// `(= SH (@bbterm F*m, c, F*(m-1)))` through the checker's shifter.
-    fn sh_fact(&self, p: &mut Proof, cbs: S) -> Option<S> {
+    fn sh_fact(&self, p: &mut Proof<'_>, cbs: S) -> Option<S> {
         let (m, n) = (self.row.m, self.row.n());
         let c = self.row.c;
         let x = p.t.zext(n - 1, self.row.cb);
@@ -295,7 +295,7 @@ impl Ctx {
 }
 
 /// Unsigned limb split of `x = 2^m hi + lo` at `2m` bits for an operand's limbs.
-fn limb_words(p: &mut Proof, hi: &[T], lo: &[T], n: u32) -> (T, T, T) {
+fn limb_words(p: &mut Proof<'_>, hi: &[T], lo: &[T], n: u32) -> (T, T, T) {
     let mut whole = lo.to_vec();
     whole.extend(hi);
     (
@@ -305,15 +305,15 @@ fn limb_words(p: &mut Proof, hi: &[T], lo: &[T], n: u32) -> (T, T, T) {
     )
 }
 
-pub(crate) fn lit_pow(p: &mut Proof, k: u32, w: u32) -> T {
+pub(crate) fn lit_pow(p: &mut Proof<'_>, k: u32, w: u32) -> T {
     p.t.lit(bits::pow2(k, w))
 }
 
-pub(crate) fn lit_neg_pow(p: &mut Proof, k: u32, w: u32) -> T {
+pub(crate) fn lit_neg_pow(p: &mut Proof<'_>, k: u32, w: u32) -> T {
     p.t.lit(bits::neg(&bits::pow2(k, w)))
 }
 
-pub(crate) fn lit_minus1(p: &mut Proof, w: u32) -> T {
+pub(crate) fn lit_minus1(p: &mut Proof<'_>, w: u32) -> T {
     p.t.lit(bits::neg(&bits::from_u64(1, w)))
 }
 
@@ -333,7 +333,7 @@ struct Parts {
 }
 
 impl Ctx {
-    pub(crate) fn schoolbook(&self, p: &mut Proof) -> Option<School> {
+    pub(crate) fn schoolbook(&self, p: &mut Proof<'_>) -> Option<School> {
         let r = &self.row;
         let (m, n, nn) = (r.m, r.n(), 4 * r.m);
         let ea = self.limb_split(p, self.za, self.za1, self.za0, &self.sh_nn_m)?;
@@ -431,7 +431,7 @@ impl Ctx {
     }
 
     /// `(= (bvadd ZMID (bvmul 2^n Zc)) (bvadd ZT ZS1 ZS2))`: the middle sum and its carry.
-    fn s5(&self, p: &mut Proof, q: &Parts) -> Option<S> {
+    fn s5(&self, p: &mut Proof<'_>, q: &Parts) -> Option<S> {
         let r = &self.row;
         let nn = 4 * r.m;
         let zcb = p.t.bits(q.zc);

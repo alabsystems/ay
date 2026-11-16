@@ -313,12 +313,9 @@ impl Solver {
             ws_shrink_chain: Vec::new(),
             tiers: tier_state::TierState {
                 kissat_rule: ay_core::sat_ab_switches().reduce_kissat_tiers == Some(true),
-                ..a.choose(
-                    || tier_state::TierState::new(),
-                    |owner| {
-                        tier_state::TierState::build_admitted(&super::construction::Counted(owner))
-                    },
-                )?
+                ..a.choose(tier_state::TierState::new, |owner| {
+                    tier_state::TierState::build_admitted(&construction::Counted(owner))
+                })?
             },
             min: minimization_state::MinimizationState::build_admitted(num_vars, a)?,
             phase_init: phase_init_state::PhaseInitState::build_admitted(num_vars, a)?,

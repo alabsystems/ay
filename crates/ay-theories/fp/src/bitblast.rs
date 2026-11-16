@@ -986,7 +986,7 @@ impl FpSolver<'_> {
                 // fell through to `None` and the whole QF_BVFP query bailed to
                 // `unknown (:reason-unknown unsupported)` even though every piece
                 // is bit-blastable (external-codegen UEQ lowering proofs, 2026-07-10).
-                // Mirrors the `TermData::Ite` arm of `bitblast_bv_value`.
+                // Mirrors the `TermData::Ite` arm of `bitblast_bv_value_with_control`.
                 "ite" if args.len() == 3 => {
                     let cond_lit = self.encode_bool_condition_with_control(args[0], control)?;
                     let Some(then_bits) =
@@ -1036,6 +1036,7 @@ impl FpSolver<'_> {
     /// circuits. Composite BV terms that appear in FP-linked predicates are
     /// recursively encoded when supported and fail closed otherwise; only leaf
     /// BV values may allocate cached fresh bits.
+    #[cfg(test)]
     pub(crate) fn bitblast_bv_value(
         &mut self,
         term: TermId,
@@ -1129,6 +1130,7 @@ impl FpSolver<'_> {
     }
 
     /// Get BV bits for a leaf term (constant or cached fresh variable).
+    #[cfg(test)]
     pub(crate) fn bitblast_bv_term(&mut self, term: TermId, expected_sz: usize) -> Vec<CnfLit> {
         uninterrupted(|control| self.bitblast_bv_term_with_control(term, expected_sz, control))
     }
@@ -1184,7 +1186,7 @@ impl FpSolver<'_> {
         Ok(result)
     }
 
-    /// Check if a BV term has cached bits from a prior `bitblast_bv_term` call.
+    /// Check if a BV term has cached bits from a prior `bitblast_bv_term_with_control` call.
     pub fn has_bv_bits(&self, term: TermId) -> bool {
         self.bv_term_bits.contains_key(&term)
     }

@@ -237,12 +237,12 @@ fn a_forged_resolution_over_a_non_matching_target_is_rejected() {
 
 /// Local helper so the assertion above reads as one predicate.
 trait StrictOutcome {
-    fn is_err_or_incomplete(self) -> bool;
+    fn is_err_or_incomplete(&self) -> bool;
 }
 
 impl StrictOutcome for Result<ay_proof::ProofQuality, ay_proof::ProofCheckError> {
-    fn is_err_or_incomplete(self) -> bool {
-        !self.is_ok_and(|quality| quality.is_complete())
+    fn is_err_or_incomplete(&self) -> bool {
+        !self.as_ref().is_ok_and(|quality| quality.is_complete())
     }
 }
 
@@ -322,12 +322,11 @@ fn the_render_gate_refuses_a_step_the_printer_cannot_print() {
         .binary_implication(tautology)
         .expect("fixture precondition: the root negates an implication");
     // `(and r (and A))` — conjunct 1 is the UNIT `(and A)`.
-    let ay_core::term::TermData::App(_, hypothesis_args) = executor.ctx.terms.get(hypothesis)
-    else {
+    let TermData::App(_, hypothesis_args) = executor.ctx.terms.get(hypothesis) else {
         panic!("fixture precondition: the hypothesis is an application");
     };
     let unit_and = hypothesis_args[1];
-    let ay_core::term::TermData::App(_, unit_args) = executor.ctx.terms.get(unit_and) else {
+    let TermData::App(_, unit_args) = executor.ctx.terms.get(unit_and) else {
         panic!("fixture precondition: the second conjunct is an application");
     };
     assert_eq!(
@@ -392,7 +391,7 @@ fn the_render_gate_refuses_a_step_the_printer_cannot_print() {
     // through. That is the whole point: neither of them can see a printer
     // refusal.
     assert!(
-        crate::Executor::proof_derives_empty_clause(&candidate),
+        Executor::proof_derives_empty_clause(&candidate),
         "control: the forged document must reach the empty clause"
     );
     assert!(

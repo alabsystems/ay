@@ -258,7 +258,6 @@ pub(in crate::executor) const fn canonical_refusal_is_symbol(
 /// The root `surface_override_collection_work` actually prices, and the
 /// traversal multiplicity it charges — the collector unwraps one `not` shell
 /// over a `forall` before descending, so the bound and this census do too.
-#[must_use]
 pub(in crate::executor) fn override_collection_root(
     terms: &TermStore,
     canonical: TermId,

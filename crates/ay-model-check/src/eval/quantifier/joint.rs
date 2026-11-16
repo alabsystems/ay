@@ -185,7 +185,7 @@ impl Planner<'_, '_> {
         }
         // Two outer-vector slots account for amortized capacity slack. Value
         // layout is platform-dependent (the enum also contains BigRational).
-        let mut bytes = std::mem::size_of::<Vec<ModelValue>>() * 2;
+        let mut bytes = size_of::<Vec<ModelValue>>() * 2;
         for binding in values {
             let limbs = match &binding.value {
                 ModelValue::Bool(_) => 0,
@@ -199,7 +199,7 @@ impl Planner<'_, '_> {
             };
             charge(self.evaluator, limbs.max(1))?;
             bytes = bytes
-                .checked_add(std::mem::size_of::<ModelValue>())
+                .checked_add(size_of::<ModelValue>())
                 .and_then(|bytes| bytes.checked_add(limbs))
                 .ok_or(QuantifierRejection::EvaluationBudget)?;
         }

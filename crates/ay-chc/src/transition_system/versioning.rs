@@ -502,7 +502,7 @@ impl TransitionSystem {
     /// every Unsafe counterexample produced by IMC/LAWI/DAR is still replayed
     /// against the ORIGINAL clauses by the portfolio acceptance pipeline
     /// (`portfolio::accept::accept_or_reject` → `validate_safe_*` /
-    /// `validate_unsafe_translating`, strict proofs). A Bool+Real result that
+    /// `validate_unsafe_translating_with_timeout`, strict proofs). A Bool+Real result that
     /// fails to validate is demoted to Unknown, never returned as a wrong
     /// verdict. PDKIND deliberately keeps the strict (Bool-rejecting) guard to
     /// avoid false-unsat from SingleLoop location variables (#6500), so this is

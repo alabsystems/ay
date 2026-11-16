@@ -15,34 +15,35 @@ fn reader_checks_every_window_and_never_consumes_after_observed_refusal() {
         deadline: Instant::now() + Duration::from_secs(60),
     };
     let mut calls = 0;
-    let mut poll = || {
-        calls += 1;
-        calls != 2
-    };
-    let mut control = Control::new(limits, &mut poll);
     let whitespace = [b' '; 1024];
     {
-        let shared = RefCell::new(&mut control);
-        let mut input = Input {
-            bytes: &whitespace,
-            position: 0,
-            grant: 0,
-            control: &shared,
+        let mut poll = || {
+            calls += 1;
+            calls != 2
         };
-        let mut output = [0_u8; 1];
-        for _ in 0..lexical::WINDOW {
-            assert_eq!(input.read(&mut output).unwrap(), 1);
+        let mut control = Control::new(limits, &mut poll);
+        {
+            let shared = RefCell::new(&mut control);
+            let mut input = Input {
+                bytes: &whitespace,
+                position: 0,
+                grant: 0,
+                control: &shared,
+            };
+            let mut output = [0_u8; 1];
+            for _ in 0..lexical::WINDOW {
+                assert_eq!(input.read(&mut output).unwrap(), 1);
+            }
+            assert!(input.read(&mut output).is_err());
+            assert_eq!(input.position, lexical::WINDOW);
+            assert!(input.read(&mut output).is_err());
+            assert_eq!(input.position, lexical::WINDOW);
         }
-        assert!(input.read(&mut output).is_err());
-        assert_eq!(input.position, lexical::WINDOW);
-        assert!(input.read(&mut output).is_err());
-        assert_eq!(input.position, lexical::WINDOW);
+        assert_eq!(
+            control.usage.charged_work,
+            (2 * lexical::WINDOW * lexical::PARSER_PASSES) as u128
+        );
     }
-    assert_eq!(
-        control.usage.charged_work,
-        (2 * lexical::WINDOW * lexical::PARSER_PASSES) as u128
-    );
-    drop(control);
     assert_eq!(calls, 2);
 }
 
@@ -62,14 +63,15 @@ fn streaming_decoder_large_whitespace_and_error_positions_remain_bounded() {
         br#"{"version":1,"rows":[{"id":2,"literals":[],"hints":[1]}],"empty_clause_id":2}"#,
     );
     let mut calls = 0;
-    let mut poll = || {
-        calls += 1;
-        true
+    let success_work = {
+        let mut poll = || {
+            calls += 1;
+            true
+        };
+        let mut control = Control::new(limits, &mut poll);
+        read(&bytes, &mut control).unwrap();
+        control.usage.charged_work
     };
-    let mut control = Control::new(limits, &mut poll);
-    read(&bytes, &mut control).unwrap();
-    let success_work = control.usage.charged_work;
-    drop(control);
     assert!(calls > 2 * (2048 / lexical::WINDOW));
     // A lexer-admitted grammar error at the end does not trigger slice-based
     // line/column rescans or refresh grants while container errors unwind.

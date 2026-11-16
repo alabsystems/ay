@@ -20,10 +20,10 @@ use classes::Classes;
 use std::collections::HashSet;
 
 pub(super) fn entails(
-    arena: &mut Arena,
+    arena: &mut Arena<'_>,
     head: usize,
     assumptions: &HashSet<usize>,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<bool> {
     let yes = arena.boolean(true, owner)?;
     let no = arena.boolean(false, owner)?;
@@ -71,11 +71,11 @@ pub(super) fn entails(
 }
 
 fn conclusion(
-    arena: &Arena,
+    arena: &Arena<'_>,
     classes: &mut Classes,
     head: usize,
     yes: usize,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<bool> {
     let mut pending = Vec::new();
     let mut visited = HashSet::new();

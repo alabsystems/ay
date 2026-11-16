@@ -117,10 +117,13 @@ fn sole_remaining_candidate_receives_the_remaining_parent_budget() {
         },
     );
     assert_eq!(result, Some(7));
-    assert_eq!(
-        *slices.borrow(),
-        vec![INITIAL_SLICE, deadline - start - INITIAL_SLICE]
-    );
+    let elapsed = deadline
+        .checked_duration_since(start)
+        .expect("deadline follows the exploration start");
+    let remainder = elapsed
+        .checked_sub(INITIAL_SLICE)
+        .expect("exploration window covers the initial slice");
+    assert_eq!(*slices.borrow(), vec![INITIAL_SLICE, remainder]);
 }
 
 #[test]

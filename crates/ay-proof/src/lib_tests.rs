@@ -504,7 +504,7 @@ fn carcara_surface_discloses_unrepresentable_names_and_sorts_instead_of_refusing
         ("char", Sort::Char, "Char"),
     ] {
         let mut terms = TermStore::new();
-        let x = terms.mk_var(&format!("{label}_surface"), sort);
+        let x = terms.mk_var(format!("{label}_surface"), sort);
         let equality = terms.mk_app(Symbol::named("="), [x, x], Sort::Bool);
         let proof = Proof::from_steps(vec![ProofStep::Assume(equality)]);
         let output = try_export_alethe(&proof, &terms)
@@ -745,11 +745,12 @@ fn bv_bitblast_width_65_idempotency_is_checked() {
         [supported_wide, supported_wide],
         Sort::bitvec(65),
     );
-    for literal in [terms.mk_app(
-        Symbol::named("="),
-        [repeated_wide, supported_wide],
-        Sort::Bool,
-    )] {
+    {
+        let literal = terms.mk_app(
+            Symbol::named("="),
+            [repeated_wide, supported_wide],
+            Sort::Bool,
+        );
         let mut proof = Proof::new();
         proof.add_theory_lemma_with_kind("bv", vec![literal], TheoryLemmaKind::BvBitBlast);
         let output = export_alethe(&proof, &terms);

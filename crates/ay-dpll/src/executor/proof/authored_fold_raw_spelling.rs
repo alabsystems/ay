@@ -127,7 +127,7 @@ impl Executor {
     }
 
     fn raw_retry_canonical_work(&self, root: TermId) -> Option<(usize, usize)> {
-        if self.proof_source_work.remaining() < std::mem::size_of::<TermData>() {
+        if self.proof_source_work.remaining() < size_of::<TermData>() {
             return None;
         }
         let (work, visits) = canonical_term_work_probe_metered(&self.ctx.terms, root, |work| {
@@ -142,7 +142,7 @@ impl Executor {
         while let Some(term) = pending.pop() {
             if !self
                 .proof_source_work
-                .spend_canonical_scan_work(std::mem::size_of::<TermData>())
+                .spend_canonical_scan_work(size_of::<TermData>())
             {
                 return None;
             }
@@ -171,9 +171,7 @@ impl Executor {
     ) -> Option<usize> {
         // The payload preflight visits at most `visits` terms and that many
         // sort nodes; pay before asking it, including on a refused payload.
-        let work = visits
-            .checked_mul(2)?
-            .checked_mul(std::mem::size_of::<TermData>())?;
+        let work = visits.checked_mul(2)?.checked_mul(size_of::<TermData>())?;
         if !self.proof_source_work.spend_canonical_scan_work(work) {
             return None;
         }
@@ -295,7 +293,7 @@ fn override_table_copy_work(overrides: &HashMap<TermId, String>) -> Option<usize
     // allowance for table scans and snapshots; rendering is charged separately.
     overrides
         .capacity()
-        .checked_mul(std::mem::size_of::<(TermId, String)>())?
+        .checked_mul(size_of::<(TermId, String)>())?
         .checked_mul(2)?
         .checked_mul(4)
 }

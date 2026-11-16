@@ -16,7 +16,7 @@ fn set_empty_hole(proof: &mut Proof) {
 /// answered, so a census of `preprocessor-fold-to-false` declines can read
 /// the decision off the trace instead of inferring it from the artifact.
 fn fold_note(message: &'static str) {
-    super::authored_consequence_replay::replay_note(|| format!("[fold-to-false] {message}"));
+    authored_consequence_replay::replay_note(|| format!("[fold-to-false] {message}"));
 }
 
 /// Whether `proof` reaches the empty clause through an `assume false`.
@@ -62,7 +62,7 @@ pub(super) fn demote_unattributed_assumed_false(executor: &mut Executor, proof: 
     // Name the authored root(s) the fold erased, for the shape census: the
     // provenance ledger is aligned with the parsed stack, so a row whose
     // elaborated term is the constant `false` is a root the elaborator folded.
-    super::authored_consequence_replay::replay_note(|| {
+    authored_consequence_replay::replay_note(|| {
         let parsed = executor.ctx.assertions_parsed();
         let originals = executor.proof_original_problem_assertions_slice();
         let mut named = Vec::new();

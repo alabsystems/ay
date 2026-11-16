@@ -95,21 +95,18 @@ impl PinAdmission {
     }
 
     fn capture_counter(exec: &Executor, used: Arc<AtomicUsize>) -> Result<Self, UnknownOrigin> {
-        exec.poll_evaluation_stop().map_err(|origin| {
+        exec.poll_evaluation_stop().inspect_err(|_| {
             used.fetch_max(work_counter::REFUSED, Ordering::AcqRel);
-            origin
         })?;
         let attempt = exec.evaluation_attempt();
         let original_check_stop = current_check_stop().map_err(|_| {
             used.fetch_max(work_counter::REFUSED, Ordering::AcqRel);
             attempt.record_stop(UnknownOrigin::IncompleteSolverLane)
         })?;
-        let arena = attempt.temporary_arena().map_err(|origin| {
+        let arena = attempt.temporary_arena().inspect_err(|_| {
             used.fetch_max(work_counter::REFUSED, Ordering::AcqRel);
-            origin
         })?;
-        let arena_storage =
-            std::mem::size_of::<EvaluationArena>() + 2 * std::mem::size_of::<usize>();
+        let arena_storage = size_of::<EvaluationArena>() + 2 * size_of::<usize>();
         arena
             .check_usage(
                 exec.ctx.terms.true_memory_bytes(),

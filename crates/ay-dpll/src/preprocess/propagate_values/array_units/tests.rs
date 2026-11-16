@@ -40,7 +40,7 @@ fn exact_unit_is_source_authenticated_and_clones_share_the_proof() {
     assert!(Arc::ptr_eq(&unit.proof, &proof));
     // Append-only scratch growth is harmless; the consumer nevertheless
     // rechecks the source-bound proof instead of trusting the old result.
-    terms.mk_var("scratch", Sort::bitvec(129));
+    let _ = terms.mk_var("scratch", Sort::bitvec(129));
     assert!(copy
         .reauthenticate(&terms, &roots, &mut |_, _| true)
         .is_some());

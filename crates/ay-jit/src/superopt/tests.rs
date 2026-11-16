@@ -18,7 +18,7 @@ fn enumeration_prunes_dead_scratch_writes() {
         max_candidates: 64,
     });
 
-    assert!(!candidates.is_empty());
+    assert_ne!(candidates.as_slice(), &[] as &[SuperoptCandidate]);
     assert!(candidates
         .iter()
         .all(|candidate| candidate.insts()[0].dst == SuperoptReg::X2));

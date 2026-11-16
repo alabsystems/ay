@@ -636,7 +636,7 @@ fn marker_dag_formula(
 
         let subst = names.node(node_id)?;
         if let Some(constraint) = &clause.body.constraint {
-            conjuncts.push(constraint.substitute_name_map(&subst).simplify_constants());
+            conjuncts.push(constraint.substitute_name_map(subst).simplify_constants());
         }
 
         for (body_idx, (body_pred, body_args)) in clause.body.predicates.iter().enumerate() {
@@ -653,9 +653,9 @@ fn marker_dag_formula(
             for (body_arg, child_head_arg) in body_args.iter().zip(child_head_args) {
                 control.admit(1, 256)?;
                 conjuncts.push(ChcExpr::eq(
-                    body_arg.substitute_name_map(&subst).simplify_constants(),
+                    body_arg.substitute_name_map(subst).simplify_constants(),
                     child_head_arg
-                        .substitute_name_map(&child_subst)
+                        .substitute_name_map(child_subst)
                         .simplify_constants(),
                 ));
             }
@@ -682,17 +682,17 @@ fn marker_dag_formula(
     for (query_arg, root_head_arg) in query_args.iter().zip(root_head_args) {
         conjuncts.push(ChcExpr::eq(
             query_arg
-                .substitute_name_map(&query_subst)
+                .substitute_name_map(query_subst)
                 .simplify_constants(),
             root_head_arg
-                .substitute_name_map(&root_subst)
+                .substitute_name_map(root_subst)
                 .simplify_constants(),
         ));
     }
     if let Some(constraint) = &query.body.constraint {
         conjuncts.push(
             constraint
-                .substitute_name_map(&query_subst)
+                .substitute_name_map(query_subst)
                 .simplify_constants(),
         );
     }

@@ -46,7 +46,7 @@ impl VSIDS {
             }
         }
         if next.is_none_or(eligible) {
-            let depth = (usize::BITS - self.heap.len().leading_zeros()) as usize;
+            let depth = self.heap.len().bit_width() as usize;
             owner.admit(2 * depth + 4, 0)?;
             return Ok(usize::from(domain.is_some() && available(root)));
         }
@@ -56,7 +56,7 @@ impl VSIDS {
 
     pub(crate) fn admit_domain_heap_selection(&self, owner: &CountedAdmission) -> Result<usize> {
         let length = self.heap.len();
-        let depth = (usize::BITS - length.leading_zeros()) as usize;
+        let depth = length.bit_width() as usize;
         // Per initial member: selector visit, pop/remove, scratch bookkeeping,
         // and reinsertion; at most three root-to-leaf/leaf-to-root traversals.
         let work = length

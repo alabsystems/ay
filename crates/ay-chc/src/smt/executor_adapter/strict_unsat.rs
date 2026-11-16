@@ -12,36 +12,27 @@ use ay_core::time::Instant;
 use ay_dpll::api::{Logic, Solver, SolverConfig};
 use std::borrow::Cow;
 use std::panic::AssertUnwindSafe;
+#[cfg(test)]
 use std::time::Duration;
 
 mod resources;
 use resources::ProofProgress;
 mod retained;
 pub(crate) use retained::{
-    check_plain_unsat_retained_native_with_progress, BoundRetainedProof, BoundRetainedProofBytes,
+    check_plain_unsat_retained_native_with_progress, BoundRetainedProofBytes,
     RetainedReplayProgress,
 };
 
 #[cfg(test)]
 mod tests;
 
-/// An independently rechecked native UNSAT proof bundle for one CHC replay
-/// obligation, plus optional Alethe diagnostic text.
-///
-/// No external process is invoked. The serialized bundle is authoritative only
-/// after a fresh complete `re_check_bundle_strict` pass and exact rebinding to
-/// the hard assertions parsed for this call. Alethe is optional presentation.
+/// Independently rechecked native evidence exposed only to negative-control
+/// tests. Production fresh rechecks consume the evidence and return no proof
+/// object because they never publish it.
+#[cfg(test)]
 pub(crate) struct StrictUnsatCert {
     pub bundle: ay_dpll::api::SerializableProofBundle,
-    pub alethe: Option<String>,
     pub strict_verdict: ay_dpll::api::StrictProofVerdict,
-}
-
-/// Presentation only: both modes retain identical native proof authority.
-#[derive(Clone, Copy)]
-enum StrictPresentation {
-    NativeOnly,
-    WithAletheDiagnostic,
 }
 
 struct PlainQuery<'a> {
@@ -124,11 +115,8 @@ fn is_timeout_override(command: &ay_frontend::Command) -> bool {
     keyword.trim_start_matches(':') == "timeout"
 }
 
-fn solver_config(timeout: Option<Duration>) -> SolverConfig {
-    let config = match timeout {
-        Some(timeout) if !timeout.is_zero() => SolverConfig::default().with_timeout(timeout),
-        _ => SolverConfig::default(),
-    };
+fn solver_config() -> SolverConfig {
+    let config = SolverConfig::default();
     match ReplayMemory::capture(None).term_limit() {
         Some(limit) => config.with_term_memory_limit(limit),
         None => config,
@@ -146,12 +134,12 @@ pub(super) fn ordered_unique_assumes(terms: &[ay_core::TermId]) -> Vec<ay_core::
     unique
 }
 
-fn solve_plain_unsat(
+fn solve_plain_unsat<T>(
     query: PlainQuery<'_>,
     config: SolverConfig,
     limit: ReplayLimit<'_>,
-    presentation: StrictPresentation,
-) -> Option<StrictUnsatCert> {
+    finish: impl FnOnce(ay_dpll::api::SerializableProofBundle, ay_dpll::api::StrictProofVerdict) -> T,
+) -> Option<T> {
     let memory = ReplayMemory::capture(config.term_memory_limit);
     // #completed-check-accepted: the outer phases ADMIT the executor and never
     // poll after it returns. Every `Some` below is a certificate whose strict
@@ -169,9 +157,9 @@ fn solve_plain_unsat(
                 let _cleanup_start = cleanup.start_on_drop();
                 memory.check()?;
                 limit.phase(|| {
-                    // Native bundle replay is mandatory below; Alethe is only
-                    // diagnostic. Do not implicitly demand a hole-free wire proof.
-                    // An explicit strict-wire option in the source remains intact.
+                    // Native bundle replay is mandatory below. Do not
+                    // implicitly demand a hole-free wire proof; an explicit
+                    // strict-wire option in the source remains intact.
                     solver.set_produce_proofs(true);
                     Some(())
                 })?;
@@ -219,13 +207,7 @@ fn solve_plain_unsat(
                             .flatten()
                     })
                 })?;
-                checked_certificate_with_presentation(
-                    &solver,
-                    bundle,
-                    limit,
-                    &mut progress,
-                    presentation,
-                )
+                checked_certificate_with(bundle, limit, &mut progress, finish)
             })
         })
     })
@@ -233,27 +215,24 @@ fn solve_plain_unsat(
 
 #[cfg(test)]
 fn checked_certificate(
-    solver: &Solver,
     bundle: ay_dpll::api::SerializableProofBundle,
     limit: ReplayLimit<'_>,
     progress: &mut ProofProgress<'_>,
 ) -> Option<StrictUnsatCert> {
-    checked_certificate_with_presentation(
-        solver,
-        bundle,
-        limit,
-        progress,
-        StrictPresentation::WithAletheDiagnostic,
-    )
+    checked_certificate_with(bundle, limit, progress, |bundle, strict_verdict| {
+        StrictUnsatCert {
+            bundle,
+            strict_verdict,
+        }
+    })
 }
 
-fn checked_certificate_with_presentation(
-    solver: &Solver,
+fn checked_certificate_with<T>(
     bundle: ay_dpll::api::SerializableProofBundle,
     limit: ReplayLimit<'_>,
     progress: &mut ProofProgress<'_>,
-    presentation: StrictPresentation,
-) -> Option<StrictUnsatCert> {
+    finish: impl FnOnce(ay_dpll::api::SerializableProofBundle, ay_dpll::api::StrictProofVerdict) -> T,
+) -> Option<T> {
     // #completed-check-accepted: the recheck is admitted at entry; its stop
     // polls happen between its steps (the callback below), never after its
     // last step, and nothing after the exact binding consults the limit.
@@ -275,42 +254,17 @@ fn checked_certificate_with_presentation(
         tracing::debug!("executor_adapter: exact-query bundle failed the consumer strict recheck");
         return None;
     }
-    let quality = checked.quality;
-    let alethe = optional_presentation(presentation, limit, || solver.export_last_proof_alethe());
-    Some(StrictUnsatCert {
+    Some(finish(
         bundle,
-        alethe,
-        strict_verdict: ay_dpll::api::StrictProofVerdict::Verified(quality),
-    })
+        ay_dpll::api::StrictProofVerdict::Verified(checked.quality),
+    ))
 }
 
-fn optional_presentation(
-    presentation: StrictPresentation,
-    limit: ReplayLimit<'_>,
-    render: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    // #completed-check-accepted: this runs after the native check completed,
-    // so it can only add or omit the diagnostic text, never refuse the
-    // certificate. The limit admits the renderer; an expired or cancelled
-    // limit omits the text instead of starting the (opaque) render.
-    phase_probe::option(Phase::Presentation, limit, || match presentation {
-        StrictPresentation::NativeOnly => Some(None),
-        StrictPresentation::WithAletheDiagnostic => Some(limit.check().and_then(|()| {
-            ay_core::catch_ay_panics(AssertUnwindSafe(render), |reason| {
-                tracing::debug!("executor_adapter: optional Alethe diagnostic declined: {reason}");
-                None
-            })
-        })),
-    })
-    .flatten()
-}
-
-fn run_strict_unsat(
+fn run_strict_unsat<T>(
     smt: &str,
-    timeout: Option<Duration>,
     limit: ReplayLimit<'_>,
-    presentation: StrictPresentation,
-) -> Option<StrictUnsatCert> {
+    finish: impl FnOnce(ay_dpll::api::SerializableProofBundle, ay_dpll::api::StrictProofVerdict) -> T,
+) -> Option<T> {
     let memory = ReplayMemory::capture(None);
     // #completed-check-accepted: entry admission only; see `solve_plain_unsat`.
     memory.admit(|| {
@@ -320,8 +274,8 @@ fn run_strict_unsat(
                     let query = phase_probe::option(Phase::ParseShape, limit, || {
                         limit.phase(|| parse_plain_query(smt, limit))
                     })?;
-                    let config = limit.phase(|| Some(solver_config(timeout)))?;
-                    solve_plain_unsat(query, config, limit, presentation)
+                    let config = limit.phase(|| Some(solver_config()))?;
+                    solve_plain_unsat(query, config, limit, finish)
                 }),
                 |reason| {
                     tracing::debug!("executor_adapter: strict-unsat-cert ay panic: {reason}");
@@ -332,46 +286,8 @@ fn run_strict_unsat(
     })
 }
 
-/// Discharge one canonical plain UNSAT replay obligation with AY's native
-/// proof producer and independent strict bundle checker.
-///
-/// Any parse/shape error, panic, non-UNSAT result, missing proof, incomplete
-/// quality, or exact-query authority mismatch returns `None` and must be
-/// treated by callers as metadata-only. Repeated proof `Assume` steps are
-/// compared after ordered deduplication because the exported authority
-/// inventory is deliberately unique in first-use order. For compatibility,
-/// `None` and zero both leave the relative solver timeout unset.
-/// The inherited CHC term cap configures the native solver independently of
-/// that timeout. Export and all three independent proof rechecks share one
-/// cumulative allowance for the resident term ledger and accounted proof copies.
-/// It is not an RSS limit or an allocation bound on parser/diagnostic buffers;
-/// global exhaustion is checked around those phases.
-pub(crate) fn smtlib_strict_unsat_cert_via_executor(
-    smt: &str,
-    timeout: Option<Duration>,
-) -> Option<StrictUnsatCert> {
-    run_strict_unsat(
-        smt,
-        timeout,
-        ReplayLimit::Legacy,
-        StrictPresentation::WithAletheDiagnostic,
-    )
-}
-
-/// Discharge an exact plain UNSAT query under one already-elapsing deadline.
-///
-/// Setup never renews the caller's wall. The native interruptible solve owns a
-/// deadline-only callback through search and mandatory UNSAT certification.
-/// Exact bundle export and independent rechecks share resource/deadline polls.
-/// Parsing, optional Alethe rendering, individual arithmetic/allocation and
-/// destruction retain opaque intervals; guards between phases reject overruns
-/// up to the strict recheck's last step. A certificate whose recheck and exact
-/// binding completed is accepted whatever the clock says afterwards: rendering
-/// is admitted only on a live limit (otherwise the text is omitted) and solver
-/// destruction is not polled. This is not a hard return-time or asynchronous
-/// caller-token cancellation guarantee. Script-local timeout options are
-/// refused, and an expired deadline never admits the START of a check.
-/// All exact-source binding and independent proof checks match the legacy lane.
+/// Test-only access to the exact bundle retained by the production check.
+#[cfg(test)]
 pub(crate) fn smtlib_strict_unsat_cert_via_executor_until(
     smt: &str,
     deadline: Instant,
@@ -379,25 +295,19 @@ pub(crate) fn smtlib_strict_unsat_cert_via_executor_until(
     smtlib_strict_unsat_cert_via_executor_with_limit(smt, ReplayLimit::Until(deadline))
 }
 
-/// Same exact-query adapter with optional owned caller-cancellation control.
-/// Only a clone of `ReplayCancellation` enters the native watchdog; no borrowed
-/// progress callback is sent to a thread. Cancellation is sticky across solve
-/// and subsequent phase guards, even if the caller resets its token. Opaque
-/// parsing/export/recheck intervals retain the deadline-only API's limitations.
+#[cfg(test)]
 pub(crate) fn smtlib_strict_unsat_cert_via_executor_with_limit(
     smt: &str,
     limit: ReplayLimit<'_>,
 ) -> Option<StrictUnsatCert> {
-    run_strict_unsat(smt, None, limit, StrictPresentation::WithAletheDiagnostic)
+    run_strict_unsat(smt, limit, |bundle, strict_verdict| StrictUnsatCert {
+        bundle,
+        strict_verdict,
+    })
 }
 
-/// Internal fresh rechecks discard their certificate; do not construct unused
-/// Alethe diagnostics. Exact binding, native checks and all resource admission
-/// are unchanged. In particular, source-requested strict-wire options still
-/// reach the solver unchanged and may refuse before this presentation choice.
-pub(crate) fn smtlib_strict_unsat_cert_native_only_with_limit(
-    smt: &str,
-    limit: ReplayLimit<'_>,
-) -> Option<StrictUnsatCert> {
-    run_strict_unsat(smt, None, limit, StrictPresentation::NativeOnly)
+/// Freshly solve and independently recheck one exact plain UNSAT query without
+/// publishing or retaining its proof object.
+pub(crate) fn check_plain_unsat_native_with_limit(smt: &str, limit: ReplayLimit<'_>) -> Option<()> {
+    run_strict_unsat(smt, limit, |_, _| ())
 }

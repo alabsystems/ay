@@ -141,13 +141,13 @@ fn empty_input_and_tautology_only_input_preserve_fresh_traced_and_untraced_names
         identity_parity(&loaded.solver, &expected);
         assert!(conflict.is_none() && rows(&loaded.solver).is_empty());
         assert_eq!(loaded.initial_conflict, InitialConflict::None);
-        assert!(loaded.source_ids.is_empty());
+        assert_eq!(loaded.source_ids.len(), 0);
     }
     let clauses = [&[p(0), n(0)][..], &[p(1), n(1)]];
     let traced = build(2, &clauses, &[], ample()).unwrap();
     let (expected, _) = ordinary(2, &clauses);
     identity_parity(&traced.solver, &expected);
-    assert!(rows(&traced.solver).is_empty());
+    assert_eq!(rows(&traced.solver).len(), 0);
     assert_eq!(traced.source_ids, [Some(1), Some(2)]);
     let untraced = CountedInitialCnf::try_new(2, &clauses, ample())
         .unwrap()

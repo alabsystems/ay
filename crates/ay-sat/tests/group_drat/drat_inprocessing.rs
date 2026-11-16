@@ -130,14 +130,14 @@ fn solve_and_verify(cnf_relative: &str, config: InprocConfig) {
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof_bytes = writer.into_vec().expect("proof flush");
 
-    assert!(!proof_bytes.is_empty(), "{tag}: proof is empty (0 bytes)");
+    assert_ne!(proof_bytes.len(), 0, "{tag}: proof is empty (0 bytes)");
 
     // Verify with ay-drat-check in-process forward checker.
     let cnf_for_check =
         parse_cnf(cnf_text.as_bytes()).unwrap_or_else(|e| panic!("{tag}: CNF parse: {e}"));
     let steps = parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{tag}: DRAT parse: {e}"));
 
-    assert!(!steps.is_empty(), "{tag}: DRAT proof has 0 steps");
+    assert_ne!(steps.len(), 0, "{tag}: DRAT proof has 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker

@@ -29,7 +29,12 @@ fn original_deadline_is_checked_before_preparation_and_discharge() {
     let source = source("fill");
     let token = CancellationToken::new();
     let model = model(&source, &control(&token));
-    let expired = SourceControl::new(Instant::now() - Duration::from_secs(1), &token);
+    let expired = SourceControl::new(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset"),
+        &token,
+    );
     assert!(prepare(&source, &model, 0, &expired).is_none());
     let prepared = prepare(&source, &model, 0, &control(&token)).unwrap();
     // This returns at its first control check; it cannot launch an SMT solve.

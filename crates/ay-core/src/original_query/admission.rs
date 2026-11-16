@@ -43,10 +43,11 @@ impl FiniteAdmissionGrant {
 /// an arbitrary callback/destructor that does not return.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OriginalAdmissionError {
-    /// The underlying query budget or cancellation check refused.
+    /// The underlying query ledger, cancellation/deadline check, or structural
+    /// validation refused.
     #[error(transparent)]
     Query(#[from] QueryError),
-    /// The original stop observer returned false.
+    /// The original stop observer returned true and requested termination.
     #[error("the original check-stop observer refused")]
     ObserverStopped,
     /// The original stop observer unwound.
@@ -151,18 +152,15 @@ fn with_work<T>(
     match result {
         Err(payload) => {
             let first = inner.refuse(OriginalAdmissionError::OperationPanicked);
-            drop(work);
             drop(payload);
             Err(first)
         }
         Ok(Err(error)) => {
             let first = inner.refuse(OriginalAdmissionError::Query(error));
-            drop(work);
             Err(first)
         }
         Ok(Ok(value)) => {
             let final_adapter = work.charge(0);
-            drop(work);
             if let Err(error) = final_adapter {
                 let first = inner.refuse(OriginalAdmissionError::Query(error));
                 drop(value);

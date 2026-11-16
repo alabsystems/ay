@@ -12,7 +12,7 @@ type Head = Option<(PredicateId, Vec<ValueId>)>;
 pub(crate) fn validate(
     problem: &ChcProblem,
     derivation: &CompactDerivation,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<()> {
     let _scope = owner.enter();
     let result = validate_inner(problem, derivation, owner);
@@ -25,7 +25,7 @@ pub(crate) fn validate(
 fn validate_inner(
     problem: &ChcProblem,
     derivation: &CompactDerivation,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<()> {
     let mut source = Source::new(problem, owner)?;
     source.validate(owner)?;
@@ -61,7 +61,7 @@ fn replay_arena(
     source: &mut Source<'_>,
     original: &Arena,
     arena: &mut Arena,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Vec<ValueId>> {
     owner.admit(
         original.nodes().len(),
@@ -136,7 +136,7 @@ fn replay_step<'a>(
     roots: &[ValueId],
     arena: &mut Arena,
     heads: &[Head],
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Head> {
     let clause = source
         .problem
@@ -209,7 +209,7 @@ fn replay_step<'a>(
     }
 }
 
-fn reachable(derivation: &CompactDerivation, owner: &mut Owner) -> Result<()> {
+fn reachable(derivation: &CompactDerivation, owner: &mut Owner<'_>) -> Result<()> {
     let count = derivation.steps.len();
     if count == 0 || derivation.query_step != count - 1 {
         return Err(Error::InvalidDerivation);

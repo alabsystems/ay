@@ -96,7 +96,7 @@ fn nullary_error_wrapper_candidates_seal_and_fail_closed() {
             .certificate
             .ghost_interpretation(predicate)
             .expect("complete sink interpretation");
-        assert!(interpretation.vars.is_empty());
+        assert_eq!(interpretation.vars, [] as [ChcVar; 0]);
         assert_eq!(interpretation.formula, ChcExpr::Bool(false));
     }
 

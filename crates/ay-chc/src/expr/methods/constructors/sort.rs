@@ -126,7 +126,7 @@ impl ChcExpr {
     fn bv_concat_sort(args: &[Arc<Self>]) -> ChcSort {
         if let (Some(a), Some(b)) = (args.first(), args.get(1)) {
             if let (ChcSort::BitVec(w1), ChcSort::BitVec(w2)) = (a.sort(), b.sort()) {
-                return ChcSort::BitVec(w1.checked_add(w2).unwrap_or(u32::MAX));
+                return ChcSort::BitVec(w1.saturating_add(w2));
             }
         }
         debug_assert!(
@@ -139,7 +139,7 @@ impl ChcExpr {
     fn bv_extend_sort(args: &[Arc<Self>], extension: u32) -> ChcSort {
         if let Some(arg) = args.first() {
             if let ChcSort::BitVec(width) = arg.sort() {
-                return ChcSort::BitVec(width.checked_add(extension).unwrap_or(u32::MAX));
+                return ChcSort::BitVec(width.saturating_add(extension));
             }
         }
         debug_assert!(
@@ -157,7 +157,7 @@ impl ChcExpr {
     fn bv_repeat_sort(args: &[Arc<Self>], repetitions: u32) -> ChcSort {
         if let Some(arg) = args.first() {
             if let ChcSort::BitVec(width) = arg.sort() {
-                return ChcSort::BitVec(width.checked_mul(repetitions).unwrap_or(u32::MAX));
+                return ChcSort::BitVec(width.saturating_mul(repetitions));
             }
         }
         debug_assert!(

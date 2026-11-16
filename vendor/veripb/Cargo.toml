@@ -110,6 +110,7 @@ required-features = ["reference-cli"]
 name = "veripb-bench"
 path = "benches/bench.rs"
 harness = false
+required-features = ["reference-cli"]
 
 
 [[test]]

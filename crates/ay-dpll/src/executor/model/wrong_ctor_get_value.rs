@@ -263,7 +263,7 @@ impl Executor {
                     .ok_or_else(|| exec.record_evaluation_stop(UnknownOrigin::MemoryBudget))?;
                 let planned = target
                     .checked_sub(before)
-                    .and_then(|n| n.checked_mul(std::mem::size_of::<TermId>()))
+                    .and_then(|n| n.checked_mul(size_of::<TermId>()))
                     .ok_or_else(|| exec.record_evaluation_stop(UnknownOrigin::MemoryBudget))?;
                 // Admit the entire planned growth and relocation before the
                 // opaque reserve. Geometric growth bounds total ID copying.
@@ -274,7 +274,7 @@ impl Executor {
                 let actual = stack
                     .capacity()
                     .checked_sub(before)
-                    .and_then(|n| n.checked_mul(std::mem::size_of::<TermId>()))
+                    .and_then(|n| n.checked_mul(size_of::<TermId>()))
                     .ok_or_else(|| exec.record_evaluation_stop(UnknownOrigin::MemoryBudget))?;
                 pay_metadata(exec, 0, actual.saturating_sub(planned))?;
             }

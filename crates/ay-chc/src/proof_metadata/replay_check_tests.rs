@@ -220,9 +220,10 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
     assert_eq!(obligations[0].kind, ChcReplayObligationKind::Safety);
     assert!(obligations[0].smtlib.contains("(check-sat)"));
     assert_eq!(
-        crate::smt::executor_adapter::smtlib_first_verdict_via_executor(
+        crate::smt::executor_adapter::smtlib_first_verdict_via_executor_until(
             &obligations[0].smtlib,
-            Some(Duration::from_secs(20)),
+            ay_core::time::Instant::now() + REPLAY_TEST_BUDGET,
+            None,
         )
         .as_deref(),
         Some("unsat"),
@@ -358,9 +359,10 @@ fn dead_end_strip_does_not_hide_reachable_error() {
         acyclic_exhaustion_replay_obligations(&problem).expect("dead-end strip should succeed");
     assert_eq!(obligations.len(), 1);
     assert_eq!(
-        crate::smt::executor_adapter::smtlib_first_verdict_via_executor(
+        crate::smt::executor_adapter::smtlib_first_verdict_via_executor_until(
             &obligations[0].smtlib,
-            Some(Duration::from_secs(20)),
+            ay_core::time::Instant::now() + REPLAY_TEST_BUDGET,
+            None,
         )
         .as_deref(),
         Some("sat"),

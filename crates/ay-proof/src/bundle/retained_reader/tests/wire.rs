@@ -163,7 +163,7 @@ fn present_empty_wire_inventory_checks_boolean_proof_without_a_producer() {
     drop(snapshot);
     let owned = decoded(&bytes).result.unwrap();
     assert_eq!(owned.parts().0.schema, RETAINED_SCHEMA);
-    assert!(owned.parts().1.is_empty());
+    assert_eq!(owned.parts().1, []);
     let actual = checked(&bytes).result.unwrap();
     assert_eq!(actual.quality, expected.quality);
     assert_eq!(actual.assume_terms, expected.assume_terms);

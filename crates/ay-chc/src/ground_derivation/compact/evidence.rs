@@ -4,7 +4,9 @@
 //! A carried candidate keeps its complete values AND the original allowance.
 //! Presence is not authority: every accepting boundary replays the original.
 
-use super::{CompactDerivation, Owner, Result};
+#[cfg(test)]
+use super::Result;
+use super::{CompactDerivation, Owner};
 
 pub(crate) struct CompactEvidence {
     derivation: CompactDerivation,
@@ -36,6 +38,7 @@ impl CompactEvidence {
         self.owner.owner()
     }
 
+    #[cfg(test)]
     pub(crate) fn validate(&self, problem: &crate::ChcProblem) -> Result<()> {
         super::validate(problem, &self.derivation, &mut self.owner())
     }

@@ -110,7 +110,7 @@ impl CountedInitialCnf {
     }
 
     fn prepare(num_vars: usize, clauses: &[&[Literal]], owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         if num_vars > i32::MAX as usize {
             return Err(invalid(
                 owner,
@@ -124,7 +124,7 @@ impl CountedInitialCnf {
             normalized: Vec::new(),
             rows: Vec::new(),
         };
-        owner.admit(1, std::mem::size_of::<normalize::Scratch>())?;
+        owner.admit(1, size_of::<normalize::Scratch>())?;
         let mut scratch = normalize::Scratch::new();
         for clause in clauses {
             owner.admit(1, 0)?;
@@ -142,7 +142,7 @@ impl CountedInitialCnf {
         let original_start = self.originals.len();
         storage::reserve_append(&mut self.originals, clause.len(), owner)?;
         for literal in clause {
-            owner.admit(1, std::mem::size_of::<Literal>())?;
+            owner.admit(1, size_of::<Literal>())?;
             let literal = *literal;
             if literal.variable().index() >= self.num_vars {
                 return Err(invalid(
@@ -158,7 +158,7 @@ impl CountedInitialCnf {
             storage::append_literals(&mut self.normalized, scratch.literals(), owner)?;
         }
         storage::reserve_append(&mut self.rows, 1, owner)?;
-        owner.admit(1, std::mem::size_of::<Row>())?;
+        owner.admit(1, size_of::<Row>())?;
         self.rows.push(Row {
             original: original_start..self.originals.len(),
             normalized: normalized_start..self.normalized.len(),

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use ay_core::{Sort, TermStore};
+use ay_core::{Sort, TermData, TermStore};
 use ay_frontend::command::Term as FrontendTerm;
 
 use super::{surface_source_work, SurgeryPlanningBudget};
@@ -18,7 +18,7 @@ fn unmetered_probe_keeps_its_results_with_an_accepting_meter() {
         Sort::Bool,
     );
     let binder = terms.mk_forall(vec![("bound".into(), Sort::Bool)], leaf);
-    let node = std::mem::size_of::<ay_core::TermData>();
+    let node = size_of::<TermData>();
     for (root, expected, expected_visits) in [
         (leaf, Ok("legacy_probe".len() + node), 1),
         (negated, Ok(1 + "legacy_probe".len() + 2 * node), 2),
@@ -31,7 +31,7 @@ fn unmetered_probe_keeps_its_results_with_an_accepting_meter() {
     ] {
         assert_eq!(
             super::canonical_term_work_probe(&terms, root),
-            (expected.clone(), expected_visits)
+            (expected, expected_visits)
         );
         let (actual, actual_visits) =
             super::canonical_term_work_probe_metered(&terms, root, |_| true);

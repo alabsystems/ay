@@ -117,7 +117,7 @@ fn a_guarded_clause_is_never_a_support_axiom() {
 /// asserting something the query never said.
 #[test]
 fn a_guarded_clause_is_never_an_authored_problem_assertion() {
-    let mut exec = solved(DISJUNCT_POSITION_FORALL);
+    let exec = solved(DISJUNCT_POSITION_FORALL);
     let authored = exec.proof_problem_assertions();
     let original = exec.proof_original_problem_assertions();
     for &clause in &exec.guarded_instance_clauses {

@@ -95,8 +95,8 @@ fn finite_candidates_ignore_category_caps_but_not_global_cap() {
     );
     assert_eq!(prefixes.selected().copied().collect::<Vec<_>>(), [1, 3]);
     assert_eq!(prefixes.global_skipped(), 1);
-    assert!(prefixes.same_base.is_empty());
-    assert!(prefixes.cross_base.is_empty());
+    assert_eq!(prefixes.same_base, [] as [usize; 0]);
+    assert_eq!(prefixes.cross_base, [] as [usize; 0]);
 }
 
 #[test]

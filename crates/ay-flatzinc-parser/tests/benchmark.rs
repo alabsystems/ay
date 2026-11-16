@@ -65,7 +65,7 @@ fn test_parse_triangular_n9() {
     assert_eq!(model.parameters.len(), 2);
     assert_eq!(model.variables.len(), 49);
     assert_eq!(model.constraints.len(), 331);
-    assert!(model.predicates.is_empty());
+    assert_eq!(model.predicates.as_slice(), &[]);
     assert_maximize_objective(&model);
     assert_eq!(model.solve.annotations.len(), 1);
 }

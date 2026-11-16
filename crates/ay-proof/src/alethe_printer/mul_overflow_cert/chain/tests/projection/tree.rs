@@ -44,7 +44,7 @@ fn every_small_projection_keeps_exact_invariant_steps_and_proof_bytes() {
                 })
                 .collect();
             let actual = Chain::project(
-                &mut db.clone(),
+                &db,
                 &Model::default(),
                 &atoms,
                 &mut 1_000_000,
@@ -74,12 +74,12 @@ fn the_original_state_bound_is_enforced_before_enumeration() {
     let atoms: Vec<T> = (1..=MAX_STATE as T).collect();
     let fixed = atoms.iter().map(|&a| (a, true)).collect();
     assert_eq!(
-        Chain::project(&mut vec![], &fixed, &atoms, &mut 100_000, &owner),
+        Chain::project(&[], &fixed, &atoms, &mut 100_000, &owner),
         Some(HashSet::from_iter([vec![true; MAX_STATE]]))
     );
     let oversized = vec![1; MAX_STATE + 1];
     assert_eq!(
-        Chain::project(&mut vec![], &fixed, &oversized, &mut 100_000, &owner),
+        Chain::project(&[], &fixed, &oversized, &mut 100_000, &owner),
         None
     );
 }

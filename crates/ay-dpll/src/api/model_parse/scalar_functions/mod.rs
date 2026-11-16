@@ -8,12 +8,9 @@
 use ay_core::Sort;
 use ay_frontend::{sexp::parse_sexps, SExpr};
 
-use super::typed::Decoder;
+use super::{admission, typed::Decoder};
 use crate::api::types::{ModelValue, ScalarFunctionModel};
 
-// Reuse the existing allocation-free lexical envelope before any AST exists.
-#[path = "../get_value/admission.rs"]
-mod admission;
 mod body;
 mod budget;
 mod operations;
@@ -155,10 +152,7 @@ fn admit_expected(expected: &[(&str, &[Sort], &Sort)], budget: &mut Budget) -> O
             return None;
         }
         budget.scalar(Scalar::from_sort(result)?)?;
-        budget.charge(
-            args.len(),
-            args.len().checked_mul(std::mem::size_of::<Sort>())?,
-        )?;
+        budget.charge(args.len(), args.len().checked_mul(size_of::<Sort>())?)?;
         for sort in *args {
             budget.scalar(Scalar::from_sort(sort)?)?;
         }
@@ -249,11 +243,7 @@ fn decode(
             Scalar::from_sort(result)?,
             budget,
         )?;
-        budget.charge(
-            1,
-            name.len()
-                .checked_add(std::mem::size_of::<ScalarFunctionModel>())?,
-        )?;
+        budget.charge(1, name.len().checked_add(size_of::<ScalarFunctionModel>())?)?;
         models.push(ScalarFunctionModel::from_decoded(
             (*name).to_owned(),
             args.to_vec(),

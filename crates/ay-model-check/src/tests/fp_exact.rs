@@ -40,11 +40,11 @@ fn exact_min_max_checks_low_bits_negative_order_and_nan_selection() {
     let nan = exact(true, 255u32.into(), 1u32.into(), 8, 200);
     for name in ["fp.min", "fp.max"] {
         for args in [[nan.clone(), finite.clone()], [finite.clone(), nan.clone()]] {
-            let selected = crate::fp::min_max(name, &args).unwrap().unwrap();
-            assert!(crate::fp::same_element(&selected, &finite));
+            let selected = fp::min_max(name, &args).unwrap().unwrap();
+            assert!(fp::same_element(&selected, &finite));
         }
-        assert!(crate::fp::min_max(name, &[finite.clone()]).is_err());
-        assert!(crate::fp::min_max(
+        assert!(fp::min_max(name, &[finite.clone()]).is_err());
+        assert!(fp::min_max(
             name,
             &[
                 finite.clone(),
@@ -78,10 +78,10 @@ fn exact_min_max_zero_choice_rejects_nonzero_and_wrong_format() {
     let x = terms.mk_var("zero_x", sort.clone());
     let y = terms.mk_var("zero_y", sort.clone());
     for name in ["fp.min", "fp.max"] {
-        assert!(crate::fp::min_max_unspecified(name, &operands));
+        assert!(fp::min_max_unspecified(name, &operands));
         assert_eq!(
-            crate::fp::min_max(name, &operands).unwrap_err(),
-            crate::fp::UNDERSPECIFIED
+            fp::min_max(name, &operands).unwrap_err(),
+            fp::UNDERSPECIFIED
         );
         let application = app(&mut terms, name, &[x, y], sort.clone());
         let claim = app(&mut terms, "fp.isZero", &[application], Sort::Bool);
@@ -110,14 +110,14 @@ fn exact_min_max_zero_choice_rejects_nonzero_and_wrong_format() {
         }
     }
     for allowed in [positive, negative] {
-        assert!(crate::fp::check_min_max_choice(&operands, &allowed).is_ok());
+        assert!(fp::check_min_max_choice(&operands, &allowed).is_ok());
     }
     for invalid in [
         exact(false, 127u32.into(), 0u32.into(), 8, 200),
         exact(false, 0u32.into(), 0u32.into(), 8, 201),
         exact(false, 255u32.into(), 1u32.into(), 8, 200),
     ] {
-        assert!(crate::fp::check_min_max_choice(&operands, &invalid).is_err());
+        assert!(fp::check_min_max_choice(&operands, &invalid).is_err());
     }
 }
 
@@ -187,7 +187,7 @@ fn exact_fp_retained_memo_obeys_original_owner_and_fresh_request_recovers() {
         ),
         stopped: Cell::new(false),
     };
-    let evaluator = crate::eval::Evaluator::new(&terms, &owner);
+    let evaluator = Evaluator::new(&terms, &owner);
     assert!(matches!(evaluator.evaluate(x), EvalOutcome::Value(_)));
     owner.stopped.set(true);
     assert!(matches!(evaluator.evaluate(x), EvalOutcome::Unevaluable(_)));

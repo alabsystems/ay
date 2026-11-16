@@ -21,53 +21,14 @@ pub(crate) struct ScopedWindowLanes {
 }
 
 impl Executor {
-    /// Run `solve` over `ctx.assertions` with every session-persistent
-    /// incremental encoder swapped out for a fresh one, then restore them.
-    ///
-    /// `solve_scoped_assumptions` and `solve_quantified_assumptions` merge
-    /// query-local assumption literals into `ctx.assertions`. In incremental
-    /// mode the ordinary dispatch lands on lanes that keep ONE SAT solver per
-    /// session (`#lra-inc-engine`, the persist-SAT and lazy push/pop pipelines
-    /// on `incr_theory_state`, the BV lane on `incr_bv_state`). They encode
-    /// every root of `ctx.assertions` and add its activation unit at the
-    /// current scope depth. Restoring `ctx.assertions` does not retract that
-    /// unit: the assumption stays a hard constraint until the enclosing user
-    /// scope is popped, and at depth 0 forever. `(assert (not (= z x))) (push 1) (check-sat-assuming (p))
-    /// (assert (not p)) (check-sat)` answered `unsat`.
-    ///
-    /// An assumption literal must never enter a persistent clause database,
-    /// so the sub-solve gets fresh state, as `with_isolated_incremental_state`
-    /// gives every other inner solve. The saved state never sees the
-    /// assumptions and is put back on every exit, including a panic.
-    ///
-    /// Outside incremental mode this runs `solve` as is; the scoped route
-    /// uses [`Self::solve_scoped_window`], which does not.
-    pub(super) fn solve_without_persistent_encoding(
-        &mut self,
-        solve: fn(&mut Self) -> Result<SolveResult>,
-    ) -> Result<SolveResult> {
-        if !self.incremental_mode {
-            return solve(self);
-        }
-        let saved_theory = self
-            .incr_theory_state
-            .replace(IncrementalTheoryState::new());
-        let saved_bv = self.incr_bv_state.take();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solve(self)));
-        self.incr_theory_state = saved_theory;
-        self.incr_bv_state = saved_bv;
-        result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
-    }
-
     /// Solve the scoped route's window (`ctx.assertions` = base ∧ A) on lanes
     /// that are never the session's own, in EVERY session, and put the
     /// session's lanes back on every exit, a panic included.
     ///
     /// A session with `check-sat-assuming` and no `push` never enters
     /// incremental mode, but the lanes below the scoped route keep their state
-    /// across queries all the same; origin/main (whose
-    /// `solve_without_persistent_encoding` returns early there) solved the
-    /// window on the session's lanes, and its assumptions became permanent
+    /// across queries all the same; the predecessor solved the window on the
+    /// session's lanes, and its assumptions became permanent
     /// units (2026-09-29 scope-leak fix-up: a QF_NIA script of depth-0
     /// windows, `--z3-mode` wrong `unsat`; the same script with a `(push 1)
     /// (pop 1)` first is right). The lanes this solve gets are
@@ -95,8 +56,7 @@ impl Executor {
     /// The lanes a scoped window starts on, and whether they are kept for a
     /// later sub-solve of the same window in this query.
     ///
-    /// - In incremental mode: an empty theory lane and no BV lane, exactly
-    ///   [`Self::solve_without_persistent_encoding`].
+    /// - In incremental mode: an empty theory lane and no BV lane.
     /// - Outside it, the lanes an earlier sub-solve of the same window left
     ///   in this query, if any. Else, when no checked certificate is demanded
     ///   and the window contains every root of the query, a COPY of the

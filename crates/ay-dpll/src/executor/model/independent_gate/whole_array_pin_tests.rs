@@ -117,10 +117,11 @@ fn whole_caller_rejects_equal_but_foreign_arc_and_then_changed_original_source()
         "the original selected Arc still uses the actual caller"
     );
     drop(valid);
-    assert!(exec
-        .execute_all(&parse("(assert false)").expect("source change"))
-        .expect("source mutation only")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&parse("(assert false)").expect("source change"))
+            .expect("source mutation only"),
+        [] as [String; 0]
+    );
     assert!(exec
         .complete_functional_array_model_pin(leaf, selected)
         .is_none());

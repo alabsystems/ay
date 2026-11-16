@@ -69,6 +69,10 @@ fn padded_model(problem: &ChcProblem) -> InvariantModel {
         let ChcExpr::Op(ChcOp::And, facts) = &interpretation.formula else {
             panic!("the facts parse as one conjunction");
         };
+        #[expect(
+            clippy::rc_clone_in_vec_init,
+            reason = "the retained-model fixture intentionally shares one immutable padding node across the prefix"
+        )]
         let mut padded = vec![Arc::new(ChcExpr::Bool(true)); index];
         padded.extend(facts.iter().cloned());
         let formula = ChcExpr::Op(ChcOp::And, padded);

@@ -168,6 +168,10 @@ fn depth_width_and_names_are_bounded_even_when_every_support_is_empty() {
         deep = op(ChcOp::And, vec![deep]);
     }
     assert!(eliminate(&deep, "i", &ChcSort::BitVec(64)).is_none());
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the node-cap fixture intentionally shares one immutable leaf instead of materializing width nodes"
+    )]
     let wide = ChcExpr::Op(
         ChcOp::And,
         vec![Arc::new(leaf); MAX_SINGLETON_FORALL_INSPECTION_NODES],

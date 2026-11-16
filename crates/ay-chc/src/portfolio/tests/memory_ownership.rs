@@ -78,7 +78,7 @@ fn config(count: usize) -> PortfolioConfig {
 fn store(label: &str) -> TermStore {
     let mut terms = TermStore::new();
     for index in 0..32 {
-        terms.mk_var(format!("{label}_{index}"), Sort::bitvec(64));
+        let _ = terms.mk_var(format!("{label}_{index}"), Sort::bitvec(64));
     }
     assert!(terms.instance_term_bytes() > 0);
     terms

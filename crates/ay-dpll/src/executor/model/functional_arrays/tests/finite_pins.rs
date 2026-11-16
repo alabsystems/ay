@@ -380,10 +380,7 @@ fn finite_capture_clones_and_retries_share_the_original_exhausted_work_counter()
     let mut retry = Model::empty();
     exec.install_functional_array_candidate(&mut retry);
     assert!(retry.functional_arrays.is_none());
-    assert_eq!(
-        used.load(Ordering::Acquire),
-        super::super::work_counter::REFUSED
-    );
+    assert_eq!(used.load(Ordering::Acquire), REFUSED);
 }
 
 #[test]

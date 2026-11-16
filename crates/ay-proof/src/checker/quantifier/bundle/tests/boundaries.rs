@@ -79,7 +79,7 @@ fn unused_large_names_are_not_hidden_by_proof_root_reachability() {
     let mut fixture = Fixture::new();
     let baseline = work_used(&fixture, &[]);
     let name = "unused".repeat(16_384);
-    fixture.terms.mk_var(&name, Sort::Int);
+    let _unused_large_name = fixture.terms.mk_var(&name, Sort::Int);
     assert!(work_used(&fixture, &[]) >= baseline + name.len());
     let mut left = baseline + 1_024;
     assert_resource(fixture.authenticate(&[], &mut |work, _| {

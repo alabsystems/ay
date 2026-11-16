@@ -64,7 +64,7 @@ pub(super) struct Atoms {
 }
 
 impl Atoms {
-    fn new(p: &mut Proof, s: &Signed, row: &Row) -> Self {
+    fn new(p: &mut Proof<'_>, s: &Signed, row: &Row) -> Self {
         let t = &mut p.t;
         Atoms {
             xaa: t.eq(s.xa, s.a),
@@ -92,7 +92,7 @@ impl Atoms {
     }
 }
 
-pub(crate) fn prove(p: &mut Proof, s: &Signed, core: &Core<'_>, dl: &DivLemma) -> Option<S> {
+pub(crate) fn prove(p: &mut Proof<'_>, s: &Signed, core: &Core<'_>, dl: &DivLemma) -> Option<S> {
     let row = core.row;
     let at = Atoms::new(p, s, row);
     let zero = split_or(p, core.zero);
@@ -122,7 +122,7 @@ pub(crate) fn prove(p: &mut Proof, s: &Signed, core: &Core<'_>, dl: &DivLemma) -
 /// The core's words are the magnitudes: `(= a |B|)`, `(= p lo)` (returned)
 /// and the zero and quotient atoms read through them.
 fn core_words(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     s: &Signed,
     row: &Row,
     at: &Atoms,
@@ -166,7 +166,7 @@ fn core_words(
 }
 
 /// The magnitudes, the wrapped magnitude product and the limit by the signs.
-fn by_sign(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
+fn by_sign(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
     for (sign, x, same, neg) in [(s.sa, s.xa, at.xaa, at.xan), (s.sb, s.xb, at.xbb, at.xbn)] {
         let nsign = not(p, sign);
         facts.push(under(p, &[nsign], same, |p, h| branch(p, x, h[0]))?);
@@ -208,7 +208,7 @@ fn by_sign(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<
 
 /// One-bit facts of the product's and the divisor's sign bits; returns
 /// `(cl (not p0) (not p1))`.
-fn sign_bits(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<S> {
+fn sign_bits(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<S> {
     let (np0, np1) = (not(p, s.p0), not(p, s.p1));
     let (nd0, nd1) = (not(p, s.d0), not(p, s.d1));
     let not_both_p = bitfact(p, &[], &[np0, np1])?;
@@ -235,7 +235,7 @@ fn sign_bits(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Optio
 
 /// The divisor `D` is `B` off the special cases, and neither `D` nor `-D`
 /// is zero unless `B` is.
-fn divisor(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
+fn divisor(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
     let (nbz, nspec) = (not(p, s.bz), not(p, s.spec));
     facts.push(under(p, &[nbz, nspec], at.db, |p, h| {
         let mut prem = p.gate(s.dc);
@@ -260,7 +260,7 @@ fn divisor(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<
 }
 
 /// Zero operands, word by word, and the zero products they make.
-fn zero_operands(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
+fn zero_operands(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
     let nz = p.t.neg(s.z);
     for (w, x, neg, zero, same, negated) in [
         (s.a, s.xa, s.na, at.az, at.xaa, at.xan),
@@ -331,7 +331,7 @@ fn zero_operands(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> O
 
 /// The overflow side: the magnitude product against the limit by the
 /// product's sign bit, `B = 0` is not `B = -1`, and `MIN * -1` overflows.
-fn overflow(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
+fn overflow(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
     let (nlz, novl) = (not(p, at.lz), not(p, s.ovl));
     let (nlop, nlonp) = (not(p, at.lop), not(p, at.lonp));
     let (nmax, nmin) = (not(p, at.limmax), not(p, at.limmin));
@@ -363,7 +363,7 @@ fn overflow(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option
 }
 
 /// The `bvsdiv` case taken, and its result against `A`.
-fn case_taken(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
+fn case_taken(p: &mut Proof<'_>, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Option<()> {
     let paths: [Vec<(usize, bool)>; 4] = [
         vec![(0, true)],
         vec![(0, false), (1, true)],
@@ -372,7 +372,7 @@ fn case_taken(p: &mut Proof, s: &Signed, at: &Atoms, facts: &mut Vec<S>) -> Opti
     ];
     for (k, path) in paths.iter().enumerate() {
         let conds: Vec<T> = path.iter().map(|&(i, v)| lit(p, s.c[i], v)).collect();
-        let to_res = |p: &mut Proof, hs: &[S]| -> Option<S> {
+        let to_res = |p: &mut Proof<'_>, hs: &[S]| -> Option<S> {
             let mut chain = Vec::new();
             for (j, &(i, _)) in path.iter().enumerate() {
                 chain.push(branch(p, s.ites[i], hs[j])?);

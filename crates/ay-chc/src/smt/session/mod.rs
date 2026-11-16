@@ -94,9 +94,9 @@ pub(crate) fn session_trace() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct AssertId(pub(crate) u32);
 
-/// The arithmetic theory of a session, fixed per session from the PROBLEM's
-/// sorts (`problem.has_real_sorts()` etc., §2.3), never from a query. Mixed
-/// Int/Real problems use `Lia`.
+/// Arithmetic-theory classification used by conversion eligibility and lane
+/// census. Persistent `HornSmt` sessions are constructed only for `Lra`;
+/// `Lia` remains a classification for unsupported-route accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TheoryKind {
     Lra,
@@ -147,10 +147,9 @@ pub(crate) enum AssertState {
     Tombstone,
 }
 
-/// Session knobs. Defaults are the design's (§2.1); `theory` has no default.
+/// Session knobs. Defaults are the design's (§2.1).
 #[derive(Debug, Clone)]
 pub(crate) struct SessionConfig {
-    pub(crate) theory: TheoryKind,
     /// Shim conjuncts unused for this many queries are unit-killed.
     pub(crate) kill_after_queries: u64,
     pub(crate) rebuild_dead_vars: usize,
@@ -196,9 +195,8 @@ pub(crate) struct SessionConfig {
 }
 
 impl SessionConfig {
-    pub(crate) fn new(theory: TheoryKind) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            theory,
             kill_after_queries: 4,
             rebuild_dead_vars: 4_096,
             rebuild_queries_after: 256,
@@ -218,7 +216,7 @@ impl SessionConfig {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self::new(TheoryKind::Lra)
+        Self::new()
     }
 }
 
@@ -269,9 +267,9 @@ pub(crate) enum PoisonKind {
 pub(crate) enum UnknownReason {
     Budget(BudgetKind),
     Unsupported(UnsupportedKind),
-    /// LRA/LIA `TheoryResult::Unknown` not at a deadline, an unmappable
-    /// conflict literal, or the strict-verification demotion of a SAT model
-    /// (the `missing assignment` class).
+    /// LRA `TheoryResult::Unknown` not at a deadline, an unmappable conflict
+    /// literal, or the strict-verification demotion of a SAT model (the
+    /// `missing assignment` class).
     TheoryIncomplete,
     /// An internal invariant tripped; the session is rebuilt before next use.
     Poisoned(PoisonKind),
@@ -320,11 +318,7 @@ impl Default for LogHistogram {
 
 impl LogHistogram {
     pub(crate) fn record(&mut self, v: u64) {
-        let bucket = if v == 0 {
-            0
-        } else {
-            (u64::BITS - v.leading_zeros()) as usize
-        };
+        let bucket = v.bit_width() as usize;
         self.buckets[bucket] += 1;
         self.count += 1;
         self.sum = self.sum.saturating_add(v);
@@ -508,19 +502,16 @@ pub(crate) struct HornSmt {
 
 impl HornSmt {
     /// Build the session: fresh `SmtContext` (with `datatype_defs`), Tseitin
-    /// state, `ay_sat::Solver` in the `#lra-inc-engine` profile (§2.10), and the
-    /// theory for `cfg.theory`.
+    /// state, `ay_sat::Solver` in the `#lra-inc-engine` profile (§2.10), and
+    /// the LRA theory.
     pub(crate) fn new(cfg: SessionConfig, datatype_defs: Option<&DatatypeDefs>) -> Self {
-        let kind = cfg.theory;
-        Self::build(cfg, datatype_defs, |own| {
-            theory_box::TheoryBox::new_for(kind, own)
-        })
+        Self::build(cfg, datatype_defs, theory_box::TheoryBox::new)
     }
 
     /// Test-only: a session over a caller-supplied theory (`TheoryBox::mock`),
     /// the injection hook the bridge unit tests and the Poison locks need.
-    /// `rebuild()` builds its replacement with `new`, i.e. the configured
-    /// theory kind, not the mock.
+    /// `rebuild()` builds its replacement with `new`, i.e. the LRA theory,
+    /// not the mock.
     #[cfg(test)]
     pub(super) fn with_theory(cfg: SessionConfig, theory: theory_box::TheoryBox) -> Self {
         // Scripted mock theories count their calls; keep their call sequence
@@ -620,7 +611,7 @@ impl HornSmt {
         partition: Partition,
         origin: AssertOrigin,
     ) -> Result<AssertId, UnknownReason> {
-        convert_memo::eligible(c, self.cfg.theory, convert_memo::Rung::Rung1)
+        convert_memo::eligible(c, TheoryKind::Lra, convert_memo::Rung::Rung1)
             .map_err(UnknownReason::Unsupported)?;
         let key = convert_memo::ConvertMemo::key_of(c);
         if let Some(&id) = self.by_key.get(&key) {
@@ -1007,7 +998,6 @@ impl HornSmt {
         self.stats
             .assumptions_per_query
             .record(assumptions.len() as u64);
-        self.theory.set_deadline(deadline);
         self.sat.set_solve_deadline(deadline);
         let interrupt = self.interrupt.clone();
         let should_stop = move || {
@@ -1040,7 +1030,7 @@ impl HornSmt {
         } = self;
         let parts = bridge::BridgeParts {
             theory,
-            own: &mut **own,
+            own,
             tseitin,
             st: bridge_state,
             ledger,
@@ -1576,8 +1566,8 @@ fn poison_unknown(poisoned: &mut Option<PoisonKind>) -> HornCheck {
 /// Drop guard created by `run_query` around ONE query: on every exit path —
 /// including early `Unknown(Budget)` returns — it pops the theory to scope 0
 /// through `bridge.backtrack(0)` (§2.4; A-lifetime minor). Model extraction
-/// happens INSIDE the guard's scope, before it drops (LIA clears
-/// `direct_enum_witness` on push/pop).
+/// happens INSIDE the guard's scope, before it drops; theory model values are
+/// scope-bound and unavailable after backtracking.
 ///
 /// Division of labour with `TheoryBridge::init()`: a §4.2 re-entry re-solves
 /// the same query on the same bridge, and ay-sat's incremental reset drops
@@ -1694,8 +1684,11 @@ mod tests {
     /// query answers (WP-3 hazard H1).
     #[test]
     fn in_call_rebuild_keeps_the_conjuncts_staged_for_this_query() {
-        let mut cfg = SessionConfig::default();
-        cfg.rebuild_queries_after = 1;
+        let base = SessionConfig::default();
+        let cfg = SessionConfig {
+            rebuild_queries_after: 1,
+            ..base
+        };
         let mut s = HornSmt::new(cfg, None);
         let _ = s.check_assuming_unverified(&[], &[], Some(Duration::ZERO));
         assert!(s.should_rebuild());
@@ -1867,7 +1860,7 @@ mod tests {
             s.tseitin().as_ref().unwrap().term_to_var.contains_key(&eq),
             "the minted equality keeps its SAT variable"
         );
-        assert!(s.stats().ext_full_reset_hits == 0);
+        assert_eq!(s.stats().ext_full_reset_hits, 0);
 
         // The same query again: the original is in the clause DB, the theory
         // has nothing to ask, no re-entry.

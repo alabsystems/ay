@@ -287,7 +287,7 @@ impl Solver {
                     .executor
                     .context_mut_internal()
                     .replace_soft_constraints(installed);
-                debug_assert!(displaced.is_empty());
+                debug_assert_eq!(displaced, [] as [SoftAssertion; 0]);
             }
             let installed_native_softs = self
                 .executor

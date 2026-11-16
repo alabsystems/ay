@@ -23,9 +23,9 @@ use wait_timeout::ChildExt;
 /// Default child deadline. Keep it BELOW the file's ntest #[timeout] (most
 /// files use 30_000 ms) so this helper fires first and the test thread
 /// unwinds normally instead of being detached.
-pub const DEFAULT_CHILD_TIMEOUT: Duration = Duration::from_secs(25);
+pub(crate) const DEFAULT_CHILD_TIMEOUT: Duration = Duration::from_secs(25);
 
-pub trait OutputTimeout {
+pub(crate) trait OutputTimeout {
     /// Drop-in replacement for `Command::output()`.
     /// Differences: own process group; stdout/stderr drained on reader
     /// threads (no 64 KiB pipe-buffer deadlock — the sat_par2_harness house

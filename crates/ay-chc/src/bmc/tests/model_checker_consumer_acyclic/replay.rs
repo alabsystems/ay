@@ -50,7 +50,7 @@ fn assert_original_values(checked: &ChcValidatedGroundDerivation, expected: &Big
     for (index, step) in checked.steps().enumerate() {
         assert_eq!(step.clause_index(), index);
         if index == 0 {
-            assert!(step.premises().is_empty());
+            assert_eq!(step.premises(), &[] as &[usize]);
         } else {
             assert_eq!(step.premises(), &[index - 1]);
         }

@@ -174,8 +174,8 @@ fn threads_alive_at_once_write_different_stripes() {
     // Only a stack a whole cycle of stripes away, give or take the one
     // window the two markers can straddle, may share a stripe.
     let off_cycle = apart % STRIPES_APART;
-    let a_cycle_apart = apart >= STRIPES_APART - WINDOW
-        && (off_cycle < WINDOW || off_cycle > STRIPES_APART - WINDOW);
+    let a_cycle_apart =
+        apart >= STRIPES_APART - WINDOW && !(WINDOW..=STRIPES_APART - WINDOW).contains(&off_cycle);
     assert!(
         first_stripe != second_stripe || a_cycle_apart,
         "threads {apart} bytes apart share stripe {first_stripe}"

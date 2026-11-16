@@ -36,7 +36,7 @@ fn shared_work_allowance_and_public_decode_precharge_fail_closed() {
     assert_eq!(decoder.decode(&SExpr::True, &Sort::Bool), None);
     assert_eq!(decoder.charge(0), None);
     let mut decoder = Decoder::new();
-    decoder.bytes = std::mem::size_of::<&SExpr>() + std::mem::size_of::<ModelValue>();
+    decoder.bytes = size_of::<&SExpr>() + size_of::<ModelValue>();
     assert_eq!(
         decoder.decode(&SExpr::True, &Sort::Bool),
         Some(ModelValue::Bool(true))
@@ -44,7 +44,7 @@ fn shared_work_allowance_and_public_decode_precharge_fail_closed() {
     assert_eq!(decoder.bytes, 0);
     assert_eq!(decoder.decode(&SExpr::True, &Sort::Bool), None);
     let mut decoder = Decoder::new();
-    decoder.bytes = std::mem::size_of::<&SExpr>() + std::mem::size_of::<ModelValue>() - 1;
+    decoder.bytes = size_of::<&SExpr>() + size_of::<ModelValue>() - 1;
     assert_eq!(decoder.decode(&SExpr::True, &Sort::Bool), None);
 }
 

@@ -12,7 +12,7 @@ fn fixture(argument: Sort, count: usize) -> (TermStore, Vec<TermId>) {
     let mut terms = TermStore::new();
     let mut roots = Vec::new();
     for i in 0..count {
-        let arg = terms.mk_var(&format!("x{i}"), argument.clone());
+        let arg = terms.mk_var(format!("x{i}"), argument.clone());
         roots.push(terms.mk_app(Symbol::named("foreign"), [arg], Sort::Bool));
     }
     (terms, roots)
@@ -185,7 +185,10 @@ fn the_exact_group_cap_and_unencodable_argument_refusals_are_preserved() {
         })
         .unwrap();
         assert!(plan.incomplete && plan.clauses.is_empty());
-        assert!(owner.finish().unwrap().clauses.is_empty());
+        assert_eq!(
+            owner.finish().unwrap().clauses,
+            [] as [ay_core::CnfClause; 0]
+        );
         if count == 65 {
             assert_eq!(checks.get(), 3); // Entry, skipped group, final.
         } else {

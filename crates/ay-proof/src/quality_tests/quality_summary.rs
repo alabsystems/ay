@@ -96,7 +96,7 @@ fn test_has_trust_steps_false_for_verified_proof() {
         !quality.has_trust_steps(),
         "has_trust_steps should be false for fully verified proof"
     );
-    assert!(quality.trust_theory_kinds.is_empty());
+    assert_eq!(quality.trust_theory_kinds, []);
 }
 
 #[test]

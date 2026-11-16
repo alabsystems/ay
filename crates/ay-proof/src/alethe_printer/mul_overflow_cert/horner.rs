@@ -14,7 +14,7 @@ use super::term::T;
 /// Under the assumption step `asm` (`e0` or `(not e0)`), `(= (bvmul other wd) other)`
 /// or `(= (bvmul other wd) 0)` where `wd = bb(e0, false, ..)`.
 pub(crate) fn bit_times(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     e0: T,
     positive: bool,
     asm: S,
@@ -54,7 +54,7 @@ pub(crate) fn bit_times(
 }
 
 /// `(cl K)` for a ground side condition `K` by evaluation.
-pub(crate) fn ground(p: &mut Proof, k: T) -> Option<S> {
+pub(crate) fn ground(p: &mut Proof<'_>, k: T) -> Option<S> {
     let tt = p.t.tt;
     let e = p.t.eq(k, tt);
     let ev = p.emit(&[e], "evaluate", &[], &[]);
@@ -65,7 +65,7 @@ pub(crate) fn ground(p: &mut Proof, k: T) -> Option<S> {
 }
 
 /// Close a lemma body `(or (not A_1) .. (not A_k) C)` proved as the clause `spc`.
-pub(crate) fn body_from_clause(p: &mut Proof, body: T, spc: S) -> Option<S> {
+pub(crate) fn body_from_clause(p: &mut Proof<'_>, body: T, spc: S) -> Option<S> {
     let args = p.t.args(body).to_vec();
     let mut prem = vec![Prem::Step(spc)];
     for (i, &d) in args.iter().enumerate() {
@@ -81,6 +81,6 @@ pub(crate) fn body_from_clause(p: &mut Proof, body: T, spc: S) -> Option<S> {
 }
 
 /// `(cl c)` for the conjunction `c` from facts for its conjuncts.
-pub(crate) fn and_from(p: &mut Proof, c: T, facts: &[S]) -> Option<S> {
+pub(crate) fn and_from(p: &mut Proof<'_>, c: T, facts: &[S]) -> Option<S> {
     super::helpers::conjoin(p, c, facts)
 }

@@ -167,16 +167,17 @@ fn cnf_work_counter_overflow_refuses_instead_of_reporting_saturation() {
     let proof = fixture(BvOp::Xor, 1);
     let limits = limits(&proof);
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        true
-    };
-    let mut budget = ReplayBudget::new(&limits, &mut callback);
-    assert_eq!(budget.add_work(usize::MAX), Ok(()));
-    assert_eq!(budget.work(), u64::MAX);
-    assert_eq!(budget.add_work(1), Err(BvBlastValidateError::WorkOverflow));
-    assert_eq!(budget.work(), u64::MAX, "no wrapped or saturated new debit");
-    assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
-    drop(budget);
+    {
+        let mut callback = || {
+            calls += 1;
+            true
+        };
+        let mut budget = ReplayBudget::new(&limits, &mut callback);
+        assert_eq!(budget.add_work(usize::MAX), Ok(()));
+        assert_eq!(budget.work(), u64::MAX);
+        assert_eq!(budget.add_work(1), Err(BvBlastValidateError::WorkOverflow));
+        assert_eq!(budget.work(), u64::MAX, "no wrapped or saturated new debit");
+        assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
+    }
     assert_eq!(calls, 1, "overflow cannot publish or restart the budget");
 }

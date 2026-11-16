@@ -14,13 +14,26 @@ pub enum ModelRecoveryFact<'a> {
     ScanSlots(usize),
     /// One valid graph node and its immediate union-find parent. Consumers must
     /// bound/check their traversal; no missing node is claimed a singleton.
-    Parent { term: TermId, parent: TermId },
+    Parent {
+        /// The graph node.
+        term: TermId,
+        /// The node's immediate union-find parent.
+        parent: TermId,
+    },
     /// An active Boolean assignment (also a current kernel-inventory root).
-    Boolean { term: TermId, value: bool },
+    Boolean {
+        /// The assigned Boolean term.
+        term: TermId,
+        /// The term's current truth value.
+        value: bool,
+    },
     /// An active decoded equality/biconditional, with its actual truth value.
     Equality {
+        /// The equality's left endpoint.
         left: TermId,
+        /// The equality's right endpoint.
         right: TermId,
+        /// Whether the endpoints are currently equal.
         equal: bool,
     },
     /// An active TRUE distinct atom. Every pair, not only a false equality,
@@ -29,7 +42,12 @@ pub enum ModelRecoveryFact<'a> {
     /// A scoped live disequality communicated by another theory (including
     /// arithmetic). Its endpoints are current kernel occurrences, not guesses
     /// from the absence of an explicit false equality.
-    SharedDisequality { left: TermId, right: TermId },
+    SharedDisequality {
+        /// The disequality's left endpoint.
+        left: TermId,
+        /// The disequality's right endpoint.
+        right: TermId,
+    },
 }
 
 impl EufSolver<'_> {

@@ -68,7 +68,7 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("c {error}");
             println!("s NOT VERIFIED");
-            return ExitCode::from(1);
+            ExitCode::from(1)
         }
     }
 }

@@ -136,8 +136,8 @@ fn test_bve_rebuild_skips_garbage_clause_with_removed_variable() {
 
     bve.rebuild(&clauses);
 
-    assert!(bve.get_occs(lit(0, true)).is_empty());
-    assert!(bve.get_occs(lit(1, true)).is_empty());
+    assert_eq!(bve.get_occs(lit(0, true)).len(), 0);
+    assert_eq!(bve.get_occs(lit(1, true)).len(), 0);
 }
 
 /// CaDiCaL fastelim product shortcut (elimfast.cpp:85-88, :239):
@@ -481,7 +481,7 @@ fn test_bve_run_elimination() {
     let results = bve.run_elimination(&mut clauses, &vals, frozen, 1);
 
     // Some variable should be eliminated
-    assert!(!results.is_empty());
+    assert_ne!(results.len(), 0);
     assert!(results.iter().any(|r| r.eliminated));
 }
 
@@ -2273,8 +2273,8 @@ fn test_backward_subsumption_basic() {
 
     assert_eq!(result.subsumed.len(), 1, "c0 should be subsumed by r0");
     assert_eq!(result.subsumed[0], c0);
-    assert!(result.strengthened.is_empty());
-    assert!(result.units.is_empty());
+    assert_eq!(result.strengthened.len(), 0);
+    assert_eq!(result.units.len(), 0);
     assert_eq!(bve.stats().backward_subsumed, 1);
 }
 
@@ -2316,7 +2316,7 @@ fn test_backward_self_subsumption() {
         lit(2, false),
         "~b should be removed"
     );
-    assert!(result.units.is_empty());
+    assert_eq!(result.units.len(), 0);
     assert_eq!(bve.stats().backward_strengthened, 1);
 }
 
@@ -2344,7 +2344,7 @@ fn test_backward_hyper_unary_resolution() {
 
     let result = bve.backward_subsume_resolvents(&clauses, &[r0], &mut marks, &vals);
 
-    assert!(result.subsumed.is_empty());
+    assert_eq!(result.subsumed.len(), 0);
     // Hyper-unary resolution: complementary pair (a, b) and (a, ~b) with
     // d_active == active_size and exactly one non-negated active literal
     // triggers direct unit derivation of `a` (CaDiCaL backward.cpp:119-148).
@@ -2380,8 +2380,8 @@ fn test_backward_no_subsumption_resolvent_larger() {
         result.subsumed.is_empty(),
         "shorter clause should not be subsumed"
     );
-    assert!(result.strengthened.is_empty());
-    assert!(result.units.is_empty());
+    assert_eq!(result.strengthened.len(), 0);
+    assert_eq!(result.units.len(), 0);
 }
 
 /// The resolvent should not subsume itself.
@@ -2488,9 +2488,9 @@ fn test_backward_two_negated_skips() {
 
     let result = bve.backward_subsume_resolvents(&clauses, &[r0], &mut marks, &vals);
 
-    assert!(result.subsumed.is_empty());
-    assert!(result.strengthened.is_empty());
-    assert!(result.units.is_empty());
+    assert_eq!(result.subsumed.len(), 0);
+    assert_eq!(result.strengthened.len(), 0);
+    assert_eq!(result.units.len(), 0);
 }
 
 /// Satisfied candidate (at root level) is collected for deletion (#8007).

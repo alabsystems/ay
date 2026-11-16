@@ -64,8 +64,9 @@ fn the_script_channels_ignore_a_verdict_only_search() {
         "the script executor stays proof-carrying under a verdict-only scope"
     );
     let built_before = shed_search_executors_built();
-    let verdict = super::super::smtlib_first_verdict_via_executor(
+    let verdict = super::super::smtlib_first_verdict_via_executor_until(
         "(set-logic QF_LIA)\n(declare-const x Int)\n(assert (> x x))\n(check-sat)\n",
+        ay_core::time::Instant::now() + std::time::Duration::from_mins(1),
         None,
     );
     assert_eq!(verdict.as_deref(), Some("unsat"));

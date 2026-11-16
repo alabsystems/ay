@@ -238,8 +238,11 @@ fn whole_division_relation_keeps_all_original_roots_and_both_input_words() {
         let namespace = ChcProblem::new();
         let output = lower_fp_clause(&terms, &roots, &inputs, &namespace, budget).unwrap();
         assert_eq!(output.source_roots(), &roots);
-        assert!(std::ptr::eq(output.source_terms(), &terms));
-        assert!(std::ptr::eq(output.source_namespace(), &namespace));
+        assert!(std::ptr::eq(output.source_terms(), &raw const terms));
+        assert!(std::ptr::eq(
+            output.source_namespace(),
+            &raw const namespace
+        ));
         assert!(output
             .auxiliary_variables()
             .iter()
@@ -420,12 +423,13 @@ fn division_multiplicity_never_raises_the_original_complete_gate_ceiling() {
     let actual = div(&mut terms, x, y, 32, RoundingMode::RNE);
     let root = predicate(&mut terms, "fp.isNormal", &[actual]);
     let mut checkpoint = || ControlFlow::Continue(());
-    let mut budget = WorkBudget::new(10_000_000_000, &mut checkpoint);
-    assert!(matches!(
-        source::plan(&terms, &[root; 32], &[], &mut budget),
-        Err(FpAdapterError::Unsupported("complete circuit envelope"))
-    ));
-    drop(budget);
+    {
+        let mut budget = WorkBudget::new(10_000_000_000, &mut checkpoint);
+        assert!(matches!(
+            source::plan(&terms, &[root; 32], &[], &mut budget),
+            Err(FpAdapterError::Unsupported("complete circuit envelope"))
+        ));
+    }
     let mut zero = WorkBudget::new(0, &mut checkpoint);
     assert!(matches!(
         lower_fp_clause(&terms, &[root], &[], &ChcProblem::new(), &mut zero),

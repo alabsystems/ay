@@ -16,7 +16,7 @@ fn explicit_ground_formats_and_default_v1_retain_exact_payloads() {
         Format::SmtlibV1,
     ] {
         let mut callback = || true;
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exported = Vec::new();
         let plan = select_plan(
             Some(preferred),
@@ -42,7 +42,7 @@ fn explicit_ground_formats_and_default_v1_retain_exact_payloads() {
 #[test]
 fn ordinary_v1_rejection_upgrades_even_with_interruption_text() {
     let mut callback = || true;
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = live_progress(&mut callback);
     let mut exported = Vec::new();
     let plan = select_plan(
         Some(Format::SmtlibV1),
@@ -78,7 +78,7 @@ fn explicit_smt_and_absent_ground_payloads_preserve_single_fallback() {
         Some(Format::GroundDerivationV2),
     ] {
         let mut callback = || true;
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exported = Vec::new();
         let fallbacks = Cell::new(0);
         let plan = select_plan(
@@ -118,7 +118,7 @@ fn ordinary_rejections_preserve_smt_fallback_without_explicit_version_probing() 
         Format::SmtlibV1,
     ] {
         let mut callback = || true;
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exported = Vec::new();
         let plan = select_plan(
             Some(preferred),
@@ -148,7 +148,7 @@ fn absent_payload_preserves_the_original_fallback_error() {
         Some(Format::SmtlibV1),
     ] {
         let mut callback = || true;
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let result = select_plan(
             preferred,
             |_, _| Ok(None),
@@ -165,7 +165,7 @@ fn absent_payload_preserves_the_original_fallback_error() {
 fn failed_upgrade_keeps_both_reasons_and_absent_v2_keeps_v1_reason() {
     for v2_absent in [false, true] {
         let mut callback = || true;
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exported = Vec::new();
         let result = select_plan(
             Some(Format::SmtlibV1),

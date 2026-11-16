@@ -145,7 +145,7 @@ mod tests {
         // cap 10 the budget (40) covers the space and the first 10
         // clauses of the partial subset are emitted as before.
         for index in 0..8_usize {
-            let argument = executor.ctx.terms.mk_var(&format!("x{index}"), Sort::Int);
+            let argument = executor.ctx.terms.mk_var(format!("x{index}"), Sort::Int);
             let app = executor
                 .ctx
                 .terms

@@ -303,11 +303,11 @@ impl Pools {
                         &[&self.pick(rng, Kind::Bool), &self.pick(rng, Kind::Bool)],
                     ),
                     4 => op(
-                        [ChcOp::Le, ChcOp::Lt, ChcOp::Ge, ChcOp::Gt][rng.below(4)].clone(),
+                        [ChcOp::Le, ChcOp::Lt, ChcOp::Ge, ChcOp::Gt][rng.below(4)],
                         &[&self.pick(rng, num), &self.pick(rng, num)],
                     ),
                     5 => op(
-                        [ChcOp::Eq, ChcOp::Ne][rng.below(2)].clone(),
+                        [ChcOp::Eq, ChcOp::Ne][rng.below(2)],
                         &[&self.pick(rng, num), &self.pick(rng, num)],
                     ),
                     _ => op(

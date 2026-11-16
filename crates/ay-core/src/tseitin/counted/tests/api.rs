@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 fn actual_public_exports_preserve_rows_steps_and_exact_materialized_literals() {
     let (mut terms, root, _) = formula(CountedBuiltin::Distinct);
     let original = ample();
-    let cnf = crate::CountedCnf::encode(&mut terms, &[root], &original).unwrap();
+    let cnf = CountedCnf::encode(&mut terms, &[root], &original).unwrap();
     let _: &crate::CountedCnfRow = &cnf.rows()[0];
     let _: &crate::CountedCnfStep = &cnf.steps()[0];
     let _: crate::CountedCnfDistinctBridge = cnf.bridges()[0];
     let _: crate::CountedCnfJustification = cnf.rows()[0].justification();
     assert_eq!(cnf.roots(), [root]);
-    assert!(cnf.theory_atoms().is_empty());
+    assert_eq!(cnf.theory_atoms(), &[]);
     for step in cnf.steps() {
         let _ = (step.rule(), step.source(), step.premises(), step.pivot());
         for &literal in step.clause() {

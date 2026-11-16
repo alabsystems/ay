@@ -46,7 +46,7 @@ impl ConflictAnalyzer {
 
     /// The normal constructor has only scalars and empty, unallocated buffers.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         Ok(Self::new(num_vars))
     }
 
@@ -110,37 +110,6 @@ impl ConflictAnalyzer {
         try_reserve(owner, &mut self.learned, 1)
     }
 
-    pub(crate) fn prepare_counted_ic3_lbd(
-        &mut self,
-        num_vars: usize,
-        owner: &CountedAdmission,
-    ) -> Result<()> {
-        owner.admit(1, 0)?;
-        let required = num_vars
-            .checked_add(1)
-            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
-        let growth = required.saturating_sub(self.lbd_seen.len());
-        let count = self
-            .learned
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
-        let work = count
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(growth))
-            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
-        // Existing compute_lbd reads each literal, marks distinct levels and
-        // clears them. The third count also covers exceptional retirement.
-        owner.admit(work, 0)?;
-        try_reserve(owner, &mut self.lbd_seen, growth)?;
-        try_reserve(owner, &mut self.lbd_to_clear, count)?;
-        Ok(())
-    }
-
-    pub(crate) fn counted_ic3_lower_literals(&self) -> &[crate::literal::Literal] {
-        &self.learned
-    }
-
     pub(crate) fn prepare_counted_minimize_copy(&mut self, owner: &CountedAdmission) -> Result<()> {
         // Copy traversal and eventual buffer clear/destruction are paid here.
         let work = self
@@ -192,7 +161,7 @@ mod tests {
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
         assert_eq!(
             owner.usage().unwrap().storage_admitted,
-            std::mem::size_of::<ConflictAnalyzer>()
+            size_of::<ConflictAnalyzer>()
         );
     }
 }

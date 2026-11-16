@@ -262,7 +262,7 @@ fn dry_run_github_account_check_records_policy_without_gh_probe() {
     )
     .expect("dry-run account warning succeeds");
 
-    assert!(report.commands.is_empty());
+    assert_eq!(report.commands.as_slice(), &[] as &[JsonValue]);
     assert!(report.steps.iter().any(|step| step["name"]
         .as_str()
         .is_some_and(|name| name == "github_account_policy")));

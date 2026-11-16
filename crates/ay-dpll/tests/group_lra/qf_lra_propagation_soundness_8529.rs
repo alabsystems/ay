@@ -33,10 +33,8 @@ const DETERMINISM_RUNS: usize = 15;
 #[test]
 #[ntest::timeout(300_000)]
 fn test_synched_base_release_unsat_8529() -> Result<()> {
-    use crate::common::{
-        check_z3_or_skip, run_executor_file_with_timeout, run_z3_file, workspace_path,
-        SolverOutcome,
-    };
+    use crate::common::z3::{check_z3_or_skip, run_z3_file};
+    use crate::common::{run_executor_file_with_timeout, workspace_path, SolverOutcome};
 
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/synched.base.smt2");
     if !path.exists() && crate::common::corpus_skip_allowed(&path) {

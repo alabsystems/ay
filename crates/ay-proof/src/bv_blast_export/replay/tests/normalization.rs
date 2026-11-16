@@ -57,32 +57,34 @@ fn normalization_and_every_candidate_comparison_keep_sticky_cancellation() {
     let proof = fixture(BvOp::Xor, 2);
     let limits = limits(&proof);
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        true
-    };
-    let mut budget = ReplayBudget::new(&limits, &mut callback);
-    assert_eq!(clauses::validate(&proof, &mut budget), Ok(()));
-    drop(budget);
+    {
+        let mut callback = || {
+            calls += 1;
+            true
+        };
+        let mut budget = ReplayBudget::new(&limits, &mut callback);
+        assert_eq!(clauses::validate(&proof, &mut budget), Ok(()));
+    }
     assert!(calls > 30 && calls < 2_000);
     for stop in 1..=calls {
         let mut observed = 0;
-        let mut callback = || {
-            observed += 1;
-            observed != stop
-        };
-        let mut budget = ReplayBudget::new(&limits, &mut callback);
-        assert_eq!(
-            clauses::validate(&proof, &mut budget),
-            Err(BvBlastValidateError::Cancelled),
-            "comparison/normalization poll {stop}/{calls}"
-        );
-        assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
-        assert_eq!(
-            clauses::validate(&proof, &mut budget),
-            Err(BvBlastValidateError::Cancelled)
-        );
-        drop(budget);
+        {
+            let mut callback = || {
+                observed += 1;
+                observed != stop
+            };
+            let mut budget = ReplayBudget::new(&limits, &mut callback);
+            assert_eq!(
+                clauses::validate(&proof, &mut budget),
+                Err(BvBlastValidateError::Cancelled),
+                "comparison/normalization poll {stop}/{calls}"
+            );
+            assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
+            assert_eq!(
+                clauses::validate(&proof, &mut budget),
+                Err(BvBlastValidateError::Cancelled)
+            );
+        }
         assert_eq!(observed, stop);
     }
 }

@@ -926,11 +926,8 @@ impl CnfEncoder {
                 // only define fresh auxiliaries), which can never manufacture
                 // UNSAT, and whose models the caller must verify. The
                 // interruptible encoder abandons the encode instead.
-                if adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var)
-                    .is_none()
-                {
-                    return;
-                }
+                let _ =
+                    adder::encode_adder(coeffs, lits, rhs, &mut self.clauses, &mut self.next_var);
             }
         }
     }
@@ -1880,7 +1877,7 @@ mod tests {
 
         let encoded = CnfEncoder::encode_instance(&instance);
         assert!(encoded.num_vars >= 3);
-        assert!(!encoded.clauses.is_empty());
+        assert_ne!(encoded.clauses.as_slice(), &[] as &[Vec<i32>]);
 
         // x1=true, x2=true, x3=false should satisfy both constraints.
         assert!(crate::solver::eval_constraint(
@@ -2060,7 +2057,7 @@ mod tests {
         };
         let mut enc = CnfEncoder::new(0);
         enc.encode_constraint(&constraint);
-        assert!(enc.clauses.is_empty());
+        assert_eq!(enc.clauses.as_slice(), &[] as &[Vec<i32>]);
     }
 
     #[test]

@@ -50,9 +50,6 @@ const GE_WORK_BUDGET: u128 = 1 << 28;
 pub(super) struct GeBasis {
     pub free: Vec<u32>,
     pub exprs: Vec<Definition>,
-    /// Parity constant per expression: `x_pivot = expr_rhs[i] XOR
-    /// (parity of exprs[i].inputs)`. Parallel to `exprs`.
-    pub expr_rhs: Vec<bool>,
 }
 
 /// Build the GF(2) basis from the recovered gates, or `None` when there is
@@ -103,7 +100,7 @@ pub(super) fn build_ge_basis(
         rhs.push(*r);
     }
     let pivot_of_col = gauss_jordan(&mut rows, &mut rhs, cols.len())?;
-    read_basis(&rows, &rhs, &pivot_of_col, &cols)
+    read_basis(&rows, &pivot_of_col, &cols)
 }
 
 /// Dedupe XOR gates into `(sorted variables, rhs)` equations over decidable
@@ -216,15 +213,9 @@ fn gauss_jordan(
 /// Read free variables and pivot expressions out of the RREF matrix. In
 /// RREF a pivot row's set bits are its pivot column plus free columns only,
 /// so the expression is the row's bit set minus the pivot.
-fn read_basis(
-    rows: &[Vec<u64>],
-    rhs: &[bool],
-    pivot_of_col: &[Option<usize>],
-    cols: &[u32],
-) -> Option<GeBasis> {
+fn read_basis(rows: &[Vec<u64>], pivot_of_col: &[Option<usize>], cols: &[u32]) -> Option<GeBasis> {
     let mut free: Vec<u32> = Vec::new();
     let mut exprs: Vec<Definition> = Vec::new();
-    let mut expr_rhs: Vec<bool> = Vec::new();
     for (col, piv) in pivot_of_col.iter().enumerate() {
         let var = *cols.get(col)?;
         match *piv {
@@ -241,7 +232,6 @@ fn read_basis(
                     output: var,
                     inputs,
                 });
-                expr_rhs.push(*rhs.get(row_idx)?);
             }
         }
     }
@@ -249,9 +239,5 @@ fn read_basis(
     if exprs.is_empty() {
         return None;
     }
-    Some(GeBasis {
-        free,
-        exprs,
-        expr_rhs,
-    })
+    Some(GeBasis { free, exprs })
 }

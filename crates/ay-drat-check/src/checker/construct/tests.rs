@@ -115,7 +115,7 @@ fn zero_variable_universe_still_admits_initial_hash_storage_and_fill() {
     })
     .unwrap();
     assert_eq!(checker.hash_buckets.len(), INITIAL_HASH_CAPACITY);
-    assert!(checker.assigns.is_empty());
+    assert_eq!(checker.assigns.as_slice(), &[] as &[Option<bool>]);
     assert_eq!(
         offers.iter().map(|(_, bytes)| bytes).sum::<usize>(),
         INITIAL_HASH_CAPACITY * size_of::<Vec<usize>>()

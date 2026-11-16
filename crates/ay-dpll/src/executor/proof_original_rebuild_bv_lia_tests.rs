@@ -71,14 +71,16 @@ fn internal_bv_lia_rebuild_authority_rejects_mismatched_assumption_window() {
         "a solver-visible assumption window different from the bound epoch must fail closed"
     );
     executor.last_assumptions = Some(vec![assumption]);
-    assert!(!executor
-        .authenticated_authored_roots_for_internal_certificate()
-        .is_empty());
+    assert_ne!(
+        executor.authenticated_authored_roots_for_internal_certificate(),
+        [] as [TermId; 0]
+    );
 
     executor.last_assumptions = Some(vec![assumption, unrelated]);
-    assert!(executor
-        .authenticated_authored_roots_for_internal_certificate()
-        .is_empty());
+    assert_eq!(
+        executor.authenticated_authored_roots_for_internal_certificate(),
+        [] as [TermId; 0]
+    );
 }
 
 #[test]
@@ -93,14 +95,16 @@ fn internal_bv_lia_rebuild_authority_rejects_mismatched_provenance() {
         .as_mut()
         .expect("public solve installs provenance");
     provenance.original_problem_assertions = vec![unrelated];
-    assert!(executor
-        .authenticated_authored_roots_for_internal_certificate()
-        .is_empty());
+    assert_eq!(
+        executor.authenticated_authored_roots_for_internal_certificate(),
+        [] as [TermId; 0]
+    );
 
     executor.proof_problem_assertion_provenance = None;
-    assert!(executor
-        .authenticated_authored_roots_for_internal_certificate()
-        .is_empty());
+    assert_eq!(
+        executor.authenticated_authored_roots_for_internal_certificate(),
+        [] as [TermId; 0]
+    );
 }
 
 #[test]

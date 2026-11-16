@@ -18,7 +18,7 @@ fn classification(result: Result<(), ProofCheckError>) -> u8 {
 
 fn compare_oracle(clause: &[TermId], certificate: NraSosCertificate, expected: u8) {
     let entries = entries();
-    let legacy = crate::bundle::nra_sos::validate(&entries, 0, clause, &certificate);
+    let legacy = nra_sos::validate(&entries, 0, clause, &certificate);
     let steps = [ProofStep::NraSos {
         clause: clause.to_vec(),
         certificate,

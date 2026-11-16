@@ -56,7 +56,6 @@ fn measured(
     };
     let mut work = WorkBudget::with_admission(work_limit, &mut sink);
     let result = euf.try_model_terms_from_roots(roots, &mut work);
-    drop(work);
     (result, used.get(), copied.get())
 }
 
@@ -198,7 +197,6 @@ fn sparse_installed_scope_prices_full_hash_capacity() {
         euf.try_scoped_model_terms(&mut work).unwrap(),
         vec![roots[0]]
     );
-    drop(work);
     assert!(used.get() >= 32 * capacity + 256);
 }
 

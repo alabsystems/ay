@@ -40,7 +40,7 @@ fn reset_discards_script_armed_retention() {
         fresh.assertions_parsed().len(),
         "the query after (reset) must retain exactly what a fresh context retains"
     );
-    assert!(reused.assertions_parsed().is_empty());
+    assert_eq!(reused.assertions_parsed().len(), 0);
 }
 
 /// A retaining host stays retaining across `(reset)`.

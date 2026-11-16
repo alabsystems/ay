@@ -34,7 +34,7 @@ fn every_callback_refusal_keeps_complete_rounds_and_refuses_final_publication() 
         }),
         Some(())
     );
-    assert!(expected.is_empty());
+    assert_eq!(expected, [] as [ChcExpr; 0]);
     assert_eq!(expected_env, initial_env);
     assert!((10..4000).contains(&calls));
     for ordinal in 1..=calls {

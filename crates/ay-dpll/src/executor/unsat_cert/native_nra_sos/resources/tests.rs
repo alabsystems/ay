@@ -113,7 +113,7 @@ fn selected_sos_state_still_rejects_epoch_snapshot_assumption_and_proof_changes(
         let mut executor = sealed();
         match mutation {
             0 => {
-                executor.ctx.terms.mk_var("later-unused", Sort::Bool);
+                let _ = executor.ctx.terms.mk_var("later-unused", Sort::Bool);
             }
             1 => {
                 executor.last_assumptions = Some(vec![executor.ctx.terms.true_term()]);

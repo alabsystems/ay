@@ -98,7 +98,7 @@ fn reused_rows_preserve_exact_hint_order_and_clear_every_normal_exit() {
         assert_eq!(result, expected);
         assert_eq!(result, fresh_result);
         assert!(returned.assign.iter().all(Option::is_none));
-        assert!(returned.touched.is_empty());
+        assert_eq!(returned.touched.len(), 0);
         owner = returned;
     }
     // A stale x=true from an ordinary None must not forge conflict at ¬x.
@@ -249,9 +249,7 @@ fn cancellation_and_unwind_drop_partial_scratch_without_rearming() {
             calls.set(n);
             // Meter entry, row entry, then the first charged 1024-work
             // boundary while the target is only partially seeded.
-            if n == 3 {
-                panic!("injected callback panic");
-            }
+            assert_ne!(n, 3, "injected callback panic");
             false
         };
         let mut meter = ConversionMeter::new(&limits, &mut stop).unwrap();
@@ -380,5 +378,5 @@ fn scratch_coexists_with_rooted_full_and_terminal_repair() {
     .unwrap();
     assert_eq!(checked.dag().derived.len(), 2);
     assert_eq!(checked.dag().derived[0].rup_hints, vec![1, 2]);
-    assert!(checked.dag().derived.last().unwrap().clause.is_empty());
+    assert_eq!(checked.dag().derived.last().unwrap().clause.len(), 0);
 }

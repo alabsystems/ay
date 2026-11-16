@@ -107,7 +107,7 @@ fn random_sort(rng: &mut Rng, depth: u32, pool: &mut Vec<ChcSort>) -> ChcSort {
         2 => random_sort(rng, 0, pool),
         _ => {
             let name = NAMES[rng.below(4) as usize];
-            let constructors = (0..1 + rng.below(2))
+            let constructors = (0..=rng.below(2))
                 .map(|constructor| ChcDtConstructor {
                     name: format!("{name}-{constructor}"),
                     selectors: (0..rng.below(3))
@@ -145,6 +145,10 @@ fn random_entry(rng: &mut Rng, name: &str, regular: bool, pool: &mut Vec<ChcSort
     }
 }
 
+#[expect(
+    clippy::ptr_arg,
+    reason = "the oracle compares Cow ownership as well as sort value"
+)]
 fn assert_same(label: &str, expected: &Cow<'_, ChcSort>, actual: &Cow<'_, ChcSort>) {
     assert_eq!(
         matches!(expected, Cow::Borrowed(_)),

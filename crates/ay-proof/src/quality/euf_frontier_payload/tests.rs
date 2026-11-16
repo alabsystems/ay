@@ -11,6 +11,14 @@ fn eq(terms: &mut TermStore, a: TermId, b: TermId) -> TermId {
     app(terms, "=", &[a, b], Sort::Bool)
 }
 
+type CongruenceFixture = (
+    TermStore,
+    Proof,
+    Vec<TermId>,
+    ProofId,
+    Vec<Option<Vec<TermId>>>,
+);
+
 fn fixture(depth: usize) -> (TermStore, Proof, Vec<TermId>, ProofId) {
     let mut terms = TermStore::new();
     let sort = Sort::array(Sort::bitvec(64), Sort::bitvec(8));
@@ -187,13 +195,7 @@ fn bounded_app_congruence(
     arity: usize,
     extra: usize,
     name: &str,
-) -> (
-    TermStore,
-    Proof,
-    Vec<TermId>,
-    ProofId,
-    Vec<Option<Vec<TermId>>>,
-) {
+) -> CongruenceFixture {
     let mut terms = TermStore::new();
     let array_sort = Sort::array(Sort::bitvec(64), Sort::bitvec(8));
     let mut left = terms.mk_var("large_operand", array_sort.clone());
@@ -214,16 +216,16 @@ fn bounded_app_congruence(
         let a = if i == 0 {
             left
         } else {
-            terms.mk_var(&format!("a{i}"), array_sort.clone())
+            terms.mk_var(format!("a{i}"), array_sort.clone())
         };
-        let b = terms.mk_var(&format!("b{i}"), array_sort.clone());
+        let b = terms.mk_var(format!("b{i}"), array_sort.clone());
         lhs.push(a);
         rhs.push(b);
         equalities.push(eq(&mut terms, a, b));
     }
     for i in 0..extra {
-        let a = terms.mk_var(&format!("unused_a{i}"), array_sort.clone());
-        let b = terms.mk_var(&format!("unused_b{i}"), array_sort.clone());
+        let a = terms.mk_var(format!("unused_a{i}"), array_sort.clone());
+        let b = terms.mk_var(format!("unused_b{i}"), array_sort.clone());
         equalities.push(eq(&mut terms, a, b));
     }
     let f = app(&mut terms, name, &lhs, Sort::bitvec(64));

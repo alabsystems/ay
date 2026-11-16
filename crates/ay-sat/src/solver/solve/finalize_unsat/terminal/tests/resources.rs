@@ -56,7 +56,10 @@ fn every_original_observer_poll_stops_terminal_publication_without_late_writer_f
     let (mut baseline, conflict, _) = fixture();
     let owner = observing(usize::MAX, &calls);
     baseline.attach_counted_admission(owner.clone()).unwrap();
-    run(&mut baseline, conflict, &owner).unwrap();
+    assert!(matches!(
+        run(&mut baseline, conflict, &owner).unwrap(),
+        SatResult::Unsat(_)
+    ));
     let total = calls.load(Ordering::SeqCst);
     assert!(total > 50);
     for cut in 0..total {
@@ -102,7 +105,10 @@ fn pending_decision_writer_is_not_flushed_by_successful_ordinary_or_counted_decl
         if counted {
             let owner = test_owner(1_000_000, 1_000_000);
             s.attach_counted_admission(owner.clone()).unwrap();
-            run(&mut s, conflict, &owner).unwrap();
+            assert!(matches!(
+                run(&mut s, conflict, &owner).unwrap(),
+                SatResult::Unsat(_)
+            ));
         } else {
             s.record_level0_conflict_chain(conflict);
             assert!(matches!(s.declare_unsat(), SatResult::Unsat(_)));

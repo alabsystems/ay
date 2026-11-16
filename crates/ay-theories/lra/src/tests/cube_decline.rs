@@ -255,8 +255,8 @@ fn queued_comparison_row_cube_success_keeps_a_valid_integer_point() {
         let x_value = solver.get_value(x).expect("materialized x");
         let y_value = solver.get_value(y).expect("materialized y");
         assert_eq!(
-            x_value + y_value * num_rational::BigRational::from_integer(BigInt::from(2)),
-            num_rational::BigRational::from_integer(BigInt::from(1))
+            x_value + y_value * BigRational::from_integer(BigInt::from(2)),
+            BigRational::from_integer(BigInt::from(1))
         );
         assert!(matches!(solver.check(), TheoryResult::Sat));
         assert!(solver.assignment_satisfies_bounds());

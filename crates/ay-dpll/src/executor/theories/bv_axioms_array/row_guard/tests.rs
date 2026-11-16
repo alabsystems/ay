@@ -58,7 +58,7 @@ fn assert_all_assignments(
         let row1 = differs || equal(result, value, assignment);
         let expected = match row2 {
             Some((eq_idx, read)) => {
-                literal(eq_idx, assignment) == !differs
+                literal(eq_idx, assignment) != differs
                     && row1
                     && (!differs || equal(result, read, assignment))
             }
@@ -108,8 +108,11 @@ fn missing_base_read_retains_byte_exact_wide_row1() {
 
 #[test]
 fn empty_differences_retain_existing_no_emission_behavior() {
-    assert!(collect(&[], &[1], &[2], None).is_empty());
-    assert!(collect(&[], &[1], &[2], Some((4, &[3]))).is_empty());
+    assert_eq!(collect(&[], &[1], &[2], None), [] as [Vec<i32>; 0]);
+    assert_eq!(
+        collect(&[], &[1], &[2], Some((4, &[3]))),
+        [] as [Vec<i32>; 0]
+    );
 }
 
 #[test]

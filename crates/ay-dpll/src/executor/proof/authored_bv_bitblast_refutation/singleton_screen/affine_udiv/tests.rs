@@ -42,14 +42,16 @@ fn six_exact_original_walker_division_roots_skip_only_their_singletons() {
     for original in originals {
         let (executor, root, surface) = fixture(declarations, original);
         assert!(screened(&executor, root), "{original}");
-        assert!(candidate_selections(
-            &[(root, &surface)],
-            &[root],
-            &executor.ctx,
-            &executor.proof_source_work,
-            &|| false
-        )
-        .is_empty());
+        assert_eq!(
+            candidate_selections(
+                &[(root, &surface)],
+                &[root],
+                &executor.ctx,
+                &executor.proof_source_work,
+                &|| false
+            ),
+            [] as [Vec<(TermId, &ay_frontend::Term)>; 0]
+        );
     }
 }
 

@@ -47,7 +47,7 @@ fn signed_dispatch_exhausts_small_words_including_zero_and_min_overflow() {
         let b_bits = solver.get_bits(b);
         let outputs = terms.map(|term| solver.get_bits(term));
         assert_eq!(solver.signed_div_cache.len(), 1);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         for av in 0..1_u64 << width {
             for bv in 0..1_u64 << width {
                 let fixes = [fix_word(&a_bits, av), fix_word(&b_bits, bv)].concat();
@@ -79,7 +79,7 @@ fn unsigned_dispatch_shares_one_divider_in_either_request_order() {
         assert_eq!(solver.unsigned_div_cache.len(), 1);
         let a_bits = solver.get_bits(a);
         let b_bits = solver.get_bits(b);
-        let model = Circuit::new(&solver)
+        let model = Circuit::from_clauses(solver.num_vars(), solver.clauses())
             .propagate(&[fix_word(&a_bits, 29), fix_word(&b_bits, 3)].concat());
         let expected = if reverse { (2, 9) } else { (9, 2) };
         assert_eq!(

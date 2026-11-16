@@ -17,7 +17,7 @@ fn declared_array_operator_keeps_its_committed_array_on_a_lazy_read() {
     impl ModelView for Arrays {
         fn leaf_value(&self, term: TermId) -> Option<ModelValue> {
             (term == self.base).then(|| {
-                ModelValue::Array(Box::new(crate::ArrayValue {
+                ModelValue::Array(Box::new(ArrayValue {
                     default: ModelValue::Int(0.into()),
                     store: Vec::new(),
                 }))
@@ -25,7 +25,7 @@ fn declared_array_operator_keeps_its_committed_array_on_a_lazy_read() {
         }
         fn uf_app_value(&self, term: TermId) -> Option<ModelValue> {
             (term == self.application).then(|| {
-                ModelValue::Array(Box::new(crate::ArrayValue {
+                ModelValue::Array(Box::new(ArrayValue {
                     default: ModelValue::Int(2.into()),
                     store: Vec::new(),
                 }))

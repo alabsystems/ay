@@ -128,7 +128,6 @@ use std::io::Write;
 
 use veripb_checker::{checker::ForwardsChecker, config::CheckerConfig, prelude::Context};
 use veripb_parser::{
-    io::MaybeCompressed,
     opb_parser::parse_opb_from_file,
     pbp_parser::{
         legacy_v2::parser::Version2Parser,

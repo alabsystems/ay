@@ -70,7 +70,7 @@ fn evaluate_and_propagate_emits_reasoned_int_equalities() {
     assert_eq!(eqs[0].lhs, x);
     assert_eq!(eqs[0].rhs, three);
     assert_eq!(eqs[0].reason, vec![reason_lit]);
-    assert!(speculative.is_empty());
+    assert_eq!(speculative, [] as [(ay_core::TermId, ay_core::TermId); 0]);
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn evaluate_and_propagate_real_supports_to_real_fallback_to_input_term() {
     assert_eq!(eqs[0].rhs, three_real);
     assert_eq!(eqs[0].reason, vec![reason_lit]);
     // Non-empty Boolean reasons → proven equality, nothing speculative.
-    assert!(speculative.is_empty());
+    assert_eq!(speculative, [] as [(ay_core::TermId, ay_core::TermId); 0]);
 }
 
 #[test]

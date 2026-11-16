@@ -22,7 +22,7 @@ fn source_macro_lookup_borrows_the_unfolded_body_without_mutating_context() {
     let body = context
         .source_nullary_definition_for_proof("alias")
         .unwrap();
-    assert!(std::ptr::eq(body, &context.fun_defs["alias"].2));
+    assert!(std::ptr::eq(body, &raw const context.fun_defs["alias"].2));
     assert!(matches!(body, ParsedTerm::App(op, args) if op == "bvadd" && args.len() == 2));
     assert!(context.source_nullary_definition_for_proof("x").is_none());
     assert!(context
@@ -51,7 +51,7 @@ fn native_and_forged_definition_slots_do_not_gain_source_ownership() {
     );
     let body = context.fun_defs["original"].clone();
     context.fun_defs.insert("ordinary".into(), body.clone());
-    context.register_native_global_constant("native".into(), Sort::bitvec(8));
+    let _ = context.register_native_global_constant("native".into(), Sort::bitvec(8));
     context.fun_defs.insert("native".into(), body);
     for name in ["ordinary", "native"] {
         assert!(context.source_nullary_definition_for_proof(name).is_none());

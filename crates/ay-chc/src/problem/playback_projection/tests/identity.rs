@@ -192,6 +192,8 @@ fn playback_replay_checks_schema_and_digest_together() {
             lifted["normalized_input_sha256"],
             source.normalized_input_sha256()
         );
-        crate::validate_chc_ground_derivation_artifact_v2(&source, artifact.bytes()).unwrap();
+        let validated =
+            crate::validate_chc_ground_derivation_artifact_v2(&source, artifact.bytes()).unwrap();
+        assert_eq!(validated.artifact_sha256(), artifact.sha256());
     }
 }

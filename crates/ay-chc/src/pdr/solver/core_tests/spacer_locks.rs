@@ -13,10 +13,6 @@ use crate::pdr::config::SpacerLane;
 use crate::pdr::solver::strengthen::{level0_cap_policy, point_block_cap_policy};
 use crate::PredicateId;
 
-fn int_var(name: &str) -> ChcExpr {
-    ChcExpr::var(ChcVar::new(name, ChcSort::Int))
-}
-
 /// `Init: x = 0 → P(x)`, `P(x) ∧ x' = x + 1 → P(x')`, `P(x) ∧ x < 0 → false`.
 fn counter_problem() -> ChcProblem {
     let mut problem = ChcProblem::new();
@@ -278,8 +274,11 @@ fn spacer_core_construction_gates() {
 /// runs, and only then.
 #[test]
 fn spacer_profile_is_applied_when_the_lane_runs_via_the_cli_switch() {
-    let mut switches = crate::ab_switches::ChcAbSwitches::default();
-    switches.spacer_rung = 1;
+    let base = crate::ab_switches::ChcAbSwitches::default();
+    let switches = crate::ab_switches::ChcAbSwitches {
+        spacer_rung: 1,
+        ..base
+    };
     let _override = crate::ab_switches::TestOverride::set(switches);
 
     // The CLI path: the lane flags arrive through the config default, the

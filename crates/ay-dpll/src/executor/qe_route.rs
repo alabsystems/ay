@@ -154,18 +154,16 @@ impl Executor {
 
     /// Whether the closed-universal validity precheck may run for this solve.
     pub(crate) fn closed_universal_precheck_armed(&self) -> bool {
-        if !self.is_producing_proofs() {
-            return true;
-        }
-
         #[cfg(test)]
         {
-            self.measured_negative_quantifier_routes
-                .closed_universal_precheck_in_proof_mode
+            !self.is_producing_proofs()
+                || self
+                    .measured_negative_quantifier_routes
+                    .closed_universal_precheck_in_proof_mode
         }
         #[cfg(not(test))]
         {
-            false
+            !self.is_producing_proofs()
         }
     }
 

@@ -36,7 +36,7 @@ impl Control<'_> {
             .checked_add(bytes)
             .ok_or(TransportError::Overflow)
             .or_else(|e| self.fail(e))?;
-        let work_limit = usize::try_from(self.work_limit).map_or(usize::MAX, |value| value);
+        let work_limit = usize::try_from(self.work_limit).unwrap_or(usize::MAX);
         self.cap("transport work", self.usage.charged_work, work_limit)?;
         self.cap(
             "new transport bytes",

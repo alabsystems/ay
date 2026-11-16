@@ -163,13 +163,12 @@ impl BoolCircuit {
     }
 
     fn syntax_clause(terms: &[String]) -> String {
-        format!(
-            "(cl{})",
-            terms
-                .iter()
-                .map(|term| format!(" {term}"))
-                .collect::<String>()
-        )
+        let mut output = String::from("(cl");
+        for term in terms {
+            write!(output, " {term}").expect("writing to a String cannot fail");
+        }
+        output.push(')');
+        output
     }
 
     fn add_clause(
@@ -403,10 +402,8 @@ fn exhaustive_rup(
     }
     for &var in &atom_vars {
         let mut next = Vec::with_capacity(cubes.len() / 2);
-        for pair in cubes.chunks_exact(2) {
-            let [left, right] = pair else {
-                return None;
-            };
+        for pair in cubes.as_chunks::<2>().0 {
+            let [left, right] = pair;
             if !left.contains(&var) || !right.contains(&-var) {
                 return None;
             }

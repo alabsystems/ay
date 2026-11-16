@@ -82,13 +82,10 @@ impl LratChecker {
         self.clause_arena.extend_from_slice(clause);
         // Register each literal in occurrence lists for O(occ) RAT lookup.
         for &lit in clause {
-            match self.occ_lists.get_mut(lit.index()) {
-                Some(occ) => occ.push(clause_id),
-                // Unreachable: the loop above sized `occ_lists` for every
-                // literal. Refusing keeps the clause out of `clause_index`, and
-                // the caller records the failure.
-                None => return None,
-            }
+            // Unreachable refusal: the loop above sized `occ_lists` for every
+            // literal. Refusing keeps the clause out of `clause_index`, and the
+            // caller records the failure.
+            self.occ_lists.get_mut(lit.index())?.push(clause_id);
         }
         let entry = ClauseEntry {
             start,

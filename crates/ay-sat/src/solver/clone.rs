@@ -580,7 +580,7 @@ impl cold::ColdState {
             veripb_stated_root_units: Vec::new(),
             proof_vars_compacted: false,
             // Clones carry no proof surface: no hints.
-            veripb_hints: super::veripb_hints::VeripbHintState::default(),
+            veripb_hints: veripb_hints::VeripbHintState::default(),
             empty_clause_in_proof: false,
             empty_clause_lrat_id: None,
             // The refutation flag itself is copied (`has_empty_clause` in the

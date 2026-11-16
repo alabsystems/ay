@@ -36,7 +36,6 @@ use std::time::Duration;
 mod bv_regression;
 mod cancel_latency;
 mod confirmed_unsafe_trace;
-mod engine_memory;
 mod engine_specific;
 mod lemma_transfer;
 mod memory_ownership;
@@ -45,7 +44,6 @@ mod panic_and_spawn;
 mod solving;
 mod trivial_solver;
 mod validation;
-mod witnessless_unsafe;
 
 fn create_safe_problem() -> ChcProblem {
     // Safe: x = 0 => Inv(x), Inv(x) /\ x < 5 => Inv(x+1), Inv(x) /\ x >= 10 => false

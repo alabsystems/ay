@@ -45,7 +45,7 @@ fn dependency_only_collection_preserves_edges_without_requesting_opaque_definiti
          (assert (= (f 0) (store c 1 2)))",
     )
     .unwrap();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     let model = empty_model();
     let (_, full_edges, _, definitions, _) = exec.collect_array_completion_graph(&model, &[]);
     assert!(definitions
@@ -81,7 +81,7 @@ fn uncertain_opaque_congruence_keeps_the_other_pending_component_withheld() {
          (assert (= (f y) c))",
     )
     .unwrap();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     let terms = ["a", "b", "c", "d"].map(|wanted| {
         exec.ctx
             .symbol_iter()
@@ -259,9 +259,7 @@ fn candidate_error_stop_and_unwind_restore_exact_array_reasons_cache_and_seal() 
                     }
                 },
                 || {
-                    if case == "admission-panic" {
-                        panic!("owner callback panic");
-                    }
+                    assert!(case != "admission-panic", "owner callback panic");
                     case != "stop"
                 },
             )
@@ -293,7 +291,7 @@ fn a_shared_gate_cache_session_is_an_explicit_recovery_decline() {
         "/../ay-chc/tests/fixtures/quantified_nested_cells/missing_outer_frame.smt2"
     ));
     let mut exec = Executor::new();
-    exec.set_timeout(Some(std::time::Duration::from_secs(30)));
+    exec.set_timeout(Some(Duration::from_secs(30)));
     let output = exec
         .execute_all(&ay_frontend::parse(script).unwrap())
         .unwrap();
@@ -377,7 +375,7 @@ fn two_independent_real_aliases_recover_through_the_complete_production_transact
     )
     .unwrap();
     let mut exec = Executor::new();
-    exec.set_timeout(Some(std::time::Duration::from_secs(30)));
+    exec.set_timeout(Some(Duration::from_secs(30)));
     assert_eq!(exec.execute_all(&commands).unwrap(), ["sat"]);
     assert!(exec.last_model_validated);
     let mut model = exec.last_model.take().unwrap();

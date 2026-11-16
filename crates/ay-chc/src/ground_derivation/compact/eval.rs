@@ -16,7 +16,7 @@ pub(super) struct Evaluation<'a, 'b, 'p> {
 }
 
 impl<'a> Evaluation<'a, '_, '_> {
-    pub fn expression(&mut self, expr: &'a ChcExpr, depth: usize) -> Result<ValueId> {
+    pub(super) fn expression(&mut self, expr: &'a ChcExpr, depth: usize) -> Result<ValueId> {
         self.owner.admit(1, 128)?;
         if depth > 512 {
             return Err(Error::Unsupported);

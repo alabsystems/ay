@@ -1163,7 +1163,7 @@ fn test_bitblast_udiv_urem_basic() {
 
     assert_eq!(q.len(), 4);
     assert_eq!(r.len(), 4);
-    assert!(!solver.clauses.is_empty());
+    assert_ne!(solver.clauses.as_slice(), &[] as &[CnfClause]);
 
     let model = solve_bv_clauses(&solver);
     let q_val = extract_bv_value(&model, &q);
@@ -2525,6 +2525,30 @@ fn test_mul_fallback_orientation_is_operand_order_independent() {
     }
 
     assert_eq!(clause_count(false), clause_count(true));
+}
+
+#[test]
+fn test_mul_equal_cost_operands_share_the_commuted_word() {
+    // Exercise both case splitting and shift-add, including negative literals
+    // and a common prefix: equality of cost alone must not choose the order.
+    for width in [2, 8, 16] {
+        for common_prefix in [false, true] {
+            let store = setup_store();
+            let mut solver = BvSolver::new(&store);
+            let a: Vec<CnfLit> = (0..width).map(|_| solver.fresh_var()).collect();
+            let mut b: Vec<CnfLit> = (0..width).map(|_| -solver.fresh_var()).collect();
+            if common_prefix {
+                b[0] = a[0];
+            }
+            assert_eq!(solver.mul_selector_score(&a), solver.mul_selector_score(&b));
+            let product = solver.bitblast_mul(&a, &b);
+            assert_eq!(
+                solver.bitblast_mul(&b, &a),
+                product,
+                "width={width} common_prefix={common_prefix}"
+            );
+        }
+    }
 }
 
 #[test]

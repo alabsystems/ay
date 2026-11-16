@@ -535,6 +535,7 @@ impl Solver {
         }
     }
 
+    /// Enable or disable the official SAT Competition Main conflict pruning policy.
     pub fn set_sat_comp_main_conflict_pruning(&mut self, enabled: bool) {
         self.cold.sat_comp_main_conflict_pruning = enabled;
     }

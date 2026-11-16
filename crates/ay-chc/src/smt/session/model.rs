@@ -19,9 +19,9 @@ use crate::smt::types::SmtValue;
 /// `active`:
 /// - Bool vars -> `sat_model[var_of_term]` (default `false` if no SAT var: the
 ///   var is a don't-care);
-/// - Int/Real -> `view.theory.arith_value(term)`; Int must be integral for
-///   `Lia` (else `Err(TheoryIncomplete)`); mapped via `SmtValue::int_from_bigint`
-///   / `SmtValue::Real` following `smt/check_sat/theory_model.rs` conventions.
+/// - Int/Real -> `view.theory.arith_value(term)`; Int must be integral (else
+///   `Err(TheoryIncomplete)`); mapped via `SmtValue::int_from_bigint` /
+///   `SmtValue::Real` following `smt/check_sat/theory_model.rs` conventions.
 ///
 /// A var of an ACTIVE assertion with no theory value => `missing_assignment += 1`;
 /// default 0 is applied ONLY when the var occurs in no theory atom of any
@@ -143,8 +143,8 @@ fn arith_smt_value(sort: &Sort, v: BigRational) -> Result<SmtValue, UnknownReaso
             if v.denom().is_one() {
                 Ok(SmtValue::int_from_bigint(v.numer().clone()))
             } else {
-                // Under `Lra` an Int var cannot be active (eligibility rejects
-                // it); under `Lia` a fractional value means B&B did not finish.
+                // Runtime sessions use LRA. Integer-sorted values are accepted
+                // only when integral; a fractional value fails closed.
                 Err(UnknownReason::TheoryIncomplete)
             }
         }

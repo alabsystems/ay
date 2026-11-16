@@ -450,7 +450,10 @@ fn solver_capability_descriptor_surface_reexported() {
     );
     assert!(symbolic_manifest_health.accepted_for_consumer);
     assert!(symbolic_manifest_health.all_contracts_fail_closed);
-    assert!(symbolic_manifest_health.issues.is_empty());
+    assert_eq!(
+        symbolic_manifest_health.issues.as_slice(),
+        &[] as &[crate::SymbolicExecutionContractManifestHealthIssue]
+    );
     assert_eq!(
         crate::validate_symbolic_execution_contract_manifest(&symbolic_manifest),
         symbolic_manifest_health

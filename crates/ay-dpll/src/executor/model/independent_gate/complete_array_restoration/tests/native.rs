@@ -16,7 +16,7 @@ fn accepted_original(script: &str, end: Instant) {
     let assertions = solver
         .parse_smtlib2(script)
         .expect("unaltered full original query");
-    assert!(!assertions.is_empty());
+    assert_ne!(assertions, [] as [crate::Term; 0]);
     drop(assertions);
     assert!(Instant::now() < end);
     assert!(solver.instance_term_bytes() <= 128 * 1024 * 1024);

@@ -130,7 +130,7 @@ fn replay_passes(original: &[Vec<Literal>], proof: &str) -> (usize, usize, usize
                 if tokens[0] == "rup" && rest.first() == Some(&":") {
                     let hints: Vec<u64> =
                         rest[1..].iter().map(|t| t.parse().expect("id")).collect();
-                    assert!(!hints.is_empty(), "empty annotation in {line}");
+                    assert_ne!(hints.len(), 0, "empty annotation in {line}");
                     // Assume the negation of C (a clause); propagate on the
                     // hints only.
                     let mut val: HashMap<i64, bool> = constraint

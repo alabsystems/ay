@@ -27,7 +27,7 @@ fn next(state: &mut u64) -> u64 {
 fn gadget_formula(seed: u64, gadgets: usize, core: usize) -> (usize, Vec<Vec<i32>>) {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut clauses: Vec<Vec<i32>> = Vec::new();
-    let mut lit = |state: &mut u64| {
+    let lit = |state: &mut u64| {
         let v = (next(state) % core as u64) as i32 + 1;
         if next(state) & 1 == 0 {
             v

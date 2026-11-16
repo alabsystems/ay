@@ -103,8 +103,8 @@ impl<'a> AuthoredSource<'a> {
             // tree height upper-bounds BTree height; 16 node/key operations per
             // level conservatively price search/splits before allocation.
             let count = tokens.len();
-            let height = usize::BITS - count.leading_zeros();
-            scanner.work.charge(16 * (height as usize + 1))?;
+            let height = count.bit_width() as usize;
+            scanner.work.charge(16 * (height + 1))?;
             tokens.insert(
                 count,
                 SourceToken {

@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use crate::common::{check_z3_or_skip as z3_available, solve_with_z3};
+use crate::common::z3::{check_z3_or_skip as z3_available, solve_with_z3};
 use ntest::timeout;
 
 type KnownUnsatCase = (&'static str, &'static str, Option<&'static str>);

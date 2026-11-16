@@ -156,14 +156,6 @@ fn tar_command() -> Command {
 }
 
 #[cfg(unix)]
-fn workspace_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/ay has a workspace root")
-}
-
-#[cfg(unix)]
 fn write_minimal_chc_comp_root(root: &Path, tracks: &[&str], smt2: &str) {
     let smoke_dir = root.join("smoke");
     fs::create_dir_all(&smoke_dir).expect("create CHC smoke dir");

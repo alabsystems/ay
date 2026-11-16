@@ -101,7 +101,7 @@ fn test_model_value_expr_or_default_dt_nullary() {
         ChcExpr::FuncApp(name, s, args) => {
             assert_eq!(name, "None");
             assert_eq!(s, &sort);
-            assert!(args.is_empty());
+            assert_eq!(args.as_slice(), []);
         }
         other => panic!("Expected FuncApp(None), got: {other:?}"),
     }

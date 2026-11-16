@@ -524,21 +524,36 @@ impl BvSolver<'_> {
             return self.shift_left_const(b, k);
         }
 
-        // Try const-case multiplier optimization first (#1828)
+        // The circuit is asymmetric even
+        // though multiplication is commutative: only selector zero-bits skip
+        // an addition, and unknown selector bits also need an n-bit mask.
+        // Orient the cheaper word as selector, breaking equal-cost ties by
+        // signed literal order. Both a*b and b*a then use the same circuit
+        // and existing gate caches, rather than asking SAT to rediscover
+        // modular multiplication commutativity. Apply this to case splitting
+        // too: its first operand otherwise changes its decision-tree shape.
+        let a_score = self.mul_selector_score(a);
+        let b_score = self.mul_selector_score(b);
+        let mut a_is_selector = a_score < b_score;
+        if a_score == b_score {
+            for (&a_bit, &b_bit) in a.iter().zip(b) {
+                if !self.encoding_step() {
+                    return Vec::new();
+                }
+                if a_bit != b_bit {
+                    a_is_selector = a_bit < b_bit;
+                    break;
+                }
+            }
+        }
+        let (a, b) = if a_is_selector { (b, a) } else { (a, b) };
+
+        // Try const-case multiplier optimization first (#1828).
         if let Some(result) = self.try_const_case_mul(a, b) {
             return result;
         }
 
-        // Fall back to standard shift-and-add. The circuit is asymmetric even
-        // though multiplication is commutative: only selector zero-bits skip
-        // an addition, and unknown selector bits also need an n-bit mask.
-        // Orient the cheaper word as selector so raw bvmul performance cannot
-        // depend on operand order.
-        if self.mul_selector_score(a) < self.mul_selector_score(b) {
-            self.bitblast_mul_shift_add(b, a)
-        } else {
-            self.bitblast_mul_shift_add(a, b)
-        }
+        self.bitblast_mul_shift_add(a, b)
     }
 
     /// Cost key for the selector side of shift-and-add multiplication.

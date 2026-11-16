@@ -11,40 +11,6 @@ pub(in crate::vsids) struct BacktrackBuckets {
     membership_len: usize,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::counted_storage::test_owner;
-
-    #[test]
-    fn paid_all_bucket_classes_and_membership_growth_are_allocation_free_after_reserve() {
-        let mut actual = BucketQueue::new();
-        actual.max_exponent = f64_exponent(2f64.powi(31));
-        let activities: Vec<_> = (0..64).map(|i| 2f64.powi(i % 32)).collect();
-        let mut expected = actual.clone();
-        let mut plan = BacktrackBuckets::default();
-        let owner = test_owner(1_000_000, 1_000_000);
-        for index in 0..64 {
-            actual
-                .plan_backtrack(Variable(index), &activities, &mut plan, &owner)
-                .unwrap();
-        }
-        actual.reserve_backtrack(plan, &owner).unwrap();
-        let capacities = actual.buckets.each_ref().map(|bucket| bucket.capacity());
-        let membership_capacity = actual.in_queue.capacity();
-        for index in 0..64 {
-            actual.push_with_activity(Variable(index), &activities);
-            expected.push_with_activity(Variable(index), &activities);
-            assert_eq!(
-                actual.buckets.each_ref().map(|bucket| bucket.capacity()),
-                capacities
-            );
-            assert_eq!(actual.in_queue.capacity(), membership_capacity);
-        }
-        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
-    }
-}
-
 impl BucketQueue {
     pub(in crate::vsids) fn admit_selection(&self, owner: &CountedAdmission) -> Result<()> {
         // During one selection the cursor only moves forward. Every queued
@@ -93,5 +59,39 @@ impl BucketQueue {
             try_reserve(owner, bucket, additional)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::counted_storage::test_owner;
+
+    #[test]
+    fn paid_all_bucket_classes_and_membership_growth_are_allocation_free_after_reserve() {
+        let mut actual = BucketQueue::new();
+        actual.max_exponent = f64_exponent(2f64.powi(31));
+        let activities: Vec<_> = (0..64).map(|i| 2f64.powi(i % 32)).collect();
+        let mut expected = actual.clone();
+        let mut plan = BacktrackBuckets::default();
+        let owner = test_owner(1_000_000, 1_000_000);
+        for index in 0..64 {
+            actual
+                .plan_backtrack(Variable(index), &activities, &mut plan, &owner)
+                .unwrap();
+        }
+        actual.reserve_backtrack(plan, &owner).unwrap();
+        let capacities = actual.buckets.each_ref().map(|bucket| bucket.capacity());
+        let membership_capacity = actual.in_queue.capacity();
+        for index in 0..64 {
+            actual.push_with_activity(Variable(index), &activities);
+            expected.push_with_activity(Variable(index), &activities);
+            assert_eq!(
+                actual.buckets.each_ref().map(|bucket| bucket.capacity()),
+                capacities
+            );
+            assert_eq!(actual.in_queue.capacity(), membership_capacity);
+        }
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
     }
 }

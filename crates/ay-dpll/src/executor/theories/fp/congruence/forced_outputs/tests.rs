@@ -53,7 +53,7 @@ impl Fixture {
         let mut args = Vec::new();
         let mut words = Vec::new();
         for i in 0..count {
-            let word = terms.mk_var(&format!("word{i}"), Sort::bitvec(64));
+            let word = terms.mk_var(format!("word{i}"), Sort::bitvec(64));
             let arg = match kind {
                 Argument::Bv => word,
                 Argument::FpBits => {

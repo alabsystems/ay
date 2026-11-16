@@ -3512,7 +3512,7 @@ impl Executor {
                     .copied()
                     .or_else(|| late_reads.and_then(|reads| reads.get(base_array, sel_idx)));
                 let read_lits = read_term
-                    .and_then(|read_term| scalar_elem_lits(read_term))
+                    .and_then(scalar_elem_lits)
                     .filter(|read_lits| read_lits.len() == result_lits.len());
                 // Reserve the SAME summary variable ROW2 already needed. ROW1
                 // can reference its later definition without copying every

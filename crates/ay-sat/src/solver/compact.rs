@@ -440,9 +440,9 @@ impl Solver {
         // probe_parent: variable-indexed, values are Literals.
         {
             let mut new_pp: Vec<Option<Literal>> = vec![None; map.new_num_vars];
-            for old_var in 0..old_num_vars {
+            for (old_var, probe_parent) in self.probe_parent[..old_num_vars].iter().enumerate() {
                 if let Some(new_var) = map.map_var(old_var) {
-                    new_pp[new_var] = self.probe_parent[old_var].and_then(|lit| map.map_lit(lit));
+                    new_pp[new_var] = probe_parent.and_then(|lit| map.map_lit(lit));
                 }
             }
             self.probe_parent = new_pp;
@@ -456,9 +456,9 @@ impl Solver {
         // at use time (is_active check in backtrack and conflict analysis).
         {
             let mut new_lambda: Vec<Option<ClauseRef>> = vec![None; map.new_num_vars];
-            for old_var in 0..old_num_vars {
+            for (old_var, &lambda) in self.lambda[..old_num_vars].iter().enumerate() {
                 if let Some(new_var) = map.map_var(old_var) {
-                    new_lambda[new_var] = self.lambda[old_var];
+                    new_lambda[new_var] = lambda;
                 }
             }
             self.lambda = new_lambda;
@@ -497,11 +497,7 @@ impl Solver {
             }
             // Read the positive-literal value from vals (literal-indexed).
             let pos_lit_idx = old_var * 2;
-            let val = if pos_lit_idx < self.vals.len() {
-                self.vals[pos_lit_idx] > 0
-            } else {
-                false
-            };
+            let val = pos_lit_idx < self.vals.len() && self.vals[pos_lit_idx] > 0;
             self.cold.eliminated_ext_vals[ext_var] = val;
         }
 

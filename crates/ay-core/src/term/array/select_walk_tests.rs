@@ -67,7 +67,7 @@ fn prefix(store: &mut TermStore, kind: Indices, mut array: TermId) -> TermId {
 fn recursive_reference(store: &mut TermStore, array: TermId, index: TermId) -> TermId {
     let elem_sort = match store.sort(array).array_element() {
         Some(elem_sort) => {
-            debug_assert!(store.sort(array).array_index() == Some(store.sort(index)));
+            debug_assert_eq!(store.sort(array).array_index(), Some(store.sort(index)));
             elem_sort.clone()
         }
         None => {

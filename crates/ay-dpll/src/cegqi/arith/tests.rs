@@ -13,7 +13,10 @@ fn test_arith_instantiator_creation() {
     let inst = ArithInstantiator::new();
     assert!(inst.lower_bounds.is_empty());
     assert!(inst.upper_bounds.is_empty());
-    assert!(inst.equalities.is_empty());
+    assert_eq!(
+        inst.equalities,
+        [] as [(num_rational::Ratio<BigInt>, TermId); 0]
+    );
 }
 
 #[test]

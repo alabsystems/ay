@@ -277,16 +277,16 @@ mod tests {
             bv(&mut terms, "c"),
         );
         let seven = terms.mk_bitvec(num_bigint::BigInt::from(7), 8);
-        let sum = terms.mk_app(Symbol::named("bvadd"), &[b, seven], Sort::bitvec(8));
-        let first = terms.mk_app(Symbol::named("="), &[a, b], Sort::Bool);
-        let second = terms.mk_app(Symbol::named("="), &[seven, c], Sort::Bool);
+        let sum = terms.mk_app(Symbol::named("bvadd"), [b, seven], Sort::bitvec(8));
+        let first = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+        let second = terms.mk_app(Symbol::named("="), [seven, c], Sort::Bool);
         // A compound definition is not a substitution: it would be copied.
-        let third = terms.mk_app(Symbol::named("="), &[a, sum], Sort::Bool);
-        let goal = terms.mk_app(Symbol::named("="), &[a, c], Sort::Bool);
+        let third = terms.mk_app(Symbol::named("="), [a, sum], Sort::Bool);
+        let goal = terms.mk_app(Symbol::named("="), [a, c], Sort::Bool);
         let not_goal = terms.mk_not_raw(goal);
         let conjunction = terms.mk_app(
             Symbol::named("and"),
-            &[first, second, third, not_goal],
+            [first, second, third, not_goal],
             Sort::Bool,
         );
         let clause = [terms.mk_not_raw(conjunction)];
@@ -300,8 +300,8 @@ mod tests {
     fn a_positive_equality_is_not_a_hypothesis() {
         let mut terms = TermStore::new();
         let (a, b) = (bv(&mut terms, "a"), bv(&mut terms, "b"));
-        let equality = terms.mk_app(Symbol::named("="), &[a, b], Sort::Bool);
-        assert!(hypothesis_equalities(&terms, &[equality]).is_empty());
+        let equality = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+        assert_eq!(hypothesis_equalities(&terms, &[equality]), []);
         let negated = terms.mk_not_raw(equality);
         assert_eq!(hypothesis_equalities(&terms, &[negated]), vec![(a, b)]);
     }

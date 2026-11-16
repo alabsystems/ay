@@ -461,14 +461,14 @@ impl SatProofManager<'_> {
                     existing_clause_map.get(&normalized_key).is_some_and(|pid| {
                         matches!(
                             proof.steps.get(pid.0 as usize),
-                            Some(ay_core::ProofStep::Step {
-                                rule: ay_core::AletheRule::Trust,
+                            Some(ProofStep::Step {
+                                rule: AletheRule::Trust,
                                 premises,
                                 ..
                             }) if premises.is_empty()
                         ) || matches!(
                             proof.steps.get(pid.0 as usize),
-                            Some(ay_core::ProofStep::TheoryLemma {
+                            Some(ProofStep::TheoryLemma {
                                 kind: ay_core::TheoryLemmaKind::Generic,
                                 ..
                             })

@@ -323,14 +323,11 @@ impl LiaSolver<'_> {
         //
         // The CERTIFICATE rule below is untouched and its retention on this
         // path is BETTER justified than on the pre-existing one, not worse.
-        // The #8147 hazard the drop-on-append rule guards is a certificate
-        // whose LITERAL SET is an incomplete explanation (the simplex builder
-        // missed pivoted-away shared-equality slack reasons), so
-        // `minimize_farkas_conflict`'s zero-coefficient strip could delete a
-        // load-bearing literal. This exit is reached only after a FRESH solver
-        // re-derives the infeasibility from those literals with no shared
-        // equality asserted at all — a direct proof that the literal set is a
-        // complete explanation, which is exactly what #8147 could not assume.
+        // The simplex builder may miss pivoted-away shared-equality slack
+        // reasons, so appended reasons may be load-bearing. This exit is
+        // reached only after a FRESH solver re-derives the infeasibility from
+        // the unaugmented literals with no shared equality asserted at all — a
+        // direct proof that the literal set is a complete explanation.
         if !self.should_timeout() {
             probe_checks += 1;
             if probe_verdict_is_unsat(&probe.check()) {
@@ -1070,17 +1067,13 @@ impl LiaSolver<'_> {
             }
         }
         // #rank-4 increment 2 (adversarial-review fix): keep the certificate
-        // ONLY when augmentation appended nothing. The appended shared-
-        // equality/Dioph reasons are load-bearing exactly when the simplex
-        // Farkas builder missed pivoted-away slack reasons (#8147) — but
-        // `minimize_farkas_conflict` strips every zero-coefficient literal
-        // from the learned clause in all builds, so a certificate
-        // zero-extended over the appended reasons would delete them and
-        // re-create the #8147 false-UNSAT class. Dropping the certificate
-        // whenever literals were appended keeps the verdict and the learned
-        // clause intact; the no-append case (still the common one) keeps the
-        // certificate — a strict improvement over the parent, which dropped
-        // it wholesale.
+        // ONLY when augmentation appended nothing. The positional certificate
+        // covers only the pre-augmentation literal vector and establishes no
+        // coefficient for appended shared-equality/Dioph reasons, which may be
+        // load-bearing when the simplex builder missed pivoted-away slack
+        // reasons (#8147). Dropping the certificate whenever literals were
+        // appended keeps the verdict and learned clause intact; the no-append
+        // case (still the common one) keeps the certificate.
         match farkas {
             Some(farkas)
                 if literals.len() == original_len && farkas.coefficients.len() == original_len =>

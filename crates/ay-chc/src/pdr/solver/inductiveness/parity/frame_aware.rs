@@ -757,7 +757,7 @@ mod tests {
             Some(6),
             "ordinary multipliers still report their magnitude"
         );
-        assert!(PdrSolver::prime_factors(i128::MIN).is_empty());
+        assert_eq!(PdrSolver::prime_factors(i128::MIN), [] as [i128; 0]);
         assert_eq!(PdrSolver::prime_factors(-12), vec![2, 3]);
 
         // `v = MIN * q` through the divisor scan: no hint for `v`, no panic.

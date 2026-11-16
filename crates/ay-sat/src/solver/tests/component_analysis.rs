@@ -178,15 +178,12 @@ fn test_decompose_solve_model_correctness() {
             for clause in clauses_1.iter().chain(clauses_2.iter()) {
                 let satisfied = clause.iter().any(|&lit| {
                     let vi = lit.variable().index();
-                    if vi < model.len() {
-                        if lit.is_positive() {
+                    vi < model.len()
+                        && if lit.is_positive() {
                             model[vi]
                         } else {
                             !model[vi]
                         }
-                    } else {
-                        false
-                    }
                 });
                 assert!(satisfied, "clause {clause:?} not satisfied by model");
             }
@@ -311,15 +308,15 @@ fn test_decompose_sub_solvers_share_the_deadline_flag() {
         }
     }
 
-    let deadline = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    solver.set_deadline_interrupt_handle(Some(std::sync::Arc::clone(&deadline)));
+    let deadline = Arc::new(AtomicBool::new(true));
+    solver.set_deadline_interrupt_handle(Some(Arc::clone(&deadline)));
     let result = solver.try_decompose_solve();
     assert!(
         result.is_none(),
         "a stopped sub-solve abandons decomposition, got {result:?}"
     );
 
-    deadline.store(false, std::sync::atomic::Ordering::Relaxed);
+    deadline.store(false, Ordering::Relaxed);
     let result = solver.try_decompose_solve();
     assert!(
         matches!(result, Some(SatResult::Sat(_))),

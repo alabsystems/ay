@@ -7,6 +7,7 @@ use ay_core::{Symbol, TermData, TermId};
 use super::*;
 
 mod boundaries;
+mod empty_identity;
 
 struct Fixture {
     terms: TermStore,
@@ -20,8 +21,8 @@ fn fixture() -> Fixture {
     let carrier = Sort::Uninterpreted("MeterBox".into());
     let value = terms.mk_var("payload", Sort::Int);
     let boxed = terms.mk_app(Symbol::named("meter-mk"), [value], carrier.clone());
-    terms.mk_app(Symbol::named("meter-value"), [boxed], Sort::Int);
-    terms.mk_app(Symbol::named("is-meter-mk"), [boxed], Sort::Bool);
+    let _selector_application = terms.mk_app(Symbol::named("meter-value"), [boxed], Sort::Int);
+    let _recognizer_application = terms.mk_app(Symbol::named("is-meter-mk"), [boxed], Sort::Bool);
     Fixture {
         terms,
         declarations: vec![("MeterBox".into(), vec!["meter-mk".into()])],
@@ -171,7 +172,7 @@ fn duplicate_missing_and_extra_context_members_remain_invalid() {
 fn unused_member_occurrence_is_still_authenticated() {
     let mut fixture = fixture();
     let wrong = fixture.terms.false_term();
-    fixture.terms.mk_app(
+    let _ill_typed_member_occurrence = fixture.terms.mk_app(
         Symbol::named("meter-mk"),
         [wrong],
         Sort::Uninterpreted("MeterBox".into()),
@@ -202,9 +203,10 @@ fn missing_nullary_binding_is_typed_and_both_valid_representations_survive() {
     let pinned = fixture
         .terms
         .mk_fresh_named_var("meter-mk", carrier.clone());
-    fixture
-        .terms
-        .mk_app(Symbol::named("meter-mk"), Vec::<TermId>::new(), carrier);
+    let _nullary_member_application =
+        fixture
+            .terms
+            .mk_app(Symbol::named("meter-mk"), Vec::<TermId>::new(), carrier);
     fixture.selectors[0].1.clear();
     fixture.signatures.pop();
     fixture.signatures[0].argument_sorts.clear();

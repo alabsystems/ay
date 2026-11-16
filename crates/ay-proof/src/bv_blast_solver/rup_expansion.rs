@@ -100,7 +100,7 @@ pub(super) fn expand_dag_to_resolution_with_cancellation(
 
 fn copy_sat_lits_bounded(
     source: &[Literal],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<Vec<Lit>, BvSolvedExportError> {
     let mut out = reserve_rup_vec(source.len(), state, source.len())?;
     for lit in source {
@@ -112,7 +112,7 @@ fn copy_sat_lits_bounded(
 
 fn copy_lits_bounded(
     source: &[Lit],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<Vec<Lit>, BvSolvedExportError> {
     let mut out = reserve_rup_vec(source.len(), state, source.len())?;
     for &lit in source {
@@ -138,7 +138,7 @@ fn expand_one_rup_step(
     target: &[Lit],
     lits_by_lrat: &std::collections::HashMap<u64, Vec<Lit>>,
     lrat_to_premise: &std::collections::HashMap<u64, u32>,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<(u32, Option<Vec<Lit>>), BvSolvedExportError> {
     state.check_deadline()?;
     // ── 1. RUP replay to discover per-hint unit literals. ──
@@ -302,7 +302,7 @@ fn stronger_resolvent(
     resolvent: Vec<Lit>,
     target: &[Lit],
     id: u64,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<Option<Vec<Lit>>, BvSolvedExportError> {
     if clause_set_eq(&resolvent, target, state)? {
         return Ok(None);
@@ -319,7 +319,7 @@ fn resolve_pair(
     a: &[Lit],
     b: &[Lit],
     pivot: u32,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<Option<Vec<Lit>>, BvSolvedExportError> {
     if !state.is_bounded() {
         let a_pos = a.contains(&Lit::pos(pivot));
@@ -380,7 +380,7 @@ fn resolve_pair(
 fn contains_lit_bounded(
     clause: &[Lit],
     needle: Lit,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<bool, BvSolvedExportError> {
     for &lit in clause {
         state.charge_work(1)?;
@@ -396,7 +396,7 @@ fn contains_lit_bounded(
 fn clause_subset(
     a: &[Lit],
     b: &[Lit],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<bool, BvSolvedExportError> {
     if !state.is_bounded() {
         let sb: BTreeSet<Lit> = b.iter().copied().collect();
@@ -416,7 +416,7 @@ fn clause_subset(
 fn clause_set_eq(
     a: &[Lit],
     b: &[Lit],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<bool, BvSolvedExportError> {
     if !state.is_bounded() {
         let sa: BTreeSet<Lit> = a.iter().copied().collect();

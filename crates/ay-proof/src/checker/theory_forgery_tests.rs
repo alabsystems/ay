@@ -472,8 +472,10 @@ fn test_bv_bitblast_proof_producer_interprets_or_abstracts_division_but_never_fo
     );
     validate_theory_lemma_strict(&terms, vec![same], TheoryLemmaKind::BvBitBlast)
         .expect("an identity of one opaque term holds for every interpretation");
-    // Literal unit division lowers exactly, unlike the symbolic divisor.
-    // Keep both a valid unit identity and an invalid quotient claim.
+    // These wide signed cells are Unsupported/NoProof: refusal does not
+    // refute their mathematics or discriminate a forged signed identity.
+    // Their new lowering relation needs Lean authority. Keep the entire
+    // wide population and separately exercise supported signed semantics below.
     let one = terms.mk_bitvec(BigInt::from(1), 32);
     let by_one = terms.mk_app(
         ay_core::Symbol::named("bvsdiv"),
@@ -482,14 +484,41 @@ fn test_bv_bitblast_proof_producer_interprets_or_abstracts_division_but_never_fo
     );
     let meaning = terms.mk_app(ay_core::Symbol::named("="), vec![by_one, bv], Sort::Bool);
     validate_theory_lemma_strict(&terms, vec![meaning], TheoryLemmaKind::BvBitBlast)
-        .expect("signed division by literal one preserves the dividend");
+        .expect_err("NoProof: wide signed unit semantics need Lean authority");
     let zero = terms.mk_bitvec(BigInt::from(0), 32);
     let wrong_unit = terms.mk_app(ay_core::Symbol::named("="), vec![by_one, zero], Sort::Bool);
     validate_theory_lemma_strict(&terms, vec![wrong_unit], TheoryLemmaKind::BvBitBlast)
-        .expect_err("signed division by one is not always zero");
+        .expect_err("NoProof: the wide false-unit cell is unsupported too");
     let symbolic_meaning = terms.mk_app(ay_core::Symbol::named("="), vec![signed, bv], Sort::Bool);
     validate_theory_lemma_strict(&terms, vec![symbolic_meaning], TheoryLemmaKind::BvBitBlast)
-        .expect_err("a symbolic divisor does not always preserve the dividend");
+        .expect_err("NoProof: a wide symbolic quotient has no interpreted meaning");
+
+    // Existing bounded semantics really interprets all sixteen dividends.
+    // Its valid unit identity is accepted, so the false-unit refusal here
+    // remains a discriminating supported forgery control.
+    let mut bounded = TermStore::new();
+    let small = bounded.mk_var("small", Sort::bitvec(4));
+    let unit = bounded.mk_bitvec(BigInt::from(1), 4);
+    let quotient = bounded.mk_app(
+        ay_core::Symbol::named("bvsdiv"),
+        vec![small, unit],
+        Sort::bitvec(4),
+    );
+    let valid = bounded.mk_app(
+        ay_core::Symbol::named("="),
+        vec![quotient, small],
+        Sort::Bool,
+    );
+    validate_theory_lemma_strict(&bounded, vec![valid], TheoryLemmaKind::BvBitBlast)
+        .expect("existing bounded signed unit semantics validates the true identity");
+    let zero = bounded.mk_bitvec(BigInt::from(0), 4);
+    let forged = bounded.mk_app(
+        ay_core::Symbol::named("="),
+        vec![quotient, zero],
+        Sort::Bool,
+    );
+    validate_theory_lemma_strict(&bounded, vec![forged], TheoryLemmaKind::BvBitBlast)
+        .expect_err("existing bounded signed semantics rejects the false unit claim");
 }
 
 #[test]

@@ -147,6 +147,55 @@ fn metered_sort_retains_invalid_scalar_and_duplicate_namespace_refusals() {
     }
 }
 
+/// Datatype `||` with the nullary constructor `||` and the constructor `mk`
+/// whose one field is `||`.
+fn empty_names() -> DatatypeSort {
+    DatatypeSort::new(
+        "",
+        vec![
+            DatatypeConstructor::unit(""),
+            DatatypeConstructor::new("mk", vec![DatatypeField::new("", Sort::Int)]),
+        ],
+    )
+}
+
+fn malformed(sort: DatatypeSort, expected: &str) {
+    let result = check(&Sort::Datatype(sort), &mut |_, _| true);
+    assert!(
+        matches!(&result, Err(ProofCheckError::MalformedProofBundle { reason })
+            if reason == expected),
+        "expected {expected:?}, got {result:?}"
+    );
+}
+
+#[test]
+fn metered_sort_admits_empty_names_and_refuses_duplicates_and_empty_constructor_sets() {
+    let sort = Sort::Datatype(empty_names());
+    check(&sort, &mut |_, _| true).unwrap();
+    validate_sort(&sort, 17, "test sort", 0).unwrap();
+
+    let mut duplicate = empty_names();
+    duplicate.constructors.push(DatatypeConstructor::unit(""));
+    malformed(
+        duplicate,
+        "term t17 test sort has a duplicate datatype constructor",
+    );
+    let mut duplicate = empty_names();
+    duplicate.constructors[1]
+        .fields
+        .push(DatatypeField::new("", Sort::Bool));
+    malformed(
+        duplicate,
+        "term t17 test sort has a duplicate datatype field",
+    );
+    let mut no_constructors = empty_names();
+    no_constructors.constructors.clear();
+    malformed(
+        no_constructors,
+        "term t17 test sort has an empty constructor set",
+    );
+}
+
 #[test]
 fn metered_sort_charges_diagnostics_before_constructing_an_error_string() {
     let malformed = Sort::FloatingPoint(1, 1);

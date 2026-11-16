@@ -33,7 +33,7 @@ impl FiniteFieldSort {
             if modulus < prime * prime {
                 return Some(Self(modulus));
             }
-            if modulus % prime == 0 {
+            if modulus.is_multiple_of(prime) {
                 return None;
             }
         }
@@ -149,7 +149,7 @@ mod tests {
             }
             let mut divisor = 2;
             while divisor <= n / divisor {
-                if n % divisor == 0 {
+                if n.is_multiple_of(divisor) {
                     return false;
                 }
                 divisor += 1;

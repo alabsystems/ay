@@ -393,21 +393,30 @@ fn test_extract_mod_terms_simple_mod() {
 fn test_extract_mod_terms_skips_modulus_one() {
     let x = ChcVar::new("x", ChcSort::Int);
     let expr = ChcExpr::mod_op(ChcExpr::var(x), ChcExpr::int(1));
-    assert!(ModResidueHintProvider::extract_mod_terms(&expr).is_empty());
+    assert_eq!(
+        ModResidueHintProvider::extract_mod_terms(&expr),
+        [] as [(ChcExpr, i128); 0]
+    );
 }
 
 #[test]
 fn test_extract_mod_terms_skips_zero_modulus() {
     let x = ChcVar::new("x", ChcSort::Int);
     let expr = ChcExpr::mod_op(ChcExpr::var(x), ChcExpr::int(0));
-    assert!(ModResidueHintProvider::extract_mod_terms(&expr).is_empty());
+    assert_eq!(
+        ModResidueHintProvider::extract_mod_terms(&expr),
+        [] as [(ChcExpr, i128); 0]
+    );
 }
 
 #[test]
 fn test_extract_mod_terms_skips_next_var_dividend() {
     let x_next = ChcVar::new("x_next", ChcSort::Int);
     let expr = ChcExpr::mod_op(ChcExpr::var(x_next), ChcExpr::int(2));
-    assert!(ModResidueHintProvider::extract_mod_terms(&expr).is_empty());
+    assert_eq!(
+        ModResidueHintProvider::extract_mod_terms(&expr),
+        [] as [(ChcExpr, i128); 0]
+    );
 }
 
 #[test]
@@ -524,7 +533,10 @@ fn test_extract_mod_terms_non_constant_modulus_ignored() {
     let x = ChcVar::new("x", ChcSort::Int);
     let y = ChcVar::new("y", ChcSort::Int);
     let expr = ChcExpr::mod_op(ChcExpr::var(x), ChcExpr::var(y));
-    assert!(ModResidueHintProvider::extract_mod_terms(&expr).is_empty());
+    assert_eq!(
+        ModResidueHintProvider::extract_mod_terms(&expr),
+        [] as [(ChcExpr, i128); 0]
+    );
 }
 
 #[test]

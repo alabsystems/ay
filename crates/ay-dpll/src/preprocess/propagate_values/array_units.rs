@@ -30,7 +30,7 @@ impl ArrayUnitDerivation {
         term: TermId,
         progress: &mut dyn FnMut(usize, usize) -> bool,
     ) -> Option<Self> {
-        if !progress(1, std::mem::size_of::<Self>()) {
+        if !progress(1, size_of::<Self>()) {
             return None;
         }
         let candidate = Self {

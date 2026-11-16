@@ -81,6 +81,7 @@ fn finish(
 }
 
 impl BoundRetainedProofBytes {
+    #[cfg(test)]
     pub(crate) fn query_bytes(&self) -> &[u8] {
         &self.query
     }

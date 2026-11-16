@@ -131,9 +131,9 @@ fn stage_bcp_blocker_cert_false_start_wrap(
 
 fn learned_tail_reorder_fixture(clause_len: usize) -> (Solver, Vec<Literal>) {
     let mut solver = Solver::new(clause_len);
-    for i in 0..clause_len {
-        solver.var_data[i].level = 0;
-        solver.var_data[i].trail_pos = 0;
+    for data in &mut solver.var_data[..clause_len] {
+        data.level = 0;
+        data.trail_pos = 0;
     }
     solver.var_data[0].level = 99;
     solver.var_data[0].trail_pos = 99;

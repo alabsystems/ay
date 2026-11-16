@@ -54,7 +54,7 @@ pub(super) fn public_problem_roots(exec: &Executor) -> Result<ProblemRoots, Unkn
         .and_then(|n| n.checked_add(exec.ctx.soft_constraints().len()))
         .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?;
     let bytes = count
-        .checked_mul(std::mem::size_of::<TermId>())
+        .checked_mul(size_of::<TermId>())
         .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?;
     owner.pay(0, bytes)?;
     fence.check(exec, &mut owner)?;
@@ -65,7 +65,7 @@ pub(super) fn public_problem_roots(exec: &Executor) -> Result<ProblemRoots, Unkn
     let extra = roots
         .capacity()
         .checked_sub(count)
-        .and_then(|n| n.checked_mul(std::mem::size_of::<TermId>()))
+        .and_then(|n| n.checked_mul(size_of::<TermId>()))
         .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?;
     owner.pay(0, extra)?;
     fence.check(exec, &mut owner)?;
@@ -131,7 +131,7 @@ pub(super) fn reserve<T>(
             )
             .max(4);
         let bytes = target
-            .checked_mul(std::mem::size_of::<T>())
+            .checked_mul(size_of::<T>())
             .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?;
         pay(
             owner,
@@ -149,7 +149,7 @@ pub(super) fn reserve<T>(
                 budget,
                 0,
                 (out.capacity() - target)
-                    .checked_mul(std::mem::size_of::<T>())
+                    .checked_mul(size_of::<T>())
                     .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?,
             )?;
         }
@@ -175,7 +175,7 @@ fn insert(
         // Fixed-size keys use the native counted registry envelope for bucket
         // controls/rehash storage, admitted BEFORE the opaque allocation.
         let bytes = target
-            .checked_mul(std::mem::size_of::<TermId>())
+            .checked_mul(size_of::<TermId>())
             .and_then(|n| n.checked_mul(8))
             .and_then(|n| n.checked_add(4096))
             .ok_or_else(|| owner.refuse(UnknownOrigin::MemoryBudget))?;
@@ -414,7 +414,7 @@ mod tests {
         let fresh = problem();
         let input = public_problem_roots(&fresh).unwrap();
         assert_eq!(input.roots, fresh.ctx.assertions);
-        assert!(!input.roots.is_empty());
+        assert_ne!(input.roots.as_slice(), &[] as &[TermId]);
     }
 
     #[test]

@@ -25,10 +25,7 @@ fn unregistered_level0_uf_lia_executor() -> Executor {
         "/../../benchmarks/smt/QF_UFLIA/unsat_congruence_to_lia.smt2"
     ));
     let mut commands = ay_frontend::parse(input).expect("parse producer fixture");
-    assert!(matches!(
-        commands.pop(),
-        Some(ay_frontend::Command::CheckSat)
-    ));
+    assert!(matches!(commands.pop(), Some(Command::CheckSat)));
     let mut executor = Executor::new();
     executor
         .execute_all(&commands)
@@ -125,8 +122,7 @@ fn level0_theory_conflict_records_derivation_without_conferring_authority() {
         "recording the theory conflict must NOT by itself mint a refutation"
     );
     let error = CheckedSatRefutation::build(&mut executor)
-        .err()
-        .expect("a T-lemma with no registered proof must not authenticate");
+        .expect_err("a T-lemma with no registered proof must not authenticate");
     assert!(
         matches!(
             error,
@@ -223,7 +219,7 @@ fn unexplained_level0_callback_executor() -> Executor {
     let mut variables = Vec::new();
     for entry in trace.entries().iter() {
         assert!(entry.is_original);
-        assert!(entry.resolution_hints.is_empty());
+        assert_eq!(entry.resolution_hints, &[] as &[u64]);
         assert_eq!(
             entry.clause.len(),
             1,

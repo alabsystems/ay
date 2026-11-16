@@ -130,8 +130,8 @@ fn normalize_rhs(
             return None;
         }
         if b[row].is_negative() {
-            for column in 0..n {
-                a[row][column] = lp_neg(&a[row][column], budget)?;
+            for coefficient in &mut a[row][..n] {
+                *coefficient = lp_neg(coefficient, budget)?;
             }
             b[row] = lp_neg(&b[row], budget)?;
         }
@@ -202,9 +202,10 @@ fn pivot_tableau(
 ) -> Option<()> {
     let pivot = tableau[leaving][entering].clone();
     if !pivot.is_one() {
-        for column in 0..=total {
-            if !tableau[leaving][column].is_zero() {
-                tableau[leaving][column] = lp_div(&tableau[leaving][column], &pivot, budget)?;
+        let columns = total.checked_add(1)?;
+        for coefficient in &mut tableau[leaving][..columns] {
+            if !coefficient.is_zero() {
+                *coefficient = lp_div(coefficient, &pivot, budget)?;
             }
         }
     }

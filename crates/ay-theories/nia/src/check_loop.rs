@@ -1926,7 +1926,7 @@ mod eq_union_find_tests {
         let uf = EqUnionFind::default();
         let mut reasons = Vec::new();
         uf.path_reasons(TermId(7), TermId(7), &mut reasons);
-        assert!(reasons.is_empty());
+        assert_eq!(reasons, Vec::<(TermId, bool)>::new());
     }
 }
 #[cfg(test)]

@@ -51,16 +51,13 @@ impl Ring<'_, '_> {
         let required = out.len().checked_add(extra)?;
         if required > out.capacity() {
             let target = required.max(out.capacity().max(4).checked_mul(2)?);
-            self.pay(out.len(), target.checked_mul(std::mem::size_of::<T>())?)?;
+            self.pay(out.len(), target.checked_mul(size_of::<T>())?)?;
             if out.try_reserve_exact(target - out.len()).is_err() {
                 *self.fuel = 0;
                 return None;
             }
             if out.capacity() > target {
-                self.pay(
-                    0,
-                    (out.capacity() - target).checked_mul(std::mem::size_of::<T>())?,
-                )?;
+                self.pay(0, (out.capacity() - target).checked_mul(size_of::<T>())?)?;
             }
         }
         Some(())
@@ -532,12 +529,12 @@ mod tests {
         let y = terms.mk_var("y", Sort::FiniteField(field));
         let xx = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, x],
+            [x, x],
             Sort::FiniteField(field),
         );
         let xy = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, y],
+            [x, y],
             Sort::FiniteField(field),
         );
         let value = terms.mk_finite_field(square, field);
@@ -672,12 +669,12 @@ mod tests {
         assert!(!(0..prime).any(|v| v * v % prime == 3));
         let xx = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, x],
+            [x, x],
             Sort::FiniteField(field),
         );
         let yy = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[y, y],
+            [y, y],
             Sort::FiniteField(field),
         );
         let scale = terms.mk_finite_field(slope, field);
@@ -685,12 +682,12 @@ mod tests {
         let one = terms.mk_finite_field(1, field);
         let scaled = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[scale, y],
+            [scale, y],
             Sort::FiniteField(field),
         );
         let rhs = terms.mk_app(
             Symbol::Named("ff.add".into()),
-            &[scaled, offset],
+            [scaled, offset],
             Sort::FiniteField(field),
         );
         let a = terms.mk_eq(xx, rhs);
@@ -734,22 +731,22 @@ mod tests {
                         let zero = terms.mk_finite_field(0, field);
                         let xy = terms.mk_app(
                             Symbol::Named("ff.mul".into()),
-                            &[x, y],
+                            [x, y],
                             Sort::FiniteField(field),
                         );
                         let bx = terms.mk_app(
                             Symbol::Named("ff.mul".into()),
-                            &[bc, x],
+                            [bc, x],
                             Sort::FiniteField(field),
                         );
                         let cy = terms.mk_app(
                             Symbol::Named("ff.mul".into()),
-                            &[cc, y],
+                            [cc, y],
                             Sort::FiniteField(field),
                         );
                         let sum = terms.mk_app(
                             Symbol::Named("ff.add".into()),
-                            &[xy, bx, cy, dc],
+                            [xy, bx, cy, dc],
                             Sort::FiniteField(field),
                         );
                         let equation = terms.mk_eq(sum, zero);

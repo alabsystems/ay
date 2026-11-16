@@ -166,7 +166,7 @@ fn solve_once(num_vars: usize, lits: &[Vec<Literal>], materialize: bool) -> Dura
     if materialize {
         let writer = solver.take_proof_writer().expect("writer present");
         let bytes = writer.into_vec().expect("in-memory flush");
-        assert!(!bytes.is_empty(), "materialized proof is non-empty");
+        assert_ne!(bytes.len(), 0, "materialized proof is non-empty");
     }
     start.elapsed()
 }

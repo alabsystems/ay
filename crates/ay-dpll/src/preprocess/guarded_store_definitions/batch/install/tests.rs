@@ -4,9 +4,7 @@
 use super::*;
 use ay_core::ProofStep;
 
-#[path = "../tests/fixtures.rs"]
-mod fixtures;
-use fixtures::Fixture;
+use super::super::tests::fixtures::Fixture;
 
 fn sources(roots: &[TermId]) -> Vec<Vec<TermId>> {
     roots.iter().map(|&root| vec![root]).collect()

@@ -846,13 +846,7 @@ impl Solver {
     /// Problems". CaDiCaL phases.cpp initial_phase=2 (JW-based).
     pub(super) fn init_jw_phases(&mut self) {
         // Only fill in phases that are still unset (don't override walk/warmup).
-        let mut has_unset = false;
-        for i in 0..self.num_vars {
-            if self.phase[i] == 0 {
-                has_unset = true;
-                break;
-            }
-        }
+        let has_unset = self.phase[..self.num_vars].contains(&0);
         if !has_unset {
             return;
         }

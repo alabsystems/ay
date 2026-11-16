@@ -18,17 +18,17 @@ fn assert_empty_namespace(solver: &FpSolver<'_>) {
         ieee_nan_encodings,
         rm_terms,
     } = solver.export_cache();
-    assert!(term_to_fp.is_empty());
-    assert!(bv_term_bits.is_empty());
+    assert_eq!(term_to_fp.len(), 0);
+    assert_eq!(bv_term_bits.len(), 0);
     assert_eq!(next_var, 1);
     assert_eq!(cached_false, None);
     assert_eq!(cached_true, None);
-    assert!(bool_input_lits.is_empty());
-    assert!(to_bv_unspec_sites.is_empty());
-    assert!(ieee_nan_encodings.is_empty());
-    assert!(rm_terms.is_empty());
-    assert!(solver.clauses().is_empty());
-    assert!(solver.pending_condition_links.is_empty());
+    assert_eq!(bool_input_lits.len(), 0);
+    assert_eq!(to_bv_unspec_sites.len(), 0);
+    assert_eq!(ieee_nan_encodings.len(), 0);
+    assert_eq!(rm_terms.len(), 0);
+    assert_eq!(solver.clauses().len(), 0);
+    assert_eq!(solver.pending_condition_links.len(), 0);
     assert!(!solver.has_encoding_gap());
 }
 
@@ -60,7 +60,7 @@ fn reset_rebuilds_nan_encodings_and_their_constraints() {
     let mut solver = FpSolver::new(&terms);
     solver.bitblast_to_ieee_bv(x);
     assert_eq!(solver.ieee_nan_encodings.len(), 1);
-    assert!(!solver.clauses().is_empty());
+    assert_ne!(solver.clauses().len(), 0);
     solver.reset();
     assert_empty_namespace(&solver);
 
@@ -148,7 +148,7 @@ fn reset_drops_pending_proxies_and_gap_but_keeps_external_tseitin_names() {
     );
     assert_eq!(solver.take_pending_condition_links(), vec![(1, 41)]);
     assert_eq!(fresh.take_pending_condition_links(), vec![(1, 41)]);
-    assert!(solver.take_pending_condition_links().is_empty());
+    assert_eq!(solver.take_pending_condition_links().len(), 0);
     solver.encode_bool_condition(opaque);
     assert!(solver.take_encoding_gap());
 }
@@ -166,13 +166,13 @@ fn reset_of_imported_cache_is_a_fresh_namespace_even_after_clause_drain() {
     conversions(&mut first, x);
     let cache = first.export_cache();
     let retained = first.take_clauses();
-    assert!(!retained.is_empty());
+    assert_ne!(retained.len(), 0);
     let mut next = FpSolver::new(&terms);
     // Import ordinarily accompanies `retained` in the same external SAT
     // namespace. Reset then discards that namespace, not merely new clauses.
     next.import_cache(cache);
-    assert!(!next.bv_term_bits().is_empty());
-    assert!(!next.bool_input_lits().is_empty());
+    assert_ne!(next.bv_term_bits().len(), 0);
+    assert_ne!(next.bool_input_lits().len(), 0);
     next.reset();
     assert_empty_namespace(&next);
     let mut fresh = FpSolver::new(&terms);

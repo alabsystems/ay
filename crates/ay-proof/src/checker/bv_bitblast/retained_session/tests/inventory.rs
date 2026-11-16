@@ -96,7 +96,7 @@ fn out_of_order_or_repeated_step_poisons_the_session_and_discards_output() {
     session.validate_step(ProofId(0), &mut |_, _| true).unwrap();
     assert_eq!(session.output.len(), 1);
     assert!(session.validate_step(ProofId(0), &mut |_, _| true).is_err());
-    assert!(session.output.is_empty());
+    assert_eq!(session.output, []);
     assert!(session.finish(&mut |_, _| true).is_err());
 }
 

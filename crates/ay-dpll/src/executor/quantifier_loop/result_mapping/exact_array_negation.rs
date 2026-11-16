@@ -163,10 +163,10 @@ mod tests {
         )
         .expect("fixture parses");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("fixture executes")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("fixture executes"),
+            [] as [String; 0]
+        );
         let original = executor.ctx.assertions.clone();
         let evidence = executor
             .rewrite_exact_top_level_array_negation()

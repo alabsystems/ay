@@ -437,7 +437,7 @@ impl Conditioning {
             // is NOT in the candidate clause, "unassign" it. When unassignment
             // causes a watched clause to lose all true literals, promote the
             // false autarky literals in that clause to conditional.
-            debug_assert!(self.unassigned.is_empty());
+            debug_assert_eq!(self.unassigned.len(), 0);
             let mut cond_cursor: usize = 0;
 
             'refine: while watched_autarky.is_some()

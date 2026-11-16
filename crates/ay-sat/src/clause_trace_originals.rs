@@ -71,7 +71,7 @@ impl<'a> TraceEntries<'a> {
         if self.originals.is_none() || self.meta.is_empty() {
             return 0;
         }
-        (usize::BITS - self.meta.len().leading_zeros()) as usize
+        self.meta.len().bit_width() as usize
     }
 
     pub(super) fn combined_entry(

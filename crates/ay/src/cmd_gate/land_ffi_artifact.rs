@@ -87,7 +87,7 @@ fn hash(path: &Path) -> Result<String> {
         bail!("produced FFI artifact is not a regular file");
     }
     let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = vec![0u8; 65536].into_boxed_slice();
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn ffi_artifact_native_plan_reuses_one_graph_and_links_the_bound_output() {
-        use super::super::{Runner, Step, StepKind};
+        use super::super::{Runner, StepKind};
         use crate::cmd_gate::land::{plan, scope::RustScope};
         // The containing native test owns admission. Like land_batch's actual
         // fixture, use that SAME inherited bank, with a separate build tree.

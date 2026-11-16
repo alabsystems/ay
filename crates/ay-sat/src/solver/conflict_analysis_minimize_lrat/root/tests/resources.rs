@@ -70,7 +70,7 @@ fn every_original_observer_poll_is_terminal_and_quiet_across_root_bfs_and_finish
             .decision_trace
             .as_mut()
             .unwrap()
-            .write_event(&crate::decision_trace::TraceEvent::Decide { lit_dimacs: 1 })
+            .write_event(&TraceEvent::Decide { lit_dimacs: 1 })
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let owner = observing(cut, &calls);
@@ -123,7 +123,7 @@ fn owned_materializer_scratch_unwind_returns_buffers_and_never_flushes_pending_t
         .decision_trace
         .as_mut()
         .unwrap()
-        .write_event(&crate::decision_trace::TraceEvent::Decide { lit_dimacs: 1 })
+        .write_event(&TraceEvent::Decide { lit_dimacs: 1 })
         .unwrap();
     let owner = test_owner(1_000_000, 1_000_000);
     Counted(&owner).enter(&mut s).unwrap();
@@ -144,7 +144,7 @@ fn owned_materializer_scratch_unwind_returns_buffers_and_never_flushes_pending_t
         ))
     );
     assert_eq!(s.cold.lrat_level0_unit_materialize_cursor, 0);
-    assert!(s.cold.lrat_materialize_hints_buf.is_empty());
+    assert_eq!(s.cold.lrat_materialize_hints_buf.len(), 0);
     assert_eq!(s.cold.lrat_materialize_hints_buf.capacity(), 16);
     assert!(s.cold.clause_trace.as_ref().unwrap().proof_work_exhausted());
     assert!(s.cold.decision_trace.is_none());

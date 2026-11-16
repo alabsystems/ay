@@ -88,7 +88,7 @@ impl<'terms> Builder<'terms, '_> {
     fn tables(&mut self) -> Result<()> {
         let count = self.program.reference.terms.len();
         let bytes = count
-            .checked_mul(1 + std::mem::size_of::<Option<Value>>())
+            .checked_mul(1 + size_of::<Option<Value>>())
             .ok_or(ReferenceError::Width)?;
         self.program.reference.storage(count, bytes)?;
         self.states
@@ -107,7 +107,7 @@ impl<'terms> Builder<'terms, '_> {
     }
 
     fn task(&mut self, tasks: &mut Vec<(TermId, Visit)>, id: TermId, phase: Visit) -> Result<()> {
-        let bytes = std::mem::size_of::<(TermId, Visit)>();
+        let bytes = size_of::<(TermId, Visit)>();
         self.program.reference.storage(1, bytes)?;
         tasks
             .try_reserve_exact(1)
@@ -213,9 +213,7 @@ impl<'terms> Builder<'terms, '_> {
     }
 
     fn push_root(&mut self, word: RefId) -> Result<()> {
-        self.program
-            .reference
-            .storage(1, std::mem::size_of::<RefId>())?;
+        self.program.reference.storage(1, size_of::<RefId>())?;
         self.program
             .roots
             .try_reserve_exact(1)
@@ -230,9 +228,7 @@ impl<'terms> Builder<'terms, '_> {
             .program
             .reference
             .binary(super::super::graph::Binary::Ult, word, five)?;
-        self.program
-            .reference
-            .storage(1, std::mem::size_of::<RefId>())?;
+        self.program.reference.storage(1, size_of::<RefId>())?;
         self.program
             .domains
             .try_reserve_exact(1)

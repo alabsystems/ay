@@ -7,6 +7,21 @@ use super::super::term::Sort;
 use super::*;
 use crate::{check_alethe_document, ProblemScope};
 
+#[test]
+fn an_unchecked_rule_is_written_only_as_the_canonical_hole() {
+    let mut proof = Proof::new("t".into(), "@shared_".into());
+    let step = proof.new_step(&[]);
+    let id = proof.id(step);
+
+    proof.write_step(step, "(cl p)", "invented_rule", &[], &[], "");
+
+    assert_eq!(
+        proof.out,
+        format!("(step {id} (cl p) :rule {})\n", ay_core::UNPROVED_STEP_RULE)
+    );
+    assert!(!proof.out.contains("invented_rule"));
+}
+
 fn one_premise_document(negative: bool) -> String {
     let mut proof = Proof::new("t".into(), "@shared_".into());
     let atom = proof.t.var("p", Sort::Bool);
@@ -33,7 +48,7 @@ fn one_premise_document(negative: bool) -> String {
     let final_step = proof
         .derive(&[], &[Prem::Step(repeated), Prem::Step(contra)], &[])
         .expect("real contradictory BCP closure");
-    assert!(proof.clause(final_step).is_empty());
+    assert_eq!(proof.clause(final_step), &[] as &[T]);
     proof.out
 }
 

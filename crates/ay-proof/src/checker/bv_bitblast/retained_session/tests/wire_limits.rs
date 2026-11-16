@@ -36,7 +36,7 @@ fn bounded_replay(
     for index in 0..proof.steps.len() {
         session.validate_step(ProofId(index as u32), progress)?;
     }
-    assert!(session.finish(progress)?.is_empty());
+    assert_eq!(session.finish(progress)?, []);
     Ok(())
 }
 
@@ -63,7 +63,7 @@ fn every_field_intersects_once_and_loose_limits_cannot_raise_source_caps() {
         max_hints: 3,
         max_work: 4,
         max_storage_bytes: 5,
-        deadline: end - Duration::from_secs(1),
+        deadline: end.checked_sub(Duration::from_secs(1)).unwrap(),
     };
     assert_limits(effective(end, Some(tight)), tight);
 }
@@ -131,7 +131,7 @@ fn absent_override_preserves_the_legacy_complete_callback_sequence() {
     session
         .validate_step(ProofId(0), &mut old_progress)
         .unwrap();
-    assert!(session.finish(&mut old_progress).unwrap().is_empty());
+    assert_eq!(session.finish(&mut old_progress).unwrap(), []);
     let mut new_trace = Vec::new();
     bounded_replay(&terms, &proof, &payloads, end, None, &mut |w, b| {
         new_trace.push((w, b));
@@ -210,7 +210,7 @@ fn capture_also_obeys_the_wire_ceiling_and_failure_poison_is_terminal() {
         session.validate_step(ProofId(0), &mut |_, _| true),
         Err(ProofCheckError::ResourceLimit)
     );
-    assert!(session.output.is_empty());
+    assert_eq!(session.output, []);
     let calls = producer_test_counter::count();
     assert!(session.validate_step(ProofId(0), &mut |_, _| true).is_err());
     assert!(session.finish(&mut |_, _| true).is_err());
@@ -260,7 +260,7 @@ fn expired_wire_deadline_refuses_before_session_or_whole_proof_callbacks() {
     let proof = proof(clause, 1);
     let end = deadline();
     let mut wire = defaults(end);
-    wire.deadline = Instant::now() - Duration::from_secs(1);
+    wire.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     assert!(matches!(
         RetainedSession::new_with_wire_limits(
             credits(&proof, &terms, end),

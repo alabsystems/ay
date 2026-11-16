@@ -73,7 +73,8 @@ fn mixed_65_real_encoding_materializes_all_arguments_and_preserves_pair_order() 
             let plan = plan_congruence(&fixture.terms, &mut fp, &cnf, &scan);
             assert!(!plan.incomplete);
             assert_eq!(plan.clauses.len(), expected.len() * 2);
-            for (clauses, &(i, j)) in plan.clauses.chunks_exact(2).zip(&expected) {
+            let (clause_pairs, _) = plan.clauses.as_chunks::<2>();
+            for (clauses, &(i, j)) in clause_pairs.iter().zip(&expected) {
                 let a = cnf.var_for_term(group[i].0).unwrap() as i32;
                 let b = cnf.var_for_term(group[j].0).unwrap() as i32;
                 let outputs = |clause: &[crate::executor::theories::fp::congruence::PlanLit]| {

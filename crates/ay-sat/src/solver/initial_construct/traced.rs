@@ -30,7 +30,7 @@ pub(super) fn arm(solver: &mut Solver, owner: &CountedAdmission) -> Result<()> {
     // Fixed copies and pass-table checks in the shared proof override kernel;
     // InprocessingControls contains only fixed-size TechniqueControl values.
     owner.admit(
-        std::mem::size_of::<super::super::inproc_control::InprocessingControls>()
+        size_of::<inproc_control::InprocessingControls>()
             .saturating_mul(8)
             .saturating_add(128),
         0,

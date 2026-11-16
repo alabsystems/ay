@@ -179,7 +179,7 @@ fn expired_original_deadline_precedes_input_errors_and_callbacks() {
             text,
             WORK,
             STORAGE,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| {
                 calls += 1;
                 true

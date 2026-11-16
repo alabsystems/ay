@@ -410,10 +410,16 @@ fn test_reset_clears_dioph_substitution_cache() {
 
     solver.reset();
 
-    assert!(solver.dioph_equality_key.is_empty());
+    assert_eq!(solver.dioph_equality_key.as_slice(), &[] as &[TermId]);
     assert!(solver.dioph_safe_dependent_vars.is_empty());
-    assert!(solver.dioph_cached_substitutions.is_empty());
-    assert!(solver.dioph_cached_reasons.is_empty());
+    assert_eq!(
+        solver.dioph_cached_substitutions.as_slice(),
+        &[] as &[SubstitutionTriple<TermId, BigInt>]
+    );
+    assert_eq!(
+        solver.dioph_cached_reasons.as_slice(),
+        &[] as &[(TermId, bool)]
+    );
 }
 
 /// Regression test: pop() must not let STALE Dioph caches be reused (#3736).
@@ -672,10 +678,16 @@ fn test_dioph_cache_clears_when_no_equalities_remain() {
         "Inequality-only system should stay SAT after cache invalidation, got {result:?}"
     );
 
-    assert!(solver.dioph_equality_key.is_empty());
+    assert_eq!(solver.dioph_equality_key.as_slice(), &[] as &[TermId]);
     assert!(solver.dioph_safe_dependent_vars.is_empty());
-    assert!(solver.dioph_cached_substitutions.is_empty());
-    assert!(solver.dioph_cached_reasons.is_empty());
+    assert_eq!(
+        solver.dioph_cached_substitutions.as_slice(),
+        &[] as &[SubstitutionTriple<TermId, BigInt>]
+    );
+    assert_eq!(
+        solver.dioph_cached_reasons.as_slice(),
+        &[] as &[(TermId, bool)]
+    );
 }
 
 #[test]
@@ -684,7 +696,7 @@ fn test_detached_linear_parse_cache_is_send() {
     // its shared TermStore borrow and therefore its store's auto-traits;
     // the owner/view compile-fail controls require that it remains non-Send.
     fn assert_send<T: Send>() {}
-    assert_send::<crate::LiaLinearParseCache>();
+    assert_send::<LiaLinearParseCache>();
 }
 
 #[test]
@@ -1971,7 +1983,7 @@ fn test_lia_finite_domain_search_is_bounded_by_work_not_only_nodes() {
     // Never a witness for pigeonhole; a tripped budget is "no conclusion",
     // so the ordinary procedure decides.
     assert!(
-        matches!(result, crate::types::DirectEnumResult::NoConclusion),
+        matches!(result, DirectEnumResult::NoConclusion),
         "pigeonhole 17-in-16 is UNSAT, got {result:?}"
     );
     let stats = solver.fd_search_stats;
@@ -2014,7 +2026,7 @@ fn test_lia_finite_domain_search_polls_deadline_inside_a_node() {
 
     let result = solver.try_finite_domain_search();
     assert!(
-        matches!(result, crate::types::DirectEnumResult::NoConclusion),
+        matches!(result, DirectEnumResult::NoConclusion),
         "expected no conclusion on timeout, got {result:?}"
     );
     let stats = solver.fd_search_stats;
@@ -2143,9 +2155,10 @@ fn test_lia_violated_disequalities_and_repair_fixing() {
     assert_eq!(fix_var2, if fix_var == x { y } else { x });
 
     // A violated non-disequality declines the whole report.
-    let mut bad_solution: Vec<(usize, BigInt)> = Vec::new();
-    bad_solution.push((term_to_idx[&x], BigInt::from(3)));
-    bad_solution.push((term_to_idx[&y], BigInt::one()));
+    let bad_solution: Vec<(usize, BigInt)> = vec![
+        (term_to_idx[&x], BigInt::from(3)),
+        (term_to_idx[&y], BigInt::one()),
+    ];
     assert!(solver
         .violated_disequalities(&bad_solution, &idx_to_term)
         .is_none());

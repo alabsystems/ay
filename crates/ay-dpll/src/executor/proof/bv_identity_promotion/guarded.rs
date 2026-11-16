@@ -264,7 +264,7 @@ impl Executor {
         let root = self
             .ctx
             .terms
-            .mk_app(Symbol::named("and"), roots.to_vec(), Sort::Bool);
+            .mk_app(Symbol::named("and"), roots, Sort::Bool);
         let negative = self.ctx.terms.mk_not_raw(root);
         let mut candidate = Proof::new();
         let mut assumptions = Vec::new();

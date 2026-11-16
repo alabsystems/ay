@@ -188,7 +188,7 @@ fn yun_on_an_already_square_free_input_returns_it_unchanged() {
 fn yun_on_a_constant_returns_no_factors() {
     let d = z(&[7]).square_free_decomposition().expect("non-zero");
     assert_eq!(d.c, BigInt::from(7));
-    assert!(d.factors.is_empty());
+    assert_eq!(d.factors.as_slice(), &[] as &[(ZPoly, usize)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +433,10 @@ fn factoring_the_zero_polynomial_fails_closed_and_a_constant_is_its_own_factor()
     assert!(m.factor(&m.zero()).is_none());
     let c = m.factor(&m.from_u64(vec![9])).expect("non-zero constant");
     assert_eq!(c.lc, 9);
-    assert!(c.factors.is_empty());
+    assert_eq!(
+        c.factors.as_slice(),
+        &[] as &[(crate::upoly::ZpPoly, usize)]
+    );
 }
 
 #[test]

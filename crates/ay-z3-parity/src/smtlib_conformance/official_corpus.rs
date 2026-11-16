@@ -1077,29 +1077,29 @@ fn source_from_metadata(bytes: &[u8]) -> Result<CorpusSource, String> {
     // View/download statistics change in the API response. Authenticate the
     // record, DOI and exact immutable archive rows below, and retain the raw
     // response's observed hash as provenance, not as a mutable-content pin.
-    let value: serde_json::Value = serde_json::from_slice(bytes)
+    let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid Zenodo record metadata JSON: {error}"))?;
     let id_matches = value
         .get("id")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(Value::as_u64)
         .is_some_and(|id| id.to_string() == RECORD_ID);
     if !id_matches {
         return Err(format!(
             "Zenodo metadata is not immutable record {RECORD_ID}"
         ));
     }
-    if value.get("doi").and_then(serde_json::Value::as_str) != Some(RECORD_DOI) {
+    if value.get("doi").and_then(Value::as_str) != Some(RECORD_DOI) {
         return Err(format!("Zenodo metadata DOI is not {RECORD_DOI}"));
     }
     let files = value
         .get("files")
-        .and_then(serde_json::Value::as_array)
+        .and_then(Value::as_array)
         .ok_or("Zenodo metadata has no files array")?;
     let mut archives = Vec::new();
     for file in files {
         let key = file
             .get("key")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .ok_or("Zenodo file has no key")?;
         let Some(division) = key.strip_suffix(".tar.zst") else {
             continue;
@@ -1107,14 +1107,14 @@ fn source_from_metadata(bytes: &[u8]) -> Result<CorpusSource, String> {
         validate_division(division)?;
         let size = file
             .get("size")
-            .and_then(serde_json::Value::as_u64)
+            .and_then(Value::as_u64)
             .ok_or_else(|| format!("Zenodo archive {key:?} has no byte size"))?;
         if size == 0 {
             return Err(format!("Zenodo archive {key:?} is empty"));
         }
         let checksum = file
             .get("checksum")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .ok_or_else(|| format!("Zenodo archive {key:?} has no checksum"))?;
         validate_md5(checksum)?;
         archives.push(CorpusArchive {
@@ -3772,7 +3772,7 @@ mod tests {
         });
         let checker = Artifact {
             path: "checker".to_string(),
-            sha256: unsat_proofs::CARCARA_SHA256.to_string(),
+            sha256: checker_cohort::LEGACY_SHA256.to_string(),
         };
         let error = validate_query_evidence(
             &file.queries[0],

@@ -269,6 +269,7 @@ pub(super) fn semantic_predicate(owner: &str) -> Option<&'static str> {
         .find_map(|&(name, predicate)| (name == owner).then_some(predicate))
 }
 
+#[cfg(test)]
 pub(super) fn semantic_owner_names() -> impl Iterator<Item = &'static str> {
     DECLARATION_SEMANTIC_PREDICATES
         .iter()

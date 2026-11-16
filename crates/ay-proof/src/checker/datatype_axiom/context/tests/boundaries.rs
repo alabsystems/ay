@@ -97,7 +97,7 @@ fn diagnostics_and_first_registry_allocation_are_refusable() {
 fn unused_nonmember_names_are_still_charged_during_the_global_scan() {
     let mut fixture = fixture();
     let (baseline_work, _, _) = usage(&fixture);
-    fixture
+    let _unused_global_name = fixture
         .terms
         .mk_var("unused-global-name".repeat(4096), Sort::Int);
     let (large_work, _, _) = usage(&fixture);
@@ -132,7 +132,7 @@ fn a_thousand_member_context_fits_a_reasonable_shared_allocation_envelope() {
         work <= 64 * 1024 * 1024 && bytes <= 64 * 1024 * 1024
     })
     .unwrap();
-    assert!(bytes > 1000 * std::mem::size_of::<String>());
+    assert!(bytes > 1000 * size_of::<String>());
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn an_empty_signature_context_does_not_scan_the_term_store() {
     let mut terms = TermStore::new();
     let baseline = empty(&terms);
     for index in 0..10_000 {
-        terms.mk_var(format!("unrelated-{index}"), Sort::Int);
+        let _unrelated_term = terms.mk_var(format!("unrelated-{index}"), Sort::Int);
     }
     assert_eq!(empty(&terms), baseline);
 
@@ -209,7 +209,7 @@ fn an_empty_signature_context_does_not_scan_the_term_store() {
     let mut fixture = fixture();
     let (with_members, _, _) = usage(&fixture);
     for index in 0..1_000 {
-        fixture
+        let _unrelated_term = fixture
             .terms
             .mk_var(format!("unrelated-{index}"), Sort::Int);
     }

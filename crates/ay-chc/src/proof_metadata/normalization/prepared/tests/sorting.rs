@@ -74,7 +74,7 @@ fn commutative_children_sort_but_noncommutative_order_remains_visible() {
 
 #[test]
 fn mergesort_is_stable_and_prices_long_common_prefix_comparisons() {
-    let mut keys = vec![
+    let mut keys = [
         vec![b'a'; 257],
         vec![b'a'; 257],
         vec![b'a'; 257],
@@ -85,16 +85,17 @@ fn mergesort_is_stable_and_prices_long_common_prefix_comparisons() {
     keys[2].push(b'b');
     keys[3].push(b'a');
     let mut count = 0usize;
-    let mut sink = |work: usize, _: usize| {
-        count += work;
-        Ok(())
-    };
-    let mut work = WorkBudget::with_admission(1_000_000, &mut sink);
-    let indices = order::indices(keys.len(), &mut Borrowed(&mut work), |a, b, control| {
-        order::compare(&keys[a], &keys[b], control)
-    })
-    .unwrap();
-    assert_eq!(indices, vec![1, 3, 0, 2]);
-    drop(work);
+    {
+        let mut sink = |work: usize, _: usize| {
+            count += work;
+            Ok(())
+        };
+        let mut work = WorkBudget::with_admission(1_000_000, &mut sink);
+        let indices = order::indices(keys.len(), &mut Borrowed(&mut work), |a, b, control| {
+            order::compare(&keys[a], &keys[b], control)
+        })
+        .unwrap();
+        assert_eq!(indices, vec![1, 3, 0, 2]);
+    }
     assert!(count >= 4 * 257);
 }

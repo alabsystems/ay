@@ -89,7 +89,7 @@ fn the_residue_vector_and_its_slack_do_not_veto_the_prune() {
         let _residue = translator.int_residue_var(x, 8);
         translator.into_range_assertions()
     };
-    assert!(!assertions.is_empty());
+    assert_ne!(assertions, [] as [TermId; 0]);
     let names = bv_lia_names(&terms);
     for prefix in ["__ay_bv_lia_i_", "__ay_bv_lia_cong_"] {
         assert!(
@@ -114,7 +114,7 @@ fn the_euclidean_quotient_does_not_veto_the_prune() {
     executor.execute_all(&commands).expect("fixture executes");
     let roots = executor.ctx.assertions.clone();
     let bridge = executor.collect_bv_lia_residue_bridge_assertions(&roots);
-    assert!(!bridge.is_empty());
+    assert_ne!(bridge, [] as [TermId; 0]);
     let names = bv_lia_names(&executor.ctx.terms);
     assert!(
         names.iter().any(|name| name.starts_with("__ay_bv_lia_q_")),

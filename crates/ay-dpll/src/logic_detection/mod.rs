@@ -10,6 +10,7 @@
 mod parse;
 mod transforms;
 
+#[cfg(test)]
 pub(crate) use parse::FAIL_CLOSED_COMBINED;
 pub(crate) use parse::{declared_logic_routes_as_all, is_z3_recognized_logic};
 

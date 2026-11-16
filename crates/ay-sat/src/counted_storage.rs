@@ -27,7 +27,7 @@ pub(crate) fn try_reserve<T>(
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     // Match RawVec's ordinary amortized-growth floor. Capacities feed solver
     // memory heuristics, so an arbitrary minimum could alter search cadence.
-    let element_bytes = std::mem::size_of::<T>();
+    let element_bytes = size_of::<T>();
     let minimum = if element_bytes == 1 {
         8
     } else if element_bytes <= 1024 {
@@ -37,7 +37,7 @@ pub(crate) fn try_reserve<T>(
     };
     let target = required.max(doubled).max(minimum);
     let bytes = target
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     let work = target
         .checked_add(values.len())
@@ -52,7 +52,7 @@ pub(crate) fn try_reserve<T>(
 pub(crate) fn try_reserved_exact<T>(owner: &CountedAdmission, capacity: usize) -> Result<Vec<T>> {
     owner.admit(1, 0)?;
     let bytes = capacity
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     owner.admit(capacity, bytes)?;
     let mut values = Vec::new();
@@ -71,7 +71,7 @@ pub(crate) fn try_vec_with<T>(
 ) -> Result<Vec<T>> {
     let mut values = try_reserved_exact(owner, len)?;
     for index in 0..len {
-        owner.admit(1, std::mem::size_of::<T>())?;
+        owner.admit(1, size_of::<T>())?;
         values.push(make(index));
     }
     Ok(values)

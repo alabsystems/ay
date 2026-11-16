@@ -5,6 +5,7 @@
 //! Tests for deterministic polynomial generation.
 
 use super::{gen_poly, gen_poly_shaped, render, work_cost, Rng, Shape, ALL_SHAPES};
+use num_rational::BigRational;
 use num_traits::Zero;
 
 #[test]
@@ -37,7 +38,7 @@ fn every_shape_builds_within_reason() {
         for _ in 0..32 {
             let p = gen_poly_shaped(&mut rng, shape, 8);
             if shape == Shape::Zero {
-                assert!(p.coeffs.is_empty());
+                assert_eq!(p.coeffs.as_slice(), &[] as &[BigRational]);
             } else {
                 assert!(!p.coeffs.is_empty(), "{} produced nothing", shape.name());
             }

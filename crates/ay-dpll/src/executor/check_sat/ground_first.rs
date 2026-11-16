@@ -283,7 +283,7 @@ impl Executor {
                 .current_solve_deadline()
                 .map_or(MAX_PUBLICATION, |deadline| {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    left - left / PUBLICATION_RESERVE_SHARE
+                    left.saturating_sub(left / PUBLICATION_RESERVE_SHARE)
                 })
                 .min(MAX_PUBLICATION);
             self.ground_first_publish_certified(

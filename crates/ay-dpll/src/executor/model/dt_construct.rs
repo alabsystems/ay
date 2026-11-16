@@ -1953,7 +1953,7 @@ impl DtBuilder<'_> {
         let mut path: Vec<usize> = Vec::new();
         for r in constrained.into_iter().chain(free) {
             self.construct_class(r, &mut path, MAX_DEPTH);
-            debug_assert!(path.is_empty());
+            debug_assert_eq!(path.as_slice(), &[] as &[usize]);
             if self.work_budget.exhausted() {
                 return false;
             }

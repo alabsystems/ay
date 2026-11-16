@@ -112,8 +112,8 @@ mod assurance_resolution_tests {
         SolveArgs {
             assurance,
             competition,
-            strict_proofs,
             self_check,
+            strict_proofs,
             ..SolveArgs::default()
         }
     }
@@ -223,8 +223,8 @@ mod assurance_cli_tests {
         SolveArgs {
             assurance,
             competition,
-            strict_proofs,
             self_check,
+            strict_proofs,
             ..SolveArgs::default()
         }
     }

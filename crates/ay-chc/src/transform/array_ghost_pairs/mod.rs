@@ -51,8 +51,9 @@
 //! The back-translated model is genuinely quantified and `ChcExpr` has no
 //! quantifier node, so it CANNOT be represented as a `PredicateInterpretation`.
 //! Instead the route seals a [`GhostPairCertificate`] — the transformed model
-//! plus the ghost layout — via [`GhostPairCertificate::certify_and_seal`],
-//! which discharges every ORIGINAL clause under the quantified semantics:
+//! plus the ghost layout — via
+//! [`GhostPairCertificate::certify_and_seal_with_term_memory_limit`], which
+//! discharges every ORIGINAL clause under the quantified semantics:
 //!
 //! - the head `forall` is skolemized with fresh constants (sound + complete),
 //! - each body `forall` hypothesis is instantiated at every index term
@@ -64,7 +65,7 @@
 //!   the verdict (fail-closed, returns unknown).
 //!
 //! Certification is construction-sealed: a `GhostPairCertificate` can only be
-//! obtained through `certify_and_seal`, which runs the full original-clause
+//! obtained through `certify_and_seal_with_term_memory_limit`, which runs the full original-clause
 //! discharge. Downstream gates re-run [`recheck_ghost_pair_certificate`]
 //! (finalize: all clauses; the runner's excludes-error gate: query clauses).
 //!
@@ -102,7 +103,7 @@ use super::{
     ValidityWitness,
 };
 
-pub(crate) use candidate_houdini::{try_query_anchored_and_seal, QueryAnchoredSeal};
+pub(crate) use candidate_houdini::try_query_anchored_and_seal;
 pub(crate) use certify::{
     ghost_pair_replay_obligations, recheck_ghost_pair_certificate, try_quantified_source,
     GhostPairCertificate, QuantifiedSourceCertificate,

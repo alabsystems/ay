@@ -226,7 +226,7 @@ fn real_term_budget_rejection_uses_existing_public_revocation() {
     executor.set_term_memory_limit(Some(0));
     let result = executor.solve_fp_stateless().unwrap();
     assert!(result.is_unknown());
-    executor.finalize_unknown_publication(result);
+    let _ = executor.finalize_unknown_publication(result);
     assert_revoked(&executor, UnknownOrigin::MemoryBudget);
 }
 

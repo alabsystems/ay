@@ -263,7 +263,7 @@ fn precancellation_and_the_final_postcleanup_poll_cannot_publish_a_proof() {
     ));
     assert_eq!(terms.snapshot_stamp(), stamp);
     // Warm only the raw complements, so both attempts copy the same snapshot.
-    terms.mk_not_raw(root);
+    let _ = terms.mk_not_raw(root);
     let mut calls = 0;
     let success = build(&mut terms, &[root], &[], &mut |_, _| {
         calls += 1;

@@ -67,18 +67,6 @@ fn negation_operand_borrowed(text: &str) -> Option<&str> {
     }
 }
 
-/// carcara's `remove_all_negations_with_polarity`: strip every leading
-/// `not`; the flag is `true` for an even count.
-pub(super) fn polarity(text: &str) -> (bool, String) {
-    let mut positive = true;
-    let mut current = text.to_string();
-    while let Some(inner) = negation_operand(&current) {
-        positive = !positive;
-        current = inner;
-    }
-    (positive, current)
-}
-
 /// One `and_simplify` (`conjunction`) or `or_simplify` result exactly as
 /// carcara's `generic_and_or_simplify` accepts it, or `None` when the rule
 /// changes nothing or carcara could not state the result.

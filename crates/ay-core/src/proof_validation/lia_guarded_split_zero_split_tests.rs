@@ -118,7 +118,7 @@ fn accepts_the_corpus_divisibility_conflict_with_no_split_source() {
                 for r in -6..=6i64 {
                     let witness = 3 * k3 + r == 3 * k1 + 6 * k2;
                     assert!(
-                        !witness || !(1 <= r) || !(r <= 2),
+                        !witness || !(1..=2).contains(&r),
                         "accepted clause is FALSE at k1={k1} k2={k2} k3={k3} r={r}"
                     );
                 }

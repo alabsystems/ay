@@ -33,7 +33,7 @@ fn round(guard_asserted: bool, generation: u32) -> EMatchingResult {
     }
     let mut tracker = GenerationTracker::new();
     for i in 0..GROUND_TERMS {
-        let c = terms.mk_var(&format!("dd_c{i}"), Sort::Int);
+        let c = terms.mk_var(format!("dd_c{i}"), Sort::Int);
         let seven = terms.mk_int(BigInt::from(7));
         let q_c = terms.mk_app(Symbol::named("dd_Q"), vec![c, seven], Sort::Bool);
         let p_c = terms.mk_app(Symbol::named("dd_P"), vec![c], Sort::Bool);

@@ -65,6 +65,9 @@ fn the_lint_sees_what_it_bans() {
         offences("static SEEN: Mutex<Vec<TermId>> = Mutex::new(Vec::new());").len(),
         1
     );
-    assert!(offences("// thread_local! in a comment").is_empty());
-    assert!(offences("let id: TermId = t;").is_empty());
+    assert_eq!(
+        offences("// thread_local! in a comment").as_slice(),
+        &[] as &[String]
+    );
+    assert_eq!(offences("let id: TermId = t;").as_slice(), &[] as &[String]);
 }

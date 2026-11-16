@@ -459,13 +459,11 @@ impl ArraySolver<'_> {
         map2: &[(TermId, TermId, Vec<TheoryLit>)],
         eq_cache: &mut EqualityReasonCache,
     ) -> (Vec<TermId>, Vec<TheoryLit>) {
-        // Capacity hint only: if the reservation fails, the pushes grow the
-        // vector as they go.
+        // Capacity hint only: if the reservation fails, resize allocates the
+        // match flags as the old pushes did.
         let mut used = Vec::new();
         let _ = used.try_reserve_exact(map2.len());
-        for _ in 0..map2.len() {
-            used.push(false);
-        }
+        used.resize_with(map2.len(), bool::default);
         let mut support = Vec::new();
         let mut reasons = Vec::new();
 

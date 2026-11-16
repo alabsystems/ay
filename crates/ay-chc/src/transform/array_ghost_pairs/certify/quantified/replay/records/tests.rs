@@ -144,7 +144,7 @@ fn fabricated_forwarding_and_false_finite_query_cannot_discharge_a_sat_uf_obliga
         executor_term_memory_limit: Some(MEMORY),
     };
     let prepared = super::super::prepare(&source, &interpretation, 0, &live, None).unwrap();
-    assert!(std::ptr::eq(prepared.source, &source));
+    assert!(std::ptr::eq(prepared.source, &raw const source));
     assert_eq!(
         prepared.obligation.smtlib.matches("(declare-fun ").count(),
         3

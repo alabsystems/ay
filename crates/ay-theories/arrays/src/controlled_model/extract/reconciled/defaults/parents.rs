@@ -20,7 +20,7 @@ pub(super) fn apply(
         let Some(value) = value else {
             continue;
         };
-        if !scan::lookup(&model.array_values, base, work)?.is_some_and(|v| v.default.is_none()) {
+        if scan::lookup(&model.array_values, base, work)?.is_none_or(|v| v.default.is_some()) {
             continue;
         }
         let value = owned::text(value, work)?;

@@ -543,6 +543,7 @@ impl Solver {
     /// Collected proof IDs are appended to `self.conflict` chain.
     ///
     /// CaDiCaL reference: analyze.cpp:253-268 (analyze_literal) + 1240-1246.
+    #[cfg(test)]
     pub(super) fn append_lrat_unit_chain(
         &mut self,
         level0_vars: &[usize],

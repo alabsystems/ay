@@ -2304,7 +2304,7 @@ impl AdaptivePortfolio {
             // nothing to operate on.
             //
             // Race the BV-native Lane C (which preserves Array(BV,BV) via
-            // PreprocessSummary::build_bv_native) in parallel with the array-safe
+            // PreprocessSummary::build_bv_native_with_limits) in parallel with the array-safe
             // lane. First definitive result wins. For LIA-indexed arrays,
             // has_bv_sorts() is false and we fall through to the original path.
             if self.problem.has_bv_sorts() {
@@ -2505,7 +2505,7 @@ impl AdaptivePortfolio {
     /// #5877: BV runs non-incremental with a tight budget
     /// (`simple_loop_kind_budget_nominal`). Kind Safe results passed
     /// original-clause validation inside `try_kind`; Unsafe traces are
-    /// validated by `finalize_verified_result`.
+    /// validated by `finalize_verified_result_with_deadline`.
     pub(super) fn try_simple_loop_direct_kind(
         &self,
         features: &ProblemFeatures,
@@ -2908,7 +2908,7 @@ impl AdaptivePortfolio {
             parallel_timeout: Some(budget),
             verbose: self.config.verbose,
 
-            // Preprocessing already done via PreprocessSummary::build_bv_native.
+            // Preprocessing already done via PreprocessSummary::build_bv_native_with_limits.
             enable_preprocessing: false,
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,

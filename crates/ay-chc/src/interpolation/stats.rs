@@ -240,7 +240,7 @@ impl Hist {
         self.count += 1;
         self.sum_us = self.sum_us.saturating_add(us);
         self.max_us = self.max_us.max(us);
-        let bucket = u64::BITS - us.leading_zeros();
+        let bucket = us.bit_width();
         *self.buckets.entry(bucket).or_default() += 1;
     }
 

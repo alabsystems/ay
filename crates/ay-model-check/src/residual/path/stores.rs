@@ -96,7 +96,7 @@ impl Misses {
     }
 
     fn push_edge(&mut self, parent: TermId, child: TermId, cx: &mut Classifier<'_>) -> Option<()> {
-        if !cx.spend_classify_work(std::mem::size_of::<(TermId, TermId)>()) {
+        if !cx.spend_classify_work(size_of::<(TermId, TermId)>()) {
             return None;
         }
         self.edges.try_reserve(1).ok()?;
@@ -125,7 +125,7 @@ impl StoreEdges {
         // Prepay the complete union reservation, including duplicate entries.
         let work = edges
             .len()
-            .checked_mul(std::mem::size_of::<(TermId, TermId)>())?
+            .checked_mul(size_of::<(TermId, TermId)>())?
             .checked_mul(2)?;
         if !cx.spend_classify_work(work) {
             return None;

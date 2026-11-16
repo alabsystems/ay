@@ -77,7 +77,7 @@ impl Executor {
                 arrays
                     .pending_definitions
                     .len()
-                    .saturating_mul(std::mem::size_of::<PendingArrayDefinition>()),
+                    .saturating_mul(size_of::<PendingArrayDefinition>()),
             )
             .is_err()
         {
@@ -201,7 +201,7 @@ impl Executor {
             records.len(),
             records
                 .len()
-                .checked_mul(std::mem::size_of::<PreparedPendingArrayAlias>())
+                .checked_mul(size_of::<PreparedPendingArrayAlias>())
                 .ok_or(QueryError::Exhausted)?,
         )?;
         let mut prepared = Vec::with_capacity(records.len());
@@ -248,7 +248,7 @@ impl Executor {
             records.len(),
             records
                 .len()
-                .checked_mul(std::mem::size_of::<&PreparedPendingArrayAlias>())
+                .checked_mul(size_of::<&PreparedPendingArrayAlias>())
                 .ok_or(QueryError::Exhausted)?,
         )?;
         let mut completed = Vec::with_capacity(records.len());
@@ -412,7 +412,7 @@ impl Executor {
             .and_then(|n| n.checked_mul(bytes.checked_add(rows)?))
             .ok_or(QueryError::Exhausted)?;
         let storage = rows
-            .checked_mul(std::mem::size_of::<(String, String)>())
+            .checked_mul(size_of::<(String, String)>())
             .and_then(|n| n.checked_add(bytes))
             .ok_or(QueryError::Exhausted)?;
         work.admit(visits, storage)
@@ -489,7 +489,7 @@ impl Executor {
                 roots.len(),
                 roots
                     .len()
-                    .checked_mul(std::mem::size_of::<TermId>())
+                    .checked_mul(size_of::<TermId>())
                     .ok_or(QueryError::Exhausted)?,
             )?;
         }
@@ -530,7 +530,7 @@ impl Executor {
                 _ => return Err(QueryError::Invalid("unsupported recovery arena term")),
             };
             let storage = edges
-                .checked_mul(std::mem::size_of::<TermId>())
+                .checked_mul(size_of::<TermId>())
                 .and_then(|n| n.checked_add(bytes))
                 .ok_or(QueryError::Exhausted)?;
             work.admit(
@@ -567,7 +567,7 @@ impl Executor {
             model
                 .dt_array_field_classes
                 .len()
-                .checked_mul(std::mem::size_of::<
+                .checked_mul(size_of::<
                     super::super::datatype_array_fields::ExactDatatypeArrayClassAuthority,
                 >())
                 .ok_or(QueryError::Exhausted)?,

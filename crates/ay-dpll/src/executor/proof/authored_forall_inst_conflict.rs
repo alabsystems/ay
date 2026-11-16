@@ -137,7 +137,7 @@ impl Executor {
     /// and the arithmetic conflict are all producer-side HINTS that the
     /// checkers re-decide:
     ///
-    /// * `forall_inst` — `ay_proof::checker::quantifier::validate_forall_inst`
+    /// * `forall_inst` — `ay_proof::checker::quantifier::validate_forall_inst_with_progress`
     ///   re-derives binder/argument arity and sorts, argument groundness, and
     ///   that the instance is the EXACT simultaneous capture-safe substitution.
     /// * `or` — `ay-proof`'s clausification validator re-derives that the

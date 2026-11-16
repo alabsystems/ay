@@ -38,7 +38,6 @@ fn test_model_checker_consumer_looping_id_pdr_produces_no_invalid_sat_models() {
          persistent-BV-cache reuse split circuits again)"
     );
 }
-
 // ---------------------------------------------------------------------------
 // No-progress circuit breaker (ny-cert JSON-serialization grind). The DPLL(T)
 // loop's fail-closed "SAT model missing an assignment for a free variable in an
@@ -51,9 +50,8 @@ fn test_model_checker_consumer_looping_id_pdr_produces_no_invalid_sat_models() {
 
 use super::check_sat::unassignable_free_var_set_signature_for_tests;
 use super::context::{
-    no_progress_breaker_tripped, note_bv_cache_thrash_clear, note_solve_progress,
-    note_unassignable_free_var_no_progress, ScopedNoProgressBreaker,
-    NO_PROGRESS_BV_CACHE_CLEAR_LIMIT, NO_PROGRESS_SAME_SIG_LIMIT, NO_PROGRESS_TOTAL_LIMIT,
+    no_progress_breaker_tripped, note_solve_progress, note_unassignable_free_var_no_progress,
+    ScopedNoProgressBreaker, NO_PROGRESS_SAME_SIG_LIMIT, NO_PROGRESS_TOTAL_LIMIT,
 };
 
 #[test]
@@ -266,58 +264,4 @@ fn test_fresh_id_spin_trips_same_sig_breaker() {
         "a fresh-id renaming spin must trip the same-signature breaker within \
          NO_PROGRESS_SAME_SIG_LIMIT records once suffixes are normalized"
     );
-}
-
-/// FIX 2 (bv-cache thrash bail): repeated full `PersistentBvCache` cap-clears
-/// with no reuse — the strongest ny-cert pathology signal (observed ~470×) —
-/// must trip the no-progress breaker within `NO_PROGRESS_BV_CACHE_CLEAR_LIMIT`
-/// clears so the solve bails to Unknown instead of re-bitblasting to the SIGKILL.
-#[test]
-#[serial]
-fn test_bv_cache_thrash_trips_breaker() {
-    let _guard = ScopedNoProgressBreaker::new();
-    assert!(
-        !no_progress_breaker_tripped(),
-        "fresh scope starts un-tripped"
-    );
-
-    let mut trip_edges = 0usize;
-    let mut clears_until_trip = None;
-    for i in 1..=NO_PROGRESS_BV_CACHE_CLEAR_LIMIT {
-        if note_bv_cache_thrash_clear() {
-            trip_edges += 1;
-            clears_until_trip.get_or_insert(i);
-        }
-    }
-    assert!(
-        no_progress_breaker_tripped(),
-        "repeated bv-cache cap-clears must trip the breaker within \
-         NO_PROGRESS_BV_CACHE_CLEAR_LIMIT clears"
-    );
-    assert_eq!(trip_edges, 1, "the trip edge must be reported exactly once");
-    assert_eq!(
-        clears_until_trip,
-        Some(NO_PROGRESS_BV_CACHE_CLEAR_LIMIT),
-        "the breaker must trip precisely at the cap-clear limit"
-    );
-}
-
-/// A bv-cache thrash bail must survive a DECIDED sub-query verdict: unlike the
-/// missing-var streaks, `note_solve_progress` must NOT reset the clear count,
-/// because a decided sub-query does not undo the fact that the solve is
-/// re-blasting an oversized structure.
-#[test]
-#[serial]
-fn test_bv_cache_thrash_not_reset_by_progress() {
-    let _guard = ScopedNoProgressBreaker::new();
-    for _ in 1..NO_PROGRESS_BV_CACHE_CLEAR_LIMIT {
-        assert!(!note_bv_cache_thrash_clear());
-    }
-    // A decided sub-query in between must not rescue the thrash.
-    note_solve_progress();
-    assert!(
-        note_bv_cache_thrash_clear(),
-        "the final cap-clear must still trip despite an intervening decided verdict"
-    );
-    assert!(no_progress_breaker_tripped());
 }

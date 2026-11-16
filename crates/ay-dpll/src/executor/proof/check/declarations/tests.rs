@@ -6,7 +6,7 @@ use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort};
 
 fn install(exec: &mut Executor, source: &str) {
     let commands = ay_frontend::parse(source).unwrap();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
 }
 
 fn fixture() -> Executor {
@@ -190,13 +190,14 @@ fn local_overflow_and_caught_callback_panic_latch_before_retry() {
         calls += 1;
         true
     };
-    let mut control = Control::new(&mut callback);
-    assert!(matches!(
-        control.run(|c| c.vector::<u64>(usize::MAX)),
-        Err(ProofCheckError::ResourceLimit)
-    ));
-    assert!(control.charge(0, 0).is_err());
-    drop(control);
+    {
+        let mut control = Control::new(&mut callback);
+        assert!(matches!(
+            control.run(|c| c.vector::<u64>(usize::MAX)),
+            Err(ProofCheckError::ResourceLimit)
+        ));
+        assert!(control.charge(0, 0).is_err());
+    }
     assert_eq!(calls, 1);
 
     let mut calls = 0;
@@ -204,11 +205,13 @@ fn local_overflow_and_caught_callback_panic_latch_before_retry() {
         calls += 1;
         panic!("injected callback panic")
     };
-    let mut control = Control::new(&mut callback);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control.charge(0, 0)));
-    assert!(result.is_err());
-    assert!(control.charge(0, 0).is_err());
-    drop(control);
+    {
+        let mut control = Control::new(&mut callback);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control.charge(0, 0)));
+        assert!(result.is_err());
+        assert!(control.charge(0, 0).is_err());
+    }
     assert_eq!(calls, 1);
     assert!(collect(&fixture(), &mut |_, _| true).is_ok());
 }

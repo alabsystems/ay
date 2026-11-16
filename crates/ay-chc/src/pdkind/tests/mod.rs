@@ -411,7 +411,7 @@ fn test_reachability_lemma_checkpoint_restore() {
 
     assert_eq!(checker.lemmas.len(), checkpoint.len());
     assert_eq!(checker.lemmas[0], vec![l0_a]);
-    assert!(checker.lemmas[1].is_empty());
+    assert_eq!(checker.lemmas[1], [] as [ChcExpr; 0]);
     assert_eq!(checker.lemmas[2], vec![l2_a]);
 }
 

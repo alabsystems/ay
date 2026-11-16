@@ -322,9 +322,7 @@ fn commands_are_read_as_commands_not_as_lines_of_text() {
     );
     assert_eq!(names(rendered), ["t3.split", "t3.lo"]);
     // A comment mentioning the rule is not a command.
-    assert!(read("; :rule la_generic")
-        .expect("comment skipped")
-        .is_empty());
+    assert_eq!(read("; :rule la_generic").expect("comment skipped"), []);
     // A step claiming the rule in a shape this printer never emits is read as
     // unreadable, which the caller refuses — under its own name, so the
     // refusal names the command and not the whole step.

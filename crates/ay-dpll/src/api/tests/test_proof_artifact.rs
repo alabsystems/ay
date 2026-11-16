@@ -1049,7 +1049,7 @@ fn alethe_export_returns_text() {
     let alethe = solver
         .export_last_proof_alethe()
         .expect("Alethe text must be present");
-    assert!(!alethe.is_empty());
+    assert_ne!(alethe, "");
     // Alethe proofs contain assume and step/resolution commands
     assert!(
         alethe.contains("assume") || alethe.contains("step"),

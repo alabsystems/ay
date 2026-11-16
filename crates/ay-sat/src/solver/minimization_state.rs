@@ -61,10 +61,10 @@ pub(crate) struct MinimizationState {
     /// Incrementally derived shrink-prescan bit (#8790): set by
     /// `track_level_seen` when a non-conflict-level decision level is seen a
     /// second time (or a tracked literal has a stale trail position). While
-    /// `level_seen_flag_valid`, equals what
-    /// `learned_clause_has_repeated_non_uip_level` would return at finalize,
-    /// eliminating that O(clause_len) prescan. Reset by `clear_level_seen`
-    /// and at analysis entry.
+    /// `level_seen_flag_valid`, equals the `repeated_level_admitted` result
+    /// consumed by `finalize_repeated_level_admitted`, eliminating that
+    /// O(clause_len) prescan. Reset by `clear_level_seen` and at analysis
+    /// entry.
     pub level_seen_repeated_non_uip: bool,
     /// True when the current conflict analysis started with clean
     /// `level_seen` state, making `level_seen_repeated_non_uip` exact.

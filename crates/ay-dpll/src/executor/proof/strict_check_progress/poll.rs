@@ -38,10 +38,10 @@ impl Executor {
 /// Capture the explicit caller and the actual walk's node, not a search node
 /// when a stop closure was lifted out before entering Certify. No scope or
 /// allowance is replaced. The captured callback remains the exact original Arc.
-pub(super) fn strided_memory_poll<'a>(
-    should_stop: &'a impl Fn() -> bool,
+pub(super) fn strided_memory_poll(
+    should_stop: &impl Fn() -> bool,
     memory_limit: Option<usize>,
-) -> StopPoll<&'a impl Fn() -> bool, impl Fn() -> bool> {
+) -> StopPoll<&impl Fn() -> bool, impl Fn() -> bool> {
     sampled_poll(should_stop, move || {
         crate::memory::memory_exceeded(memory_limit) || ay_sys::process_memory_exceeded()
     })
@@ -247,9 +247,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let _scope = enter_check_stop(Arc::new(move || {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("observer fixture")
-            }
+            assert!(
+                observed.fetch_add(1, Ordering::SeqCst) != 0,
+                "observer fixture"
+            );
             false
         }));
         let poll = sampled_poll(|| false, || false);

@@ -132,7 +132,10 @@ fn copy_allowance_is_prepaid_atomic_sticky_and_empty_cost_is_zero() {
         QuantifiedChcProblem::parse_smtlib("(set-logic HORN)(assert false)(check-sat)").unwrap();
     let no_bytes = control(&token);
     no_bytes.bytes(64 * 1024 * 1024).unwrap();
-    assert!(copy_declarations(&empty, &no_bytes).unwrap().is_empty());
+    assert_eq!(
+        copy_declarations(&empty, &no_bytes).unwrap(),
+        [] as [QuantifiedChcFunction; 0]
+    );
     assert_eq!(declarations_smtlib(&empty, &no_bytes).unwrap(), "");
     assert!(names(&empty, &no_bytes).unwrap().next().is_none());
     assert!(retain(&empty, &no_bytes).is_some());

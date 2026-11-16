@@ -27,7 +27,7 @@ impl Fixture {
 "#;
         let commands = ay_frontend::parse(source).unwrap();
         let mut executor = Executor::new();
-        assert!(executor.execute_all(&commands).unwrap().is_empty());
+        assert_eq!(executor.execute_all(&commands).unwrap(), [] as [String; 0]);
         let originals = executor.ctx.assertions.clone();
         assert_eq!(originals.len(), 3);
         let mut working = originals.clone();

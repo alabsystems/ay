@@ -57,7 +57,6 @@ fn scan_units<T>(allocation_bytes: usize) -> usize {
     let allowance = u64::try_from(expected).expect("fixture allowance fits u64");
     let mut work = WorkBudget::with_admission(allowance, &mut sink);
     owned::scan_table::<T>(allocation_bytes, &mut work).unwrap();
-    drop(work);
     assert_eq!(charged.get(), expected);
     expected
 }

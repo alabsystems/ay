@@ -130,9 +130,11 @@ fn caught_callback_panic_latches_original_owner_without_rebuilding() {
         FiniteAdmissionGrant::new(100_000_000, 256_000_000),
         Instant::now() + Duration::from_secs(20),
         Arc::new(move || {
-            if observed.fetch_add(1, Ordering::SeqCst) == 12 {
-                panic!("fixture observer panic");
-            }
+            assert_ne!(
+                observed.fetch_add(1, Ordering::SeqCst),
+                12,
+                "fixture observer panic"
+            );
             false
         }),
     );

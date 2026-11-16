@@ -106,6 +106,6 @@ fn repeated_dag_edges_are_charged_instead_of_deduplicated() {
     );
     assert_eq!(result, Ok(true));
     assert!(work >= 511, "all unfolded visits must be priced");
-    assert!(bytes >= 256 * (std::mem::size_of::<TermId>() + 1));
+    assert!(bytes >= 256 * (size_of::<TermId>() + 1));
     compare(&terms, assumed, &[(C, branch, E)], true);
 }

@@ -287,7 +287,9 @@ fn unreachable_repeated_occurrence_is_rejected_before_projection() {
     };
     assert_eq!(error.reason, DerivationRejected);
     assert_eq!(error.detail, "step 0 is not reachable from the root step");
-    row.lift_ground_derivation_v2(&valid, &mut owner).unwrap();
+    let (_, validated) = row.lift_ground_derivation_v2(&valid, &mut owner).unwrap();
+    assert_eq!(validated.step_count(), 3);
+    assert_eq!(validated.query_step(), 2);
 }
 
 mod boundaries;

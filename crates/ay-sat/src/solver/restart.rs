@@ -587,9 +587,9 @@ impl Solver {
             // Diversifies the search space at mode boundaries.
             // `--sat-randec-kissat`: only on entering focused mode, and never
             // over a running sequence (Kissat decide.c:57-84).
-            if ay_core::sat_ab_switches().randec_kissat != Some(true) {
-                self.start_random_sequence();
-            } else if !self.stable_mode && self.cold.randomized_deciding == 0 {
+            if ay_core::sat_ab_switches().randec_kissat != Some(true)
+                || (!self.stable_mode && self.cold.randomized_deciding == 0)
+            {
                 self.start_random_sequence();
             }
         }

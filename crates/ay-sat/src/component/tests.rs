@@ -288,5 +288,5 @@ fn test_find_components_detailed_empty() {
 
     assert_eq!(result.num_components, 0);
     assert_eq!(decomp.num_components, 0);
-    assert!(decomp.components.is_empty());
+    assert_eq!(decomp.components.len(), 0);
 }

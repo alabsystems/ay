@@ -51,7 +51,7 @@ fn push_cache_deps_captures_body_predicates() {
     ));
     let deps = build_push_cache_deps(&problem);
     assert!(deps[&p].contains(&q));
-    assert!(deps[&q].is_empty());
+    assert_eq!(deps[&q], [] as [PredicateId; 0]);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn predicate_users_inverts_deps() {
     // P is used by Q
     assert!(users[&p].contains(&q));
     // Q is not used by anyone
-    assert!(users[&q].is_empty());
+    assert_eq!(users[&q], [] as [PredicateId; 0]);
 }
 
 // --- compute_reachable_predicates ---
@@ -229,7 +229,7 @@ fn triangular_pattern_exact_fit() {
     let result = detect_triangular_pattern(&data, 0, 1, &vars, false);
     assert!(result.is_some());
     let bounds = result.unwrap();
-    assert!(!bounds.is_empty());
+    assert_ne!(bounds, [] as [ChcExpr; 0]);
 }
 
 #[test]

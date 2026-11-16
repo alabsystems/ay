@@ -57,7 +57,7 @@ impl ContextProof<'_, '_, '_> {
                 }
                 TermData::Not(inner) => {
                     let inner = self.boolean(*inner, depth + 1)?;
-                    let changed = self.proof.congruence("not", &[inner.clone()])?;
+                    let changed = self.proof.congruence("not", std::slice::from_ref(&inner))?;
                     let target = match inner.right.as_str() {
                         "true" => "false",
                         "false" => "true",

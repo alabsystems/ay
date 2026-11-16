@@ -344,7 +344,7 @@ fn every_small_success_and_partial_failure_callback_can_refuse_publication() {
 fn expired_original_deadline_and_sticky_failures_prevent_owner_publication() {
     for text in [MIXED, r#"{"Not":null}"#] {
         let outcome = control::run(
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| -> bool { panic!("expired before callback") },
             |control| read(raw(text), control),
         );

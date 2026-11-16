@@ -151,10 +151,10 @@ fn filtered_cascade_matches_unfiltered_hints_and_saves_row_work() {
         filtered.assign,
         vec![Some(true), Some(false), None, None, None]
     );
-    assert!(filtered.row_trail.is_empty());
-    assert!(filtered.cand_order.is_empty());
+    assert_eq!(filtered.row_trail.len(), 0);
+    assert_eq!(filtered.cand_order.len(), 0);
     assert!(filtered.cand_reason.iter().all(|&reason| reason == 0));
-    assert!(filtered.cone_vars.is_empty());
+    assert_eq!(filtered.cone_vars.len(), 0);
     assert!(filtered.cone_mark.iter().all(|&mark| mark == 0));
     assert_eq!(filtered.index_heads, heads);
     assert_eq!(filtered.index_items, items);
@@ -239,7 +239,7 @@ fn opposed_root_target_still_uses_full_original_synthesis() {
     .unwrap();
     assert_eq!(synthesized, Some(vec![1]));
     assert_eq!(root.assign, vec![Some(true), Some(false), None, None, None]);
-    assert!(root.row_trail.is_empty());
+    assert_eq!(root.row_trail.len(), 0);
     assert_eq!(root.index_items, items);
     assert!(repair(&mut root, &originals, pos(2), &mut meter).is_some());
 }

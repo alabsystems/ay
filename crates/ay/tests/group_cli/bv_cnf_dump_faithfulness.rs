@@ -984,27 +984,26 @@ fn non_solve_early_modes_reject_requested_export_and_remove_stale_artifact() {
     // env alias was the ONLY channel that could smuggle an export request
     // into that early mode, so the rejection property now holds by
     // construction (there is nothing to reject).
-    for mode in ["features"] {
-        let temp = TempDir::new(mode);
-        let dump = temp.write("stale.cnf", "STALE-DUMP-SENTINEL\n");
-        let mut command = Command::new(ay_binary());
-        command.arg("solve");
-        command.arg("--dump-bv-cnf").arg(&dump).arg("--features");
-        let output = command.output().expect("spawn incompatible early mode");
-        let (stdout, stderr) = output_text(&output);
-        assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
-        assert!(
-            !stdout
-                .lines()
-                .any(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
-            "early mode must not synthesize a verdict; stdout={stdout}; stderr={stderr}"
-        );
-        assert!(
-            stderr.contains("no check-sat query was executed"),
-            "stdout={stdout}; stderr={stderr}"
-        );
-        assert!(!dump.exists(), "early rejection must remove stale artifact");
-    }
+    let mode = "features";
+    let temp = TempDir::new(mode);
+    let dump = temp.write("stale.cnf", "STALE-DUMP-SENTINEL\n");
+    let mut command = Command::new(ay_binary());
+    command.arg("solve");
+    command.arg("--dump-bv-cnf").arg(&dump).arg("--features");
+    let output = command.output().expect("spawn incompatible early mode");
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
+        "early mode must not synthesize a verdict; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("no check-sat query was executed"),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(!dump.exists(), "early rejection must remove stale artifact");
 }
 
 #[test]

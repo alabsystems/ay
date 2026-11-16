@@ -32,10 +32,10 @@ pub(super) fn loaded(source: &str, end: Instant) -> Executor {
     let mut exec = Executor::new();
     exec.set_term_memory_limit(Some(128 * 1024 * 1024));
     let commands = parse(source).expect("complete original fixture source");
-    assert!(exec
-        .execute_all(&commands)
-        .expect("elaborate, not solve")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("elaborate, not solve"),
+        [] as [String; 0]
+    );
     exec.begin_external_decision_query(false);
     exec.set_deadline(Some(end));
     let mut model = Model::empty();

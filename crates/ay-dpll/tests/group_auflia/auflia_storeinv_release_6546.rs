@@ -18,9 +18,10 @@ use anyhow::{Context, Result};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[cfg(not(debug_assertions))]
+use crate::common::z3::{check_z3_or_skip, run_z3_file};
+#[cfg(not(debug_assertions))]
 use crate::common::{
-    check_z3_or_skip, run_executor_file_with_timeout, run_executor_smt_with_timeout, run_z3_file,
-    workspace_path, SolverOutcome,
+    run_executor_file_with_timeout, run_executor_smt_with_timeout, workspace_path, SolverOutcome,
 };
 
 #[cfg(not(debug_assertions))]

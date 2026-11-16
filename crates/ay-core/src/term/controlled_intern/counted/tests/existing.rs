@@ -106,7 +106,7 @@ fn malformed_existing_rational_is_accounted_raw_not_normalized_or_authorized() {
     let id = store.intern(raw, Sort::Real);
     let original = ample();
     let mut builder = CountedTermBuilder::new(&mut store, &original).unwrap();
-    builder.boolean(true).unwrap();
+    let _ = builder.boolean(true).unwrap();
     assert!(
         matches!(builder.store.get(id), TermData::Const(Constant::Rational(value)) if value.0.denom() == &BigInt::from(0))
     );

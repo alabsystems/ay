@@ -10,7 +10,7 @@ use super::proof::{Arg, Prem, Proof, S};
 use super::term::{Op, T};
 use ay_core::kani_compat::DetHashMap as HashMap;
 
-pub(crate) fn symm(p: &mut Proof, s: S) -> S {
+pub(crate) fn symm(p: &mut Proof<'_>, s: S) -> S {
     let e = p.unit(s);
     let (a, b) = (p.t.args(e)[0], p.t.args(e)[1]);
     let f = p.t.eq(b, a);
@@ -18,20 +18,20 @@ pub(crate) fn symm(p: &mut Proof, s: S) -> S {
 }
 
 /// `(= first last)` from a chain of equalities.
-pub(crate) fn trans(p: &mut Proof, chain: &[S]) -> S {
+pub(crate) fn trans(p: &mut Proof<'_>, chain: &[S]) -> S {
     let first = p.t.args(p.unit(chain[0]))[0];
     let last = p.t.args(p.unit(chain[chain.len() - 1]))[1];
     let e = p.t.eq(first, last);
     p.emit(&[e], "trans", chain, &[])
 }
 
-pub(crate) fn eq_step(p: &mut Proof, a: T, b: T, rule: &str, prem: &[S]) -> S {
+pub(crate) fn eq_step(p: &mut Proof<'_>, a: T, b: T, rule: &str, prem: &[S]) -> S {
     let e = p.t.eq(a, b);
     p.emit(&[e], rule, prem, &[])
 }
 
 /// `(cl (= W1 W2))` for `@bbterm` words from per-bit `(cl (= a_i b_i))` facts.
-pub(crate) fn word_eq(p: &mut Proof, w1: T, w2: T, bits: &[S]) -> Option<S> {
+pub(crate) fn word_eq(p: &mut Proof<'_>, w1: T, w2: T, bits: &[S]) -> Option<S> {
     let (b1, b2) = (p.t.bits(w1), p.t.bits(w2));
     if b1.is_empty() || b1.len() != b2.len() || bits.len() != b1.len() {
         return None;
@@ -63,7 +63,7 @@ pub(crate) fn word_eq(p: &mut Proof, w1: T, w2: T, bits: &[S]) -> Option<S> {
 }
 
 /// From `(cl (= A B))` (Boolean) and a unit fact about `A` or `B`, the same fact about the other.
-pub(crate) fn transfer(p: &mut Proof, eq: S, fact: S) -> Option<S> {
+pub(crate) fn transfer(p: &mut Proof<'_>, eq: S, fact: S) -> Option<S> {
     let e = p.unit(eq);
     let (a, b) = (p.t.args(e)[0], p.t.args(e)[1]);
     let lit = p.unit(fact);
@@ -93,7 +93,7 @@ pub(crate) fn transfer(p: &mut Proof, eq: S, fact: S) -> Option<S> {
 }
 
 /// Project conjunct `i` of a unit conjunction fact.
-pub(crate) fn project(p: &mut Proof, fact: S, i: usize) -> Option<S> {
+pub(crate) fn project(p: &mut Proof<'_>, fact: S, i: usize) -> Option<S> {
     let c = p.unit(fact);
     let x = *p.t.args(c).get(i)?;
     let nc = p.t.not(c);
@@ -102,7 +102,7 @@ pub(crate) fn project(p: &mut Proof, fact: S, i: usize) -> Option<S> {
 }
 
 /// `(and c_0 ..)` from facts for each conjunct.
-pub(crate) fn conjoin(p: &mut Proof, conj: T, facts: &[S]) -> Option<S> {
+pub(crate) fn conjoin(p: &mut Proof<'_>, conj: T, facts: &[S]) -> Option<S> {
     let mut l = vec![conj];
     for &c in p.t.args(conj).to_vec().iter() {
         l.push(p.t.not(c));
@@ -115,7 +115,7 @@ pub(crate) fn conjoin(p: &mut Proof, conj: T, facts: &[S]) -> Option<S> {
 
 /// `(= lhs rhs)` given unit equalities `(= u_i v_i)` with optional multipliers,
 /// where `lhs - rhs` and `sum c_i (u_i - v_i)` are the same polynomial.
-pub(crate) fn lincomb(p: &mut Proof, lhs: T, rhs: T, eqs: &[(S, Option<T>)]) -> Option<S> {
+pub(crate) fn lincomb(p: &mut Proof<'_>, lhs: T, rhs: T, eqs: &[(S, Option<T>)]) -> Option<S> {
     let mut d_terms = vec![rhs];
     let mut z_terms = vec![rhs];
     let mut prem = Vec::new();
@@ -148,9 +148,9 @@ pub(crate) fn lincomb(p: &mut Proof, lhs: T, rhs: T, eqs: &[(S, Option<T>)]) -> 
 /// Prove `(forall vars BODY)` where `body` runs inside the `bind` context and
 /// returns `(BODY, step (cl BODY))`.
 pub(crate) fn forall_lemma(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     vars: &[T],
-    body: impl FnOnce(&mut Proof) -> Option<(T, S)>,
+    body: impl FnOnce(&mut Proof<'_>) -> Option<(T, S)>,
 ) -> Option<S> {
     let a = p.anchor(vars);
     let (b, bs) = body(p)?;
@@ -178,7 +178,7 @@ pub(crate) fn forall_lemma(
 }
 
 /// Instantiate the proved `(forall vars BODY)` at `args`: the step `(cl BODY[args])`.
-pub(crate) fn instantiate(p: &mut Proof, fa_step: S, args: &[T]) -> Option<S> {
+pub(crate) fn instantiate(p: &mut Proof<'_>, fa_step: S, args: &[T]) -> Option<S> {
     let fa = p.unit(fa_step);
     let fargs = p.t.args(fa).to_vec();
     let (vars, body) = fargs.split_at(fargs.len() - 1);
@@ -196,12 +196,12 @@ pub(crate) fn instantiate(p: &mut Proof, fa_step: S, args: &[T]) -> Option<S> {
 }
 
 /// Split a unit `(cl (or d_1 .. d_k))` into `(cl d_1 .. d_k)`.
-pub(crate) fn split_or(p: &mut Proof, s: S) -> S {
+pub(crate) fn split_or(p: &mut Proof<'_>, s: S) -> S {
     let disj = p.t.args(p.unit(s)).to_vec();
     p.emit(&disj, "or", &[s], &[])
 }
 
-pub(crate) fn substitute(p: &mut Proof, t: T, map: &HashMap<T, T>) -> T {
+pub(crate) fn substitute(p: &mut Proof<'_>, t: T, map: &HashMap<T, T>) -> T {
     let mut memo: HashMap<T, T> = HashMap::default();
     let mut stack = vec![(t, false)];
     while let Some((u, done)) = stack.pop() {

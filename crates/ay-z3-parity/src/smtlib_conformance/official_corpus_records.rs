@@ -6,7 +6,6 @@
 //! including its campaign header, row order, and terminating newlines.
 
 use super::*;
-use sha2::Digest as _;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
 // A query may retain four 1-MiB capture streams (producer/checker stdout/stderr),
@@ -418,6 +417,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::naive_bytecount,
+        reason = "the tiny bounded framing fixture asserts its exact newline count"
+    )]
     fn incomplete_execution_keeps_durable_rows_without_claiming_completion() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("records.jsonl");

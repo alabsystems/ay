@@ -24,7 +24,7 @@ fn malformed_store_arity_base_index_cell_and_result_sorts_refuse() {
             4 => args[2] = index,
             _ => result = Sort::array(Sort::bitvec(64), Sort::bitvec(16)),
         }
-        terms.mk_app(Symbol::named("store"), args, result);
+        let _malformed_store = terms.mk_app(Symbol::named("store"), args, result);
         refuse_arena(&terms);
         assert!(Instant::now() < end);
     }
@@ -47,7 +47,8 @@ fn store_dead_immediate_and_nested_children_refuse_before_indexing() {
         } else {
             TermId(u32::MAX)
         };
-        terms.mk_app(Symbol::named("store"), [base, index, child], sort);
+        let _store_with_dead_child =
+            terms.mk_app(Symbol::named("store"), [base, index, child], sort);
         refuse_arena(&terms);
         assert!(Instant::now() < end);
     }
@@ -68,7 +69,8 @@ fn hidden_casts_arithmetic_and_foreign_values_are_not_store_admission() {
         let index = terms.mk_bitvec(0u8.into(), 64);
         let raw = terms.mk_var("raw", Sort::bitvec(8));
         let child = terms.mk_app(symbol, [raw], Sort::bitvec(8));
-        terms.mk_app(Symbol::named("store"), [base, index, child], sort);
+        let _store_with_non_admitted_child =
+            terms.mk_app(Symbol::named("store"), [base, index, child], sort);
         let root = terms.mk_bool(false);
         let source = prepare(&terms, &[]);
         assert!(matches!(
@@ -86,7 +88,7 @@ fn indexed_store_spelling_is_not_the_named_builtin_constructor() {
     let sort = Sort::array(Sort::Bool, Sort::Bool);
     let base = terms.mk_var("base", sort.clone());
     let value = terms.mk_bool(false);
-    terms.mk_app(
+    let _indexed_store = terms.mk_app(
         Symbol::indexed("store", vec![0]),
         [base, value, value],
         sort,

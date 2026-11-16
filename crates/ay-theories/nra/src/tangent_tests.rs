@@ -272,7 +272,7 @@ fn test_nra_reset_clears_state() {
 
     solver.reset();
     assert!(solver.monomials.is_empty());
-    assert!(solver.asserted.is_empty());
+    assert_eq!(solver.asserted.as_slice(), &[] as &[(TermId, bool)]);
     assert!(solver.sign_constraints.is_empty());
     assert!(solver.div_purifications.is_empty());
 }

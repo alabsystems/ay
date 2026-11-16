@@ -37,7 +37,7 @@ pub(crate) fn reserve<T>(values: &mut Vec<T>, extra: usize, control: &EncodingCo
     control.counted_admit(work, bytes)
         && values
             .try_reserve_exact(target - values.len())
-            .map_or_else(|_| storage(control), |_| true)
+            .map_or_else(|_| storage(control), |()| true)
 }
 
 pub(crate) fn map<K: Eq + Hash, V>(values: &mut HashMap<K, V>, control: &EncodingControl) -> bool {
@@ -59,7 +59,7 @@ pub(crate) fn map<K: Eq + Hash, V>(values: &mut HashMap<K, V>, control: &Encodin
     control.counted_admit(work, bytes)
         && values
             .try_reserve(target - values.len())
-            .map_or_else(|_| storage(control), |_| true)
+            .map_or_else(|_| storage(control), |()| true)
 }
 
 pub(crate) fn set<K: Eq + Hash>(values: &mut HashSet<K>, control: &EncodingControl) -> bool {
@@ -81,7 +81,7 @@ pub(crate) fn set<K: Eq + Hash>(values: &mut HashSet<K>, control: &EncodingContr
     control.counted_admit(work, bytes)
         && values
             .try_reserve(target - values.len())
-            .map_or_else(|_| storage(control), |_| true)
+            .map_or_else(|_| storage(control), |()| true)
 }
 
 fn table_growth<T>(target: usize, old_len: usize) -> Option<(usize, usize)> {

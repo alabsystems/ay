@@ -58,7 +58,7 @@ fn shared_preflight_rejects_changed_width_and_zero_memory() {
 #[test]
 fn keys_and_occurrences_are_charged_against_one_byte_ceiling() {
     use super::Sharing;
-    use std::mem::size_of;
+    use size_of;
     let leaf = BvExpr::leaf("x", 8);
     let key_bytes = 2 * size_of::<(super::Key, u32)>() + "x".len();
     let occurrence_bytes = 2 * size_of::<(usize, u32)>();

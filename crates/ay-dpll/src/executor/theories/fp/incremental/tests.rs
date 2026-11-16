@@ -214,9 +214,7 @@ fn caught_transfer_unwind_leaves_only_the_same_scope_rebuild_shell() {
         executor.try_solve_fp_incremental_observed(&|phase| {
             if matches!(phase, IncrementalFpPhase::GlobalFpClause) {
                 clauses.set(clauses.get() + 1);
-                if clauses.get() == 2 {
-                    panic!("intentional partial-transfer unwind");
-                }
+                assert!(clauses.get() != 2, "intentional partial-transfer unwind");
             }
         })
     }));

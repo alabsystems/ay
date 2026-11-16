@@ -58,7 +58,7 @@ impl Solver {
         if self.cold.probe_round_kissat {
             let (swept, found) = self.sweep_kitten_counts();
             let (swept, found) = (swept - kitten_before.0, found - kitten_before.1);
-            if super::super::subst_kissat::kissat_unproductive(found, swept) {
+            if subst_kissat::kissat_unproductive(found, swept) {
                 self.cold.sweep_kissat_delay.bump();
             } else {
                 self.cold.sweep_kissat_delay.reduce();

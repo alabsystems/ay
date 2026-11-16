@@ -16,6 +16,15 @@ fn rewriter_rounding_names_do_not_assign_values_to_free_or_declared_symbols() {
     let declared = terms.mk_app(Symbol::named("RTP"), [], sort);
     terms.register_declared_function("RTP");
     assert!(rounding_mode_literal(&terms, declared).is_none());
+    let unknown_name = "unknown_mode".repeat(1024);
+    let unknown = terms.mk_app(
+        Symbol::named(&unknown_name),
+        [],
+        terms.sort(declared).clone(),
+    );
+    assert!(rounding_mode_literal(&terms, unknown).is_none());
+    terms.register_declared_function(&unknown_name);
+    assert!(rounding_mode_literal(&terms, unknown).is_none());
 }
 
 #[test]

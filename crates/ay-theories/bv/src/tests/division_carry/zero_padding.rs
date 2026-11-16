@@ -21,16 +21,15 @@ fn zero_padded_division_exhausts_small_inputs_including_zero_divisors() {
                 padded_b.resize(width, zero);
                 let (q, r) = solver.bitblast_udiv_urem(&padded_a, &padded_b);
                 assert_eq!((q.len(), r.len()), (width, width));
-                let circuit = Circuit::new(&solver);
+                let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
                 let mask = u64::MAX >> (64 - width);
                 for av in 0..1_u64 << a_width {
                     for bv in 0..1_u64 << b_width {
                         let model =
                             circuit.propagate(&[fix_word(&a, av), fix_word(&b, bv)].concat());
-                        let expected = if bv == 0 {
-                            (mask, av)
-                        } else {
-                            (av / bv, av % bv)
+                        let expected = match av.checked_div(bv) {
+                            Some(quotient) => (quotient, av % bv),
+                            None => (mask, av),
                         };
                         assert_eq!(
                             (word_value(&model, &q), word_value(&model, &r)),
@@ -70,13 +69,12 @@ fn zero_padded_native_dispatch_preserves_division_remainder_cache() {
         assert_eq!(solver.unsigned_div_cache.len(), 1);
         let a_bits = solver.get_bits(a);
         let b_bits = solver.get_bits(b);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         for (av, bv) in [(255, 0), (0, 0), (255, 1), (255, 3), (1, 255)] {
             let model = circuit.propagate(&[fix_word(&a_bits, av), fix_word(&b_bits, bv)].concat());
-            let (q, r) = if bv == 0 {
-                (u32::MAX as u64, av)
-            } else {
-                (av / bv, av % bv)
+            let (q, r) = match av.checked_div(bv) {
+                Some(quotient) => (quotient, av % bv),
+                None => (u32::MAX as u64, av),
             };
             let expected = if reverse { (r, q) } else { (q, r) };
             assert_eq!(
@@ -106,14 +104,13 @@ fn zero_padded_small_unsigned_division_uses_its_actual_eager_circuit() {
             assert!(solver.delayed_ops().is_empty());
             let a_bits = solver.get_bits(a);
             let b_bits = solver.get_bits(b);
-            let circuit = Circuit::new(&solver);
+            let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
             for (av, bv) in [(255, 0), (0, 0), (255, 1), (255, 3), (1, 255)] {
                 let model =
                     circuit.propagate(&[fix_word(&a_bits, av), fix_word(&b_bits, bv)].concat());
-                let expected = if bv == 0 {
-                    (u64::MAX >> (64 - width), av)
-                } else {
-                    (av / bv, av % bv)
+                let expected = match av.checked_div(bv) {
+                    Some(quotient) => (quotient, av % bv),
+                    None => (u64::MAX >> (64 - width), av),
                 };
                 assert_eq!((word_value(&model, &q), word_value(&model, &r)), expected);
             }

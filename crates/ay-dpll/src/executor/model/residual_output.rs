@@ -115,7 +115,7 @@ impl Executor {
         root: TermId,
         visited: &mut HashSet<TermId>,
     ) -> Result<bool, ()> {
-        if !super::evaluation_copies::pay(1, 4 * std::mem::size_of::<TermId>()) {
+        if !super::evaluation_copies::pay(1, 4 * size_of::<TermId>()) {
             return Err(());
         }
         let mut pending = vec![root];
@@ -128,7 +128,7 @@ impl Executor {
             if self.ctx.terms.entry_stamp(term).is_none() {
                 return Err(());
             }
-            if !super::evaluation_copies::pay(1, 4 * std::mem::size_of::<TermId>()) {
+            if !super::evaluation_copies::pay(1, 4 * size_of::<TermId>()) {
                 return Err(());
             }
             if !visited.insert(term) {
@@ -154,7 +154,7 @@ impl Executor {
                 TermData::App(_, args) => args.as_slice(),
                 TermData::Not(child) => std::slice::from_ref(child),
                 TermData::Ite(condition, then_value, else_value) => {
-                    if !super::evaluation_copies::pay(3, 6 * std::mem::size_of::<TermId>()) {
+                    if !super::evaluation_copies::pay(3, 6 * size_of::<TermId>()) {
                         return Err(());
                     }
                     if pending.len().checked_add(3).is_none_or(|n| n > remaining) {
@@ -166,7 +166,7 @@ impl Executor {
                 TermData::Let(bindings, body) => {
                     let count = bindings.len().checked_add(1).ok_or(())?;
                     if !count
-                        .checked_mul(2 * std::mem::size_of::<TermId>())
+                        .checked_mul(2 * size_of::<TermId>())
                         .is_some_and(|bytes| super::evaluation_copies::pay(count, bytes))
                     {
                         return Err(());
@@ -190,7 +190,7 @@ impl Executor {
             };
             if !children
                 .len()
-                .checked_mul(2 * std::mem::size_of::<TermId>())
+                .checked_mul(2 * size_of::<TermId>())
                 .is_some_and(|bytes| super::evaluation_copies::pay(children.len(), bytes))
             {
                 return Err(());

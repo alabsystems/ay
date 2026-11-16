@@ -162,7 +162,7 @@ fn replayable_frontier_import_rejects_invalid_incumbent_after_closed_replay() {
         search.seed_validated_frontier_incumbent(target).is_none(),
         "a closed frontier must still fail closed when the target incumbent is not a clique"
     );
-    assert!(search.best_vertices.is_empty());
+    assert_eq!(search.best_vertices.as_slice(), &[] as &[usize]);
 }
 
 #[test]

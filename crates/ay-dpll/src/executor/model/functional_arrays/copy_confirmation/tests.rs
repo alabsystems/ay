@@ -27,10 +27,11 @@ fn loaded_source(source: &str, end: Instant) -> Executor {
     let mut exec = Executor::new();
     exec.set_term_memory_limit(Some(128 * 1024 * 1024));
     exec.set_deadline(Some(end));
-    assert!(exec
-        .execute_all(&parse(source).expect("original parse"))
-        .expect("elaboration")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&parse(source).expect("original parse"))
+            .expect("elaboration"),
+        [] as [String; 0]
+    );
     exec.begin_external_decision_query(false);
     exec.set_deadline(Some(end));
     let mut model = Model::empty();
@@ -85,7 +86,7 @@ fn empty_copy_still_requires_the_single_unchosen_source_capture() {
         .iter()
         .position(|(id, _)| *id == copy.arrays[2])
         .expect("single source");
-    data.entries.remove(position);
+    let _ = data.entries.remove(position);
     assert!(data.entries.iter().any(|(id, _)| *id == copy.arrays[0]));
     assert!(data.entries.iter().any(|(id, _)| *id == copy.arrays[1]));
     assert!(!confirm(&exec, term), "unchosen source cannot disappear");

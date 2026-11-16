@@ -125,7 +125,7 @@ fn predicate_units_decline_missing_wrong_ieee_and_partial_nan_premises() {
         let mut executor = parsed(&direct_source(5, 11, equality));
         let (outcome, proof) = attempt(&mut executor);
         assert_eq!(outcome, Outcome::Declined, "{equality}");
-        assert!(proof.steps.is_empty());
+        assert_eq!(proof.steps, [] as [ProofStep; 0]);
     }
     let source = direct_source(5, 11, "(assert (= x y))").replace("(not (g y))", "(not (h y))");
     assert_eq!(attempt(&mut parsed(&source)).0, Outcome::Declined);
@@ -201,7 +201,7 @@ fn predicate_units_reject_foreign_scope_and_popped_declaration() {
         executor.try_authored_predicate_congruence(&mut untouched, &roots, &equalities),
         Outcome::Declined
     );
-    assert!(untouched.steps.is_empty());
+    assert_eq!(untouched.steps, [] as [ProofStep; 0]);
 
     let mut executor = parsed(&direct_source(5, 11, ""));
     let (mut roots, _) = scope(&executor);
@@ -242,7 +242,7 @@ fn predicate_units_bound_search_and_keep_observed_stops_sticky() {
         ),
         Outcome::Declined
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
     let interrupted = Arc::new(AtomicBool::new(true));
     executor.set_interrupt(interrupted.clone());
     assert_eq!(attempt(&mut executor).0, Outcome::Stopped);
@@ -261,7 +261,7 @@ fn predicate_units_bound_search_and_keep_observed_stops_sticky() {
         executor.record_unknown_from_origin(origin);
         let (outcome, proof) = attempt(&mut executor);
         assert_eq!(outcome, Outcome::Stopped);
-        assert!(proof.steps.is_empty());
+        assert_eq!(proof.steps, [] as [ProofStep; 0]);
     }
 }
 

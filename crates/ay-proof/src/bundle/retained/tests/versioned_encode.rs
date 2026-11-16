@@ -189,7 +189,7 @@ fn versioned_encoding_refusal_is_sticky_through_output_cleanup() {
 #[test]
 fn versioned_encoding_uses_all_original_deadlines() {
     let envelope = owning(field());
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for expiry in 0..3 {
         let mut bound = bundle_limits();
         let mut wire = limits();

@@ -23,7 +23,7 @@ fn loaded(script: &str) -> Executor {
 }
 
 fn int_hint(exec: &mut Executor, value: i64) -> TermId {
-    exec.ctx.terms.mk_int(num_bigint::BigInt::from(value))
+    exec.ctx.terms.mk_int(BigInt::from(value))
 }
 
 fn has_rule(proof: &Proof, wanted: &AletheRule) -> bool {
@@ -202,9 +202,10 @@ fn a_hint_naming_a_foreign_symbol_is_not_proposed() {
     let bound = exec.authored_binder_names(&exec.exact_concrete_authored_scope());
     let authored = exec.exact_concrete_authored_scope();
     let ledger = exec.cegqi_witness_hints.clone();
-    assert!(exec
-        .authored_witness_hint_terms(&ledger, &authored, &Sort::Int, &bound, 8)
-        .is_empty());
+    assert_eq!(
+        exec.authored_witness_hint_terms(&ledger, &authored, &Sort::Int, &bound, 8),
+        [] as [TermId; 0]
+    );
 }
 
 /// The measured w1_51 source: the refuting value is an E-MATCHED binder

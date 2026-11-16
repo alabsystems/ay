@@ -227,10 +227,9 @@ fn arithmetic_ite_is_split_by_the_model() {
     assert!(st.ite_splits >= 1);
     assert_eq!(subst, 0, "exact after the split");
     assert_model_and_vars(&lits, &[y], &m, "ite");
-    assert_eq!(
+    assert!(
         lits.iter()
             .all(|l| holds(l, &int_model(&[("x", 9)])) == Some(true)),
-        true,
         "x = 9 is in ∃y.φ and in ψ"
     );
 }

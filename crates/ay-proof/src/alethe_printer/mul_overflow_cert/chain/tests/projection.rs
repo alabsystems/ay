@@ -7,6 +7,10 @@ use super::super::super::propagation::index_builds;
 use super::*;
 
 #[path = "../../propagation/legacy_localsat.rs"]
+#[expect(
+    clippy::duplicate_mod,
+    reason = "this frozen oracle instance binds projection-specific observational hooks"
+)]
 mod original;
 mod resources;
 mod tree;
@@ -116,7 +120,7 @@ fn compare(db: &[Clause], fixed: &Model, proj: &[T]) {
                 .collect::<Vec<_>>()
         })
         .collect();
-    let actual = Chain::project(&mut reused_db, fixed, proj, &mut 1_000_000, &progress);
+    let actual = Chain::project(&reused_db, fixed, proj, &mut 1_000_000, &progress);
     assert_eq!(actual, Some(expected));
     assert_eq!(reused_db, db);
 }
@@ -184,7 +188,7 @@ fn enumeration_builds_once_not_once_per_model_and_final_unsat() {
     .unwrap();
     assert_eq!(fresh, reused);
     assert_eq!(index_builds() - before, 9);
-    assert!(db.is_empty());
+    assert_eq!(db.as_slice(), &[] as &[Clause]);
 }
 
 #[test]
@@ -194,8 +198,8 @@ fn projection_keeps_invariant_steps_and_proof_bytes() {
     let atoms: Vec<_> = (0..3)
         .map(|i| old.t.var(&format!("s{i}"), Sort::Bool))
         .collect();
-    for i in 0..3 {
-        assert_eq!(new.t.var(&format!("s{i}"), Sort::Bool), atoms[i]);
+    for (i, &atom) in atoms.iter().enumerate() {
+        assert_eq!(new.t.var(&format!("s{i}"), Sort::Bool), atom);
     }
     let db = vec![
         vec![(atoms[0], true), (atoms[1], true)],
@@ -221,7 +225,7 @@ fn projection_keeps_invariant_steps_and_proof_bytes() {
         })
         .collect();
     let actual = Chain::project(
-        &mut db.clone(),
+        &db,
         &Model::default(),
         &atoms,
         &mut 1_000_000,

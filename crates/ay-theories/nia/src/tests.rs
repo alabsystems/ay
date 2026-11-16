@@ -258,7 +258,7 @@ fn test_nia_reset_clears_state() {
 
     solver.reset();
     assert!(solver.monomials.is_empty());
-    assert!(solver.asserted.is_empty());
+    assert_eq!(solver.asserted, Vec::<(TermId, bool)>::new());
     assert!(solver.sign_constraints.is_empty());
     assert!(solver.var_sign_constraints.is_empty());
 }

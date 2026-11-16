@@ -418,7 +418,7 @@ fn exhaustion_snapshot_records_what_the_clear_destroyed() {
     let trace = solver
         .clause_trace()
         .expect("the trace survives the degrade");
-    assert!(trace.is_empty(), "entries are cleared");
+    assert_eq!(trace.len(), 0, "entries are cleared");
     let snap = trace
         .exhaustion_snapshot()
         .expect("the clear must leave its census behind");

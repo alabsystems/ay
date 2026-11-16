@@ -50,8 +50,6 @@ pub use proof::{
 pub use strengthening::{Strengthening, StrengtheningSet};
 // Public because `Executor::set_candidate_model_policy` takes it.
 pub use model::unknown_candidate::CandidateModelPolicy;
-// Format helpers - format_sort, format_symbol now used in executor/commands.rs
-
 // Incremental state types
 use crate::incremental_state::{IncrementalBvState, IncrementalFpState, IncrementalTheoryState};
 
@@ -744,7 +742,7 @@ pub struct Executor {
     /// that cannot be certified reverts to, or is screened as, the poison it
     /// replaced). Cleared at the head of every assembly and by every session
     /// reset.
-    last_proof_surface_withheld: Option<crate::executor::ProofDeclineMechanism>,
+    last_proof_surface_withheld: Option<ProofDeclineMechanism>,
     /// One aggregate parsed-source work envelope shared by every proof pass of
     /// the query in flight. Each pass charges the traversal/clone/format work
     /// it is about to perform; the ceiling is the same
@@ -1983,8 +1981,7 @@ pub struct Executor {
     /// BV/LIA publication certificate is consumed.
     last_strict_native_bv_lia_bundle: Option<unsat_cert::StrictNativeBvLiaBundleState>,
     /// Immutable exact-source polynomial bundle, distinct from Alethe support.
-    last_strict_native_nra_sos_bundle:
-        Option<std::sync::Arc<unsat_cert::StrictNativeNraSosBundleState>>,
+    last_strict_native_nra_sos_bundle: Option<Arc<unsat_cert::StrictNativeNraSosBundleState>>,
     /// Certification class consumed by the most recent SMT-LIB command
     /// boundary. This is separate from the one-shot token so later diagnostics
     /// cannot relabel an exact semantic certificate as a strict proof merely

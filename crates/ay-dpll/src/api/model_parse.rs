@@ -4,6 +4,7 @@
 
 //! Model output parsing for AY Solver API.
 
+mod admission;
 mod get_value;
 mod legacy;
 mod scalar_functions;

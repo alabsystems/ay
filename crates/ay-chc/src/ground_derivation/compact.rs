@@ -69,7 +69,7 @@ pub(crate) enum Error {
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
-pub(crate) fn validate_source(problem: &crate::ChcProblem, owner: &mut Owner) -> Result<()> {
+pub(crate) fn validate_source(problem: &crate::ChcProblem, owner: &mut Owner<'_>) -> Result<()> {
     let _scope = owner.enter();
     let result = source::Source::new(problem, owner).and_then(|mut source| source.validate(owner));
     if result == Err(Error::Resource) {

@@ -1496,8 +1496,7 @@ impl NraSolver<'_> {
             return result;
         }
         if problem.coverage.allows_sat() && equality_count < problem.vars.len() {
-            if let Some(result) = self.pinned_sat_search(&problem.constraints, &problem.vars, &root)
-            {
+            if let Some(result) = self.pinned_sat_search(&problem, &root) {
                 return result;
             }
         }
@@ -1519,10 +1518,8 @@ impl NraSolver<'_> {
             MAX_BOXES
         };
         let result = self.branch_and_prune(
-            &problem.constraints,
-            &problem.vars,
+            &problem,
             root.clone(),
-            problem.coverage,
             SearchAuthority::Exhaustive,
             tree_budget,
             &self.icp_main_box_count,
@@ -1596,14 +1593,15 @@ impl NraSolver<'_> {
     /// turning an incomplete search region into UNSAT.
     fn branch_and_prune(
         &self,
-        constraints: &[MultiConstraint],
-        vars: &[TermId],
+        problem: &IcpProblem,
         mut root: VarBox,
-        coverage: ParseCoverage,
         mut authority: SearchAuthority,
         max_boxes: usize,
         box_counter: &std::cell::Cell<u64>,
     ) -> UniResult {
+        let constraints = &problem.constraints;
+        let vars = &problem.vars;
+        let coverage = problem.coverage;
         if coverage.allows_sat() {
             if let Some(result) = self.ladder_model(vars, &root) {
                 return result;
@@ -2127,12 +2125,9 @@ impl NraSolver<'_> {
     /// maximum structural matching between active equalities and non-point
     /// variables), then branch-and-prune the reduced system. Pins are guesses:
     /// this NEVER claims UNSAT.
-    fn pinned_sat_search(
-        &self,
-        constraints: &[MultiConstraint],
-        vars: &[TermId],
-        root: &VarBox,
-    ) -> Option<UniResult> {
+    fn pinned_sat_search(&self, problem: &IcpProblem, root: &VarBox) -> Option<UniResult> {
+        let constraints = &problem.constraints;
+        let vars = &problem.vars;
         // Active equalities: those not already reduced to constants by the
         // point-intervals of the contracted root box.
         let point_vars: Vec<(TermId, BigRational)> = vars
@@ -2223,10 +2218,8 @@ impl NraSolver<'_> {
                     continue;
                 }
                 match self.branch_and_prune(
-                    constraints,
-                    vars,
+                    problem,
                     bx,
-                    ParseCoverage::Complete,
                     SearchAuthority::SatOnly,
                     PIN_SEARCH_MAX_BOXES,
                     &self.icp_pin_box_count,

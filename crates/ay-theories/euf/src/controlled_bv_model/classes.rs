@@ -17,9 +17,8 @@ pub(super) fn prepare(
     work: &mut WorkBudget<'_>,
 ) -> Result<Vec<Class>, QueryError> {
     let mut rows = owned::reserve_vec::<Class>(terms.len(), work)?;
-    for index in 0..terms.len() {
+    for &term in terms {
         work.charge(32)?;
-        let term = terms[index];
         if let Sort::BitVec(bits) = source.terms.sort(term) {
             let rep = shape::representative(source, term, work)?;
             let position = insert(&mut rows, bits.width, rep, work)?;
@@ -33,13 +32,13 @@ pub(super) fn prepare(
             }
         }
     }
-    for index in 0..rows.len() {
+    for row in &mut rows {
         work.charge(64)?;
-        if rows[index].literal.is_none() {
-            rows[index].literal = class_literal(source, rows[index].rep, rows[index].width, work)?;
+        if row.literal.is_none() {
+            row.literal = class_literal(source, row.rep, row.width, work)?;
         }
         work.charge(32)?;
-        rows[index].value = rows[index].literal;
+        row.value = row.literal;
     }
     complete(source, &mut rows, work)?;
     Ok(rows)
@@ -52,9 +51,9 @@ fn insert(
     work: &mut WorkBudget<'_>,
 ) -> Result<usize, QueryError> {
     let mut position = rows.len();
-    for index in 0..rows.len() {
+    for (index, row) in rows.iter().enumerate() {
         work.charge(64)?;
-        let old = (rows[index].width, rows[index].rep);
+        let old = (row.width, row.rep);
         if old == (width, rep) {
             return Ok(index);
         }
@@ -66,7 +65,7 @@ fn insert(
     if rows.len() == rows.capacity() {
         return Err(work.refuse_exhaustion());
     }
-    work.admit(64, 2 * std::mem::size_of::<Class>())?;
+    work.admit(64, 2 * size_of::<Class>())?;
     rows.push(Class {
         width,
         rep,
@@ -77,11 +76,11 @@ fn insert(
     // Every shift is separately offered: reserve pricing is NOT an O(n^2) move fee.
     let mut index = rows.len() - 1;
     while index > position {
-        work.admit(64, 2 * std::mem::size_of::<Class>())?;
+        work.admit(64, 2 * size_of::<Class>())?;
         rows[index] = rows[index - 1];
         index -= 1;
     }
-    work.admit(64, 2 * std::mem::size_of::<Class>())?;
+    work.admit(64, 2 * size_of::<Class>())?;
     rows[position] = Class {
         width,
         rep,
@@ -129,10 +128,10 @@ pub(super) fn value(
     rep: u32,
     work: &mut WorkBudget<'_>,
 ) -> Result<Option<u128>, QueryError> {
-    for index in 0..rows.len() {
+    for row in rows {
         work.charge(64)?;
-        if (rows[index].width, rows[index].rep) == (width, rep) {
-            return Ok(rows[index].value);
+        if (row.width, row.rep) == (width, rep) {
+            return Ok(row.value);
         }
     }
     Err(work.refuse_exhaustion())
@@ -144,9 +143,9 @@ fn used(
     candidate: u128,
     work: &mut WorkBudget<'_>,
 ) -> Result<bool, QueryError> {
-    for index in 0..rows.len() {
+    for row in rows {
         work.charge(64)?;
-        if rows[index].width == width && rows[index].value == Some(candidate) {
+        if row.width == width && row.value == Some(candidate) {
             return Ok(true);
         }
     }
@@ -205,11 +204,11 @@ fn reuse(
             return Ok(None);
         }
         let mut blocked = false;
-        for index in 0..rows.len() {
+        for other in rows {
             work.charge(64)?;
-            if rows[index].width == row.width
-                && rows[index].value == Some(candidate)
-                && disequal(source, row.rep, rows[index].rep, row.width, work)?
+            if other.width == row.width
+                && other.value == Some(candidate)
+                && disequal(source, row.rep, other.rep, row.width, work)?
             {
                 blocked = true;
                 break;

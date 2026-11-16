@@ -90,12 +90,20 @@ fn wire_storage_hash_collisions_never_merge_different_raw_bodies_or_shells() {
     let budget = TextBudget::new(MAX_RECORDED_PRINTED_BYTES);
     let a = budget.copy("a").unwrap();
     let b = budget.copy("b").unwrap();
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "the test exercises OwnedText's immutable text identity despite its accounting Cell"
+    )]
     let mut bodies =
         std::collections::HashMap::<OwnedText, usize, BuildHasherDefault<Collision>>::default();
     bodies.insert(a.clone(), 1);
     bodies.insert(b.clone(), 2);
     assert_eq!(bodies.get("a"), Some(&1));
     assert_eq!(bodies.get("b"), Some(&2));
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "the test exercises WireLiteral's immutable text identity despite its accounting Cell"
+    )]
     let mut literals =
         std::collections::HashMap::<WireLiteral, usize, BuildHasherDefault<Collision>>::default();
     for (i, key) in [
@@ -121,8 +129,12 @@ fn wire_storage_shares_large_opposite_spellings_without_changing_rup() {
     let a = "a".repeat(2_600_000);
     let b = "b";
     let equality = format!("(= {a} {b})");
-    let source = printer.record_interned_clause(&[a.clone()]).unwrap();
-    let eq = printer.record_interned_clause(&[equality.clone()]).unwrap();
+    let source = printer
+        .record_interned_clause(std::slice::from_ref(&a))
+        .unwrap();
+    let eq = printer
+        .record_interned_clause(std::slice::from_ref(&equality))
+        .unwrap();
     let before = printer.printed_clause_bytes.get();
     let implication = printer
         .record_interned_clause(&[format!("(not {equality})"), format!("(not {a})"), b.into()])
@@ -146,7 +158,9 @@ fn wire_storage_external_handles_keep_allocation_charged_across_reset() {
     let terms = TermStore::new();
     let printer = AlethePrinter::new(&terms);
     let text = "x".repeat(4096);
-    let ids = printer.record_interned_clause(&[text.clone()]).unwrap();
+    let ids = printer
+        .record_interned_clause(std::slice::from_ref(&text))
+        .unwrap();
     let held = printer.printed_wire_literals(&ids).unwrap();
     printer.release_printed_atoms(ids);
     printer.prepare_proof(&Proof::from_steps(vec![])).unwrap();
@@ -227,7 +241,7 @@ fn wire_storage_counts_simultaneously_live_text_and_vector_capacities() {
     let vector = budget.vector::<u64>(40).unwrap();
     assert_eq!(
         budget.used.get(),
-        allocated + vector.capacity() * std::mem::size_of::<u64>()
+        allocated + vector.capacity() * size_of::<u64>()
     );
     assert!(budget.copy(&"y".repeat(300)).is_none());
     drop(vector);

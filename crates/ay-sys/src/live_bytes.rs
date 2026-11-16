@@ -264,6 +264,6 @@ pub(crate) fn caller_stripe_index_for_test() -> usize {
     let own = caller_stripe();
     PENDING
         .iter()
-        .position(|stripe| std::ptr::eq(&stripe.0, own))
+        .position(|stripe| std::ptr::eq(&raw const stripe.0, own))
         .expect("the caller's stripe is one of the pending balances")
 }

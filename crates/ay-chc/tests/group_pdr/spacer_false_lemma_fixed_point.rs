@@ -108,9 +108,3 @@ fn unreachable_predicate_false_lemma_reaches_safe_without_startup() {
         "rung 1, startup discovery skipped",
     );
 }
-
-#[test]
-fn rung_one_keeps_false_lemmas_in_the_model() {
-    assert!(SpacerLane::rung(1).false_lemma_in_model);
-    assert!(!SpacerLane::OFF.false_lemma_in_model);
-}

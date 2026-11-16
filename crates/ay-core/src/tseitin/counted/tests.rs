@@ -86,7 +86,7 @@ fn lit_value(lit: i32, assignment: usize) -> bool {
 }
 
 fn exhaustive(cnf: &CountedCnf<'_>, variables: &[TermId]) {
-    assert!(cnf.data.theory_atoms.is_empty());
+    assert_eq!(cnf.data.theory_atoms.as_slice(), &[]);
     for inputs in 0..(1 << variables.len()) {
         let expected = cnf
             .data

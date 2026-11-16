@@ -218,8 +218,7 @@ fn fp_incremental_reasserted_conflict_is_reactivated_after_pop() {
 /// The original FP bits must remain at their frozen SAT positions.
 #[test]
 fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
-    let smt = format!(
-        "(set-logic QF_FP)\n\
+    let smt = "(set-logic QF_FP)\n\
          (declare-fun x () Float32)\n\
          (declare-fun y () Float32)\n\
          (declare-fun p () Bool)\n\
@@ -234,7 +233,7 @@ fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
          (assert (and p q))\n\
          (assert r)\n\
          (check-sat)\n"
-    );
+        .to_string();
     assert_eq!(
         verdicts(&smt),
         vec!["sat", "sat", "unsat"],
@@ -262,8 +261,7 @@ fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
 /// bug without changing the FP-relevant assertion-root set.
 #[test]
 fn fp_incremental_ite_bool_condition_is_linked_when_later_named() {
-    let smt = format!(
-        "(set-logic QF_FP)\n\
+    let smt = "(set-logic QF_FP)\n\
          (declare-fun x () Float32)\n\
          (declare-fun y () Float32)\n\
          (declare-fun z () Float32)\n\
@@ -276,7 +274,7 @@ fn fp_incremental_ite_bool_condition_is_linked_when_later_named() {
          (push 1)\n\
          (assert b)\n\
          (check-sat)\n"
-    );
+        .to_string();
     assert_eq!(
         verdicts(&smt),
         vec!["sat", "sat", "unsat"],

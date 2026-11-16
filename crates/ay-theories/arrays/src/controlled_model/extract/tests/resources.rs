@@ -105,7 +105,7 @@ fn late_original_stop_after_real_copies_and_scratch_cleanup_survives_reset() {
         end,
         Arc::new(move || {
             armed.load(Ordering::Acquire)
-                && observed.fetch_add(1, Ordering::AcqRel) + 1 >= component_polls + 1
+                && observed.fetch_add(1, Ordering::AcqRel) + 1 > component_polls
         }),
     );
     assert!(matches!(
@@ -125,7 +125,9 @@ fn expired_original_end_is_not_replaced_by_a_relative_extraction_timer() {
     let fixture = Fixture::new();
     let solver = fixture.solver();
     let values = fixture.values();
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("a current instant has an earlier representable second");
     let owner = owner(end, 1_000_000, 128 << 20);
     assert!(matches!(
         owner.with_work(|work| solver.try_extract_prepared_model_with_budget(&values, work)),
@@ -174,7 +176,7 @@ fn unnamed_nested_array_value_refuses_instead_of_inventing_a_class_name() {
     let base = terms.mk_var("outer", outer_sort.clone());
     let nested = terms.mk_var("inner", inner_sort);
     let index = terms.mk_var("index", Sort::Int);
-    terms.mk_app(Symbol::named("store"), [base, index, nested], outer_sort);
+    let _nested_store = terms.mk_app(Symbol::named("store"), [base, index, nested], outer_sort);
     let mut solver = ArraySolver::new(&terms);
     solver.populate_caches();
     solver.rebuild_assign_indices();
@@ -236,8 +238,7 @@ fn retained_tombstone_backing_is_priced_before_real_model_value_probes() {
             .map(String::as_str),
         Some("concrete")
     );
-    drop(work);
-    let bound = allocation / std::mem::size_of::<(TermId, String)>() + 32;
+    let bound = allocation / size_of::<(TermId, String)>() + 32;
     assert_eq!(units.get(), 8 * bound + 512);
     let owner = owner(end, 1_000_000, 128 << 20);
     let output = owner

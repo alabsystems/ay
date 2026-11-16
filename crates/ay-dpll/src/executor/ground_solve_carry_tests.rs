@@ -236,7 +236,7 @@ fn a_rolled_back_term_store_empties_the_store() {
     terms.rollback_to(checkpoint);
     let p = terms.mk_var("p", Sort::Bool);
     let _q = terms.mk_var("q", Sort::Bool);
-    assert!(store.conflicts(&terms).is_empty());
+    assert_eq!(store.conflicts(&terms), &[] as &[Vec<CarriedLiteral>]);
     let mut solver = SatSolver::new(1);
     let mut term_to_var = HashMap::default();
     term_to_var.insert(p, 0u32);
@@ -267,7 +267,7 @@ fn a_cloned_term_store_is_another_store() {
     let mut terms = TermStore::new();
     let (mut store, _, _) = store_with_congruence_conflict(&mut terms);
     let other = terms.clone();
-    assert!(store.conflicts(&other).is_empty());
+    assert_eq!(store.conflicts(&other), &[] as &[Vec<CarriedLiteral>]);
 }
 
 /// A user declaration of `to_real` (or `is_int`) changes what the builtin's
@@ -277,12 +277,12 @@ fn a_shadowed_builtin_empties_the_store() {
     let mut terms = TermStore::new();
     let (mut store, _, _) = store_with_congruence_conflict(&mut terms);
     terms.mark_to_real_shadowed();
-    assert!(store.conflicts(&terms).is_empty());
+    assert_eq!(store.conflicts(&terms), &[] as &[Vec<CarriedLiteral>]);
 
     let mut terms = TermStore::new();
     let (mut store, _, _) = store_with_congruence_conflict(&mut terms);
     terms.mark_is_int_shadowed();
-    assert!(store.conflicts(&terms).is_empty());
+    assert_eq!(store.conflicts(&terms), &[] as &[Vec<CarriedLiteral>]);
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn a_new_query_starts_empty() {
     assert_eq!(store.counters(), (1, 3));
     store.begin_query();
     assert_eq!(store.counters(), (0, 0));
-    assert!(store.conflicts(&terms).is_empty());
+    assert_eq!(store.conflicts(&terms), &[] as &[Vec<CarriedLiteral>]);
     let mut solver = SatSolver::new(1);
     let mut term_to_var = HashMap::default();
     term_to_var.insert(a_eq_b, 0u32);

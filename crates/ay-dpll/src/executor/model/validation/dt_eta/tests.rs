@@ -14,10 +14,12 @@ fn declared(tester: &str) -> (Executor, TermId) {
         (declare-fun user-tester (D) Bool)
         (assert (= ({tester} y) (= y (C (p y) (q y) (data y)))))");
     let commands = ay_frontend::parse(&text).expect("the declaration-only fixture must parse");
-    assert!(executor
-        .execute_all(&commands)
-        .expect("the fixture must elaborate")
-        .is_empty());
+    assert_eq!(
+        executor
+            .execute_all(&commands)
+            .expect("the fixture must elaborate"),
+        [] as [String; 0]
+    );
     let term = *executor
         .ctx
         .assertions
@@ -74,7 +76,7 @@ fn equality_requires_its_canonical_owner_but_allows_a_private_surface_shadow() {
     assert!(!is_eta(&executor, term, 4000));
 
     let (mut executor, term) = declared("is-C");
-    executor
+    let _ = executor
         .ctx
         .register_native_global_constant("=".to_string(), Sort::Bool);
     let owner = executor

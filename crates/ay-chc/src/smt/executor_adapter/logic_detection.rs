@@ -498,10 +498,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
         }
         self.enter_expr(root, 0)?;
         let mut stack: Vec<(&'a ChcExpr, usize)> = vec![(root, 0)];
-        loop {
-            let Some(top) = stack.last_mut() else {
-                break;
-            };
+        while let Some(top) = stack.last_mut() {
             let node: &'a ChcExpr = top.0;
             let children = expr_children(node);
             if top.1 < children.len() {
@@ -1045,7 +1042,7 @@ fn collect_uninterpreted_function_surface<'a>(
     let mut seen: FxHashSet<(*const ChcExpr, bool)> = FxHashSet::default();
     while let Some((current, bound_body)) = stack.pop() {
         if expr_children(current).len() != 0
-            && !seen.insert((current as *const ChcExpr, bound_body))
+            && !seen.insert((std::ptr::from_ref::<ChcExpr>(current), bound_body))
         {
             continue;
         }

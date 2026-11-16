@@ -60,17 +60,17 @@ fn native_error(failure: CompactError) -> ChcGroundDerivationArtifactError {
     )
 }
 
-fn admit(owner: &mut Owner, work: usize, bytes: usize) -> Result<()> {
+fn admit(owner: &mut Owner<'_>, work: usize, bytes: usize) -> Result<()> {
     owner.admit(work, bytes).map_err(native_error)
 }
 
-fn refused<T>(owner: &mut Owner) -> Result<T> {
+fn refused<T>(owner: &mut Owner<'_>) -> Result<T> {
     owner.refuse(CompactError::Resource).map_err(native_error)
 }
 
 /// Existing byte transport borrows this owner; it never captures a new grant.
 fn controlled<T>(
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
     body: impl FnOnce(&mut GroundValidationControl<'_>) -> Result<T>,
 ) -> Result<T> {
     let result = {
@@ -123,7 +123,7 @@ pub fn validate_chc_compact_ground_derivation_artifact_with_progress(
 pub(crate) fn validate_with_owner(
     problem: &ChcProblem,
     bytes: &[u8],
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<ChcValidatedCompactGroundDerivation> {
     let _scope = owner.enter();
     owner.poll().map_err(native_error)?;
@@ -186,7 +186,7 @@ pub(crate) fn validate_with_owner(
 pub(crate) fn encode_with_owner(
     problem: &ChcProblem,
     derivation: &CompactDerivation,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<ChcProofRunArtifact> {
     let _scope = owner.enter();
     compact::validate(problem, derivation, owner).map_err(native_error)?;

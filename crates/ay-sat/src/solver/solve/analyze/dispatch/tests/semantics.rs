@@ -199,7 +199,7 @@ fn root_unit_retry_reserves_actual_pinned_slot_and_retains_proof_id() {
         Ok(CountedDispatchStep::Forced)
     );
     assert_eq!(s.cold.lrat_level0_unit_materialize_pinned, vec![0]);
-    assert!(s.pending_theory_unit_proof_ids.is_empty());
+    assert_eq!(s.pending_theory_unit_proof_ids.len(), 0);
     assert!(owner.usage().unwrap().storage_admitted > 0);
     parity(&s, &expected);
 }

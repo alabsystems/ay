@@ -81,7 +81,7 @@ fn actual_e1_local_closure_observation() {
         .steps
         .iter_mut()
         .find_map(|step| match step {
-            ay_core::ProofStep::TheoryLemma {
+            ProofStep::TheoryLemma {
                 kind: TheoryLemmaKind::ArrayRowChain,
                 clause,
                 ..
@@ -123,7 +123,7 @@ fn proved_disjuncts_use_checked_injection_for_nested_and_reversed_goals() {
         let candidate = candidate.expect("an earlier proved member entails its disjunction");
         assert!(candidate.steps.iter().any(|step| matches!(
             step,
-            ay_core::ProofStep::Step {
+            ProofStep::Step {
                 rule: AletheRule::OrNeg,
                 ..
             }
@@ -131,7 +131,7 @@ fn proved_disjuncts_use_checked_injection_for_nested_and_reversed_goals() {
         assert!(candidate
             .steps
             .iter()
-            .all(|step| !matches!(step, ay_core::ProofStep::Assume(term) if *term != root)));
+            .all(|step| !matches!(step, ProofStep::Assume(term) if *term != root)));
         assert!(executor
             .check_proof_strict_derivation_with_datatypes(&candidate)
             .unwrap()
@@ -177,7 +177,7 @@ fn disjunct_type_depth_and_work_refusals_do_not_construct_terms() {
         .terms
         .mk_app(Symbol::named("or"), [truth], Sort::Bool);
     let closure = GroundClosure::default();
-    let facts = facts::FactBase::default();
+    let facts = FactBase::default();
     let before = executor.ctx.terms.len();
     let mut work = MAX_GOAL_WORK;
     assert!(executor

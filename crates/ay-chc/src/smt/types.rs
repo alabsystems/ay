@@ -385,7 +385,7 @@ impl SmtValue {
     /// Direct legacy `BitVec` construction is normalized here as well, so an
     /// over-wide `u128` payload at a narrow width cannot leak non-bitvector bits
     /// into exact evaluator operations. Returns `None` for a non-BV value or a
-    /// width outside `1..=`[`crate::MAX_BITVECTOR_WIDTH`], including malformed
+    /// width outside <code>1..=[crate::MAX_BITVECTOR_WIDTH]</code>, including malformed
     /// enum variants constructed directly by downstream code.
     pub fn bitvec_to_biguint(&self) -> Option<(BigUint, u32)> {
         match self {
@@ -425,7 +425,7 @@ impl SmtValue {
     /// allocation-free, at-most-128-bit [`ChcExpr::BitVec`] leaves, matching
     /// the parser's representation for wide SMT-LIB literals.
     /// Returns `None` for a non-bit-vector value or a declared width outside
-    /// `1..=`[`crate::MAX_BITVECTOR_WIDTH`]. The latter check keeps public
+    /// <code>1..=[crate::MAX_BITVECTOR_WIDTH]</code>. The latter check keeps public
     /// replay/rendering code fail-closed even if it receives a directly-built,
     /// non-canonical [`SmtValue`] variant.
     pub fn bitvec_to_chc_expr(&self) -> Option<ChcExpr> {

@@ -29,7 +29,7 @@ fn bare_reads_remain_borrowed_and_stops_never_return_a_partial_normalization() {
     let bare = ChcExpr::select(a.clone(), ChcExpr::Int(0));
     assert!(matches!(
         normalize(&bare, &mut 100, &mut || false),
-        Some(Cow::Borrowed(original)) if std::ptr::eq(original, &bare)
+        Some(Cow::Borrowed(original)) if std::ptr::eq(original, &raw const bare)
     ));
     let stored = ChcExpr::select(
         ChcExpr::store(a, ChcExpr::Int(0), ChcExpr::Int(1)),

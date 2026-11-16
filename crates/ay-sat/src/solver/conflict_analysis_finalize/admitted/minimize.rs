@@ -17,10 +17,8 @@ impl Minimize for Counted<'_> {
         <Ordinary as Minimize>::sort(&Ordinary, values, data).map_err(|never| match never {})
     }
     fn frame(&self, s: &Solver, lit: Literal, _: u32) -> AdmissionResult<()> {
-        self.0.admit(
-            1,
-            std::mem::size_of::<(Literal, u32, VarData, usize, usize)>(),
-        )?;
+        self.0
+            .admit(1, size_of::<(Literal, u32, VarData, usize, usize)>())?;
         bounded_literal(s, lit, self.0)
     }
     fn antecedent(&self, s: &Solver, lit: Literal, _: Literal) -> AdmissionResult<()> {

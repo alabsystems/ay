@@ -131,7 +131,9 @@ fn level_one_predecessor_query_renames_the_fact_apart() {
             );
         }
         Err(BlockResult::Unknown) => panic!("level-1 predecessor query answered Unknown"),
-        Err(_) => panic!("unexpected result from the level-1 predecessor query"),
+        Err(
+            BlockResult::Blocked(_) | BlockResult::AlreadyBlocked | BlockResult::MustReachable(_),
+        ) => panic!("unexpected result from the level-1 predecessor query"),
         Ok(_) => panic!(
             "a state one step from init was blocked at level 1: the fact's local `D` \
              was captured by the step clause's `D`"

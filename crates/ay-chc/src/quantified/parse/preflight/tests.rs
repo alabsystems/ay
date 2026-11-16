@@ -23,7 +23,7 @@ fn empty_and_comment_only_input_add_no_forms_or_tokens() {
         "; ignored\r; also ignored\n",
     ] {
         check(input).unwrap();
-        assert!(parse_sexps(input).unwrap().is_empty());
+        assert_eq!(parse_sexps(input).unwrap(), [] as [ay_frontend::SExpr; 0]);
     }
     let input = "(rule true); (not another form)\n(check-sat) ; trailing";
     check(input).unwrap();

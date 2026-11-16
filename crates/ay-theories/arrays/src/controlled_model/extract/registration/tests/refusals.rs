@@ -14,7 +14,7 @@ fn stores_maps_as_array_lambda_and_nested_forms_never_get_a_cold_success() {
         "opaque-array",
     ] {
         let mut fixture = Fixture::new();
-        fixture.terms.mk_app(
+        let _unsupported_array_term = fixture.terms.mk_app(
             Symbol::named(name),
             [fixture.base, fixture.indices[0], fixture.otherwise],
             Sort::array(Sort::Int, Sort::Int),
@@ -24,7 +24,7 @@ fn stores_maps_as_array_lambda_and_nested_forms_never_get_a_cold_success() {
         assert!(source.dirty && source.select_cache.is_empty());
     }
     let mut terms = TermStore::new();
-    terms.mk_var(
+    let _nested_array = terms.mk_var(
         "nested",
         Sort::array(Sort::Int, Sort::array(Sort::Int, Sort::Int)),
     );
@@ -132,7 +132,7 @@ fn source_stamp_append_and_foreign_store_cannot_reuse_a_preparation_binding() {
         .with_work(|work| binding::Binding::capture(&source, work))
         .unwrap();
     drop(source);
-    fixture.terms.mk_var("new", Sort::Int);
+    let _new_term = fixture.terms.mk_var("new", Sort::Int);
     let changed = ArraySolver::new(&fixture.terms);
     assert!(original
         .with_work(|work| stamp.verify(&changed, work))

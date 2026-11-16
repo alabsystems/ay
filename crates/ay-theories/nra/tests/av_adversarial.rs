@@ -811,7 +811,7 @@ fn av_equal_written_differently() {
         println!("  WRONG: {w}");
     }
     assert!(n >= 100, "expected >= 100 equal pairs, got {n}");
-    assert!(wrong.is_empty());
+    assert_eq!(wrong.as_slice(), &[] as &[String]);
 }
 
 /// F5: algebraic vs a rational separated by ~2^-k for k growing to ~250.
@@ -910,7 +910,7 @@ fn av_algebraic_vs_close_rational() {
     for w in wrong.iter().take(40) {
         println!("  WRONG: {w}");
     }
-    assert!(wrong.is_empty());
+    assert_eq!(wrong.as_slice(), &[] as &[String]);
 }
 
 /// F6: `sign_of_poly` where `q` has a root extremely close to alpha but not
@@ -968,7 +968,7 @@ fn av_sign_of_poly_near_root() {
     for w in wrong.iter().take(40) {
         println!("  WRONG: {w}");
     }
-    assert!(wrong.is_empty());
+    assert_eq!(wrong.as_slice(), &[] as &[String]);
 }
 
 /// Liveness: nothing spins, and the declared bound is respected. Also pins the
@@ -1021,7 +1021,7 @@ fn av_liveness_and_bound() {
     for v in violations.iter().take(40) {
         println!("  VIOLATION: {v}");
     }
-    assert!(violations.is_empty());
+    assert_eq!(violations.as_slice(), &[] as &[String]);
 }
 
 #[cfg(test)]

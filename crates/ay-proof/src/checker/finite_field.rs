@@ -285,8 +285,8 @@ mod tests {
         assert!(validate(&terms, ProofId(0), &[false_claim], &mut |_, _| true).is_err());
         assert!(validate(&terms, ProofId(0), &[theorem], &mut |_, _| false).is_err());
         // A valid clause must not disguise an unsupported operator as a UF.
-        let foreign = terms.mk_app(Symbol::named("ff.div"), &[x, two], Sort::FiniteField(f));
-        let tautology = terms.mk_app(Symbol::named("="), &[foreign, foreign], Sort::Bool);
+        let foreign = terms.mk_app(Symbol::named("ff.div"), [x, two], Sort::FiniteField(f));
+        let tautology = terms.mk_app(Symbol::named("="), [foreign, foreign], Sort::Bool);
         assert!(validate(&terms, ProofId(0), &[tautology], &mut |_, _| true).is_err());
     }
 }

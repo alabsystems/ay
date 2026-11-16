@@ -106,7 +106,7 @@ impl Cnf {
             self.overflow = true;
             return;
         }
-        if self.clauses % MEMORY_POLL_CLAUSES == 0 && encode_memory_exceeded() {
+        if self.clauses.is_multiple_of(MEMORY_POLL_CLAUSES) && encode_memory_exceeded() {
             self.set_memory_out();
             return;
         }

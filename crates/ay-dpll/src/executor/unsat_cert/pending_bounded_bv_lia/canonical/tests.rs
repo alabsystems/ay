@@ -20,7 +20,7 @@ fn fixture() -> Fixture {
     let seven = terms.mk_int(BigInt::from(7));
     let sum = terms.mk_app(Symbol::named("+"), [x, seven], Sort::Int);
     let root = terms.mk_app(Symbol::named("="), [sum, seven], Sort::Bool);
-    terms.mk_bitvec((BigInt::from(1) << 128usize) + BigInt::from(3), 129);
+    let _ = terms.mk_bitvec((BigInt::from(1) << 128usize) + BigInt::from(3), 129);
     let unused_array = terms.mk_var(
         "unused_array",
         Sort::array(Sort::bitvec(8), Sort::bitvec(129)),
@@ -66,7 +66,7 @@ fn borrowed_comparison_preserves_snapshot_length_order_and_content_identity() {
         terms.var_counter(),
     );
     parity(&rebuilt, &entries, true);
-    terms.mk_var("later_unused_append", Sort::Bool);
+    let _ = terms.mk_var("later_unused_append", Sort::Bool);
     parity(&terms, &entries, false);
     parity(&terms, &terms.entries_snapshot(), true);
 }
@@ -116,7 +116,7 @@ fn unused_large_payload_is_compared_completely_by_content() {
         let TermData::Var(name, _) = &mut changed[index].0 else {
             panic!("snapshot variable");
         };
-        name.replace_range(offset..offset + 1, "b");
+        name.replace_range(offset..=offset, "b");
         assert_eq!(name.len(), source_name.len());
         parity(&fixture.terms, &changed, false);
     }

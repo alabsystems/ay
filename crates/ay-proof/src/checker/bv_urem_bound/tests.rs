@@ -110,7 +110,7 @@ fn native_bound_does_not_accept_its_negation_or_an_unguarded_range() {
                 let r = x.checked_rem(d).unwrap_or(x);
                 assert!(d == 0 || r < d);
                 if d == 0 {
-                    assert!(!(r < d));
+                    assert!(r >= d);
                 }
             }
         }

@@ -5,6 +5,7 @@
 //! Admission and exact-source acceptance for the bounded native BV prepass.
 
 use super::*;
+use crate::ChcCheckedReplayObligation;
 
 pub(super) enum QueryPolarity {
     Wrap,
@@ -168,7 +169,10 @@ fn collapsed_flipped_query_requires_original_unsafe_witness_and_replay() {
         .run_checked_replay(Duration::from_secs(20))
         .expect("the original Unsafe witness must pass checked replay");
     assert!(checked.proof_run().accepted_as_proof());
-    assert!(!checked.summary().obligations.is_empty());
+    assert_ne!(
+        checked.summary().obligations,
+        [] as [ChcCheckedReplayObligation; 0]
+    );
     checked
         .recheck_with_fresh_ay(Duration::from_secs(20))
         .expect("original Unsafe replay payloads must independently recheck");
@@ -285,7 +289,7 @@ fn expired_caller_deadline_never_starts_native_preprocessing_or_raw_fallback() {
     assert!(adaptive
         .try_acyclic_bmc_probe(&adaptive.features(), Some(Instant::now()))
         .is_none());
-    assert!(trace_session.finish().observations().is_empty());
+    assert_eq!(trace_session.finish().observations(), []);
 }
 
 #[test]
@@ -302,7 +306,7 @@ fn cancelled_caller_never_starts_native_preprocessing_or_raw_fallback() {
             Some(Instant::now() + Duration::from_secs(1))
         )
         .is_none());
-    assert!(trace_session.finish().observations().is_empty());
+    assert_eq!(trace_session.finish().observations(), []);
 }
 
 #[test]
@@ -319,5 +323,5 @@ fn expired_ambient_deadline_cannot_be_reopened_by_native_prefix() {
             Some(Instant::now() + Duration::from_secs(1))
         )
         .is_none());
-    assert!(trace_session.finish().observations().is_empty());
+    assert_eq!(trace_session.finish().observations(), []);
 }

@@ -42,14 +42,16 @@ fn total_free_word_and_boolean_definitions_skip_only_their_singleton() {
     ] {
         let (executor, root, surface) = fixture(WORDS, source);
         assert!(screened(&executor, root), "{source}");
-        assert!(candidate_selections(
-            &[(root, &surface)],
-            &[root],
-            &executor.ctx,
-            &executor.proof_source_work,
-            &|| false
-        )
-        .is_empty());
+        assert_eq!(
+            candidate_selections(
+                &[(root, &surface)],
+                &[root],
+                &executor.ctx,
+                &executor.proof_source_work,
+                &|| false
+            ),
+            [] as [Vec<(TermId, &ay_frontend::Term)>; 0]
+        );
     }
 }
 
@@ -84,7 +86,7 @@ fn all_definition_roots_remain_ordered_and_complete_in_the_joint_attempt() {
         panic!("one root")
     };
     let second = executor
-        .raw_intern_surface(&second_surface)
+        .raw_intern_surface(second_surface)
         .expect("second original root");
     let roots = [(first, &first_surface), (second, second_surface)];
     let choices = candidate_selections(

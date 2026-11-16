@@ -376,10 +376,11 @@ fn free_constants<'a>(
 /// what remains of the certification envelope until `backstop`, so step (4)
 /// keeps the other half; `None` (no cap) without an envelope.
 fn entailment_deadline(now: Instant, backstop: Option<Instant>) -> Option<Instant> {
-    backstop.map(|backstop| {
+    let backstop = backstop?;
+    Some(
         now.checked_add(backstop.saturating_duration_since(now) / 2)
-            .unwrap_or(backstop)
-    })
+            .unwrap_or(backstop),
+    )
 }
 
 /// Step (4a)'s counts: step (4)'s decisions, and conflicts per SAT solve,

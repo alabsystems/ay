@@ -225,5 +225,5 @@ fn observed_sqrt_refusal_requires_an_explicit_fresh_owning_attempt_for_recovery(
     fresh.try_get_fp(sqrt).unwrap();
     let built = fresh.finish().unwrap();
     assert!(!built.has_encoding_gap);
-    assert!(!built.clauses.is_empty());
+    assert_ne!(built.clauses.len(), 0);
 }

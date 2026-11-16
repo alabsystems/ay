@@ -49,7 +49,7 @@ impl BuildControl for Owner {
             self.stopped = true;
             return Err(());
         }
-        assert!(progress.variables <= i32::MAX as u32);
+        assert!(i32::try_from(progress.variables).is_ok());
         self.trace.push(progress);
         Ok(())
     }
@@ -408,7 +408,7 @@ fn composed_mulmod_is_exact_for_all_small_words_and_zero_divisors() {
                     inputs.extend(pins(&y, b));
                     inputs.extend(pins(&m, modulus));
                     let expected = if modulus == 0 {
-                        a * b & mask
+                        (a * b) & mask
                     } else {
                         a * b % modulus
                     };
@@ -483,17 +483,23 @@ fn empty_private_words_still_poll_both_entry_and_completion() {
     let terms = TermStore::new();
     let mut solver = FpSolver::new(&terms);
     let mut owner = Owner::new();
-    assert!(solver
-        .rem_full_product_with_control(&[], &[], &mut owner)
-        .unwrap()
-        .is_empty());
-    assert!(solver
-        .rem_narrow_remainder_with_control(&[], &[], &mut owner)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        solver
+            .rem_full_product_with_control(&[], &[], &mut owner)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        solver
+            .rem_narrow_remainder_with_control(&[], &[], &mut owner)
+            .unwrap()
+            .len(),
+        0
+    );
     assert_eq!(owner.trace.len(), 4);
     assert_eq!(solver.num_vars(), 0);
-    assert!(solver.clauses().is_empty());
+    assert_eq!(solver.clauses().len(), 0);
     drop(solver);
     owner.charge(0).unwrap();
 }

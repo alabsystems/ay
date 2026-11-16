@@ -641,9 +641,7 @@ impl Executor {
             // function keeps a DERIVATION and drops only its authored-scope
             // spelling, which is a different repair from every producer-side
             // decline and was indistinguishable from them in the census.
-            self.record_proof_decline(
-                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
-            );
+            self.record_proof_decline(ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable);
             return;
         };
         if roots.is_empty() {
@@ -660,9 +658,7 @@ impl Executor {
         if !self.ctx.retains_parsed_assertions() {
             if self.is_producing_proofs() || self.proof_artifact_required {
                 self.suppress_unsat_proof_reconstruction();
-                self.record_proof_decline(
-                    crate::executor::ProofDeclineMechanism::RetentionOffWithoutAuthoredText,
-                );
+                self.record_proof_decline(ProofDeclineMechanism::RetentionOffWithoutAuthoredText);
             }
             return;
         }
@@ -671,9 +667,7 @@ impl Executor {
             Err(AuthoredSourceResolutionFailure::AletheSurfaceUnavailable) => return,
             Err(AuthoredSourceResolutionFailure::InvalidAuthority) => {
                 self.suppress_unsat_proof_reconstruction();
-                self.record_proof_decline(
-                    crate::executor::ProofDeclineMechanism::AuthoredSourceAuthorityInvalid,
-                );
+                self.record_proof_decline(ProofDeclineMechanism::AuthoredSourceAuthorityInvalid);
                 return;
             }
         };
@@ -686,9 +680,7 @@ impl Executor {
             self.restored_authored_override_map(sources)
         else {
             self.suppress_unsat_proof_reconstruction();
-            self.record_proof_decline(
-                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
-            );
+            self.record_proof_decline(ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable);
             return;
         };
         changed |=
@@ -698,9 +690,7 @@ impl Executor {
         let Some(sealed) = self.seal_authored_identity_surfaces(&identity_roots, &mut overrides)
         else {
             self.suppress_unsat_proof_reconstruction();
-            self.record_proof_decline(
-                crate::executor::ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable,
-            );
+            self.record_proof_decline(ProofDeclineMechanism::AuthoredAssumeSurfaceUnavailable);
             return;
         };
         changed |= sealed;
@@ -851,9 +841,7 @@ impl Executor {
     /// the whole reconstruction rather than print a guess.
     fn decline_forall_instance_surface(&mut self) {
         self.suppress_unsat_proof_reconstruction();
-        self.record_proof_decline(
-            crate::executor::ProofDeclineMechanism::ForallInstanceSurfaceConflict,
-        );
+        self.record_proof_decline(ProofDeclineMechanism::ForallInstanceSurfaceConflict);
     }
 }
 

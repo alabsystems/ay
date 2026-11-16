@@ -2329,6 +2329,7 @@ impl Context {
         }
     }
 
+    /// Select whether declared SMT-LIB logics are strict language boundaries.
     pub fn set_strict_logic_compliance(&mut self, strict: bool) {
         // Deliberately does not advance the source revision (it is a host
         // policy, not a source change), so drop the macro expansion memo here:

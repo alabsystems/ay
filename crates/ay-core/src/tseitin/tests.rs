@@ -44,7 +44,7 @@ fn test_tseitin_simple_and() {
     // - v_and ↔ (a ∧ b)
     // - v_and (root assertion)
     assert!(result.num_vars >= 3); // a, b, and_ab
-    assert!(!result.clauses.is_empty());
+    assert_ne!(result.clauses.as_slice(), &[]);
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn test_tseitin_simple_or() {
     let result = tseitin.transform(or_ab);
 
     assert!(result.num_vars >= 3);
-    assert!(!result.clauses.is_empty());
+    assert_ne!(result.clauses.as_slice(), &[]);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn test_tseitin_negation() {
 
     // not(a) should just flip polarity
     // The root assertion should be ¬a
-    assert!(!result.clauses.is_empty());
+    assert_ne!(result.clauses.as_slice(), &[]);
     // Should have a unit clause with negative literal
     let has_negative_unit = result.clauses.iter().any(|c| c.0.len() == 1 && c.0[0] < 0);
     assert!(has_negative_unit);
@@ -211,7 +211,7 @@ fn test_incremental_api() {
     // First batch: encode (a ∨ b)
     let _lit1 = tseitin.encode_and_assert(or_ab);
     let clauses1 = tseitin.take_new_clauses();
-    assert!(!clauses1.is_empty());
+    assert_ne!(clauses1.as_slice(), &[]);
 
     // Record variable assignment for 'a'
     let var_a = tseitin.get_var_for_term(a).unwrap();
@@ -275,7 +275,7 @@ fn test_encode_assertion_api() {
 
     // Should get definitional clauses for the AND encoding
     // AND(a,b) creates: (¬v ∨ a), (¬v ∨ b), (¬a ∨ ¬b ∨ v)
-    assert!(!enc.def_clauses.is_empty());
+    assert_ne!(enc.def_clauses.as_slice(), &[]);
 
     // The root literal should be the variable for and_ab
     let var_and = tseitin.get_var_for_term(and_ab).unwrap();
@@ -285,7 +285,7 @@ fn test_encode_assertion_api() {
     // (term already encoded, no new definitions needed)
     let enc2 = tseitin.encode_assertion(and_ab);
     assert_eq!(enc2.root_lit, enc.root_lit);
-    assert!(enc2.def_clauses.is_empty());
+    assert_eq!(enc2.def_clauses.as_slice(), &[]);
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn test_encode_assertion_with_proofs_tracks_def_annotations() {
 
     let enc2 = tseitin.encode_assertion(and_ab);
     assert_eq!(enc2.root_lit, enc.root_lit);
-    assert!(enc2.def_clauses.is_empty());
+    assert_eq!(enc2.def_clauses.as_slice(), &[]);
     assert!(
         enc2.def_proof_annotations
             .as_ref()
@@ -368,7 +368,7 @@ fn test_let_binding_does_not_panic() {
     let tseitin = Tseitin::new(&store);
     // In release mode this must not panic; it returns an opaque literal.
     let result = tseitin.transform(let_term);
-    assert!(!result.clauses.is_empty());
+    assert_ne!(result.clauses.as_slice(), &[]);
 }
 
 // ======================================================================

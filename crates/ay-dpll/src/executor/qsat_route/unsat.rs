@@ -19,7 +19,7 @@
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
-use ay_core::{Sort, TermId, TermStore};
+use ay_core::{Sort, TermId};
 
 use super::super::proof::{
     ClausalInstanceRecord, ClausalLiteral, ExpansionStep, NegatedExistsDual,

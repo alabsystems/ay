@@ -67,7 +67,10 @@ fn rational_roots_are_exact_or_empty() {
     roots.sort();
     assert_eq!(roots, vec![rat(-1), rat(1)]);
     // x^2 - 2 has NO rational root: the discriminant 8 is not a square.
-    assert!(rational_roots(&rat(-2), &rat(0), &rat(1)).is_empty());
+    assert_eq!(
+        rational_roots(&rat(-2), &rat(0), &rat(1)),
+        [] as [num_rational::Ratio<BigInt>; 0]
+    );
     // Double root: reported once.
     assert_eq!(
         rational_roots(&rat(1), &rat(-2), &rat(1)),
@@ -79,7 +82,10 @@ fn rational_roots_are_exact_or_empty() {
         vec![ratio(1, 3)]
     );
     // Degenerate: no equation at all.
-    assert!(rational_roots(&rat(5), &rat(0), &rat(0)).is_empty());
+    assert_eq!(
+        rational_roots(&rat(5), &rat(0), &rat(0)),
+        [] as [num_rational::Ratio<BigInt>; 0]
+    );
 }
 
 #[test]

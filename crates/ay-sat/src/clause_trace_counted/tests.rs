@@ -76,10 +76,9 @@ fn abandoned_preparation_has_no_row_unsat_marker_or_provenance_mutation() {
     let before = rows(&trace);
     trace.solver_num_vars = Some((5, vec![pos(2)]));
     let owner = test_owner(1_000_000, 1_000_000);
-    let token = trace
+    trace
         .prepare_counted_add(9, &[], false, &[1], &owner)
         .unwrap();
-    drop(token);
     assert_eq!(rows(&trace), before);
     assert!(!trace.has_empty_clause());
     assert!(trace.solver_num_vars.is_some());

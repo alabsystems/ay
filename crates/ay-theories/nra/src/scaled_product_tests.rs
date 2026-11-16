@@ -204,7 +204,7 @@ fn compound_factor_is_recorded_and_blocks_unavailable_models() {
     let mut solver = NraSolver::new(&terms);
     solver.assert_literal(atom, true);
     assert!(solver.compound_factors.contains(&sum));
-    let memo = std::cell::RefCell::new(crate::check_loop::ValueMemo::default());
+    let memo = std::cell::RefCell::new(check_loop::ValueMemo::default());
     assert!(solver.has_undefined_compound_factors(&memo));
     assert!(solver.has_inconsistent_monomials());
 }
@@ -336,8 +336,9 @@ fn horner_factor_resolves_through_the_tableau_first() {
     let opaque_inner = solver
         .var_value(inner)
         .expect("the nested product has an opaque LRA column");
+    let memo = std::cell::RefCell::default();
     let resolved = solver
-        .monomial_factor_value(horner)
+        .monomial_factor_value(horner, &memo)
         .expect("the Horner factor must resolve through the structural path");
     assert_eq!(
         resolved,

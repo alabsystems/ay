@@ -78,7 +78,7 @@ p cnf 1 2
         .take_proof_writer()
         .expect("Proof writer should exist");
     let proof = String::from_utf8(writer.into_vec().expect("flush")).expect("UTF-8");
-    assert!(!proof.is_empty(), "LRAT proof should not be empty");
+    assert_ne!(proof.len(), 0, "LRAT proof should not be empty");
 }
 
 /// Test that enable_lrat() panics when called after clauses have been added.
@@ -388,7 +388,7 @@ p cnf 1 2
 
     // Binary DRAT proofs should start with 'a' (0x61) for additions
     // and contain binary-encoded literals
-    assert!(!proof.is_empty(), "Binary DRAT proof should not be empty");
+    assert_ne!(proof.len(), 0, "Binary DRAT proof should not be empty");
 
     // The proof should end with 'a' followed by just 0 (empty clause)
     // In binary format: 'a' (0x61) + 0x00 (terminating zero)
@@ -430,7 +430,7 @@ p cnf 1 2
     let proof = writer.into_vec().expect("proof writer flush");
 
     // Binary LRAT proofs should start with 'a' (0x61) for additions
-    assert!(!proof.is_empty(), "Binary LRAT proof should not be empty");
+    assert_ne!(proof.len(), 0, "Binary LRAT proof should not be empty");
 
     // Check that proof starts with 'a' (addition)
     assert_eq!(
@@ -632,8 +632,8 @@ p cnf 3 6
         .expect("proof writer flush");
 
     // Both proofs should be non-empty
-    assert!(!text_proof.is_empty(), "Text proof should not be empty");
-    assert!(!binary_proof.is_empty(), "Binary proof should not be empty");
+    assert_ne!(text_proof.len(), 0, "Text proof should not be empty");
+    assert_ne!(binary_proof.len(), 0, "Binary proof should not be empty");
 
     // Binary format should generally be smaller than text format
     // (not always guaranteed for very small proofs, so we just check both are valid)

@@ -34,7 +34,10 @@ fn check_unknown_fallback(valid: bool) {
         ChcExpr::Bool(true)
     );
     assert_eq!(PdrSolver::filter_blocking_lemmas_aggressive(&body), body);
-    assert!(PdrSolver::fixed_int_subst_from_conjuncts(&body).is_empty());
+    assert_eq!(
+        PdrSolver::fixed_int_subst_from_conjuncts(&body),
+        [] as [(ChcVar, ChcExpr); 0]
+    );
     let query = ChcExpr::and(body.clone(), ChcExpr::not(head.clone()));
     let mut solver = PdrSolver::new(
         problem,

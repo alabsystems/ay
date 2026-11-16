@@ -8,7 +8,7 @@ use std::cell::Cell;
 fn stage_projection(progress: EmissionProgress<'_>) -> Option<()> {
     let mut p = Proof::new_with_progress("r.".into(), "@r".into(), progress);
     let (x, y) = (free_bits(&mut p, "x", 3), free_bits(&mut p, "y", 3));
-    super::super::specification::remainder_stages(&mut p, &x, &y)?;
+    specification::remainder_stages(&mut p, &x, &y)?;
     p.observe()
 }
 

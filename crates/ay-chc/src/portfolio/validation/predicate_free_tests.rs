@@ -183,7 +183,7 @@ fn predicate_free_trivial_solving_keeps_true_false_and_arithmetic_results() {
     assert_eq!(problem.clauses().len(), 1);
     let query = problem.queries().next().unwrap();
     let constraint = query.body.constraint.as_ref().unwrap();
-    assert!(!constraint.vars().is_empty());
+    assert_ne!(constraint.vars(), [] as [ChcVar; 0]);
     assert!(!matches!(constraint, ChcExpr::Bool(_)));
     // Constant-false query bodies are pruned by ChcProblem::add_clause:
     // assert-true is a vacuous positive, not evidence of live-clause checking.

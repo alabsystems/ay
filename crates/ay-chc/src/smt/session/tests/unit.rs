@@ -199,7 +199,10 @@ fn split_flattens_nested_and_drops_true_and_keeps_arcs() {
     let single = split_conjuncts(&ge("x", 0)).unwrap();
     assert_eq!(single.len(), 1);
     assert_eq!(*single[0], ge("x", 0));
-    assert!(split_conjuncts(&ChcExpr::Bool(true)).unwrap().is_empty());
+    assert_eq!(
+        split_conjuncts(&ChcExpr::Bool(true)).unwrap(),
+        [] as [Arc<ChcExpr>; 0]
+    );
     // `false` anywhere is trivially UNSAT.
     assert_eq!(split_conjuncts(&ChcExpr::Bool(false)), Err(TriviallyFalse));
     let with_false = ChcExpr::Op(
@@ -467,8 +470,8 @@ fn plan_delta_counts_only_the_new_conjuncts() {
     let q1 = ChcExpr::and_all([t.clone(), ge("x", 0), le("x", 5)]);
     let parts1 = split_conjuncts(&q1).unwrap();
     let plan1 = s.plan_delta(&parts1);
-    assert!(plan1.reuse.is_empty());
-    assert!(plan1.revive.is_empty());
+    assert_eq!(plan1.reuse, [] as [AssertId; 0]);
+    assert_eq!(plan1.revive, [] as [AssertId; 0]);
     assert_eq!(plan1.fresh.len(), parts1.len());
     let _ = s.check_conjunction(&q1, Some(Duration::ZERO), None);
     assert_eq!(s.stats().delta_conjuncts, parts1.len() as u64);
@@ -485,7 +488,7 @@ fn plan_delta_counts_only_the_new_conjuncts() {
     );
     assert_eq!(plan2.fresh.len(), 1);
     assert_eq!(*plan2.fresh[0], ge("y", 7));
-    assert!(plan2.revive.is_empty());
+    assert_eq!(plan2.revive, [] as [AssertId; 0]);
     let before = s.stats().delta_conjuncts;
     let _ = s.check_conjunction(&q2, Some(Duration::ZERO), None);
     assert_eq!(s.stats().delta_conjuncts, before + 1);
@@ -535,7 +538,7 @@ fn unit_kill_after_four_unused_queries_then_revive_as_a_new_id() {
     let t_parts = split_conjuncts(&t).unwrap();
     let plan = s.plan_delta(&t_parts);
     assert_eq!(plan.reuse.len(), t_parts.len());
-    assert!(plan.fresh.is_empty());
+    assert_eq!(plan.fresh, [] as [Arc<ChcExpr>; 0]);
 
     // The same cube recurs: planned as revive + fresh, re-asserted under a NEW id.
     let q = ChcExpr::and_all([t.clone(), c1.clone()]);
@@ -580,8 +583,11 @@ fn retention_never_kills_api_assertions() {
 
 #[test]
 fn shim_rebuilds_before_staging_so_fresh_conjuncts_survive() {
-    let mut cfg = SessionConfig::default();
-    cfg.rebuild_queries_after = 2;
+    let base = SessionConfig::default();
+    let cfg = SessionConfig {
+        rebuild_queries_after: 2,
+        ..base
+    };
     let mut s = HornSmt::new(cfg, None);
     let t = transition();
     let _ = s.check_conjunction(
@@ -712,11 +718,11 @@ fn session_budget_folds_check_timeout_and_global_deadline() {
     ctx.set_global_solve_deadline(Some(now));
     assert_eq!(session_budget(&ctx), Some(Duration::ZERO));
     // A far deadline keeps the smaller per-check budget.
-    ctx.set_global_solve_deadline(Some(now + Duration::from_secs(3600)));
+    ctx.set_global_solve_deadline(Some(now + Duration::from_hours(1)));
     assert_eq!(session_budget(&ctx), Some(Duration::from_secs(5)));
     ctx.check_timeout.set(None);
     let b = session_budget(&ctx).unwrap();
-    assert!(b > Duration::from_secs(3000) && b <= Duration::from_secs(3600));
+    assert!(b > Duration::from_mins(50) && b <= Duration::from_hours(1));
 }
 
 // -------------------------------------------------- end-to-end (WP-2 gated)
@@ -732,7 +738,7 @@ fn unsat_core_is_a_subset_of_the_query() {
     match s.check_conjunction(&q, Some(Duration::from_secs(5)), None) {
         HornCheck::Unsat { core, .. } => {
             let query_ids: Vec<AssertId> = (0..s.assertions().len() as u32).map(AssertId).collect();
-            assert!(!core.is_empty());
+            assert_ne!(core, [] as [AssertId; 0]);
             assert!(core.iter().all(|id| query_ids.contains(id)));
             assert!(core.len() <= 3);
         }

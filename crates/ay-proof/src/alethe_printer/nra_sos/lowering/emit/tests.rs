@@ -22,7 +22,7 @@ fn a_step_only_integer_strengthening_accepts_is_never_written() {
     assert!(printed_la_generic_holds(&strengthened, &["1", "1"]));
     let mut emitter = Emitter::new("t0.sos".to_string(), true);
     assert!(emitter.la_generic(rows(&strengthened)).is_none());
-    assert!(emitter.finish().is_empty());
+    assert_eq!(emitter.finish(), "");
 
     let mut emitter = Emitter::new("t0.sos".to_string(), true);
     let written = emitter

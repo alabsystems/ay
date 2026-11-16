@@ -2158,7 +2158,7 @@ fn command_capture_with_stdin_passes_exact_authenticated_bytes() {
 
     assert!(output.status.success());
     assert_eq!(output.stdout, input);
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -2285,8 +2285,7 @@ fn the_reference_cache_records_no_machine_specific_z3_path() {
     let committed = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(DEFAULT_REFERENCE_CACHE);
-    let committed: Value =
-        serde_json::from_str(&std::fs::read_to_string(committed).unwrap()).unwrap();
+    let committed: Value = serde_json::from_str(&fs::read_to_string(committed).unwrap()).unwrap();
     let command = committed["generator"]["z3_command"].as_str().unwrap();
     assert!(!Path::new(command).is_absolute(), "{command}");
 }

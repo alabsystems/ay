@@ -210,6 +210,10 @@ pub(crate) enum ValidatePolicy {
 }
 
 /// Verdict of one proof-producing solve over the groups.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the solver-bearing refutation stays owned inline without a fresh unmetered proof allocation"
+)]
 pub(crate) enum ProofCheck {
     Sat,
     Unsat(ProofRefutation),

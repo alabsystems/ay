@@ -92,7 +92,7 @@ fn polarity_is_tracked_through_connectives() {
     let iff = terms.mk_app(ay_core::Symbol::named("="), vec![p, q], Sort::Bool);
     let tree = build_nested_tree(&mut terms, &[iff]).expect("tree");
     assert!(tree.nodes[0].top.expect("top").both());
-    assert!(tree.skolems.is_empty());
+    assert_eq!(tree.skolems, [] as [TermId; 0]);
     // (not (∀x. x > 0)) at the top: effectively existential, Skolemized.
     let neg = terms.mk_not(q);
     assert_eq!(

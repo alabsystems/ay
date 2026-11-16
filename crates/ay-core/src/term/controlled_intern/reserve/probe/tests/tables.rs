@@ -6,7 +6,7 @@
 use super::*;
 use crate::sort::Sort;
 use crate::term::{ControlledTermInternError, Symbol, TermData};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 
 pub(super) fn collision_store() -> (TermStore, Vec<u64>, u64) {
     let mut store = TermStore::new();
@@ -14,9 +14,8 @@ pub(super) fn collision_store() -> (TermStore, Vec<u64>, u64) {
     store.hash_cons.try_reserve(112).expect("bounded fixture");
     let mut classes: [Vec<u64>; 256] = std::array::from_fn(|_| Vec::new());
     for key in 0..(256 * 113u64) {
-        let mut hash = store.hash_cons.hasher().build_hasher();
-        key.hash(&mut hash);
-        classes[(hash.finish() & 255) as usize].push(key);
+        let hash = store.hash_cons.hasher().hash_one(key);
+        classes[(hash & 255) as usize].push(key);
     }
     let mut keys = classes
         .into_iter()
@@ -45,7 +44,6 @@ pub(super) fn paid(store: &TermStore) -> usize {
         refused: false,
     };
     assert_eq!(store.controlled_probe_fee(&mut admission), Ok(()));
-    drop(admission);
     drop(sink);
     let expected = work(store.hash_cons.allocation_size(), store.hash_cons.len())
         .expect("pinned actual layout");

@@ -352,7 +352,7 @@ fn every_success_and_partial_failure_checkpoint_refuses_without_restart() {
 #[test]
 fn original_deadline_sticky_error_and_caught_callback_panic_cannot_publish() {
     let expired = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired before progress") },
         |control| bigint(raw("[1,[1]]"), control),
     );
@@ -373,9 +373,10 @@ fn original_deadline_sticky_error_and_caught_callback_panic_cannot_publish() {
     let outcome = control::run(
         deadline(),
         &mut |_, bytes| {
-            if bytes > 4 && !panicked.replace(true) {
-                panic!("construction admission");
-            }
+            assert!(
+                bytes <= 4 || panicked.replace(true),
+                "construction admission"
+            );
             true
         },
         |control| {

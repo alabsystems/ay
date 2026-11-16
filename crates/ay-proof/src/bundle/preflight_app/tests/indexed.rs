@@ -9,7 +9,7 @@ fn exact_named_only_namespace_matches_the_legacy_guard() {
     let entries = entries();
     assert_eq!(names::NAMED_ONLY.len(), 116);
     for &name in names::NAMED_ONLY {
-        assert!(crate::bundle::requires_named_symbol(name));
+        assert!(requires_named_symbol(name));
         for indices in [vec![], vec![0], vec![0, 1]] {
             assert!(!compare(
                 &entries,
@@ -20,7 +20,7 @@ fn exact_named_only_namespace_matches_the_legacy_guard() {
         }
     }
     for name in ["extract", "repeat", "NaN", "unknown", "to_fp"] {
-        assert!(!crate::bundle::requires_named_symbol(name));
+        assert!(!requires_named_symbol(name));
         assert!(!names::NAMED_ONLY.contains(&name));
     }
 }

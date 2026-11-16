@@ -28,7 +28,7 @@ fn symbolic(
 }
 
 fn assert_monotone(trace: &[FpBuildProgress]) {
-    assert!(!trace.is_empty());
+    assert_ne!(trace.len(), 0);
     assert_eq!(trace[0].stage, FpBuildStage::Setup);
     for pair in trace.windows(2) {
         assert!(pair[0].variables <= pair[1].variables);
@@ -257,7 +257,7 @@ fn variable_frontier_refuses_before_callbacks_and_keeps_the_exact_empty_boundary
         .finish()
         .unwrap();
     assert_eq!(built.cache.next_var, i32::MAX as u32 + 1);
-    assert!(built.clauses.is_empty());
+    assert_eq!(built.clauses.len(), 0);
     assert_eq!(calls.get(), 3); // Setup and both final admission polls.
 
     let mut control = Cooperative::new(&mut allow);

@@ -234,7 +234,7 @@ impl Checkable for RedundanceBasedStrengtheningRule {
         let add_derived = !context.is_strengthening_to_core;
         let derived_slots = crate::kernel_bridge::derived_slot_ids(database, add_derived);
         let mut goal_slots: Vec<(usize, veripb_formula::prelude::PBConstraintEnum)> = Vec::new();
-        let mut note =
+        let note =
             |source: &Rc<DBConstraint>,
              image: &Rc<DBConstraint>,
              out: &mut Vec<(usize, veripb_formula::prelude::PBConstraintEnum)>| {

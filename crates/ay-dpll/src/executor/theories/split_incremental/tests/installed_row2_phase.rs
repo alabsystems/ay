@@ -56,7 +56,7 @@ fn installed_row2_recheck_uses_bcp_operation_without_consuming_the_mandatory_ful
     let TheoryResult::NeedLemmas(requested) = &initial else {
         panic!("the real BCP array lane must first derive the installed row: {initial:?}");
     };
-    assert!(!requested.is_empty());
+    assert_ne!(requested.as_slice(), []);
     assert!(requested.iter().all(|lemma| installed.owns(&lemma.clause)));
     let original_max = installed.sat.issued_original_clause_id_max();
     let clause_count = installed.sat.num_clauses();

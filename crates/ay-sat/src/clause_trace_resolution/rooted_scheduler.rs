@@ -258,7 +258,7 @@ impl Scheduler {
         meter: &mut ConversionMeter<'_>,
     ) -> Result<(), ResolutionValidationError> {
         meter.charge(1)?;
-        debug_assert!(self.current.is_empty());
+        debug_assert_eq!(self.current.len(), 0);
         std::mem::swap(&mut self.current, &mut self.next);
         std::mem::swap(&mut self.current_bit, &mut self.next_bit);
         Ok(())

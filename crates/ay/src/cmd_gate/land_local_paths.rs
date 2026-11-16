@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub(super) struct Graph<'a> {
     root: PathBuf,
     metadata: &'a Metadata,
-    pub packages: Vec<&'a Package>,
+    pub(super) packages: Vec<&'a Package>,
     parents: BTreeMap<&'a str, BTreeSet<&'a str>>,
 }
 
@@ -30,7 +30,7 @@ impl<'a> Graph<'a> {
             })
             .unwrap_or_else(|_| normalize(&package.manifest_path))
     }
-    pub fn read(root: &Path, metadata: &'a Metadata) -> Result<Self> {
+    pub(super) fn read(root: &Path, metadata: &'a Metadata) -> Result<Self> {
         let root = root.canonicalize().unwrap_or_else(|_| normalize(root));
         let packages = metadata
             .packages
@@ -55,7 +55,7 @@ impl<'a> Graph<'a> {
         let mut parents: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         if let Some(resolve) = &metadata.resolve {
             for package in &resolve.nodes {
-                for dependency in &package.dependencies {
+                for dependency in package.dependencies.iter().flatten() {
                     parents.entry(dependency).or_default().insert(&package.id);
                 }
             }
@@ -68,7 +68,7 @@ impl<'a> Graph<'a> {
         })
     }
 
-    pub fn physical_owner(&self, path: &Path) -> Option<&'a Package> {
+    pub(super) fn physical_owner(&self, path: &Path) -> Option<&'a Package> {
         let path = path.canonicalize().unwrap_or_else(|_| normalize(path));
         self.packages
             .iter()
@@ -81,7 +81,7 @@ impl<'a> Graph<'a> {
             .max_by_key(|package| package.manifest_path.components().count())
     }
 
-    pub fn owners(&self, path: &Path, provenance: &[&&Package]) -> Vec<&'a Package> {
+    pub(super) fn owners(&self, path: &Path, provenance: &[&&Package]) -> Vec<&'a Package> {
         let physical = self.physical_owner(path);
         self.packages
             .iter()
@@ -103,7 +103,7 @@ impl<'a> Graph<'a> {
     /// Stop at the first importing workspace package on each resolved path.
     /// CLI compilation checks downstream integration without rerunning every
     /// solver suite merely because a small native dependency changed.
-    pub fn consumers(&self, id: &str) -> Vec<&'a Package> {
+    pub(super) fn consumers(&self, id: &str) -> Vec<&'a Package> {
         let mut pending = vec![id];
         let mut visited = BTreeSet::new();
         let mut selected = BTreeSet::new();
@@ -131,10 +131,71 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
+    /// Whether the CLI's resolved dependency closure includes this owner.
+    /// Unlike `consumers`, traverse through workspace importers as well.
+    /// Only metadata resolving the actual CLI features may exclude a build;
+    /// unavailable, ambiguous or incomplete graph input stays conservative.
+    pub fn cli_depends_on(&self, id: &str) -> bool {
+        let mut candidates = self.metadata.packages.iter().filter(|package| {
+            package.name == "ay" && self.metadata.workspace_members.contains(&package.id)
+        });
+        let Some(cli) = candidates.next() else {
+            return true;
+        };
+        if candidates.next().is_some() {
+            return true;
+        }
+        if !cli
+            .targets
+            .iter()
+            .any(|target| target.name == "ay" && target.kind.iter().any(|kind| kind == "bin"))
+        {
+            return true;
+        }
+        let Some(resolve) = &self.metadata.resolve else {
+            return true;
+        };
+        let nodes: BTreeMap<_, _> = resolve
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect();
+        if nodes.len() != resolve.nodes.len() || !nodes.contains_key(id) {
+            return true;
+        }
+        let Some(cli_node) = nodes.get(cli.id.as_str()) else {
+            return true;
+        };
+        if !super::CLI_FEATURES
+            .split(',')
+            .all(|feature| cli_node.features.iter().any(|enabled| enabled == feature))
+        {
+            return true;
+        }
+        let mut pending = vec![cli.id.as_str()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if current == id {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(node) = nodes.get(current) else {
+                return true;
+            };
+            let Some(dependencies) = &node.dependencies else {
+                return true;
+            };
+            pending.extend(dependencies.iter().map(String::as_str));
+        }
+        false
+    }
+
     /// Narrow only exclusion additions for known independent workspaces. All
     /// other manifest settings and explicit member selection must be equal;
     /// globs, escaping paths, removals and overlapping members stay broad.
-    pub fn only_adds_independent_exclusions(
+    pub(super) fn only_adds_independent_exclusions(
         &self,
         before: Option<&str>,
         base_paths: Option<&BTreeSet<PathBuf>>,

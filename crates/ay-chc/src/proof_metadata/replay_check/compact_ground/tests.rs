@@ -283,7 +283,12 @@ fn caller_refusal_covers_export_replay_and_final_publication() {
 #[test]
 fn compact_format_cannot_enter_legacy_export_or_smt_fallback() {
     let mut callback = || true;
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = ReplayProgress::new_retained_for_rows(
+        ReplayLimit::Until(Instant::now() + Duration::from_secs(60)),
+        &mut callback,
+        1,
+    )
+    .unwrap();
     let result = super::super::ground_export::select_plan(
         Some(Format::CompactGroundDerivationV1),
         |_, _| panic!("compact format must not enter recursive exporter"),

@@ -31,8 +31,8 @@ pub(crate) struct F3<'b> {
     lt: T,
 }
 
-impl<'a> Asm<'a> {
-    pub(crate) fn f3(&self, p: &mut Proof, ds: &Ds) -> Option<S> {
+impl Asm<'_> {
+    pub(crate) fn f3(&self, p: &mut Proof<'_>, ds: &Ds) -> Option<S> {
         let r = &self.c.row;
         let (n, nn) = (r.n(), 4 * r.m);
         let a = p.anchor(&[]);
@@ -125,7 +125,7 @@ impl<'a> Asm<'a> {
 
     fn mono_case(
         &self,
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         f: &F3<'_>,
         asm: S,
         lt_holds: bool,
@@ -214,7 +214,7 @@ impl<'a> Asm<'a> {
         p.derive(&[r.qb], &[Prem::Step(nr), Prem::Step(f.u0)], &[])
     }
 
-    fn mono_run(&self, p: &mut Proof, db: &[T]) -> Option<S> {
+    fn mono_run(&self, p: &mut Proof<'_>, db: &[T]) -> Option<S> {
         self.mono.run(p, &self.c.abits, db)
     }
 }

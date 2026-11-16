@@ -231,9 +231,7 @@ impl AlethePrinter<'_> {
         if text.len() > MAX_EQUIVALENCE_BYTES {
             return Some(true);
         }
-        let Some(bound) =
-            super::super::bounds::canonical_rendering_work_upper_bound(self.terms, term)
-        else {
+        let Some(bound) = bounds::canonical_rendering_work_upper_bound(self.terms, term) else {
             return Some(true);
         };
         let charge = bound.checked_add(u64::try_from(text.len()).ok()?)?;

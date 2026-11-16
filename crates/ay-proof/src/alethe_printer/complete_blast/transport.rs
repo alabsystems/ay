@@ -187,70 +187,66 @@ impl Blaster<'_, '_> {
                     for (index, arg) in args.iter().enumerate() {
                         self.plan(
                             vec![negative, *arg],
-                            ClauseEmit::Rule {
-                                rule: "and_pos",
-                                args: Some(index.to_string()),
-                                premises: Vec::new(),
-                            },
+                            ClauseEmit::rule("and_pos", Some(index.to_string()), Vec::new())?,
                         )?;
                     }
                     let mut lits = vec![positive];
                     for arg in &args {
                         lits.push(arg.not()?);
                     }
-                    self.plan(lits, Self::bare("and_neg"))?;
+                    self.plan(lits, ClauseEmit::bare("and_neg")?)?;
                 }
                 GateKind::Or(args) => {
                     let mut lits = vec![negative];
                     lits.extend(args.iter().copied());
-                    self.plan(lits, Self::bare("or_pos"))?;
+                    self.plan(lits, ClauseEmit::bare("or_pos")?)?;
                     for (index, arg) in args.iter().enumerate() {
                         self.plan(
                             vec![positive, arg.not()?],
-                            ClauseEmit::Rule {
-                                rule: "or_neg",
-                                args: Some(index.to_string()),
-                                premises: Vec::new(),
-                            },
+                            ClauseEmit::rule("or_neg", Some(index.to_string()), Vec::new())?,
                         )?;
                     }
                 }
                 GateKind::Xor(a, b) => {
-                    self.plan(vec![negative, a, b], Self::bare("xor_pos1"))?;
-                    self.plan(vec![negative, a.not()?, b.not()?], Self::bare("xor_pos2"))?;
-                    self.plan(vec![positive, a, b.not()?], Self::bare("xor_neg1"))?;
-                    self.plan(vec![positive, a.not()?, b], Self::bare("xor_neg2"))?;
+                    self.plan(vec![negative, a, b], ClauseEmit::bare("xor_pos1")?)?;
+                    self.plan(
+                        vec![negative, a.not()?, b.not()?],
+                        ClauseEmit::bare("xor_pos2")?,
+                    )?;
+                    self.plan(vec![positive, a, b.not()?], ClauseEmit::bare("xor_neg1")?)?;
+                    self.plan(vec![positive, a.not()?, b], ClauseEmit::bare("xor_neg2")?)?;
                 }
                 GateKind::Implies(a, b) => {
                     // Alethe's exact implication tautologies; never replace
                     // the printed source implication by an unproved `or`.
-                    self.plan(vec![negative, a.not()?, b], Self::bare("implies_pos"))?;
-                    self.plan(vec![positive, a], Self::bare("implies_neg1"))?;
-                    self.plan(vec![positive, b.not()?], Self::bare("implies_neg2"))?;
+                    self.plan(
+                        vec![negative, a.not()?, b],
+                        ClauseEmit::bare("implies_pos")?,
+                    )?;
+                    self.plan(vec![positive, a], ClauseEmit::bare("implies_neg1")?)?;
+                    self.plan(vec![positive, b.not()?], ClauseEmit::bare("implies_neg2")?)?;
                 }
                 GateKind::Iff(a, b) => {
-                    self.plan(vec![negative, a, b.not()?], Self::bare("equiv_pos1"))?;
-                    self.plan(vec![negative, a.not()?, b], Self::bare("equiv_pos2"))?;
-                    self.plan(vec![positive, a.not()?, b.not()?], Self::bare("equiv_neg1"))?;
-                    self.plan(vec![positive, a, b], Self::bare("equiv_neg2"))?;
+                    self.plan(vec![negative, a, b.not()?], ClauseEmit::bare("equiv_pos1")?)?;
+                    self.plan(vec![negative, a.not()?, b], ClauseEmit::bare("equiv_pos2")?)?;
+                    self.plan(
+                        vec![positive, a.not()?, b.not()?],
+                        ClauseEmit::bare("equiv_neg1")?,
+                    )?;
+                    self.plan(vec![positive, a, b], ClauseEmit::bare("equiv_neg2")?)?;
                 }
                 GateKind::Ite(c, a, b) => {
-                    self.plan(vec![negative, c, b], Self::bare("ite_pos1"))?;
-                    self.plan(vec![negative, c.not()?, a], Self::bare("ite_pos2"))?;
-                    self.plan(vec![positive, c, b.not()?], Self::bare("ite_neg1"))?;
-                    self.plan(vec![positive, c.not()?, a.not()?], Self::bare("ite_neg2"))?;
+                    self.plan(vec![negative, c, b], ClauseEmit::bare("ite_pos1")?)?;
+                    self.plan(vec![negative, c.not()?, a], ClauseEmit::bare("ite_pos2")?)?;
+                    self.plan(vec![positive, c, b.not()?], ClauseEmit::bare("ite_neg1")?)?;
+                    self.plan(
+                        vec![positive, c.not()?, a.not()?],
+                        ClauseEmit::bare("ite_neg2")?,
+                    )?;
                 }
             }
         }
         self.printer.complete_blast_progress()
-    }
-
-    const fn bare(rule: &'static str) -> ClauseEmit {
-        ClauseEmit::Rule {
-            rule,
-            args: None,
-            premises: Vec::new(),
-        }
     }
 
     fn sat_literal(reference: SRef) -> Option<Literal> {
@@ -700,6 +696,10 @@ impl Blaster<'_, '_> {
 
     /// Print `dag`, a refutation of `cnf`, as the transported chain, or
     /// refuse.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transported refutation schema and its independent budget stay explicit"
+    )]
     pub(super) fn transport_document(
         &self,
         dag: &ResolutionDag,
@@ -1051,6 +1051,10 @@ impl Blaster<'_, '_> {
 /// clauses this document PRINTS, resolving one pivot per step. The two phases
 /// read different clause sets on purpose: propagation is a fact about the
 /// solved formula, while the printed clauses carry the assumption literal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the RUP expansion schema keeps source, output, marks, and policy explicit"
+)]
 fn expand_rup_step(
     id: &str,
     step: &RupStep,
@@ -1295,7 +1299,7 @@ struct UsedSteps {
 
 /// The steps the empty clause of `dag` depends on; `None` past the
 /// derived-clause budget.
-fn used_by_refutation(dag: &ay_sat::ResolutionDag, original_count: u64) -> Option<UsedSteps> {
+fn used_by_refutation(dag: &ResolutionDag, original_count: u64) -> Option<UsedSteps> {
     if dag.derived.len() > MAX_DERIVED_CLAUSES {
         debug_note(|| {
             format!(

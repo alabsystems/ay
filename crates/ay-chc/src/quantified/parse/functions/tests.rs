@@ -61,7 +61,7 @@ fn fixedpoint_functions_are_neutral_ordered_and_include_unused_nullary_globals()
     let (name, sort, args) = app(&query.body.predicates[0].1[0]);
     assert_eq!(name, "global");
     assert_eq!(sort, &ChcSort::BitVec(136));
-    assert!(args.is_empty());
+    assert_eq!(args, []);
     assert!(problem
         .source_smtlib()
         .contains("(declare-fun unused ((_ BitVec 136)) (_ BitVec 8))"));
@@ -120,7 +120,7 @@ fn functions_used_only_in_grouped_premises_keep_every_binder_and_declaration() {
     };
     assert_eq!(var.name, premise.binder().name);
     assert_eq!(app(&args[1]).0, "global");
-    assert!(app(&args[1]).2.is_empty());
+    assert_eq!(app(&args[1]).2, []);
 }
 
 #[test]

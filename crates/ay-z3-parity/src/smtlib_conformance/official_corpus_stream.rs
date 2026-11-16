@@ -293,7 +293,7 @@ impl Scanner {
 
 pub(super) fn scan(reader: &mut impl Read, limit: u64) -> Result<ScannedFile, String> {
     let mut scanner = Scanner::new();
-    let mut buffer = [0u8; BUFFER_BYTES];
+    let mut buffer = vec![0u8; BUFFER_BYTES].into_boxed_slice();
     loop {
         let remaining = limit.saturating_sub(scanner.size);
         let request = usize::try_from(remaining.saturating_add(1))
@@ -516,7 +516,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "streams the measured 1.17 GB member size; run under build-slot for large-input acceptance"]
     fn streaming_query_after_more_than_one_gib_of_comment_has_exact_u64_offsets() {
         let comment_bytes = 1_169_487_267u64;
         let suffix = b"\n(check-sat)\n";

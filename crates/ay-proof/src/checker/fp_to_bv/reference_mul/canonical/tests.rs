@@ -14,13 +14,15 @@ mod ownership;
 mod word_oracle;
 
 fn limits() -> ResolutionProofLimits {
-    let mut limits = ResolutionProofLimits::default();
-    limits.deadline = Some(Instant::now() + Duration::from_secs(30));
-    limits.max_num_vars = 100_000;
-    limits.max_input_clauses = 500_000;
-    limits.max_input_literals = 2_000_000;
-    limits.max_conflicts = Some(50_000);
-    limits.max_decisions = Some(100_000);
+    let mut limits = ResolutionProofLimits {
+        deadline: Some(Instant::now() + Duration::from_secs(30)),
+        max_num_vars: 100_000,
+        max_input_clauses: 500_000,
+        max_input_literals: 2_000_000,
+        max_conflicts: Some(50_000),
+        max_decisions: Some(100_000),
+        ..ResolutionProofLimits::default()
+    };
     limits.validation.max_work = 2_000_000;
     limits
 }

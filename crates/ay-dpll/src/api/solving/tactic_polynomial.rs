@@ -393,9 +393,7 @@ impl Ring<'_, '_, '_, '_> {
                 v.push(id);
                 v
             };
-            size = size
-                .checked_mul(u64::try_from(choice.len()).map_err(|_| fail())?)
-                .unwrap_or(u64::MAX);
+            size = size.saturating_mul(u64::try_from(choice.len()).map_err(|_| fail())?);
             choices.push(choice);
         }
         if !additive || (!scalar_sum && size > limit) {
@@ -731,6 +729,7 @@ impl Ring<'_, '_, '_, '_> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn rewrite(
     store: &mut TermStore,
     roots: &[TermId],
@@ -761,6 +760,7 @@ pub(super) fn rewrite_with_sequences(
 
 #[derive(Clone, Copy)]
 enum RewriteDomain {
+    #[cfg(test)]
     Ring,
     RingAndSequences(u32),
 }
@@ -782,6 +782,7 @@ fn normalize(
     pay(owner, roots.len())?;
     current.extend_from_slice(roots);
     loop {
+        #[cfg(test)]
         let next = match domain {
             RewriteDomain::Ring => rewrite_once(store, &current, parameters, steps, owner)?,
             RewriteDomain::RingAndSequences(maximum) => {
@@ -790,6 +791,13 @@ fn normalize(
                 )?;
                 rewrite_once(store, &words, parameters, steps, owner)?
             }
+        };
+        #[cfg(not(test))]
+        let next = {
+            let RewriteDomain::RingAndSequences(maximum) = domain;
+            let words =
+                super::tactic_sequence_rewrite::rewrite(store, &current, maximum, steps, owner)?;
+            rewrite_once(store, &words, parameters, steps, owner)?
         };
         pay(owner, current.len())?;
         if next == current {

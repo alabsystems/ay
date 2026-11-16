@@ -16,6 +16,8 @@ use super::ModelValue;
 /// their source witness. Structural inequality is not array disequality.
 #[derive(Clone, Debug)]
 pub enum CompleteModelValue {
+    /// A complete scalar, datatype, or finite array value.
     Literal(ModelValue),
+    /// An immutable total functional-array interpretation.
     FunctionalArray(Arc<ay_model_check::ArraySnapshot>),
 }

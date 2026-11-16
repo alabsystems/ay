@@ -103,7 +103,7 @@ impl SatProofManager<'_> {
             exact_checked_mul(
                 coefficient_count,
                 exact_checked_add(
-                    (usize::BITS - (annotation.clause.len().max(2) - 1).leading_zeros()) as usize,
+                    (annotation.clause.len().max(2) - 1).bit_width() as usize,
                     4,
                     ResolutionValidationResource::Work,
                 )?,

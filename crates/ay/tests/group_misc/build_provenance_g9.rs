@@ -255,7 +255,11 @@ fn rustc_inputs_of_the_ay_binary(packages: &[String]) -> BTreeSet<PathBuf> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            name.starts_with("lib") && name.ends_with(".rlib") && output.is_file()
+            name.starts_with("lib")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension == "rlib")
+                && output.is_file()
         });
         let the_binary = !library
             && crate_name == "ay"

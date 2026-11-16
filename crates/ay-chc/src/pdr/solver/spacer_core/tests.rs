@@ -176,7 +176,9 @@ fn assumption_entry_returns_unknown_on_an_expired_deadline_not_a_hang() {
     let mut smt = SmtContext::new();
     let bg = vec![ChcExpr::le(ChcExpr::add(v("a"), v("b")), i(10))];
     let lits = vec![ChcExpr::ge(v("a"), i(1)), ChcExpr::ge(v("b"), i(1))];
-    let expired = ay_core::time::Instant::now() - Duration::from_millis(5);
+    let expired = ay_core::time::Instant::now()
+        .checked_sub(Duration::from_millis(5))
+        .expect("fixture instant supports a five-millisecond offset");
     let started = std::time::Instant::now();
     let r = {
         let _deadline = crate::smt::deadline::ScopedSmtDeadline::install_until(expired);
@@ -223,7 +225,7 @@ fn quickxplain_finds_the_exact_core_when_the_oracle_is_exact() {
     assert!(tests <= 24, "too many tests: {tests}");
     // The linear loop below `min_lits`.
     let mut budget = Budget::per_call_only(Duration::from_secs(1));
-    let (core, exact) = quickxplain(&vec![true; 6], 16, &mut budget, |m, _| Some(m[1] && m[4]));
+    let (core, exact) = quickxplain(&[true; 6], 16, &mut budget, |m, _| Some(m[1] && m[4]));
     assert!(exact);
     assert_eq!(core, mask_of(6, &[1, 4]));
 }

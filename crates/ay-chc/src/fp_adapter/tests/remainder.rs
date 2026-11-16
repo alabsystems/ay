@@ -161,8 +161,11 @@ fn whole_remainder_keeps_all_original_roots_and_lsb_first_free_input_links() {
         let namespace = ChcProblem::new();
         let output = lower_fp_clause(&terms, &roots, &inputs, &namespace, budget).unwrap();
         assert_eq!(output.source_roots(), &roots);
-        assert!(std::ptr::eq(output.source_terms(), &terms));
-        assert!(std::ptr::eq(output.source_namespace(), &namespace));
+        assert!(std::ptr::eq(output.source_terms(), &raw const terms));
+        assert!(std::ptr::eq(
+            output.source_namespace(),
+            &raw const namespace
+        ));
         assert_eq!(output.input_bindings().len(), 2);
         let ChcExpr::Op(crate::ChcOp::And, entries) = output.constraint() else {
             panic!()

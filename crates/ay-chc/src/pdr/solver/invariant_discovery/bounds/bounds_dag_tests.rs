@@ -109,11 +109,14 @@ fn bv_transition_problem(body: &str, bad: &str) -> String {
 /// The bounded PDR configuration of the bist_cell test
 /// (`bounded_bv_clause_splitting_config` in `tests/group_bv`).
 fn bounded_pdr(input: &str) -> PdrResult {
-    let mut config = PdrConfig::default();
-    config.max_frames = 3;
-    config.max_iterations = 25;
-    config.max_obligations = 1_000;
-    config.solve_timeout = Some(Duration::from_secs(5));
+    let base = PdrConfig::default();
+    let config = PdrConfig {
+        max_frames: 3,
+        max_iterations: 25,
+        max_obligations: 1_000,
+        solve_timeout: Some(Duration::from_secs(5)),
+        ..base
+    };
     crate::testing::pdr_solve_from_str(input, config).expect("the problem parses")
 }
 

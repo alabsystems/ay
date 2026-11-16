@@ -311,8 +311,8 @@ impl Solver {
         ranges.try_reserve_exact(num_lits).ok()?;
         let mut pos_at = 0usize;
         let mut neg_at = 0usize;
-        for slot in 0..num_lits {
-            let n = counts[slot] as usize;
+        for (slot, &count) in counts[..num_lits].iter().enumerate() {
+            let n = count as usize;
             if slot % 2 == 0 {
                 let end = pos_at.checked_add(n)?;
                 ranges.push(pos_at..end);
@@ -504,11 +504,11 @@ impl Solver {
         }
         let mut known = vec![false; num_vars];
         let mut queue: Vec<u32> = Vec::new();
-        for v in 0..num_vars {
+        for (v, known) in known[..num_vars].iter_mut().enumerate() {
             if fixed.get(v) == Some(&true) || decidable.get(v) != Some(&true) {
                 // Root constants are known; eliminated variables are not
                 // decided and carry no obligation.
-                known[v] = true;
+                *known = true;
             }
         }
         for &v in support {

@@ -171,7 +171,7 @@ fn build_predicates(
     solver.import_cache(std::mem::take(&mut trial.fp_cache));
     let build_error = |error| PreparationError::Stopped(stop.refuse_build_error(error));
     let mut should_stop = |progress| {
-        observe(IncrementalFpPhase::Construction(progress));
+        observe(IncrementalFpPhase::construction(progress));
         stop.should_stop()
     };
     let mut fp = FpConstruction::new(solver, &mut should_stop).map_err(build_error)?;

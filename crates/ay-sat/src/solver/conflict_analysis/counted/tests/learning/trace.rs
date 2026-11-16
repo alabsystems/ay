@@ -26,7 +26,7 @@ fn learned_trace_and_replay_preserve_exact_inprocess_then_learn_bytes() {
     let path = directory.path().join("learning");
     let (mut s, reference) = pending(&path);
     let id = s.cold.next_clause_id;
-    s.cold.replay_trace = Some(crate::decision_trace::ReplayTrace::decision_test_new(vec![
+    s.cold.replay_trace = Some(ReplayTrace::decision_test_new(vec![
         TraceEvent::Inprocess {
             pass_code: Solver::diagnostic_pass_code(DiagnosticPass::Learning),
         },

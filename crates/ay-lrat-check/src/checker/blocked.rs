@@ -73,7 +73,7 @@ impl LratChecker {
             let start = entry.start as usize;
             let end = start + entry.len as usize;
 
-            debug_assert!(self.checked_stack.is_empty());
+            debug_assert_eq!(self.checked_stack.as_slice(), &[] as &[usize]);
             for i in start..end {
                 let lit = self.clause_arena[i];
                 if lit.index() < self.checked_lits.len() && self.checked_lits[lit.index()] {

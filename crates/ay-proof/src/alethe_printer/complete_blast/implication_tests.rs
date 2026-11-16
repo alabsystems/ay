@@ -19,13 +19,14 @@ fn checked_planned_rules(blaster: &Blaster<'_, '_>, bindings: &[(u32, TermId)]) 
         let ClauseEmit::Rule { rule, .. } = &planned.emit else {
             continue;
         };
-        let kind = match *rule {
+        let rule = rule.as_str();
+        let kind = match rule {
             "implies_pos" => AletheRule::ImpliesPos,
             "implies_neg1" => AletheRule::ImpliesNeg1,
             "implies_neg2" => AletheRule::ImpliesNeg2,
             _ => continue,
         };
-        seen.push(*rule);
+        seen.push(rule);
         let clause = planned
             .lits
             .iter()
@@ -112,7 +113,7 @@ fn implication_ground_gate_values_and_negations_are_exact() {
             let right = circuit.constant(b);
             let root = circuit.implies(left, right);
             assert_eq!(
-                super::super::ground::constant_values(&circuit, &[root, root.not().unwrap()]),
+                ground::constant_values(&circuit, &[root, root.not().unwrap()]),
                 Some(vec![!a || b, a && !b]),
             );
         }
@@ -227,7 +228,7 @@ fn implication_sweep_uses_the_same_signed_gate_semantics_and_original_cnf() {
     let mut blaster = Blaster::new(&printer, ProofId(1), "@ay_imp_".into());
     let root = blaster.prepare(assertion).unwrap();
     let (cnf, root_id) = blaster.planned_cnf(root).unwrap();
-    let proof = super::super::sweep::refute_directly(
+    let proof = sweep::refute_directly(
         &printer,
         &blaster.circuit,
         &blaster.guarded_ites,

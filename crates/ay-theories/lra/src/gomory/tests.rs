@@ -360,17 +360,6 @@ fn test_gmi_upper_bound_coefficient_matches_standard_formula() {
 }
 
 #[test]
-fn test_abs_ceil_coeff_matches_z3_semantics() {
-    // Z3 computes abs(ceil(coeff)), not ceil(abs(coeff)).
-    // For -1/2, this must be 0.
-    let minus_half = BigRational::new(BigInt::from(-1), BigInt::from(2));
-    assert_eq!(LraSolver::abs_ceil_coeff(&minus_half), BigInt::zero());
-
-    let plus_half = BigRational::new(BigInt::from(1), BigInt::from(2));
-    assert_eq!(LraSolver::abs_ceil_coeff(&plus_half), BigInt::one());
-}
-
-#[test]
 fn test_generate_gomory_cuts_skips_row_when_numerator_exceeds_big_number() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);

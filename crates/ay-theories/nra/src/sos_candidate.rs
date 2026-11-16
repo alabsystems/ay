@@ -13,6 +13,7 @@ use ay_core::{ProofStep, TermId, TermStore};
 /// The caller refused further work, allocation, or cooperative execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SosCandidateError {
+    /// Candidate generation exceeded its resource or cancellation budget.
     #[error("SOS candidate generation exceeded the caller's resource or cancellation budget")]
     ResourceLimit,
 }

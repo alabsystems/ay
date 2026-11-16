@@ -14,7 +14,7 @@ fn supported_fields(eb: u32, sb: u32) -> bool {
 }
 
 fn fraction_fits(significand: u128, sb: u32) -> bool {
-    u128::BITS - significand.leading_zeros() <= sb - 1
+    significand.bit_width() < sb
 }
 
 impl FpModelValue {

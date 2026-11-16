@@ -86,8 +86,11 @@ pub struct Goal {
 /// A public subgoal retaining the model reconstruction its terms require.
 #[derive(Debug, Clone)]
 pub struct TacticSubgoal {
+    /// The transformed formulas in this subgoal.
     pub formulas: Vec<Term>,
+    /// The goal depth reached by the transformation.
     pub depth: usize,
+    /// Typed model reconstruction required by the transformed formulas.
     pub model_converter: Option<super::tactic_model::TacticModelConverter>,
 }
 
@@ -104,7 +107,9 @@ pub struct TacticOperation {
 pub struct TacticDecision {
     scope: crate::executor::TacticDeclarationScope,
     _read: crate::executor::EvaluationReadScope,
+    /// The verified result authorized by the declaration handoff.
     pub result: VerifiedSolveResult,
+    /// The optional model paired with `result`.
     pub model: Option<super::super::Model>,
 }
 impl TacticDecision {
@@ -122,9 +127,11 @@ impl TacticDecision {
                 .is_ok()
             && self.validate(solver)
     }
+    /// Validate that the declaration handoff remains active for `solver`.
     pub fn validate(&self, solver: &Solver) -> bool {
         self.scope.validate_decision(&solver.executor)
     }
+    /// Return the construction admission retained by the declaration scope.
     pub fn admission(&self) -> &dyn ay_core::term::TermConstructionAdmission {
         self.scope.admission()
     }
@@ -148,9 +155,11 @@ impl TacticOperation {
     pub fn publish_failure(self, solver: &mut Solver, error: &SolverError) {
         solver.set_tactic_error_unknown(error);
     }
+    /// Return the construction admission retained by this operation.
     pub fn admission(&self) -> &dyn ay_core::term::TermConstructionAdmission {
         self.scope.admission()
     }
+    /// Validate that this operation still belongs to `solver`'s live query.
     pub fn validate(&self, solver: &Solver) -> bool {
         self.scope.validate(&solver.executor)
     }
@@ -328,7 +337,7 @@ fn flatten_owned(
         owner
             .admit(1, 0)
             .map_err(|_| TacticFailure::new("tactic flatten stopped"))?;
-        if id.index() >= terms.len() || terms.sort(id) != &ay_core::Sort::Bool {
+        if id.index() >= terms.len() || terms.sort(id) != &Sort::Bool {
             return Err(TacticFailure::new("invalid Boolean goal"));
         }
         if seen[id.index()] {
@@ -561,8 +570,11 @@ pub enum Tactic {
 /// Execution metadata, not a resource grant or a claim of tactic completeness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TacticExecutionKind {
+    /// Legacy execution that does not retain typed reconstruction authority.
     Legacy,
+    /// Execution retaining typed equivalence reconstruction.
     OwnedEquivalence,
+    /// Execution retaining typed model-conversion reconstruction.
     OwnedModelConversion,
 }
 struct Requirements {
@@ -775,7 +787,7 @@ impl Tactic {
                 assertions.len(),
                 assertions
                     .len()
-                    .checked_mul(std::mem::size_of::<TermId>())
+                    .checked_mul(size_of::<TermId>())
                     .ok_or_else(|| TacticFailure::new("tactic root size overflow"))?,
             )
             .map_err(|_| TacticFailure::new("tactic original root admission refused"))?;
@@ -1054,15 +1066,6 @@ impl Tactic {
         Tactic::FailIfNotDecided
     }
 
-    /// Whether applying this tactic can issue nested solver decisions.
-    ///
-    /// Certificate export may coexist with purely syntactic transformations,
-    /// but not with `ctx-solver-simplify` hidden inside a combinator: those
-    /// probes would compete with the caller's single requested CNF artifact.
-    pub(crate) fn may_invoke_solver(&self) -> bool {
-        self.requirements(None).map_or(true, |r| r.solver)
-    }
-
     /// A stable, Z3-style name for this tactic (diagnostics/tests).
     #[must_use]
     pub fn name(&self) -> String {
@@ -1150,7 +1153,6 @@ impl Tactic {
         owner: Option<&dyn ay_core::term::TermConstructionAdmission>,
     ) -> Result<StepOutcome, TacticFailure> {
         use super::tactic_parameters as configured;
-        use ay_core::term::TermConstructionAdmission as _;
         match self {
             Self::Shared(instance) => {
                 let _settings = configured::install(instance.configured()?);
@@ -1426,7 +1428,7 @@ impl Tactic {
                     super::field_simplify::apply(terms, &goal.formulas, owner)?
                 };
                 owner
-                    .admit(1, std::mem::size_of::<Goal>())
+                    .admit(1, size_of::<Goal>())
                     .map_err(|_| TacticFailure::new("tactic original output admission refused"))?;
                 let progressed = formulas != goal.formulas;
                 Ok(StepOutcome {
@@ -3361,7 +3363,7 @@ impl Solver {
         let owner = scope.admission();
         let bytes = source_assertions
             .len()
-            .checked_mul(std::mem::size_of::<TermId>())
+            .checked_mul(size_of::<TermId>())
             .ok_or_else(|| SolverError::TacticFailed("detached roots size overflow".into()))?;
         owner.admit(source_assertions.len(), bytes).map_err(|_| {
             SolverError::TacticFailed("detached roots original admission refused".into())
@@ -3459,7 +3461,7 @@ impl Solver {
                 .admit(
                     count,
                     count
-                        .checked_mul(std::mem::size_of::<TermId>())
+                        .checked_mul(size_of::<TermId>())
                         .ok_or_else(|| SolverError::TacticFailed("tactic roots overflow".into()))?,
                 )
                 .map_err(|_| {
@@ -3546,7 +3548,7 @@ impl Solver {
         if requirements.kind != TacticExecutionKind::Legacy {
             let bytes = goal
                 .len()
-                .checked_mul(std::mem::size_of::<TermId>() + std::mem::size_of::<Term>())
+                .checked_mul(size_of::<TermId>() + size_of::<Term>())
                 .ok_or_else(|| SolverError::TacticFailed("tactic input size overflow".into()))?;
             scope.admission().admit(goal.len(), bytes).map_err(|_| {
                 SolverError::TacticFailed("tactic original input admission refused".into())
@@ -3630,7 +3632,7 @@ impl Solver {
         if requirements.kind != TacticExecutionKind::Legacy {
             let bytes = goal
                 .len()
-                .checked_mul(std::mem::size_of::<TermId>())
+                .checked_mul(size_of::<TermId>())
                 .ok_or_else(|| SolverError::TacticFailed("tactic input size overflow".into()))?;
             scope.admission().admit(goal.len(), bytes).map_err(|_| {
                 SolverError::TacticFailed("tactic original input admission refused".into())
@@ -3651,7 +3653,7 @@ impl Solver {
                         g.formulas.len(),
                         g.formulas
                             .len()
-                            .checked_mul(std::mem::size_of::<Term>())
+                            .checked_mul(size_of::<Term>())
                             .ok_or_else(|| {
                                 SolverError::TacticFailed("tactic output size overflow".into())
                             })?,
@@ -3666,7 +3668,7 @@ impl Solver {
                     subgoals.len(),
                     subgoals
                         .len()
-                        .checked_mul(std::mem::size_of::<(Vec<Term>, usize)>())
+                        .checked_mul(size_of::<(Vec<Term>, usize)>())
                         .ok_or_else(|| {
                             SolverError::TacticFailed("tactic output size overflow".into())
                         })?,
@@ -3881,11 +3883,11 @@ impl Solver {
                 return Err(failure());
             }
             let id = binding.representative;
-            let ay_core::TermData::Var(name, _) = self.terms().get(id) else {
+            let TermData::Var(name, _) = self.terms().get(id) else {
                 return Err(failure());
             };
             let sort = self.terms().sort(id).clone();
-            if !matches!(sort, ay_core::Sort::BitVec(_)) {
+            if !matches!(sort, Sort::BitVec(_)) {
                 return Err(failure());
             }
             owner
@@ -4000,7 +4002,7 @@ impl Solver {
             if self
                 .terms()
                 .sort(self.resolve_term("converted tactic decision", term)?)
-                != &ay_core::Sort::Bool
+                != &Sort::Bool
             {
                 return Err(failure());
             }
@@ -4065,7 +4067,7 @@ impl Solver {
                 }
                 if present {
                     let id = TermId(u32::try_from(index).map_err(|_| failure())?);
-                    if let ay_core::TermData::Var(name, _) = self.terms().get(id) {
+                    if let TermData::Var(name, _) = self.terms().get(id) {
                         let len = name.len();
                         scope.admission().admit(len, len).map_err(|_| failure())?;
                         ay_core::term::reserve_counted(&mut names, 1, scope.admission())
@@ -4073,7 +4075,7 @@ impl Solver {
                         if !scope.validate_decision(&self.executor) {
                             return Err(failure());
                         }
-                        let ay_core::TermData::Var(name, _) = self.terms().get(id) else {
+                        let TermData::Var(name, _) = self.terms().get(id) else {
                             return Err(failure());
                         };
                         names.push(name.clone());

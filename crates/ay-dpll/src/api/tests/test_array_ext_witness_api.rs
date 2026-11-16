@@ -135,7 +135,7 @@ fn retired_witness_in_bypassed_soft_constraint_fails_closed() {
             weight: 1,
             id: None,
         }]);
-    assert!(displaced.is_empty());
+    assert_eq!(displaced, [] as [SoftAssertion; 0]);
 
     solver.executor.execute(&Command::CheckSat).unwrap();
     assert!(

@@ -51,6 +51,9 @@ enum Outcome {
     ReadFailure,
     ReadBehind,
     Descendant,
+    DryRunConflict,
+    DryRunUnchanged,
+    DryRunPermission,
 }
 struct Peer {
     fetched: String,
@@ -108,6 +111,35 @@ impl Agh for Peer {
             self.dry_runs += 1;
             self.receipts.push(receipts.into());
             fs::write(receipts.join("dry-run.json"), b"{\"dry_run\":true}")?;
+            if matches!(
+                self.outcome,
+                Outcome::DryRunConflict | Outcome::DryRunUnchanged | Outcome::DryRunPermission
+            ) {
+                let kind = if matches!(self.outcome, Outcome::DryRunPermission) {
+                    "forbidden"
+                } else {
+                    "conflict"
+                };
+                fs::write(
+                    receipts.join("dry-run.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "repo": REPOSITORY, "op":"ref.update-atomic", "dry_run":true, "outcome":"refused"
+                    }))?,
+                )?;
+                fs::write(
+                    receipts.join("dry-run-error.json"),
+                    format!(
+                        "agh: refused\n{}\n",
+                        serde_json::json!({"error": {
+                            "repo":REPOSITORY, "kind":kind, "exit":9, "side_effect":"none"
+                        }})
+                    ),
+                )?;
+                if !matches!(self.outcome, Outcome::DryRunUnchanged) {
+                    self.fetched = self.later.clone();
+                }
+                bail!("dry run refused");
+            }
         } else {
             self.writes += 1;
             fs::write(receipts.join("ack.json"), b"{\"acknowledged\":true}")?;
@@ -123,6 +155,37 @@ impl Agh for Peer {
             }
         }
         Ok(())
+    }
+}
+
+#[test]
+fn a_nonwriting_ref_conflict_requires_fresh_composition_without_a_push() {
+    let (_temp, mut runner, base, head, later) = fixture();
+    let mut peer = Peer::new(&base, &head, &later, Outcome::DryRunConflict);
+    assert!(!push_with(&mut runner, &head, &base, &mut peer).unwrap());
+    assert_eq!(peer.writes, 0);
+    assert_eq!(peer.dry_runs, 1);
+    assert_eq!(peer.fetches, 2);
+    assert_eq!(runner.head().unwrap(), head);
+    assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(later));
+}
+
+#[test]
+fn permission_refusal_and_unchanged_conflict_do_not_retry() {
+    for outcome in [Outcome::DryRunPermission, Outcome::DryRunUnchanged] {
+        let (_temp, mut runner, base, head, later) = fixture();
+        let mut peer = Peer::new(&base, &head, &later, outcome);
+        assert!(push_with(&mut runner, &head, &base, &mut peer).is_err());
+        assert_eq!(peer.writes, 0);
+        assert_eq!(peer.dry_runs, 1);
+        assert_eq!(
+            peer.fetches,
+            if matches!(outcome, Outcome::DryRunPermission) {
+                1
+            } else {
+                2
+            }
+        );
     }
 }
 

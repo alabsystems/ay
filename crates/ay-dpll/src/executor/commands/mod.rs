@@ -19,7 +19,7 @@ use ay_frontend::{AuthoredAssertionRef, OptionValue};
 
 use crate::executor::model::EvalValue;
 use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
-use crate::executor_format::{format_bigint, format_rational, format_sort_surface, format_symbol};
+use crate::executor_format::{format_rational, format_sort_surface};
 use crate::executor_types::{SolveResult, StatValue, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
@@ -838,7 +838,7 @@ impl Executor {
         &self,
         term_id: TermId,
         owner: &dyn ay_core::term::TermConstructionAdmission,
-    ) -> std::result::Result<String, ay_core::term::CountedTermError> {
+    ) -> Result<String, ay_core::term::CountedTermError> {
         let value = self.format_term_owned(term_id, &mut |_| false, Some(owner));
         owner.check()?;
         Ok(value)

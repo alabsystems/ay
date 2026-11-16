@@ -23,7 +23,7 @@ fn original_callback_survives_scope_removal_and_one_shot_reset() {
 fn identical_explicit_and_ambient_callback_is_polled_once_per_admission() {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
-    let callback: crate::resource::CheckStop = Arc::new(move || {
+    let callback: CheckStop = Arc::new(move || {
         observed.fetch_add(1, Ordering::SeqCst);
         false
     });

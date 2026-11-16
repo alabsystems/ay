@@ -68,24 +68,18 @@ fn unsupported_domains_nested_arrays_and_opaque_functions_have_no_legacy_fallbac
     for kind in 0..4 {
         let mut terms = TermStore::new();
         let bv = Sort::BitVec(ay_core::BitVecSort { width: 8 });
-        match kind {
-            0 => {
-                terms.mk_var("integer", Sort::Int);
-            }
-            1 => {
-                terms.mk_var(
-                    "nested",
-                    Sort::array(bv.clone(), Sort::array(bv.clone(), bv.clone())),
-                );
-            }
+        let _unsupported_term = match kind {
+            0 => terms.mk_var("integer", Sort::Int),
+            1 => terms.mk_var(
+                "nested",
+                Sort::array(bv.clone(), Sort::array(bv.clone(), bv.clone())),
+            ),
             2 => {
                 let value = terms.mk_var("v", bv.clone());
-                terms.mk_app(Symbol::named("user-function"), [value], bv.clone());
+                terms.mk_app(Symbol::named("user-function"), [value], bv.clone())
             }
-            _ => {
-                terms.mk_var("zero-width", Sort::BitVec(ay_core::BitVecSort { width: 0 }));
-            }
-        }
+            _ => terms.mk_var("zero-width", Sort::BitVec(ay_core::BitVecSort { width: 0 })),
+        };
         let mut solver = ArraySolver::new(&terms);
         solver.populate_caches();
         solver.rebuild_assign_indices();

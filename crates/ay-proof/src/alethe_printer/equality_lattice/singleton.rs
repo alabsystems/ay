@@ -166,14 +166,14 @@ mod tests {
                 .expect("render");
             assert!(!text.contains(":rule hole"), "{text}");
             assert!(text.contains(":rule la_disequality"));
-            let commands = crate::alethe_printer::la_generic_surface::printed_arith_commands(&text)
-                .expect("read emitted arithmetic");
+            let commands =
+                la_generic_surface::printed_arith_commands(&text).expect("read emitted arithmetic");
             assert_eq!(commands.len(), 2);
             for command in commands {
                 match command {
-                    crate::alethe_printer::la_generic_surface::PrintedArithCommand::LaGeneric(
-                        command,
-                    ) => assert!(printed_la_generic_holds(&command.literals, &command.args)),
+                    la_generic_surface::PrintedArithCommand::LaGeneric(command) => {
+                        assert!(printed_la_generic_holds(&command.literals, &command.args));
+                    }
                     _ => panic!("unexpected arithmetic"),
                 }
             }

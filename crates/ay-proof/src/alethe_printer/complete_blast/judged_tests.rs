@@ -48,7 +48,7 @@ fn a_whole_query_bit_vector_lemma_prints_its_complete_refutation() {
             theory: "bv".to_string(),
             clause: vec![literal],
             farkas: None,
-            kind: kind.clone(),
+            kind,
             lia: None,
         };
         let printer = AlethePrinter::new(&terms);

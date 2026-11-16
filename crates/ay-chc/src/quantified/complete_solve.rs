@@ -16,6 +16,10 @@ use std::time::Duration;
 /// This is not ordinary ground CHC evidence or MODEL_CHECKER_CONSUMER interpreter playback.
 #[derive(Debug)]
 #[must_use = "Unknown grants neither safety nor counterexample authority"]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "source-bound safety evidence stays by value without an unmetered allocation or public API change"
+)]
 pub enum QuantifiedChcCompleteResult {
     /// The existing original-source quantified safety certificate.
     Safe(QuantifiedChcSafety),

@@ -65,5 +65,5 @@ fn unrelated_guards_and_later_tight_ancestor_views_are_not_covered() {
         None,
         "live child spend has not settled into this view"
     );
-    assert_eq!(tight.tick(1), Err(crate::resource::Exhausted::Rlimit));
+    assert_eq!(tight.tick(1), Err(Exhausted::Rlimit));
 }

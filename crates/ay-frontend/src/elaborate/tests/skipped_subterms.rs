@@ -275,7 +275,7 @@ fn a_shared_scratch_checks_later_names_by_sort() {
                       (let ((d2 (bvmul a p))) (bvult a b))))";
     let (ctx, results) = run(&format!("{prelude}{ill_sorted}"));
     assert!(results.last().unwrap().0.is_err());
-    assert!(ctx.assertions.is_empty());
+    assert_eq!(ctx.assertions.len(), 0);
 }
 
 /// The shared scratch copy follows declarations, definitions and labels made

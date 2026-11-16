@@ -62,7 +62,7 @@ fn fresh(out: &mut Encoder<'_>, id: TermId) -> Result<Literal> {
         .data
         .num_vars
         .checked_add(1)
-        .filter(|n| *n <= i32::MAX as u32)
+        .filter(|n| i32::try_from(*n).is_ok())
         .ok_or(Error::Unsupported)?;
     out.data.num_vars = next;
     out.data.term_literals[id.index()] = Some(next as i32);

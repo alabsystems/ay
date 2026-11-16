@@ -132,7 +132,9 @@ fn expired_original_deadline_precancellation_and_zero_memory_skip_search() {
         let mut config = configured();
         let parent = CancellationToken::new();
         let until = if case == 0 {
-            Instant::now() - Duration::from_secs(1)
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports a one-second offset")
         } else {
             deadline()
         };
@@ -184,7 +186,7 @@ fn short_search_clock_restores_original_validation_and_ambient_scopes() {
             &configured(),
             Some(supplied),
             &mut |actual, budget, config| {
-                assert!(std::ptr::eq(actual, &original));
+                assert!(std::ptr::eq(actual, &raw const original));
                 let short = crate::smt::current_thread_solve_deadline().unwrap();
                 assert!(short < smt);
                 assert_eq!(crate::smt::deadline::current_smt_deadline(), Some(short));

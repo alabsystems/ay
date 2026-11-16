@@ -81,8 +81,8 @@ mod tests_rung0_bridge_hygiene;
 pub(crate) use check_sat::ill_typed_engine_queries;
 pub(crate) use context::{current_thread_solve_deadline, ScopedSolveDeadline};
 pub(crate) use context::{
-    no_progress_breaker_tripped, note_bv_cache_thrash_clear, note_solve_progress,
-    note_unassignable_free_var_no_progress, ScopedNoProgressBreaker,
+    no_progress_breaker_tripped, note_solve_progress, note_unassignable_free_var_no_progress,
+    ScopedNoProgressBreaker,
 };
 pub use context::{SmtContext, SmtLane};
 pub use interpolation_api::InterpolationResult;

@@ -180,8 +180,6 @@ fn the_array_axiom_prints_on_the_wire() {
 
 // ===== fail-closed =====
 
-/// A rewritten assertion whose fold this lane does NOT model keeps its
-
 /// An axiom instance is never an `assume`, so the assumption scope is exactly
 /// what it was: every `Assume` in the finished proof is still an authored
 /// assertion.

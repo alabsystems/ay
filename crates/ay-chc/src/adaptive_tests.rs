@@ -2253,10 +2253,13 @@ fn test_exact_acyclic_probe_grant_leaves_a_recovery_reserve() {
         "grant {granted:?} must leave a reserve out of {row:?}"
     );
     assert_eq!(granted, Duration::from_millis(4_500));
+    let reserve = row
+        .checked_sub(granted)
+        .expect("grant does not exceed the available row");
     assert!(
-        row - granted >= Duration::from_secs(2),
+        reserve >= Duration::from_secs(2),
         "reserve {:?} must be enough for the recovering probe",
-        row - granted
+        reserve
     );
 }
 

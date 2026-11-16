@@ -32,7 +32,7 @@
 //! be proven UNSAT by AY's own executor-backed SMT (fail-closed on Sat /
 //! Unknown / panic / interrupt), the verdict carries the same
 //! `ValidationEvidence::FullVerification`, and it passes through the same
-//! `finalize_verified_result` boundary as every other Safe. The
+//! bounded finalization boundary as every other Safe. The
 //! deterministic-sequential mode never starts a race (it keeps the
 //! synchronous prepass), and neither does a problem outside the prepass's
 //! gate (arrays, datatypes, BV, multi-predicate, non-flag query).
@@ -718,7 +718,7 @@ mod tests {
         ));
         assert!(matches!(result, PortfolioResult::Unknown));
         assert!(
-            portfolio.lane_token().is_cancelled() == false,
+            !portfolio.lane_token().is_cancelled(),
             "no race left: the lane token is a plain child"
         );
     }

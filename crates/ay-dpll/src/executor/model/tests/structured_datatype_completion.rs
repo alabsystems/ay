@@ -214,7 +214,7 @@ fn structured_assignment_never_uses_an_indexed_application_as_a_seed() {
 fn structured_assignment_preserves_owned_and_scoped_models() {
     let (exec, mut model) = fixture();
     let before = format!("{model:?}");
-    let changed = super::super::with_scoped_term_evaluation_override_for_test(
+    let changed = with_scoped_term_evaluation_override_for_test(
         declared(&exec, "seed"),
         EvalValue::Element(VALUE.to_string()),
         || exec.complete_structured_datatype_values(&mut model, &[]),
@@ -230,7 +230,7 @@ fn structured_assignment_preserves_owned_and_scoped_models() {
     let seed = declared(&exec, "seed");
     model.certified_total_ufs.ground_pins.insert(
         seed,
-        super::super::certificate_data::StampedCertificatePin {
+        StampedCertificatePin {
             entry_stamp: exec.ctx.terms.entry_stamp(seed).expect("live seed"),
             value: EvalValue::Element(VALUE.to_string()),
         },

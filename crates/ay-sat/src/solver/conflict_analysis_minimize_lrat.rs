@@ -714,10 +714,10 @@ impl Solver {
 
             p.work(32)?;
             let unit_id = solver
-                .proof_emit_add(&[unit_lit], &hints, ProofAddKind::Derived)
+                .proof_emit_add(&[unit_lit], hints, ProofAddKind::Derived)
                 .unwrap_or(0);
             if unit_id != 0 {
-                solver.trace_materialized_level0_unit(unit_id, unit_lit, &hints);
+                solver.trace_materialized_level0_unit(unit_id, unit_lit, hints);
                 solver.stats.lrat_materialize_emitted_unit_lines += 1;
                 solver.stats.lrat_materialize_unit_hints += hint_count;
                 solver.stats.lrat_materialize_unit_max_hints =

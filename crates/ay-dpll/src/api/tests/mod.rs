@@ -20,6 +20,7 @@ mod test_counterexample_minimization;
 mod test_datatype_tester_spellings;
 mod test_declaration_identity;
 mod test_define_fun;
+mod test_empty_identity_bundle;
 mod test_exact_query_bundle;
 mod test_explanation_report;
 mod test_fp;

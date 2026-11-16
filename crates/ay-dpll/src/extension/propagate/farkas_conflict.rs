@@ -45,7 +45,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         }
         // Farkas origin never mints. Require an actually falsified clause;
         // unassigned mappings cannot use the coefficient-aligned proof path.
-        let Some(super::conflict::MappedConflict::Falsified(mut clause)) =
+        let Some(conflict::MappedConflict::Falsified(mut clause)) =
             self.map_conflict_clause(&conflict.literals, ConflictOrigin::Farkas, round.ctx)
         else {
             self.emit_conflict_unknown(round);

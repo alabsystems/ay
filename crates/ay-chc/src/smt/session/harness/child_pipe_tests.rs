@@ -45,7 +45,7 @@ fn run_against_a_z3_that_exits_unread_is_a_short_answer_not_a_kill() {
     }
     let directory = tempfile::tempdir().expect("tempdir");
     let z3 = exits_unread_z3(directory.path());
-    assert!(z3.run(&oversized_script(), 5).is_empty());
+    assert_eq!(z3.run(&oversized_script(), 5), [] as [Verdict; 0]);
 }
 
 #[test]

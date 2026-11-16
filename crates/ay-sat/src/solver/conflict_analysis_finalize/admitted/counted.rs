@@ -72,10 +72,8 @@ impl Policy for Counted<'_> {
         ))
     }
     fn reason_frame(&self) -> AdmissionResult<()> {
-        self.0.admit(
-            8,
-            std::mem::size_of::<(Literal, u32, usize, usize, VarData)>(),
-        )
+        self.0
+            .admit(8, size_of::<(Literal, u32, usize, usize, VarData)>())
     }
     fn analysis_seen(&self, conflict: &mut ConflictAnalyzer) -> AdmissionResult<()> {
         conflict.prepare_counted_ic3_seen(self.0)

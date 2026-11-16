@@ -201,6 +201,89 @@ fn bv_side_unsat_with_real_present() {
 }
 
 // ---------------------------------------------------------------------------
+// Premise ownership of the rescue's UNSAT proof (statistics).
+// ---------------------------------------------------------------------------
+
+/// `a > 0, b > 0, a * b < 0` (component 0) before the bit-vector row
+/// `(= (bvmul l #x00000002) #x00000001)` (component 1), with proofs on.
+#[test]
+#[timeout(60000)]
+fn an_unsat_proof_resting_on_a_later_component_counts_its_row_as_borrowed() {
+    let exec = solve(
+        r#"
+        (set-option :produce-proofs true)
+        (set-option :timeout 20000)
+        (set-logic QF_AUFBVNIA)
+        (declare-const l (_ BitVec 32))
+        (declare-const r (_ BitVec 32))
+        (declare-const a Int)
+        (declare-const b Int)
+        (assert (> a 0))
+        (assert (> b 0))
+        (assert (< (* a b) 0))
+        (assert (= (bvmul l #x00000002) #x00000001))
+        (check-sat)
+    "#,
+    );
+    assert!(
+        exec.last_result().is_some_and(|r| r.is_unsat()),
+        "expected UNSAT, got {:?}",
+        exec.last_result()
+    );
+    let statistics = exec.statistics();
+    assert_eq!(
+        statistics.get_string("solver.partition_rescue.outcome"),
+        Some("unsat")
+    );
+    let borrowed = statistics.get_int("solver.partition_rescue.borrowed_rows");
+    assert!(borrowed.is_some_and(|rows| rows >= 1), "{borrowed:?}");
+    assert_eq!(
+        statistics.get_int("solver.partition_rescue.borrow_lender"),
+        Some(1)
+    );
+}
+
+/// The same rows with the bit-vector row first (component 0).
+#[test]
+#[timeout(60000)]
+fn an_unsat_proof_resting_on_its_own_component_borrows_nothing() {
+    let exec = solve(
+        r#"
+        (set-option :produce-proofs true)
+        (set-option :timeout 20000)
+        (set-logic QF_AUFBVNIA)
+        (declare-const l (_ BitVec 32))
+        (declare-const r (_ BitVec 32))
+        (declare-const a Int)
+        (declare-const b Int)
+        (assert (= (bvmul l #x00000002) #x00000001))
+        (assert (> a 0))
+        (assert (> b 0))
+        (assert (< (* a b) 0))
+        (check-sat)
+    "#,
+    );
+    assert!(
+        exec.last_result().is_some_and(|r| r.is_unsat()),
+        "expected UNSAT, got {:?}",
+        exec.last_result()
+    );
+    let statistics = exec.statistics();
+    assert_eq!(
+        statistics.get_string("solver.partition_rescue.outcome"),
+        Some("unsat")
+    );
+    assert_eq!(
+        statistics.get_int("solver.partition_rescue.borrowed_rows"),
+        Some(0)
+    );
+    assert_eq!(
+        statistics.get_int("solver.partition_rescue.borrow_lender"),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Adversarial coupling probes — conjuncts that SHARE a symbol must NOT be
 // partitioned; the verdict must match z3, never a wrong combine.
 // ---------------------------------------------------------------------------

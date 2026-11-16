@@ -185,7 +185,7 @@ fn skipped_roots_remain_ordered_in_joint_strict_refutation() {
     );
     assert_eq!(trace.skipped, expected);
     assert!(trace.replayed.is_empty(), "{trace:?}");
-    assert_eq!(trace.joints, [expected.clone()]);
+    assert_eq!(trace.joints, std::slice::from_ref(&expected));
     let assumptions: Vec<_> = proof
         .steps
         .iter()
@@ -207,7 +207,7 @@ fn contradictory_nondefinition_retains_cheap_or_strict_acceptance() {
         accepted,
         "the occurs-check must not prune this contradiction"
     );
-    assert!(trace.skipped.is_empty());
+    assert_eq!(trace.skipped, [] as [TermId; 0]);
     assert!(trace.replayed.iter().all(|root| *root == expected));
     assert_strict(&mut executor, &proof);
 }
@@ -220,7 +220,7 @@ fn unsupported_comparison_keeps_actual_singleton_replay() {
     let expected = root(&mut executor, 0);
     let (accepted, _, trace) = prune(&mut executor);
     assert!(!accepted);
-    assert!(trace.skipped.is_empty());
+    assert_eq!(trace.skipped, [] as [TermId; 0]);
     assert_eq!(trace.replayed, [expected]);
 }
 
@@ -233,7 +233,7 @@ fn cancelled_guarded_pass_never_turns_advice_into_acceptance() {
     executor.set_solve_controls(Some(Arc::new(AtomicBool::new(true))), None);
     let (accepted, proof, trace) = prune(&mut executor);
     assert!(!accepted);
-    assert!(trace.skipped.is_empty());
+    assert_eq!(trace.skipped, [] as [TermId; 0]);
     assert_eq!(
         format!("{:?}", proof.steps),
         format!("{:?}", rejected().steps)

@@ -121,17 +121,18 @@ fn consume(
 
 fn totals(problem: &ChcProblem) -> (u64, usize) {
     let (mut units, mut bytes) = (0u64, 0usize);
-    let mut sink = |work: usize, storage: usize| {
-        units = units.checked_add(work as u64).unwrap();
-        bytes = bytes.checked_add(storage).unwrap();
-        Ok(())
-    };
-    let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
-    prepare_normalized_chc_input_with_work(problem, &mut work)
-        .unwrap()
-        .with_input(|_, _, _| Ok(()))
-        .unwrap();
-    drop(work);
+    {
+        let mut sink = |work: usize, storage: usize| {
+            units = units.checked_add(work as u64).unwrap();
+            bytes = bytes.checked_add(storage).unwrap();
+            Ok(())
+        };
+        let mut work = WorkBudget::with_admission(u64::MAX, &mut sink);
+        prepare_normalized_chc_input_with_work(problem, &mut work)
+            .unwrap()
+            .with_input(|_, _, _| Ok(()))
+            .unwrap();
+    }
     (units, bytes)
 }
 

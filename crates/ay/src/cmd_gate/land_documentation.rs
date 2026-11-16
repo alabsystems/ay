@@ -166,7 +166,7 @@ fn documentation_changes(raw: &[u8]) -> Result<Option<Vec<Change>>> {
         return Ok(None);
     }
     let mut changes = Vec::new();
-    for pair in fields.chunks_exact(2) {
+    for pair in fields.as_chunks::<2>().0 {
         let header = std::str::from_utf8(pair[0]).context("Git delta header is not UTF-8")?;
         let columns = header.split_ascii_whitespace().collect::<Vec<_>>();
         if columns.len() != 5 {

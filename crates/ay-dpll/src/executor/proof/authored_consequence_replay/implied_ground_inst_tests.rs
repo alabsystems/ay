@@ -166,10 +166,10 @@ fn an_unasserted_antecedent_proposes_nothing() {
     )
     .expect("unasserted-antecedent fixture parses");
     let mut exec = Executor::new();
-    assert!(exec
-        .execute_all(&commands)
-        .expect("fixture loads")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("fixture loads"),
+        [] as [String; 0]
+    );
     exec.begin_unsat_query_epoch(&exec.ctx.assertions.clone());
     exec.bind_unsat_query_assumptions(&[]);
     assert!(
@@ -214,10 +214,10 @@ fn the_same_derivation_over_a_satisfiable_instance_is_refused() {
     )
     .expect("satisfiable twin parses");
     let mut exec = Executor::new();
-    assert!(exec
-        .execute_all(&commands)
-        .expect("satisfiable twin loads")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("satisfiable twin loads"),
+        [] as [String; 0]
+    );
     exec.begin_unsat_query_epoch(&exec.ctx.assertions.clone());
     exec.bind_unsat_query_assumptions(&[]);
     assert!(

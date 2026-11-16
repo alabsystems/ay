@@ -709,6 +709,10 @@ pub fn try_export_alethe_with_authored_surfaces_to<W: std::io::Write>(
 ///
 /// # Errors
 /// As [`try_export_alethe_with_authored_surfaces_to`], plus caller refusal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the public streaming boundary keeps proof, context, authored surfaces, budget, and owner explicit"
+)]
 pub fn try_export_alethe_with_authored_surfaces_to_with_progress<W: std::io::Write>(
     out: &mut W,
     proof: &Proof,
@@ -742,7 +746,7 @@ pub(crate) fn export_alethe_with_printer_to<W: std::io::Write>(
         .prepare_proof(proof)
         .map_err(AletheStreamError::Print)?;
 
-    let definitions = prepare_alethe_definitions(&printer, proof, terms, problem_assertions)?;
+    let definitions = prepare_alethe_definitions(printer, proof, terms, problem_assertions)?;
     // The same obligation for APPLICATION heads and SORT names, which the
     // definitions walk never sees (`application_heads.rs`): judged on the
     // shipped bytes of each definition and step.

@@ -254,10 +254,7 @@ impl ReadChainState {
         }
         closure.class(index)?;
         let mut result = Vec::new();
-        for term in closure
-            .members(index)
-            .take(super::slice::MAX_MEMBERS_PER_SITE)
-        {
+        for term in closure.members(index).take(slice::MAX_MEMBERS_PER_SITE) {
             work.spend(1)?;
             if stop() {
                 return None;

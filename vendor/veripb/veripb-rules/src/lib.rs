@@ -614,7 +614,7 @@ impl OrderLeftVariablesRule {
 #[derive(Debug)]
 pub struct OrderProofRule;
 
-#[cfg_attr(doc, katexit::katexit)]
+#[cfg_attr(feature = "docs", katexit::katexit)]
 /// Start the environment to show that the defined order is reflexive inside an order definition.
 ///
 /// The actual proof to show reflexivity is initiated by using the [`OrderProofRule`].
@@ -640,7 +640,7 @@ impl OrderRightVariablesRule {
 #[derive(Debug)]
 pub struct OrderSpecificationRule;
 
-#[cfg_attr(doc, katexit::katexit)]
+#[cfg_attr(feature = "docs", katexit::katexit)]
 /// Start the environment to show that the defined order is transitive inside an order definition.
 ///
 /// The actual proof to show transitivity is initiated by using the [`OrderProofRule`].

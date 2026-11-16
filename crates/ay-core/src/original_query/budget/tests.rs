@@ -17,7 +17,6 @@ fn full_cost_sink_receives_bulk_and_storage_not_poll_count() {
     work.admit(0, 256).expect("storage-only operation");
     work.charge(0).expect("publication poll");
     assert_eq!(work.remaining(), 5_897);
-    drop(work);
     assert_eq!(calls, [(4_096, 0), (7, 8_192), (0, 256), (0, 0)]);
 }
 
@@ -35,7 +34,6 @@ fn storage_refusal_is_sticky_and_stops_later_owner_calls() {
     assert_eq!(work.admit(0, 1), Err(QueryError::Exhausted));
     assert_eq!(work.charge(0), Err(QueryError::Exhausted));
     assert_eq!(work.admit(0, 0), Err(QueryError::Exhausted));
-    drop(work);
     assert_eq!(calls, 2);
     assert_eq!(bytes_left, 0);
 }
@@ -98,7 +96,6 @@ fn caller_stop_survives_allocation_error_and_permissive_callback() {
         assert_eq!(work.admit(1, 32), Err(QueryError::Interrupted(reason)));
         assert_eq!(work.refuse_exhaustion(), QueryError::Interrupted(reason));
         assert_eq!(work.admit(0, 0), Err(QueryError::Interrupted(reason)));
-        drop(work);
         assert_eq!(calls, 1);
     }
 }
@@ -114,7 +111,6 @@ fn fallible_allocation_refusal_is_recorded_in_the_shared_latch() {
     work.admit(1, 16).expect("admission before allocation");
     assert_eq!(work.refuse_exhaustion(), QueryError::Exhausted);
     assert_eq!(work.charge(0), Err(QueryError::Exhausted));
-    drop(work);
     assert_eq!(calls, 1);
 }
 
@@ -130,7 +126,6 @@ fn exact_work_grant_and_one_short_local_ceiling_refuse_without_refund() {
     assert_eq!(work.remaining(), 0);
     assert_eq!(work.charge(1), Err(QueryError::Exhausted));
     assert_eq!(work.charge(0), Err(QueryError::Exhausted));
-    drop(work);
     // The owner was debited before local refusal, matching compatibility order;
     // it receives no refund, and no operation occurs after failed admission.
     assert_eq!(total, 11);
@@ -157,7 +152,6 @@ fn legacy_callback_order_and_sticky_interrupt_are_preserved() {
         work.refuse_exhaustion(),
         QueryError::Interrupted(StopReason::Deadline)
     );
-    drop(work);
     assert_eq!(calls, 1);
 }
 
@@ -172,7 +166,6 @@ fn legacy_storage_only_admission_polls_but_does_not_claim_a_storage_limit() {
     work.admit(0, usize::MAX)
         .expect("compatibility constructor has no storage owner");
     assert_eq!(work.remaining(), 1);
-    drop(work);
     assert_eq!(calls, 1);
 }
 
@@ -181,15 +174,12 @@ fn caught_owner_panic_cannot_resume_the_same_ledger() {
     let mut calls = 0;
     let mut sink = |_, _| {
         calls += 1;
-        if calls == 1 {
-            panic!("test owner panic");
-        }
+        assert_ne!(calls, 1, "test owner panic");
         Ok(())
     };
     let mut work = WorkBudget::with_admission(100, &mut sink);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.admit(2, 16))).is_err());
     assert_eq!(work.charge(0), Err(QueryError::Exhausted));
     assert_eq!(work.admit(1, 0), Err(QueryError::Exhausted));
-    drop(work);
     assert_eq!(calls, 1);
 }

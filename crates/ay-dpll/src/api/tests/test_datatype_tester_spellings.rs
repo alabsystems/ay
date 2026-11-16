@@ -90,7 +90,7 @@ fn assert_each_source_is_refused(solver: &mut Solver, native: Term, sources: &[&
             solver.try_assert_term_with_source(native, source).is_err(),
             "{source} must not reconstruct this native tester",
         );
-        assert!(solver.assertions().is_empty());
+        assert_eq!(solver.assertions(), [] as [Term; 0]);
     }
 }
 

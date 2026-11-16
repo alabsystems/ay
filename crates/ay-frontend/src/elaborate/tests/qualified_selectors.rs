@@ -220,7 +220,7 @@ fn qualified_selector_signature_errors_are_rejected() {
             "{invalid}: {error:?}"
         );
     }
-    assert!(context.assertions.is_empty());
+    assert_eq!(context.assertions.len(), 0);
 }
 
 #[test]

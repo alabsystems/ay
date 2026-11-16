@@ -23,7 +23,7 @@ impl ay_core::term::TermConstructionAdmission for ConstantArrayReadAdmission<'_>
         use ay_core::original_query::{
             CountedAdmissionError, OriginalAdmissionError, QueryError, StopReason,
         };
-        self.data.pay(self.exec, work, bytes).map_err(|_| {
+        self.data.pay(self.exec, work, bytes).map_err(|()| {
             match self.exec.evaluation_stop_origin() {
                 Some(crate::executor_types::UnknownOrigin::MemoryBudget) => {
                     CountedAdmissionError::Memory
@@ -247,7 +247,7 @@ impl Model {
             .ok_or(())?;
         ay_model_check::admit_model_value_work(value, &mut |work, bytes| {
             data.pay(exec, work, bytes)
-                .map_err(|_| "constant array copy refused".to_owned())
+                .map_err(|()| "constant array copy refused".to_owned())
         })
         .map_err(|_| ())?;
         data.pay(exec, 0, 0)?;

@@ -3803,7 +3803,10 @@ mod tests {
             constraints: vec![ge(vec![term(3, lit(1)), term(2, lit(2))], 4)],
             objective: None,
         };
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
         let (aug, res) = break_symmetries(&instance);
         assert!(!res.changed_instance());
         assert_eq!(aug, instance);
@@ -3820,7 +3823,10 @@ mod tests {
             constraints: vec![ge(vec![term(1, lit(1)), term(1, neg(2))], 1)],
             objective: None,
         };
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
     }
 
     #[test]
@@ -3847,7 +3853,10 @@ mod tests {
             constraints: vec![ge(vec![term(1, lit(1))], 1), ge(vec![term(1, lit(2))], 1)],
             objective: None,
         };
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
     }
 
     #[test]
@@ -3862,7 +3871,10 @@ mod tests {
                 terms: vec![term(1, lit(1)), term(2, lit(2))],
             }),
         };
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
     }
 
     #[test]
@@ -3918,7 +3930,10 @@ mod tests {
             objective: None,
         };
         // x1 appears twice in the same row -> excluded; x2 alone -> no group.
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
     }
 
     #[test]
@@ -4004,7 +4019,10 @@ mod tests {
             constraints: vec![],
             objective: None,
         };
-        assert!(detect_interchangeable_groups(&instance).is_empty());
+        assert_eq!(
+            detect_interchangeable_groups(&instance).as_slice(),
+            &[] as &[Vec<u32>]
+        );
         let (aug, res) = break_symmetries(&instance);
         assert!(!res.changed_instance());
         assert_eq!(aug, instance);
@@ -4220,7 +4238,10 @@ mod tests {
             ],
             objective: None,
         };
-        assert!(detect_verified_vector_transpositions(&instance).is_empty());
+        assert_eq!(
+            detect_verified_vector_transpositions(&instance).as_slice(),
+            &[] as &[VectorTransposition]
+        );
     }
 
     #[test]
@@ -4402,7 +4423,7 @@ mod tests {
         // brute-force-check the augmented instance is equisatisfiable.
         let instance = matrix_grid(3, 1);
         let gens = detect_scalable_generators(&instance, None);
-        assert!(!gens.is_empty());
+        assert_ne!(gens.as_slice(), &[] as &[BTreeMap<u32, u32>]);
         let mut augmented = instance.clone();
         for g in &gens {
             if let Some(c) = permutation_lex_leader_constraint(g) {

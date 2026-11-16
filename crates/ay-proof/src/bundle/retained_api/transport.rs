@@ -86,8 +86,8 @@ pub fn read_retained_proof_bundle_with_resource_control(
             .map_err(|error| transport_error(error, control))?;
         let bundle = RetainedProofBundle {
             envelope,
-            wire,
             deadline,
+            wire,
         };
         let checked = bundle.replay(deadline, control)?;
         Ok((bundle, checked))
@@ -129,13 +129,12 @@ pub fn read_retained_proof_bundle_with_resource_control_and_diagnostics(
             .map_err(|error| transport_error(error, control))?;
         let bundle = RetainedProofBundle {
             envelope,
-            wire,
             deadline,
+            wire,
         };
         stage = RetainedReadStage::StrictReplay;
-        let checked = bundle.replay(deadline, control).map_err(|error| {
-            diagnostics::proof(&mut first, stage, &error);
-            error
+        let checked = bundle.replay(deadline, control).inspect_err(|error| {
+            diagnostics::proof(&mut first, stage, error);
         })?;
         stage = RetainedReadStage::FinalControl;
         Ok((bundle, checked))

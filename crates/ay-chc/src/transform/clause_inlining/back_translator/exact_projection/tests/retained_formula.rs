@@ -9,8 +9,10 @@ pub(super) fn disjunctions(count: usize) -> (ChcExpr, Vec<ChcVar>) {
     let keep: Vec<_> = (0..count * 2)
         .map(|i| var(&format!("kept_{i}"), 2))
         .collect();
-    let clauses = keep
-        .chunks_exact(2)
+    let (pairs, remainder) = keep.as_chunks::<2>();
+    assert_eq!(remainder, &[] as &[ChcVar]);
+    let clauses = pairs
+        .iter()
         .map(|pair| {
             op(
                 ChcOp::Or,

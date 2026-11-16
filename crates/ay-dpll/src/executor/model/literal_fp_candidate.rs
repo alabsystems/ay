@@ -135,8 +135,8 @@ impl Executor {
         owner
             .admit(
                 1,
-                std::mem::size_of::<super::evaluation_copies::RetainedEvaluationMemory>()
-                    + 2 * std::mem::size_of::<usize>(),
+                size_of::<super::evaluation_copies::RetainedEvaluationMemory>()
+                    + 2 * size_of::<usize>(),
             )
             .map_err(|_| stopped(self))?;
         let Some(memory) = scope.retain_data_memory(self) else {

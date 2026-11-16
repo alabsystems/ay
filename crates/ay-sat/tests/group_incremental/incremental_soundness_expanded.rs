@@ -202,7 +202,7 @@ fn test_push_pop_with_lrat_proof_emission() {
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof_text = String::from_utf8(writer.into_vec().expect("flush")).expect("UTF-8");
     // LRAT output should have at least some steps.
-    assert!(!proof_text.is_empty(), "LRAT proof should be non-empty");
+    assert_ne!(proof_text.len(), 0, "LRAT proof should be non-empty");
 }
 
 // ---------------------------------------------------------------------------

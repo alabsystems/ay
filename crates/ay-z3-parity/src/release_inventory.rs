@@ -36,10 +36,10 @@ pub(crate) fn run(args: &[String]) -> i32 {
 
 fn execute(args: &[String]) -> Result<()> {
     let mut flags = BTreeMap::new();
-    if args.len() % 2 != 0 {
+    let (pairs, []) = args.as_chunks::<2>() else {
         return Err("requires --repo-root PATH --release PATH --output PATH".into());
-    }
-    for pair in args.chunks_exact(2) {
+    };
+    for pair in pairs {
         if !["--repo-root", "--release", "--output"].contains(&pair[0].as_str())
             || flags.insert(pair[0].as_str(), pair[1].as_str()).is_some()
         {
@@ -102,7 +102,7 @@ fn text(path: &Path) -> Result<String> {
 fn digest(path: &Path) -> Result<String> {
     let mut file = File::open(path).map_err(err)?;
     let mut h = Sha256::new();
-    let mut block = [0; 65536];
+    let mut block = vec![0u8; 65_536].into_boxed_slice();
     loop {
         let n = file.read(&mut block).map_err(err)?;
         if n == 0 {
@@ -135,10 +135,10 @@ impl Process {
         #[cfg(target_os = "macos")]
         {
             use ay_sys::supervisor::{observe_child_unreaped, UnreapedChildState};
-            return Ok(matches!(
+            Ok(matches!(
                 observe_child_unreaped(child, false)?,
                 UnreapedChildState::Exited
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
         {
@@ -311,7 +311,7 @@ fn query(
                 rlim_cur: OUTPUT_LIMIT,
                 rlim_max: OUTPUT_LIMIT,
             };
-            if libc::setrlimit(libc::RLIMIT_FSIZE, &bound) != 0 {
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &raw const bound) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -704,8 +704,8 @@ fn module_parameters(output: &str) -> Result<Map> {
                 || name.chars().any(char::is_whitespace)
                 || kind.is_empty()
                 || kind.contains('(')
-                || (!suffix.is_empty()
-                    && !(suffix.starts_with(" (default: ") && suffix.ends_with(')')))
+                || !(suffix.is_empty()
+                    || suffix.starts_with(" (default: ") && suffix.ends_with(')'))
             {
                 return Err("malformed module parameter/default".into());
             }

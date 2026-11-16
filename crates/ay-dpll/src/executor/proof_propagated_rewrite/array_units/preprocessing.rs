@@ -33,7 +33,7 @@ impl Executor {
         let Some(count) = stored.len().checked_add(units.len()) else {
             return false;
         };
-        let Some(bytes) = count.checked_mul(std::mem::size_of::<ArrayUnitDerivation>()) else {
+        let Some(bytes) = count.checked_mul(size_of::<ArrayUnitDerivation>()) else {
             return false;
         };
         if count > MAX_STORED_PROPAGATION_RECORDS

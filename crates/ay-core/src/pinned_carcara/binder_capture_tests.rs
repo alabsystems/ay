@@ -27,10 +27,14 @@ fn binders_that_rebind_a_definition_name_are_flagged() {
                    (assert (! (> x 0) :named |lbl|))\n";
     let flagged = |proof: &str| misread_pairs(problem, proof);
     // Uses of definitions and a parameter of the definition's own are fine.
-    assert!(
-        flagged("(assume t0 (> x 0))\n(step t1 (cl (= (f x) (+ x c))) :rule refl)\n").is_empty()
+    assert_eq!(
+        flagged("(assume t0 (> x 0))\n(step t1 (cl (= (f x) (+ x c))) :rule refl)\n"),
+        Vec::<(String, String)>::new()
     );
-    assert!(flagged("(step t1 (cl (forall ((z Int)) (= (f z) z))) :rule hole)\n").is_empty());
+    assert_eq!(
+        flagged("(step t1 (cl (forall ((z Int)) (= (f z) z))) :rule hole)\n"),
+        Vec::<(String, String)>::new()
+    );
     for (proof, name) in [
         ("(step t1 (cl (forall ((c Int)) (= c 0))) :rule hole)", "c"),
         (
@@ -76,11 +80,13 @@ fn binders_that_rebind_a_definition_name_are_flagged() {
         pairs(&[("c", "c")])
     );
     // Comments, strings and quoted symbols are not code.
-    assert!(flagged(
-        "; (forall ((c Int)) true)\n\
-         (step t1 (cl (= |(forall ((c Int)) true)| \"(let ((c 1)) c)\")) :rule hole)\n"
-    )
-    .is_empty());
+    assert_eq!(
+        flagged(
+            "; (forall ((c Int)) true)\n\
+             (step t1 (cl (= |(forall ((c Int)) true)| \"(let ((c 1)) c)\")) :rule hole)\n"
+        ),
+        Vec::<(String, String)>::new()
+    );
 }
 
 /// The three measured capture shapes (the first in every mode, the other two
@@ -186,7 +192,7 @@ fn a_deeply_nested_document_is_scanned_without_recursion() {
     assert_eq!(misread_pairs(&problem, ""), pairs(&[("y", "n")]));
     let body = format!("{}y{}", "(not ".repeat(depth), ")".repeat(depth));
     let problem = format!("(declare-const y Bool)\n(assert (! {body} :named n))\n");
-    assert!(misread_pairs(&problem, "").is_empty());
+    assert_eq!(misread_pairs(&problem, ""), Vec::<(String, String)>::new());
     // Unbalanced input does not panic.
     assert!(misread_pairs("(assert (! (= y 0) :named n)\n(forall ((y Int)) n", "").len() <= 1);
 }

@@ -268,6 +268,7 @@ impl NodeLinks<'_> {
 /// Fold `surface` under ids extending `id`: the folded text, the steps, and
 /// whether a structural rewrite fired. `None` when the fold is over a bound or
 /// changes nothing.
+#[cfg(test)]
 pub(super) fn fold_surface(
     surface: &str,
     id: &str,

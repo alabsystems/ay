@@ -199,7 +199,7 @@ fn whole_term_preflight_checks_arithmetic_before_any_repair_or_interning() {
     let mut values = original.clone();
     values.push(valid);
     let before = serde_json::to_vec(&values).expect("source snapshot serialization");
-    crate::bundle::preflight_term::validate_term_snapshot_with_progress(&values, &mut |_, _| true)
+    preflight_term::validate_term_snapshot_with_progress(&values, &mut |_, _| true)
         .expect("valid native source shape");
     assert_eq!(serde_json::to_vec(&values).expect("same snapshot"), before);
     for data in [
@@ -211,10 +211,7 @@ fn whole_term_preflight_checks_arithmetic_before_any_repair_or_interning() {
         malformed.push((data, Sort::FloatingPoint(8, 24)));
         let captured = serde_json::to_vec(&malformed).expect("negative snapshot");
         assert!(matches!(
-            crate::bundle::preflight_term::validate_term_snapshot_with_progress(
-                &malformed,
-                &mut |_, _| true
-            ),
+            preflight_term::validate_term_snapshot_with_progress(&malformed, &mut |_, _| true),
             Err(ProofCheckError::MalformedProofBundle { .. })
         ));
         assert_eq!(

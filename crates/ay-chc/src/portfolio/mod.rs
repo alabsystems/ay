@@ -122,9 +122,6 @@ pub struct PortfolioSolver {
     /// Deterministic parallel-worker limit used only by scheduler unit tests.
     #[cfg(test)]
     parallel_worker_limit_override: Option<usize>,
-    /// Lane memory shares used only by scheduler unit tests.
-    #[cfg(test)]
-    engine_memory_limits_override: Option<engine_memory::LaneMemoryLimits>,
 }
 
 impl Drop for PortfolioSolver {
@@ -372,13 +369,13 @@ impl PortfolioSolver {
     /// internal validation (validate_model_with_algebraic_fallback) which
     /// checks body AND NOT(head) is UNSAT for every clause -- a complete
     /// inductive invariant check. This is strictly stronger than portfolio-level
-    /// validate_safe_query_only() (which only checks query clauses) and
+    /// validate_safe_query_only_pre_translated() (which only checks query clauses) and
     /// equivalent to validate_safe() (which uses PDR's verify_model).
     ///
     /// Portfolio-level validate_safe() is intentionally NOT added here:
     /// 1. PDR's verify_model_with_budget may reject valid NIA invariants
     ///    (e.g., sum <= n*n) where SMT returns Unknown within 1.5s budget.
-    /// 2. validate_safe_query_only() creates a PdrSolver instance which
+    /// 2. The query-only pre-check creates a PdrSolver instance which
     ///    can be expensive for the NIA problems algebraic synthesis targets.
     /// 3. The algebraic validator handles NIA incompleteness via concrete
     ///    evaluation fallback (#7688), which PDR's verifier does not.
@@ -495,8 +492,6 @@ impl PortfolioSolver {
                 sequential_test_publish_delay: None,
                 #[cfg(test)]
                 parallel_worker_limit_override: None,
-                #[cfg(test)]
-                engine_memory_limits_override: None,
             }
         }
     }
@@ -555,8 +550,6 @@ impl PortfolioSolver {
             sequential_test_publish_delay: None,
             #[cfg(test)]
             parallel_worker_limit_override: None,
-            #[cfg(test)]
-            engine_memory_limits_override: None,
         }
     }
 
@@ -661,12 +654,6 @@ impl PortfolioSolver {
     #[cfg(test)]
     fn with_parallel_worker_limit(mut self, limit: usize) -> Self {
         self.parallel_worker_limit_override = Some(limit.max(1));
-        self
-    }
-
-    #[cfg(test)]
-    fn with_engine_memory_limits(mut self, soft: usize, hard: usize) -> Self {
-        self.engine_memory_limits_override = Some(engine_memory::LaneMemoryLimits { soft, hard });
         self
     }
 

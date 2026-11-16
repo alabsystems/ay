@@ -52,7 +52,7 @@ fn run(shape: Shape) -> ay_dpll::api::SolveDetails {
         solver.set_counterexample_style(CounterexampleStyle::Readable);
         solver.set_produce_proofs(true);
         solver.set_produce_unsat_cores(true);
-        solver.set_timeout(Some(Duration::from_millis(30_000)));
+        solver.set_timeout(Some(Duration::from_secs(30)));
     }
 
     let dt_name = "(u32, u32)";

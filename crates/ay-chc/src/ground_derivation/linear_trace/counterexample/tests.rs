@@ -50,11 +50,14 @@ fn bitvector_problem(width: u32, value: &SmtValue) -> ChcProblem {
 }
 
 fn confirmed_run(problem: &ChcProblem, candidate: Counterexample) -> ChcPdrProofRun {
-    let mut config = PdrConfig::default();
-    config.preserve_original_clauses = true;
-    config.disable_array_scalarization = true;
-    config.disable_cex_replay = true;
-    config.strict_proofs = true;
+    let base = PdrConfig::default();
+    let config = PdrConfig {
+        preserve_original_clauses: true,
+        disable_array_scalarization: true,
+        disable_cex_replay: true,
+        strict_proofs: true,
+        ..base
+    };
     let confirmed = PdrSolver::new(problem.clone(), config)
         .confirm_counterexample(candidate)
         .expect("the publication verifier confirms this original ground derivation");

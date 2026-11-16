@@ -205,32 +205,6 @@ fn power(args: &[ModelValue]) -> Result<ModelValue, String> {
     }
 }
 
-#[cfg(test)]
-mod power_tests {
-    use super::*;
-
-    #[test]
-    fn sequence_power_uses_argument_values_and_refuses_huge_witnesses() {
-        let unicode = ModelValue::Str("λ🦀".to_string());
-        let three = ModelValue::Int(BigInt::from(3));
-        assert!(matches!(eval("seq.power", &[unicode, three.clone()]),
-            Ok(ModelValue::Str(value)) if value == "λ🦀λ🦀λ🦀"));
-        let sequence = ModelValue::Seq(vec![ModelValue::Int(BigInt::from(7))]);
-        assert!(matches!(eval("seq.power", &[sequence.clone(), three]),
-            Ok(ModelValue::Seq(value)) if value.len() == 3));
-        assert!(
-            matches!(eval("seq.power", &[sequence.clone(), ModelValue::Int(BigInt::from(-1))]),
-            Ok(ModelValue::Seq(value)) if value.is_empty())
-        );
-        let huge = ModelValue::Int(BigInt::from(1u32) << 100usize);
-        assert!(eval("seq.power", &[sequence, huge.clone()]).is_err());
-        assert!(
-            matches!(eval("seq.power", &[ModelValue::Str(String::new()), huge]),
-            Ok(ModelValue::Str(value)) if value.is_empty())
-        );
-    }
-}
-
 // --- core string-like algorithms on element slices ------------------------
 
 /// Does `sub` occur in `s` starting exactly at `s[at..]`?
@@ -424,4 +398,30 @@ fn nonneg_offset(offset: &BigInt, len: usize) -> Option<usize> {
         return None;
     }
     offset.to_usize().filter(|&o| o <= len)
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+
+    #[test]
+    fn sequence_power_uses_argument_values_and_refuses_huge_witnesses() {
+        let unicode = ModelValue::Str("λ🦀".to_string());
+        let three = ModelValue::Int(BigInt::from(3));
+        assert!(matches!(eval("seq.power", &[unicode, three.clone()]),
+            Ok(ModelValue::Str(value)) if value == "λ🦀λ🦀λ🦀"));
+        let sequence = ModelValue::Seq(vec![ModelValue::Int(BigInt::from(7))]);
+        assert!(matches!(eval("seq.power", &[sequence.clone(), three]),
+            Ok(ModelValue::Seq(value)) if value.len() == 3));
+        assert!(
+            matches!(eval("seq.power", &[sequence.clone(), ModelValue::Int(BigInt::from(-1))]),
+            Ok(ModelValue::Seq(value)) if value.is_empty())
+        );
+        let huge = ModelValue::Int(BigInt::from(1u32) << 100usize);
+        assert!(eval("seq.power", &[sequence, huge.clone()]).is_err());
+        assert!(
+            matches!(eval("seq.power", &[ModelValue::Str(String::new()), huge]),
+            Ok(ModelValue::Str(value)) if value.is_empty())
+        );
+    }
 }

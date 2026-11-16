@@ -1227,7 +1227,7 @@ fn random_seed_survives_a_derived_query_executor() {
         assert_eq!(derived.last_applied_sat_random_seed_for_test(), Some(73));
         if option {
             // The standalone proof checker receives only the source context.
-            let mut context_only = crate::Executor::new();
+            let mut context_only = Executor::new();
             context_only.ctx = solver.executor.ctx.clone();
             assert_eq!(context_only.current_random_seed(), 73);
         }

@@ -83,13 +83,13 @@ fn legacy_v1_and_v2_json_and_identity_bytes_remain_literal_golden_compatible() {
             )
         );
         let (parsed, reasons) = parse(&v2.to_json_value());
-        assert!(reasons.is_empty());
+        assert_eq!(reasons, [] as [std::string::String; 0]);
         assert_eq!(parsed.unwrap(), v2);
         assert!(v2.is_current_bundle_commitment());
         assert!(!v2.is_retained_bundle_commitment());
     }
     let (parsed, reasons) = parse(&v1.to_json_value());
-    assert!(reasons.is_empty());
+    assert_eq!(reasons, [] as [std::string::String; 0]);
     assert_eq!(parsed.unwrap(), v1);
 }
 
@@ -133,7 +133,7 @@ fn retained_v3_roundtrip_binds_exact_checker_v4_and_optional_diagnostic_identity
             )
         );
         let (parsed, reasons) = parse(&value);
-        assert!(reasons.is_empty());
+        assert_eq!(reasons, [] as [std::string::String; 0]);
         assert_eq!(parsed.unwrap(), cert);
         assert!(cert.is_current_bundle_commitment());
         assert!(cert.is_retained_bundle_commitment());
@@ -183,7 +183,7 @@ fn all_schema_version_checker_bundle_crossings_refuse_without_any_legacy_fallbac
                         && schema_index == bundle_index;
                     if matches {
                         let (parsed, reasons) = parse(&value);
-                        assert!(reasons.is_empty());
+                        assert_eq!(reasons, [] as [std::string::String; 0]);
                         let cert = parsed.unwrap();
                         assert_eq!(cert.is_current_bundle_commitment(), schema_index != 0);
                         assert_eq!(cert.is_retained_bundle_commitment(), schema_index == 2);
@@ -255,7 +255,7 @@ fn malformed_required_or_optional_digests_refuse_but_absent_alethe_stays_diagnos
     let mut diagnostic_null = valid.clone();
     diagnostic_null["alethe_sha256"] = serde_json::Value::Null;
     let (parsed, reasons) = parse(&diagnostic_null);
-    assert!(reasons.is_empty());
+    assert_eq!(reasons, [] as [std::string::String; 0]);
     assert_eq!(parsed.unwrap(), retained(None));
 }
 

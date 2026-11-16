@@ -18,6 +18,54 @@ fn eq(terms: &mut TermStore, a: TermId, b: TermId) -> TermId {
 }
 
 #[test]
+fn arithmetic_custody_bv_paths_refuse_declared_equality_and_keep_numeric_ufs_opaque() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(8));
+    let zero = terms.mk_bitvec(0.into(), 8);
+    let sum = terms.mk_app_structural(Symbol::named("bvadd"), [x, zero], Sort::bitvec(8));
+    let identity = terms.mk_app_structural(Symbol::named("="), [sum, x], Sort::Bool);
+    assert!(crate::recognize_arith_clause_tautology(&terms, &[identity]));
+    terms.register_declared_function("bvadd");
+    assert!(!crate::recognize_arith_clause_tautology(
+        &terms,
+        &[identity]
+    ));
+    let difference = terms.mk_app_structural(Symbol::named("bvsub"), [sum, sum], Sort::bitvec(8));
+    let opaque_identity =
+        terms.mk_app_structural(Symbol::named("="), [difference, zero], Sort::Bool);
+    assert!(crate::recognize_arith_clause_tautology(
+        &terms,
+        &[opaque_identity]
+    ));
+    assert!(check_native(&terms, &[opaque_identity], &mut |_, _| true).unwrap());
+    terms.register_declared_function("=");
+    assert!(!crate::recognize_arith_clause_tautology(
+        &terms,
+        &[opaque_identity]
+    ));
+    assert!(!check_native(&terms, &[opaque_identity], &mut |_, _| true).unwrap());
+}
+
+#[test]
+fn arithmetic_custody_bv_complement_refuses_a_declared_xor() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(8));
+    let zero = terms.mk_bitvec(0.into(), 8);
+    let one = terms.mk_bitvec(1.into(), 8);
+    let ones = terms.mk_bitvec(255.into(), 8);
+    let complement = terms.mk_app_structural(Symbol::named("bvxor"), [x, ones], Sort::bitvec(8));
+    let pair = terms.mk_app_structural(Symbol::named("bvadd"), [x, complement], Sort::bitvec(8));
+    let sum = terms.mk_app_structural(Symbol::named("bvadd"), [pair, one], Sort::bitvec(8));
+    let identity = terms.mk_app_structural(Symbol::named("="), [sum, zero], Sort::Bool);
+    assert!(crate::recognize_arith_clause_tautology(&terms, &[identity]));
+    terms.register_declared_function("bvxor");
+    assert!(!crate::recognize_arith_clause_tautology(
+        &terms,
+        &[identity]
+    ));
+}
+
+#[test]
 fn modular_subtractor_exports_checked_original_equalities() {
     for width in [1, 9, 32, 64, 128] {
         let mut terms = TermStore::new();

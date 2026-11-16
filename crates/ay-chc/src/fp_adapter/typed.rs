@@ -162,7 +162,7 @@ fn application(
         return Ok(CostClass::Other);
     }
     if sort == &Sort::Bool {
-        return boolean(terms, symbol.name(), args).map(|_| CostClass::Other);
+        return boolean(terms, symbol.name(), args).map(|()| CostClass::Other);
     }
     if rounding_sort(sort)
         && args.is_empty()

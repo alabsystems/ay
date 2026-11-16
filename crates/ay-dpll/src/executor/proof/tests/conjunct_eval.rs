@@ -27,7 +27,7 @@ fn solve(script: &str) -> Executor {
 /// The parsed surface of one term.
 fn parse_term(text: &str) -> ay_frontend::command::Term {
     let commands = parse(&format!("(assert {text})")).expect("term parses");
-    let [ay_frontend::Command::Assert(term)] = commands.as_slice() else {
+    let [Command::Assert(term)] = commands.as_slice() else {
         panic!("one assert");
     };
     term.clone()

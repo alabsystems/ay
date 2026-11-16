@@ -39,7 +39,10 @@ pub(super) enum IncrementalFpPhase {
     Provenance,
     TrialTaken,
     Tseitin,
+    #[cfg(test)]
     Construction(FpBuildProgress),
+    #[cfg(not(test))]
+    Construction,
     BoolRepair,
     Namespace,
     SatAllocation,
@@ -55,6 +58,20 @@ pub(super) enum IncrementalFpPhase {
     ModelExtracted,
     Publication,
     Commit,
+}
+
+impl IncrementalFpPhase {
+    fn construction(progress: FpBuildProgress) -> Self {
+        #[cfg(test)]
+        {
+            Self::Construction(progress)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = progress;
+            Self::Construction
+        }
+    }
 }
 
 pub(super) fn checkpoint(

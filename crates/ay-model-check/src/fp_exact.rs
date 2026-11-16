@@ -458,12 +458,12 @@ pub(crate) fn ieee_work(value: &ModelValue) -> Result<(u32, usize), String> {
     } else if !v.exponent.zero() {
         u64::from(v.sb - 1)
             + match v.exponent {
-                Field::Native(n) => u64::from(u128::BITS - n.leading_zeros()),
+                Field::Native(n) => u64::from(n.bit_width()),
                 Field::Big(n) => n.bits(),
             }
     } else {
         match v.fraction {
-            Field::Native(n) => u64::from(u128::BITS - n.leading_zeros()),
+            Field::Native(n) => u64::from(n.bit_width()),
             Field::Big(n) => n.bits(),
         }
     };
@@ -554,7 +554,7 @@ pub(crate) fn real_plan(value: &ModelValue) -> Result<RealPlan<'_>, String> {
                 u64::from(reduced_stored) + 1
             } else {
                 match value.fraction {
-                    Field::Native(n) => u64::from(u128::BITS - n.leading_zeros()),
+                    Field::Native(n) => u64::from(n.bit_width()),
                     Field::Big(n) => n.bits(),
                 }
                 .checked_sub(trailing)
@@ -582,7 +582,7 @@ pub(crate) fn real_plan(value: &ModelValue) -> Result<RealPlan<'_>, String> {
     // conservatively even after transient allocations have been released.
     let storage = usize::try_from(bits.div_ceil(64))
         .ok()
-        .and_then(|n| n.checked_mul(4 * std::mem::size_of::<u64>()))
+        .and_then(|n| n.checked_mul(4 * size_of::<u64>()))
         .and_then(|n| n.checked_add(256))
         .ok_or("FP real storage overflow")?;
     Ok(RealPlan {
@@ -677,7 +677,7 @@ fn round_increment(
     sticky: bool,
     odd: bool,
 ) -> bool {
-    use crate::fp::RoundingMode::*;
+    use crate::fp::RoundingMode::{Rna, Rne, Rtn, Rtp, Rtz};
     match rm {
         Rtz => false,
         Rtp => !negative && (guard || sticky),

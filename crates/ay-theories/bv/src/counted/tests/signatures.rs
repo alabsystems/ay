@@ -15,7 +15,7 @@ fn ill_typed_dead_arms_refuse_before_creating_any_gate() {
     let mut encoder = CountedBvEncoder::new(&terms, &original).unwrap();
     assert!(encoder.encode_terms(&[root]).is_err());
     assert_eq!(encoder.solver.next_var, 1);
-    assert!(encoder.solver.clauses.is_empty());
+    assert_eq!(encoder.solver.clauses.as_slice(), &[] as &[CnfClause]);
     assert!(original.check().is_err());
 }
 
@@ -103,7 +103,7 @@ fn malformed_snapshot_constants_and_forward_cycles_are_not_opaque_sources() {
         let mut encoder = CountedBvEncoder::new(&terms, &original).unwrap();
         assert!(encoder.encode_terms(&[TermId::new(0)]).is_err());
         assert_eq!(encoder.solver.next_var, 1);
-        assert!(encoder.solver.clauses.is_empty());
+        assert_eq!(encoder.solver.clauses.as_slice(), &[] as &[CnfClause]);
         assert!(original.check().is_err());
     }
 }

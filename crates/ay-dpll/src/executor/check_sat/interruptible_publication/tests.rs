@@ -138,9 +138,10 @@ fn background_callback_panic_interrupts_while_operation_is_active() {
     let result = executor.with_interruptible_publication_controls(
         move || {
             owner.touch();
-            if samples.fetch_add(1, Ordering::SeqCst) > 0 {
-                panic!("background callback panic");
-            }
+            assert!(
+                samples.fetch_add(1, Ordering::SeqCst) == 0,
+                "background callback panic"
+            );
             false
         },
         |active| {

@@ -33,8 +33,13 @@ impl Executor {
     /// entered on this thread for its extent: its stop polls read that node
     /// (`stop.rs`), and a check-sat a pass runs is a `Full` child of it, so
     /// it obeys the certification envelope and the cancels above it and not
-    /// the search's deadline.
+    /// the search's deadline. The search work units this thread spends inside
+    /// it, nested solves included, are added to
+    /// `assembly_observations::thread_assembly_units` when the outermost
+    /// assembly open on this thread ends, once however deeply assemblies
+    /// nest.
     pub(in crate::executor) fn build_unsat_proof(&mut self) {
+        let _assembly_units = assembly_observations::enter_assembly_units();
         let certify = self.proof_assembly_certify_node();
         let _in_certify = certify.enter();
         // Every strict decision of the build shares one memo of the

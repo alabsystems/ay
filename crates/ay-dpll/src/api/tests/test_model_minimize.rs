@@ -395,7 +395,7 @@ fn test_infer_relevant_vars_returns_user_declared() {
 fn test_infer_relevant_vars_empty_solver() {
     let solver = Solver::new(Logic::QfBv);
     let relevant = solver.infer_relevant_vars();
-    assert!(relevant.is_empty());
+    assert_eq!(relevant, [] as [String; 0]);
 }
 
 // ---------------------------------------------------------------------------

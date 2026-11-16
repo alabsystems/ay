@@ -38,11 +38,11 @@ fn fixture(negate: [bool; 2]) -> Fixture {
     assert_eq!(operands.len(), 3);
     let mut clause = operands.clone();
     clause.push(terms.mk_not_raw(source));
-    let spell = |name, negate| {
+    let spell = |name: &str, negate| {
         if negate {
             format!("(not {name})")
         } else {
-            format!("{name}")
+            name.to_string()
         }
     };
     let surface = format!(

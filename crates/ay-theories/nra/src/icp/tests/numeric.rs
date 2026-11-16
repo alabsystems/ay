@@ -149,25 +149,40 @@ fn interval_scale_points_reach_where_the_fixed_alphabet_cannot(
     assert_eq!(w.len(), GRID_MIN_BRANCH);
     assert!(w.iter().all(|p| interval_contains(&wide, p)));
     // Unbounded on either side: no scale exists, so no points, never a panic.
-    assert!(interval_scale_points(
-        &Interval {
-            lo: Endpoint::Finite(rat(0), false),
-            hi: Endpoint::PosInf
-        },
-        GRID_MIN_BRANCH
-    )
-    .is_empty());
-    assert!(interval_scale_points(&Interval::whole(), GRID_MIN_BRANCH).is_empty());
+    assert_eq!(
+        interval_scale_points(
+            &Interval {
+                lo: Endpoint::Finite(rat(0), false),
+                hi: Endpoint::PosInf
+            },
+            GRID_MIN_BRANCH
+        )
+        .as_slice(),
+        &[] as &[BigRational]
+    );
+    assert_eq!(
+        interval_scale_points(&Interval::whole(), GRID_MIN_BRANCH).as_slice(),
+        &[] as &[BigRational]
+    );
     // Degenerate and empty requests decline.
-    assert!(interval_scale_points(&iv(rat(1), rat(1)), GRID_MIN_BRANCH).is_empty());
-    assert!(interval_scale_points(&wide, 0).is_empty());
+    assert_eq!(
+        interval_scale_points(&iv(rat(1), rat(1)), GRID_MIN_BRANCH).as_slice(),
+        &[] as &[BigRational]
+    );
+    assert_eq!(
+        interval_scale_points(&wide, 0).as_slice(),
+        &[] as &[BigRational]
+    );
     // Narrower than the scale cap: declines instead of building a
     // 2^GRID_SCALE_MAX_BITS-denominator candidate nobody can evaluate cheaply.
     let hair = iv(
         BigRational::new(BigInt::one(), BigInt::one() << 80u32),
         BigRational::new(BigInt::from(3), BigInt::one() << 80u32),
     );
-    assert!(interval_scale_points(&hair, GRID_MIN_BRANCH).is_empty());
+    assert_eq!(
+        interval_scale_points(&hair, GRID_MIN_BRANCH).as_slice(),
+        &[] as &[BigRational]
+    );
     Ok(())
 }
 

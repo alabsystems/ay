@@ -273,10 +273,7 @@ fn bv_reconstruct_boundaries_exact_surface_and_pinned_refusal() {
 
 #[test]
 fn bv_reconstruct_node_depth_precharge_stop_and_one_aggregate_bound() {
-    assert!(
-        std::mem::size_of::<Visit>() * (MAX_DEPTH as usize + 1) + std::mem::size_of::<Inspector>()
-            < BYTES
-    );
+    assert!(size_of::<Visit>() * (MAX_DEPTH as usize + 1) + size_of::<Inspector<'_, '_>>() < BYTES);
     let mut t = TermStore::new();
     let x = t.mk_var("x", Sort::bitvec(8));
     let mut deep = x;
@@ -404,7 +401,7 @@ fn bv_reconstruct_wire_visible_node_and_depth_limits_survive_consumer_parsing() 
         assert_eq!(meter.holds(&[source]).unwrap_or(false), expected);
         assert_eq!(meter.nodes, if expected { 2048 } else { 2049 });
         if let Ok(dir) = std::env::var("AY_BV_RECONSTRUCT_ARTIFACT_DIR") {
-            std::fs::write(std::path::Path::new(&dir).join(format!("{name}-inspection.json")),serde_json::to_vec_pretty(&serde_json::json!({"actual_visits":meter.nodes,"metered_units":WORK-meter.remaining,"prepaid_work":WORK,"prepaid_bytes":BYTES,"fixed_stack_slots":MAX_DEPTH as usize+1,"fixed_stack_bytes":std::mem::size_of::<Visit>()*(MAX_DEPTH as usize+1),"max_depth":MAX_DEPTH,"no_private_heap_by_construction":true,"accepted":expected})).unwrap()).unwrap();
+            std::fs::write(std::path::Path::new(&dir).join(format!("{name}-inspection.json")),serde_json::to_vec_pretty(&serde_json::json!({"actual_visits":meter.nodes,"metered_units":WORK-meter.remaining,"prepaid_work":WORK,"prepaid_bytes":BYTES,"fixed_stack_slots":MAX_DEPTH as usize+1,"fixed_stack_bytes":size_of::<Visit>()*(MAX_DEPTH as usize+1),"max_depth":MAX_DEPTH,"no_private_heap_by_construction":true,"accepted":expected})).unwrap()).unwrap();
         }
         if expected {
             check_and_export(&mut t, source, 8, name);

@@ -181,7 +181,7 @@ fn test_incremental_view_rebuild_mid_scope_then_pop() {
     trail.truncate(mark);
     cache.on_pop();
     assert_view_matches_build(&cache, &terms, &trail);
-    assert!(cache.view().equality_key.is_empty());
+    assert_eq!(cache.view().equality_key.as_slice(), &[] as &[TermId]);
     let x_bounds = cache.view().bounds_by_term.get(&x).expect("x bounds");
     assert_eq!(x_bounds.lower, Some(BigInt::one()));
     assert_eq!(x_bounds.upper, None);

@@ -68,7 +68,7 @@ impl<'a> SatProofManager<'a> {
     /// Whether the replay must stop before trace entry `entry_index`: the stop
     /// predicate is consulted once per [`STOP_POLL_STRIDE`] entries.
     pub(super) fn stop_requested_at(&self, entry_index: usize) -> bool {
-        entry_index % STOP_POLL_STRIDE == 0 && self.should_stop.is_some_and(|stop| stop())
+        entry_index.is_multiple_of(STOP_POLL_STRIDE) && self.should_stop.is_some_and(|stop| stop())
     }
 
     /// Validate and install solver-minted active-scope premises.

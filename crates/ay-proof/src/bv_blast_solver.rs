@@ -1931,7 +1931,7 @@ fn reserve_bv_expr_construction(
     vars: &mut VarTable,
     bit_lemmas: &mut Vec<BitLemma>,
     clauses: &mut Vec<Clause>,
-    blaster: &mut ExprBlaster,
+    blaster: &mut ExprBlaster<'_>,
     limits: &BvExprProofLimits,
     preflight: BvExprPreflight,
 ) -> Result<(), BvExprExportError> {

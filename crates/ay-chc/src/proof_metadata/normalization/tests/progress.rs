@@ -146,6 +146,10 @@ fn nested_unused_declaration_sorts_are_cancellable_before_clauses() {
 #[test]
 fn repeated_shared_expression_edges_each_reach_a_poll() {
     let mut problem = ChcProblem::new();
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the progress fixture intentionally shares one immutable leaf so every edge reaches the poll"
+    )]
     push_raw(
         &mut problem,
         HornClause::query(ClauseBody::constraint(ChcExpr::FuncApp(

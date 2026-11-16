@@ -102,7 +102,7 @@ fn reason_memo(expr: &ChcExpr, memo: &mut ReasonMemo) -> Option<&'static str> {
     if crate::expr::dag::children(expr).is_empty() && !matches!(expr, ChcExpr::ArrayLambda(_)) {
         return reason_node(expr, &mut |_| None);
     }
-    let key = expr as *const ChcExpr;
+    let key = std::ptr::from_ref::<ChcExpr>(expr);
     if let Some(known) = memo.get(&key) {
         return *known;
     }

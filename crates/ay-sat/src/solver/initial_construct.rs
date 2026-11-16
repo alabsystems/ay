@@ -127,7 +127,7 @@ fn preflight(input: &CountedInitialCnf, owner: &CountedAdmission) -> Result<()> 
         };
         if clause
             .normalized()
-            .is_some_and(|lits| lits.len() > super::clause_add::OVERSIZED_CLAUSE_SPLIT_THRESHOLD)
+            .is_some_and(|lits| lits.len() > clause_add::OVERSIZED_CLAUSE_SPLIT_THRESHOLD)
         {
             // Do not truncate, poison, skip, or grow a new namespace for free.
             return Err(invalid(

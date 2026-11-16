@@ -122,7 +122,7 @@ impl Shape<'_, '_> {
         work: &mut SharedGroundWork,
     ) -> Option<Option<usize>> {
         work.spend(1)?;
-        if (self.stop)() || depth > super::goal::MAX_GOAL_DEPTH {
+        if (self.stop)() || depth > goal::MAX_GOAL_DEPTH {
             return None;
         }
         if self.terms.entry_stamp(term).is_none()

@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_bucket_queue_empty() {
         let mut bq = BucketQueue::new();
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
         assert_eq!(bq.pop(), None);
     }
 
@@ -269,10 +269,10 @@ mod tests {
         let mut bq = BucketQueue::new();
         bq.ensure_capacity(5);
         bq.push(Variable(3), 0);
-        assert!(!bq.is_empty());
+        assert_ne!(bq.len(), 0);
         assert_eq!(bq.len(), 1);
         assert_eq!(bq.pop(), Some(Variable(3)));
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
         assert_eq!(bq.pop(), None);
     }
 
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(bq.pop(), Some(Variable(1)));
         assert_eq!(bq.pop(), Some(Variable(2)));
         assert_eq!(bq.pop(), Some(Variable(0)));
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
     }
 
     #[test]
@@ -308,7 +308,7 @@ mod tests {
         let mut got = vec![v1.0, v2.0, v3.0];
         got.sort_unstable();
         assert_eq!(got, vec![0, 1, 2]);
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
         bq.push(Variable(2), 0); // duplicate -- should be no-op
         assert_eq!(bq.len(), 1);
         assert_eq!(bq.pop(), Some(Variable(2)));
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(bq.len(), 3);
 
         bq.clear();
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
         assert_eq!(bq.len(), 0);
         assert!(!bq.contains(Variable(0)));
         assert!(!bq.contains(Variable(1)));
@@ -530,6 +530,6 @@ mod tests {
         let v = bq.pop().unwrap();
         assert_eq!(v, Variable(1));
 
-        assert!(bq.is_empty());
+        assert_eq!(bq.len(), 0);
     }
 }

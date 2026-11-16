@@ -267,8 +267,7 @@ impl LraSolver {
                     // `combined_theory_mode`: LRA is one DPLL(T) callback
                     // inside a lane whose every published `sat` goes through
                     // `Executor::emit_sat_verdict`'s mandatory independent
-                    // model gate (`independent_model_gate_enabled()` is
-                    // `const … true`), which re-evaluates the AUTHORED
+                    // model gate, which re-evaluates the AUTHORED
                     // assertions. That evaluator DOES interpret these terms:
                     // Euclidean quotient/remainder for a non-zero divisor, and
                     // for a zero divisor an arbitrary-but-fixed value the model

@@ -75,6 +75,9 @@ fn retained_absolute_limits_cannot_be_replaced_by_mutating_caller_configuration(
     original.deadline = None;
     original.max_num_vars = 0;
     original.validation.max_work = u64::MAX;
+    assert!(original.deadline.is_none());
+    assert_eq!(original.max_num_vars, 0);
+    assert_eq!(original.validation.max_work, u64::MAX);
     assert_eq!(proof.limits.deadline, original_deadline);
     assert_eq!(proof.limits.max_num_vars, original_vars);
     proof

@@ -54,7 +54,9 @@ fn secs(d: Duration) -> f64 {
 #[test]
 fn depth_cap_is_at_least_the_predicted_cost_within_the_remaining_budget() {
     // Lane started 5 s ago in a 14 s soft budget: 9 s remain, half = 4.5 s.
-    let start = Instant::now() - Duration::from_secs(5);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("fixture instant supports a five-second offset");
     let solver = probe_solver(
         start,
         Duration::from_secs(14),
@@ -110,7 +112,9 @@ fn depth_cap_is_at_least_the_predicted_cost_within_the_remaining_budget() {
 /// depth 2 stretched to 20.9 s of wall, 21.5 s in.
 #[test]
 fn an_unaffordable_depth_leaves_the_fresh_fallback_half_the_remainder() {
-    let start = Instant::now() - Duration::from_millis(21_500);
+    let start = Instant::now()
+        .checked_sub(Duration::from_millis(21_500))
+        .expect("fixture instant supports the elapsed probe window");
     let config = BmcConfig {
         time_budget: Some(Duration::from_secs(45)),
         ..BmcConfig::default()
@@ -141,7 +145,9 @@ fn an_unaffordable_depth_leaves_the_fresh_fallback_half_the_remainder() {
 
 #[test]
 fn depth_within_soft_budget_is_admitted_without_extending() {
-    let start = Instant::now() - Duration::from_secs(5);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("fixture instant supports a five-second offset");
     let solver = probe_solver(
         start,
         Duration::from_secs(14),
@@ -160,7 +166,9 @@ fn depth_within_soft_budget_is_admitted_without_extending() {
 fn soft_budget_reached_with_expensive_prediction_stops_the_lane() {
     // 13 s elapsed of 14 s soft; last depth 3 s -> predicted 6 s, which is
     // more than 10 % of the 50 s left on the solve: not converging enough.
-    let start = Instant::now() - Duration::from_secs(13);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(13))
+        .expect("fixture instant supports the elapsed soft budget");
     let solver = probe_solver(
         start,
         Duration::from_secs(14),
@@ -170,7 +178,9 @@ fn soft_budget_reached_with_expensive_prediction_stops_the_lane() {
     assert!(!solver.ts_probe_admit_next_depth(&start, Some(Duration::from_secs(3))));
     assert!(!solver.probe_extension_active.get());
     // With no decided depth at all there is nothing to predict from: stop.
-    let start = Instant::now() - Duration::from_secs(15);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(15))
+        .expect("fixture instant supports the elapsed soft budget");
     let solver = probe_solver(
         start,
         Duration::from_secs(14),
@@ -184,7 +194,9 @@ fn soft_budget_reached_with_expensive_prediction_stops_the_lane() {
 fn converging_lane_extends_to_the_hard_budget_and_leaves_cleanly() {
     // 13 s elapsed of 14 s soft; last depth 1 s -> predicted 2 s: fits the
     // hard budget (15 s left) and 10 % of a 50 s solve remainder (5 s).
-    let start = Instant::now() - Duration::from_secs(13);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(13))
+        .expect("fixture instant supports the elapsed soft budget");
     let solver = probe_solver(
         start,
         Duration::from_secs(14),
@@ -232,7 +244,9 @@ fn converging_lane_extends_to_the_hard_budget_and_leaves_cleanly() {
 
 #[test]
 fn without_a_soft_budget_the_policy_is_inert() {
-    let start = Instant::now() - Duration::from_secs(20);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(20))
+        .expect("fixture instant supports the elapsed solve budget");
     let solver = BmcSolver::new(
         tiny_problem(),
         BmcConfig {
@@ -258,7 +272,9 @@ fn without_a_soft_budget_the_policy_is_inert() {
 fn per_depth_deadline_follows_the_soft_budget_unless_extended() {
     let soft = Duration::from_secs(14);
     let hard = Duration::from_secs(28);
-    let start = Instant::now() - Duration::from_secs(13);
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(13))
+        .expect("fixture instant supports the elapsed soft budget");
     let mut solver = probe_solver(start, soft, hard, Duration::from_secs(50));
     solver.config.per_depth_timeout = Some(hard);
 
@@ -319,8 +335,11 @@ fn a_front_probe_shaped_solve_pins_the_soft_deadline_and_keeps_the_hard_one_asid
         panic!("a budgeted solve pins both probe deadlines");
     };
     assert_eq!(
-        hard_deadline - soft_deadline,
-        hard - soft,
+        hard_deadline
+            .checked_duration_since(soft_deadline)
+            .expect("hard deadline follows the soft deadline"),
+        hard.checked_sub(soft)
+            .expect("hard deadline follows soft deadline"),
         "both deadlines are measured from the same solve start"
     );
     assert!(!solver.probe_extension_active.get());

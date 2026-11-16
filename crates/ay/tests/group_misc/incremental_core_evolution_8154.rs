@@ -32,7 +32,7 @@ fn test_incremental_core_evolution_unit() {
 fn test_incremental_core_evolution_independent() {
     let evo =
         IncrementalCoreEvolution::new(vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]);
-    assert!(evo.persisted().is_empty());
+    assert_eq!(evo.persisted(), &[] as &[String]);
     assert!(evo.is_independent());
     assert!(!evo.is_unchanged());
     assert!((evo.persistence_ratio() - 0.0).abs() < f64::EPSILON);
@@ -43,8 +43,8 @@ fn test_incremental_core_evolution_unchanged() {
     let evo =
         IncrementalCoreEvolution::new(vec!["a".into(), "b".into()], vec!["a".into(), "b".into()]);
     assert_eq!(evo.persisted().len(), 2);
-    assert!(evo.entered().is_empty());
-    assert!(evo.exited().is_empty());
+    assert_eq!(evo.entered(), &[] as &[String]);
+    assert_eq!(evo.exited(), &[] as &[String]);
     assert!(!evo.is_independent());
     assert!(evo.is_unchanged());
     assert!((evo.persistence_ratio() - 1.0).abs() < f64::EPSILON);

@@ -307,7 +307,6 @@ impl ay_core::term::TermConstructionAdmission for EvaluationReadAdmission<'_> {
         bytes: usize,
     ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
         use ay_core::original_query::OriginalAdmissionError;
-        use ay_core::term::TermConstructionAdmission;
         if !validate(self.exec) {
             return Err(self.refuse(OriginalAdmissionError::ObserverStopped.into()));
         }
@@ -341,7 +340,6 @@ impl ay_core::term::TermConstructionAdmission for TemporaryReadAdmission<'_> {
         bytes: usize,
     ) -> Result<(), ay_core::original_query::CountedAdmissionError> {
         use ay_core::original_query::{CountedAdmissionError, OriginalAdmissionError};
-        use ay_core::term::TermConstructionAdmission;
         self.scope.owner.admission.admit(work, 0)?;
         if !validate(self.exec) {
             return Err(self.refuse(OriginalAdmissionError::ObserverStopped.into()));
@@ -423,9 +421,6 @@ impl EvaluationCopyScope {
         self.owner.admission.admit(1, 0).ok()?;
         validate(exec).then(|| self.owner.admission.retain_data_memory())
     }
-    pub(in crate::executor) fn admission(&self) -> &dyn ay_core::term::TermConstructionAdmission {
-        &self.owner.admission
-    }
     /// End the immutable producer read without releasing its paid values or
     /// original controls. Only the sole read may transition to growing terms.
     pub(in crate::executor) fn into_construction(
@@ -465,10 +460,7 @@ impl EvaluationCopyScope {
             let source = exec.ctx.source_context_stamp();
             let store = exec.ctx.terms.snapshot_stamp();
             let admission = PinAdmission::capture_current_read(exec)?;
-            admission.pay(
-                1,
-                std::mem::size_of::<Owner>() + 2 * std::mem::size_of::<usize>(),
-            )?;
+            admission.pay(1, size_of::<Owner>() + 2 * size_of::<usize>())?;
             if source != exec.ctx.source_context_stamp() || store != exec.ctx.terms.snapshot_stamp()
             {
                 return Err(admission.refuse_source());
@@ -655,7 +647,7 @@ pub(super) fn integer(value: &num_bigint::BigInt) -> bool {
     let Some(bytes) = usize::try_from(value.bits().div_ceil(64))
         .ok()
         .and_then(|limbs| limbs.checked_mul(8))
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<EvalValue>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<EvalValue>()))
     else {
         return pay_scalar_copy(usize::MAX, usize::MAX);
     };
@@ -670,8 +662,8 @@ pub(super) fn string(value: &str) -> bool {
     pay_scalar_copy(value.len(), value.len())
 }
 
-pub(super) fn copy_string(value: &String) -> Option<String> {
-    string(value).then(|| value.clone())
+pub(super) fn copy_string(value: &str) -> Option<String> {
+    string(value).then(|| value.to_owned())
 }
 
 pub(super) fn atom(value: &EvalValue) -> bool {
@@ -733,7 +725,7 @@ pub(super) fn model_value(value: &ay_model_check::ModelValue) -> bool {
 /// Admit vector growth BEFORE reserve/extend, including conservative doubling.
 pub(super) fn cells(count: usize) -> bool {
     count
-        .checked_mul(2 * std::mem::size_of::<EvalValue>())
+        .checked_mul(2 * size_of::<EvalValue>())
         .is_some_and(|bytes| pay(count, bytes))
 }
 
@@ -1305,7 +1297,7 @@ mod tests {
         let mut exec = Executor::new();
         let term = exec.ctx.terms.mk_bool(true);
         let _scope = EvaluationCopyScope::enter(&exec).unwrap();
-        exec.ctx.terms.mk_fresh_var("changed-source", Sort::Int);
+        let _ = exec.ctx.terms.mk_fresh_var("changed-source", Sort::Int);
         assert!(matches!(
             exec.evaluate_term(&Model::empty(), term),
             EvalValue::Unknown

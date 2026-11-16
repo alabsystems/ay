@@ -59,7 +59,7 @@ fn declaration_output_admits_the_whole_registry_before_allocating_text() {
         .unwrap();
     let mut output = Output::new(&exhausted);
     assert!(render(&source, &mut output, &exhausted).is_err());
-    assert!(output.finish().is_empty());
+    assert_eq!(output.finish(), "");
     assert!(exhausted.poll().is_none());
     let stopped = control(&token);
     token.cancel();
@@ -67,7 +67,7 @@ fn declaration_output_admits_the_whole_registry_before_allocating_text() {
     assert!(render(&source, &mut output, &stopped).is_err());
     token.reset();
     assert!(render(&source, &mut output, &stopped).is_err());
-    assert!(output.finish().is_empty());
+    assert_eq!(output.finish(), "");
     let fresh = control(&token);
     let mut output = Output::new(&fresh);
     render(&source, &mut output, &fresh).unwrap();

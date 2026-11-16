@@ -81,7 +81,7 @@ impl<'a> ExactQueryProofSource<'a> {
             .try_fold(0usize, |total, slice| total.checked_add(slice.len()));
         let count = count.ok_or(ProofCheckError::ResourceLimit)?;
         let bytes = count
-            .checked_mul(std::mem::size_of::<TermId>())
+            .checked_mul(size_of::<TermId>())
             .ok_or(ProofCheckError::ResourceLimit)?;
         charge(progress, count, bytes)?;
         let mut closure = Vec::new();

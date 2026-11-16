@@ -718,7 +718,7 @@ mod tests {
                     &TermData::Const(Constant::Bool(false))
                 );
             } else if defined {
-                assert!(!roots.is_empty());
+                assert_ne!(roots.as_slice(), &[] as &[Term]);
                 equivalent_under_fp_binding(solver.terms(), &originals, &roots, None);
             } else {
                 assert!(
@@ -811,7 +811,7 @@ mod tests {
                 .apply_tactic_to_goal(&Tactic::PropagateValues, &mut roots)
                 .unwrap();
             if ieee {
-                assert!(!roots.is_empty());
+                assert_ne!(roots.as_slice(), &[] as &[Term]);
                 assert!(roots
                     .iter()
                     .all(|term| solver.terms().get(term.id())
@@ -871,12 +871,11 @@ mod tests {
         let x = store.mk_var("x", Sort::Int);
         let one = store.mk_int(1.into());
         let zero = store.mk_int(0.into());
-        let definition = store.mk_app_structural(Symbol::named("="), &[x, one], Sort::Bool);
-        let opaque = store.mk_app_structural(Symbol::named("*"), &[x, x], Sort::Int);
-        let predicate = store.mk_app_structural(Symbol::named("="), &[opaque, zero], Sort::Bool);
-        let division = store.mk_app_structural(Symbol::named("div"), &[one, zero], Sort::Int);
-        let unspecified =
-            store.mk_app_structural(Symbol::named("="), &[division, zero], Sort::Bool);
+        let definition = store.mk_app_structural(Symbol::named("="), [x, one], Sort::Bool);
+        let opaque = store.mk_app_structural(Symbol::named("*"), [x, x], Sort::Int);
+        let predicate = store.mk_app_structural(Symbol::named("="), [opaque, zero], Sort::Bool);
+        let division = store.mk_app_structural(Symbol::named("div"), [one, zero], Sort::Int);
+        let unspecified = store.mk_app_structural(Symbol::named("="), [division, zero], Sort::Bool);
         let quantified = store.mk_forall(vec![("x".into(), Sort::Int)], definition);
         let owner = original(Arc::new(AtomicBool::new(false)));
         let result = apply(
@@ -921,7 +920,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(result[0].formulas.is_empty());
+        assert_eq!(result[0].formulas.as_slice(), &[] as &[Term]);
         let model = solver
             .convert_tactic_model(
                 result[0].model_converter.as_ref().unwrap(),
@@ -1022,7 +1021,7 @@ mod tests {
         let mut store = TermStore::new();
         let x = store.mk_var("x", Sort::Int);
         store.register_declared_function("predicate");
-        let predicate = store.mk_app_structural(Symbol::named("predicate"), &[x], Sort::Bool);
+        let predicate = store.mk_app_structural(Symbol::named("predicate"), [x], Sort::Bool);
         let quantified = store.mk_forall(vec![("x".into(), Sort::Int)], predicate);
         let opposite = store.mk_not(quantified);
         let owner = original(Arc::new(AtomicBool::new(false)));

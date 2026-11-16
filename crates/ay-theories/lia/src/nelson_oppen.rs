@@ -387,13 +387,24 @@ impl LiaSolver<'_> {
             for (eq_idx, (ref var_coeffs, ref constant, ref initial_reasons)) in
                 equations.iter().enumerate()
             {
-                let mut coeffs = var_coeffs.clone();
+                // PERF (Certora UFDT profiles): most equations in most
+                // rounds undergo no substitution, yet this loop used to
+                // clone every row map plus its reason vector and dedup
+                // set per equation per round. Copy-on-write keeps the
+                // exact same derivation (the owned copy is taken lazily
+                // at the first actual removal/insertion, and the dedup
+                // set is built lazily at the first reason push, seeded
+                // from the then-current reasons — identical contents to
+                // the eager build).
+                let mut coeffs: std::borrow::Cow<'_, HashMap<TermId, BigInt>> =
+                    std::borrow::Cow::Borrowed(var_coeffs);
                 // Split adjusted constant (see `adj_subtract_scaled`):
                 // integral part plus rare fractional contributions.
                 let mut adj_int = constant.clone();
                 let mut adj_frac: Option<BigRational> = None;
-                let mut reasons: Vec<TheoryLit> = initial_reasons.clone();
-                let mut reason_seen: HashSet<TheoryLit> = reasons.iter().copied().collect();
+                let mut reasons: std::borrow::Cow<'_, [TheoryLit]> =
+                    std::borrow::Cow::Borrowed(initial_reasons.as_slice());
+                let mut reason_seen: Option<HashSet<TheoryLit>> = None;
 
                 // Substitute known tight-bound values.
                 //
@@ -414,7 +425,7 @@ impl LiaSolver<'_> {
                 relevant_bound_vars.sort_unstable_by_key(|tid| tid.0);
                 for var in &relevant_bound_vars {
                     let val = &tight_bound_values[var];
-                    if let Some(coeff) = coeffs.remove(var) {
+                    if let Some(coeff) = coeffs.to_mut().remove(var) {
                         adj_subtract_scaled(&mut adj_int, &mut adj_frac, &coeff, val);
 
                         if debug {
@@ -434,16 +445,20 @@ impl LiaSolver<'_> {
                                     lower.reasons.iter().zip(lower.reason_values.iter())
                                 {
                                     let lit = TheoryLit::new(*reason, *val);
-                                    if reason_seen.insert(lit) {
-                                        reasons.push(lit);
+                                    let seen = reason_seen
+                                        .get_or_insert_with(|| reasons.iter().copied().collect());
+                                    if seen.insert(lit) {
+                                        reasons.to_mut().push(lit);
                                     }
                                 }
                                 for (reason, val) in
                                     upper.reasons.iter().zip(upper.reason_values.iter())
                                 {
                                     let lit = TheoryLit::new(*reason, *val);
-                                    if reason_seen.insert(lit) {
-                                        reasons.push(lit);
+                                    let seen = reason_seen
+                                        .get_or_insert_with(|| reasons.iter().copied().collect());
+                                    if seen.insert(lit) {
+                                        reasons.to_mut().push(lit);
                                     }
                                 }
                             }
@@ -461,8 +476,10 @@ impl LiaSolver<'_> {
                         // bridge_value_reason_mismatch_6930).
                         if let Some(derived_reasons) = derived_tight_reasons.get(var) {
                             for r in derived_reasons {
-                                if reason_seen.insert(*r) {
-                                    reasons.push(*r);
+                                let seen = reason_seen
+                                    .get_or_insert_with(|| reasons.iter().copied().collect());
+                                if seen.insert(*r) {
+                                    reasons.to_mut().push(*r);
                                 }
                             }
                         }
@@ -496,7 +513,13 @@ impl LiaSolver<'_> {
                     .collect();
                 while let Some(from_var) = pending.pop_first() {
                     let to_var = var_equalities[&from_var];
-                    if let Some(coeff) = coeffs.remove(&from_var) {
+                    let removed = if coeffs.contains_key(&from_var) {
+                        coeffs.to_mut().remove(&from_var)
+                    } else {
+                        None
+                    };
+                    if let Some(coeff) = removed {
+                        let coeffs = coeffs.to_mut();
                         *coeffs.entry(to_var).or_insert_with(|| BigInt::from(0)) += &coeff;
                         if coeffs.get(&to_var) == Some(&BigInt::from(0)) {
                             coeffs.remove(&to_var);
@@ -511,16 +534,22 @@ impl LiaSolver<'_> {
                         };
                         if let Some(eq_reasons) = var_eq_reasons.get(&canon_pair) {
                             for r in eq_reasons {
-                                if reason_seen.insert(*r) {
-                                    reasons.push(*r);
+                                let seen = reason_seen
+                                    .get_or_insert_with(|| reasons.iter().copied().collect());
+                                if seen.insert(*r) {
+                                    reasons.to_mut().push(*r);
                                 }
                             }
                         }
                     }
                 }
 
-                // Remove zero coefficients
-                coeffs.retain(|_, c| !c.is_zero());
+                // Remove zero coefficients (only an owned copy can have
+                // gained or retained any worth removing; a borrowed row
+                // with zero entries pays the one clone here, as before).
+                if coeffs.values().any(|c| c.is_zero()) {
+                    coeffs.to_mut().retain(|_, c| !c.is_zero());
+                }
 
                 // Convert adjusted constant to BigInt (fractional: skip)
                 let Some(final_constant) = adj_final_integer(adj_int, adj_frac) else {
@@ -580,7 +609,7 @@ impl LiaSolver<'_> {
                     // this in release, prefer returning no-propagation over a
                     // useless empty conflict clause.
                     if !reasons.is_empty() {
-                        self.pending_shared_eq_conflict = Some(reasons);
+                        self.pending_shared_eq_conflict = Some(reasons.into_owned());
                         // Clear any partial propagation state from this pass —
                         // the caller will report the conflict on the next
                         // `propagate_equalities()` call.
@@ -611,8 +640,12 @@ impl LiaSolver<'_> {
                             // rewritten. Without this, Case 0 emits UNSAT
                             // clauses that omit the tight-bound provenance.
                             if !initial_tight.contains(&var) {
-                                derived_tight_reasons.insert(var, reasons.clone());
-                                derived_tight_bounds.push((var, value, reasons.clone()));
+                                derived_tight_reasons.insert(var, reasons.clone().into_owned());
+                                derived_tight_bounds.push((
+                                    var,
+                                    value,
+                                    reasons.clone().into_owned(),
+                                ));
                             }
                             changed = true;
                         }
@@ -653,14 +686,14 @@ impl LiaSolver<'_> {
                             new_equalities.push(DiscoveredEquality::new(
                                 lhs_var,
                                 rhs_var,
-                                reasons.clone(),
+                                reasons.clone().into_owned(),
                             ));
                         }
 
                         // Record variable equality for substitution in other equations
                         if !var_equalities.contains_key(&lhs_var) {
                             var_equalities.insert(lhs_var, rhs_var);
-                            var_eq_reasons.insert(pair, reasons.clone());
+                            var_eq_reasons.insert(pair, reasons.clone().into_owned());
                             changed = true;
                         }
                     }

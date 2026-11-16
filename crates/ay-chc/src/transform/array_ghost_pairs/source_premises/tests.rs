@@ -108,9 +108,10 @@ fn each_binder_uses_its_own_sort_domain_and_singletons_keep_legacy_order() {
         instances(&[premise.clone()], &terms, &live).unwrap().len(),
         2
     );
-    assert!(instances(&[premise], &terms[..2], &live)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        instances(&[premise], &terms[..2], &live).unwrap(),
+        [] as [ChcExpr; 0]
+    );
     let singleton = UniversalPremise::new(i.clone(), pair(ChcExpr::var(i), ChcExpr::BitVec(7, 8)));
     assert_eq!(
         instances(&[singleton], &terms, &live).unwrap(),

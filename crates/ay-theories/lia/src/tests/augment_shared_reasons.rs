@@ -5,13 +5,11 @@
 //! Regression tests for `augment_farkas_with_shared_reasons` (#8147 +
 //! adversarial-review fix on #rank-4 increment 2).
 //!
-//! The appended shared-equality/Dioph reasons are load-bearing exactly when
-//! the simplex Farkas builder missed pivoted-away slack reasons (#8147), but
-//! `minimize_farkas_conflict` (ay-dpll) strips every zero-coefficient literal
-//! from the learned clause in ALL builds. A certificate zero-extended over
-//! appended reasons therefore re-creates the #8147 false-UNSAT class. The
-//! contract under test: augmentation that appends literals DROPS the
-//! certificate; the no-append case keeps it.
+//! The positional Farkas certificate covers only the pre-augmentation literal
+//! vector and establishes no coefficient for appended shared-equality/Dioph
+//! reasons. Those reasons may be load-bearing when the simplex builder missed
+//! pivoted-away slack reasons (#8147). The contract under test: augmentation
+//! that appends literals DROPS the certificate; the no-append case keeps it.
 
 use super::*;
 use ay_core::{FarkasAnnotation, TheoryConflict, TheoryLit, TheorySolver};
@@ -65,9 +63,8 @@ fn test_augmentation_appending_reasons_drops_certificate() {
     assert_eq!(augmented.literals.len(), 3, "{augmented:?}");
     assert!(
         augmented.farkas.is_none(),
-        "appended reasons may be load-bearing; the certificate must be \
-         DROPPED, not zero-extended (minimize_farkas_conflict strips \
-         zero-coefficient literals in all builds): {augmented:?}"
+        "appended reasons may be load-bearing; the certificate covers only the \
+         pre-augmentation literal vector and must be dropped: {augmented:?}"
     );
 }
 

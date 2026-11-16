@@ -247,7 +247,7 @@ impl Executor {
             current =
                 proof.add_resolution(remaining.clone(), assertion_ids[idx], current, assume_id);
         }
-        debug_assert!(remaining.is_empty());
+        debug_assert_eq!(remaining.as_slice(), &[] as &[TermId]);
         let _ = current;
     }
 }

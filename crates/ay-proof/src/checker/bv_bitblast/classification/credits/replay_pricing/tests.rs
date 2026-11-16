@@ -4,6 +4,7 @@
 use super::*;
 use crate::bv_blast_solver::retained::producer_test_counter;
 use crate::checker::bv_bitblast::classification::plan_expensive_bv_credits_with_progress;
+use crate::checker::bv_bitblast::proof_producing_control::OutsideFrameShape;
 use crate::checker::bv_bitblast::retained_session::{RetainedOperation, RetainedSession};
 use ay_core::{Proof, Sort, Symbol};
 use std::time::Duration;
@@ -63,11 +64,12 @@ fn ordinary_refinement_is_downward_and_credit_keeps_its_exact_borrowed_source() 
             .count(),
         1
     );
-    let borrowed = credit.take(ProofId(0), &mut |_, _| true).unwrap();
-    assert!(std::ptr::eq(borrowed.terms(), &terms));
-    assert!(std::ptr::eq(borrowed.step(), &proof.steps[0]));
-    assert!(borrowed.replay_price().is_some());
-    drop(borrowed);
+    {
+        let borrowed = credit.take(ProofId(0), &mut |_, _| true).unwrap();
+        assert!(std::ptr::eq(borrowed.terms(), &raw const terms));
+        assert!(std::ptr::eq(borrowed.step(), &raw const proof.steps[0]));
+        assert!(borrowed.replay_price().is_some());
+    }
     credit.finish().unwrap();
     assert_eq!(terms.entries_snapshot(), source);
     assert_eq!(producer_test_counter::count(), before);
@@ -216,13 +218,7 @@ fn conditional_fixture() -> (TermStore, Proof) {
     let negative = terms.mk_not_raw(property);
     let root = terms.mk_app(Symbol::named("and"), [guard, negative], Sort::Bool);
     let clause = terms.mk_not_raw(root);
-    assert!(
-        crate::checker::bv_bitblast::proof_producing_control::OutsideFrameShape::recognize(
-            &terms,
-            &[clause]
-        )
-        .is_some()
-    );
+    assert!(OutsideFrameShape::recognize(&terms, &[clause]).is_some());
     let mut proof = Proof::new();
     proof.add_theory_lemma_with_kind("BV", vec![clause], TheoryLemmaKind::BvBitBlast);
     (terms, proof)
@@ -308,7 +304,7 @@ fn malformed_gate_annotation_keeps_exact_invalid_theory_error_before_pricing() {
         panic!("fixture must be an ordinary theory lemma");
     };
     *kind = TheoryLemmaKind::BvBitBlastGate {
-        gate_type: ay_core::BvGateType::And,
+        gate_type: BvGateType::And,
         width: 9,
     };
     let before = producer_test_counter::count();
@@ -330,7 +326,7 @@ fn incomplete_array_free_source_scan_keeps_old_fee_and_never_trusts_wire() {
         panic!("fixture must be an ordinary theory lemma");
     };
     let mut root = clause[0];
-    for _ in 0..crate::checker::bv_bitblast::MAX_PROOF_PRODUCING_TERM_NODES {
+    for _ in 0..MAX_PROOF_PRODUCING_TERM_NODES {
         root = terms.mk_not_raw(root);
     }
     clause[0] = root;

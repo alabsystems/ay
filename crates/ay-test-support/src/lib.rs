@@ -4493,6 +4493,6 @@ mod tests {
         let output = built.command().output().expect("run frozen fixture");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"snapshot-ok\n");
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr, b"");
     }
 }

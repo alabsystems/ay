@@ -208,7 +208,7 @@ fn rendered_bound(
                 owner,
                 args.len(),
                 args.len()
-                    .checked_mul(std::mem::size_of::<String>())
+                    .checked_mul(size_of::<String>())
                     .ok_or(QueryError::Exhausted)?,
             )?;
             let surface = exec.dt_surface(ctor);
@@ -313,7 +313,7 @@ mod tests {
             "(declare-datatype Row ((row (tag (_ BitVec 8)) (data (Array Int Bool)))))",
         )
         .unwrap();
-        assert!(exec.execute_all(&commands).unwrap().is_empty());
+        assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
         let info = exec.ctx.exact_datatype_member_info("row").unwrap();
         let ctor = exec.ctx.symbol_identity_name("row", info).to_string();
         let sort = info.sort.clone();
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn an_unrelated_plain_work_budget_cannot_pay_the_original_owners_format_cost() {
         let exec = Executor::new();
-        let value = ModelValue::Int(num_bigint::BigInt::from(1u8) << 4096usize);
+        let value = ModelValue::Int(BigInt::from(1u8) << 4096usize);
         let _stop = ay_core::resource::enter_check_stop(Arc::new(|| false));
         let scope = RecoveryScope::enter(&exec, 1024, 1024).unwrap();
         let owner = scope.admission();

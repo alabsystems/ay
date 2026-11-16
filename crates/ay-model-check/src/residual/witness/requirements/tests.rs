@@ -60,6 +60,6 @@ fn trie_node_admission_refuses_before_retaining_a_child_and_fresh_retry_works() 
             .1
             .value
             .expect("retained leaf"),
-        &value
+        &raw const value
     ));
 }

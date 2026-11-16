@@ -6,9 +6,7 @@
 //! of names into evidence that AY implements their behavior.
 
 use super::*;
-use sha2::Digest as _;
 use std::ffi::OsString;
-use std::io::Read as _;
 
 const SCHEMA: &str = "ay-current-z3-source-inventory/v1";
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -179,6 +177,10 @@ fn collect(source: &Path, z3: &Path) -> Result<Snapshot, String> {
     for (path, blob, size) in tree {
         let bytes = authenticated_source_bytes(&source.join(&path), &blob, size)?;
         let sha256 = sha256_bytes(&bytes);
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "pinned source paths require the exact lowercase .h suffix"
+        )]
         if let Some(relative) = path
             .strip_prefix("src/api/")
             .filter(|path| path.ends_with(".h"))
@@ -478,7 +480,7 @@ fn parameters(text: &str) -> Result<BTreeMap<String, String>, String> {
         if !catalog_identifier(name)
             || kind.is_empty()
             || kind.contains('(')
-            || (!suffix.is_empty() && !(suffix.starts_with(" (default: ") && suffix.ends_with(')')))
+            || !(suffix.is_empty() || suffix.starts_with(" (default: ") && suffix.ends_with(')'))
         {
             return Err("malformed parameter row".to_string());
         }

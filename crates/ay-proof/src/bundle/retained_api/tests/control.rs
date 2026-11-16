@@ -226,9 +226,7 @@ fn caught_callback_panic_poison_and_temporary_cleanup_precede_terminal_admission
         end(),
         &mut |_, _| {
             calls += 1;
-            if calls == 2 {
-                panic!("test callback panic");
-            }
+            assert!(calls != 2, "test callback panic");
             true
         },
         |control| {

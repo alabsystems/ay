@@ -188,7 +188,7 @@ fn push<T>(values: &mut Vec<T>, value: T, progress: Progress<'_>) -> Result<(), 
 }
 
 fn tree_lookup(entries: usize, progress: Progress<'_>) -> Result<(), ProofCheckError> {
-    let levels = checked_add_usize((usize::BITS - entries.leading_zeros()) as usize, 1)?;
+    let levels = checked_add_usize(entries.bit_width() as usize, 1)?;
     charge_progress(
         progress,
         checked_add_usize(entries, 1)?.min(mul(levels, 12)?),
@@ -199,10 +199,7 @@ fn tree_lookup(entries: usize, progress: Progress<'_>) -> Result<(), ProofCheckE
 fn tree_slots(entries: usize) -> Result<usize, ProofCheckError> {
     // alloc's B=6 tree has 11 keys and 12 edges. Splits/merges touch at most
     // one node per level plus a root, even as the active path shrinks/grows.
-    mul(
-        checked_add_usize((usize::BITS - entries.leading_zeros()) as usize, 2)?,
-        32,
-    )
+    mul(checked_add_usize(entries.bit_width() as usize, 2)?, 32)
 }
 
 fn memo_get(

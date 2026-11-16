@@ -1254,7 +1254,7 @@ fn test_replace_clause_checked_vivify_lrat_standalone_validation() {
 
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
-    assert!(!proof.is_empty(), "proof must not be empty");
+    assert_ne!(proof.len(), 0, "proof must not be empty");
 
     let temp_dir = tempfile::tempdir().expect("create vivify LRAT validation tempdir");
     let cnf_path = temp_dir.path().join("vivify-replacement.cnf");

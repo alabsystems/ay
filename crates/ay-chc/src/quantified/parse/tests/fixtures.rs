@@ -51,7 +51,7 @@ pub(super) fn check_matrix(premise: &UniversalPremise) {
             .into_iter()
             .collect();
             let expected =
-                (index >= 32 || actual == 0) && (index < 32 || index >= 65 || actual == 7);
+                (index >= 32 || actual == 0) && (!(32..65).contains(&index) || actual == 7);
             assert_eq!(
                 crate::expr::evaluate::evaluate_expr(premise.matrix(), &env),
                 Some(SmtValue::Bool(expected))

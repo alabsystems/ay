@@ -95,7 +95,7 @@ fn encoding(
         .expect("healthy remainder");
     let built = attempt.finish().expect("complete encoding");
     assert!(!built.has_encoding_gap);
-    assert!(built.pending_condition_links.is_empty());
+    assert_eq!(built.pending_condition_links.len(), 0);
     (built, result)
 }
 

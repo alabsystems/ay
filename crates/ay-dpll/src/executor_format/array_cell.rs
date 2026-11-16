@@ -34,7 +34,7 @@
 //! the same value wherever an index is left to read them, or the cells
 //! conflict and the strict conflict -> taint path runs; under `Ignore` (a
 //! defined target) the candidate's replaces the extractor's.
-//! [`array_cells_equal`] decides whether two cells denote the same array. A
+//! [`equal`] decides whether two parsed cells denote the same array. A
 //! text this reader does not recognise is a conflict to the first and
 //! undecided to the second.
 
@@ -109,6 +109,7 @@ pub(crate) fn array_cell_parts(text: &str) -> Option<(String, Vec<(String, Strin
 
 /// Whether two array-valued cells denote the same array; `None` when either
 /// is not an array this reader recognises.
+#[cfg(test)]
 pub(crate) fn array_cells_equal(lhs: &str, rhs: &str) -> Option<bool> {
     Some(equal(&parse_array(lhs)?, &parse_array(rhs)?))
 }

@@ -412,7 +412,7 @@ mod darwin {
             return Err(io::Error::other("partial Darwin process table"));
         }
         let mut records = Vec::new();
-        for bytes in table.chunks_exact(SIZE) {
+        for bytes in table.as_chunks::<SIZE>().0 {
             current(end)?;
             // PID0 is the kernel scheduler, never a userspace build driver.
             if u32::from_ne_bytes(number(bytes, 40)?) == 0 {
@@ -541,6 +541,7 @@ mod linux {
         assert!(record(124, &bytes).is_err());
         assert!(record(123, b"123 (short) R 1").is_err());
     }
+    #[cfg(target_os = "linux")]
     fn read(path: &std::path::Path, maximum: usize) -> io::Result<Option<Vec<u8>>> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -610,6 +611,7 @@ mod linux {
             state,
         })
     }
+    #[cfg(target_os = "linux")]
     pub(super) fn observe(end: Instant, maximum: usize) -> io::Result<BuildActivity> {
         let mut records = Vec::new();
         let mut remaining = maximum;
@@ -713,11 +715,11 @@ mod tests {
     }
     #[test]
     fn darwin_complete_records_and_arguments_are_checked_without_environment_projection() {
-        super::darwin::check_decoders();
+        darwin::check_decoders();
     }
     #[test]
     fn linux_stat_keeps_opaque_names_and_checks_original_pid() {
-        super::linux::check_record();
+        linux::check_record();
     }
     #[test]
     fn actual_native_catalog_and_original_expired_deadline() {

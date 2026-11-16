@@ -52,7 +52,7 @@ impl Admission {
     fn tree(&mut self, len: usize, open: &mut impl FnMut() -> bool) -> Option<()> {
         // Integer keys have constant-size comparisons. Twelve comparisons per
         // binary-height bound also covers a B-tree node's linear key search.
-        let height = (usize::BITS - len.leading_zeros()) as usize + 1;
+        let height = len.bit_width() as usize + 1;
         self.spend(height.checked_mul(12)?, open)
     }
 
@@ -297,8 +297,8 @@ fn census<'a>(
     while let Some(node) = pending.pop() {
         credit.spend(1, open)?;
         let key = match &node {
-            Node::Expr(e) => (0u8, *e as *const ChcExpr as usize),
-            Node::Sort(s) => (1u8, *s as *const ChcSort as usize),
+            Node::Expr(e) => (0u8, std::ptr::from_ref::<ChcExpr>(*e) as usize),
+            Node::Sort(s) => (1u8, std::ptr::from_ref::<ChcSort>(*s) as usize),
         };
         credit.tree(seen.len(), open)?;
         if !seen.insert(key) {

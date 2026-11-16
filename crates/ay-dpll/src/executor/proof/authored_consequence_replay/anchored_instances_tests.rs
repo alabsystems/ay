@@ -242,7 +242,7 @@ fn repeated_child_width_is_admitted_before_child_storage_can_grow() {
     if view.precharge(&mut work).is_ok() {
         pending.extend(view.iter());
     }
-    assert!(pending.is_empty());
+    assert_eq!(pending, [] as [TermId; 0]);
     let mut seen = ay_core::kani_compat::DetHashSet::default();
     assert_eq!(
         collect_subterms(&terms, root, &mut seen, &mut work),
@@ -300,7 +300,7 @@ fn fixed_point_rounds_debit_every_created_term_from_one_allowance() {
         stop: &mut stop,
     };
     let (anchored, pending) = anchor_round(vec![(root, vec![x; 3])], &known, &mut work).unwrap();
-    assert!(anchored.is_empty());
+    assert_eq!(anchored, [] as [(TermId, Vec<TermId>); 0]);
     assert_eq!(
         work.remaining, 4,
         "one candidate and three occurrence scans"
@@ -308,7 +308,7 @@ fn fixed_point_rounds_debit_every_created_term_from_one_allowance() {
     known.insert(x);
     let (anchored, pending) = anchor_round(pending, &known, &mut work).unwrap();
     assert_eq!(anchored, vec![(root, vec![x; 3])]);
-    assert!(pending.is_empty());
+    assert_eq!(pending, [] as [(TermId, Vec<TermId>); 0]);
     assert_eq!(
         work.remaining, 0,
         "an early match does not refund precharged width"

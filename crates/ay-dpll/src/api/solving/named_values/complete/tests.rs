@@ -91,11 +91,13 @@ fn complete_request_authentication_rejects_definitions_overloads_and_wrong_sorts
     for name in ["x", "fixed", "f", "(f x)"] {
         assert!(solver.named_value_requests(&[name]).is_err());
     }
-    assert!(matching_sorts(&Sort::bitvec(8), &Sort::bitvec(16), &mut MAX_SORT_WORK).is_none());
+    let mut work = MAX_SORT_WORK;
+    assert!(matching_sorts(&Sort::bitvec(8), &Sort::bitvec(16), &mut work).is_none());
+    let mut work = MAX_SORT_WORK;
     assert!(matching_sorts(
         &Sort::array(Sort::bitvec(64), Sort::Bool),
         &Sort::array(Sort::bitvec(64), Sort::bitvec(1)),
-        &mut MAX_SORT_WORK,
+        &mut work,
     )
     .is_none());
 }

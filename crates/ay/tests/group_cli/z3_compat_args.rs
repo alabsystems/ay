@@ -6,7 +6,7 @@
 
 use ntest::timeout;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4839,7 +4839,7 @@ fn z3_mode_unknown_option_is_z3_invalid_option_109() {
         .output()
         .expect("spawn ay --z3-mode -zzz");
     assert_eq!(output.status.code(), Some(109));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.as_slice(), &[] as &[u8]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Error: invalid command line option: -zzz"),
@@ -4862,7 +4862,7 @@ fn z3_mode_missing_file_is_z3_failed_to_open_108() {
         .output()
         .expect("spawn ay --z3-mode MISSING");
     assert_eq!(output.status.code(), Some(108));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.as_slice(), &[] as &[u8]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(&format!(

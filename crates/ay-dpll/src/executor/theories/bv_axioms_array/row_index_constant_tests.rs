@@ -226,10 +226,12 @@ fn execute_row(extra: &str, expected: &str) {
     let mut executor = Executor::new();
     executor.set_self_check(true);
     executor.set_produce_proofs(true);
-    assert!(executor
-        .execute_all(&ay_frontend::parse(&input).unwrap())
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        executor
+            .execute_all(&ay_frontend::parse(&input).unwrap())
+            .unwrap(),
+        [] as [String; 0]
+    );
     let originals = executor.ctx.assertions.clone();
     executor.set_deadline(Some(
         ay_core::time::Instant::now() + std::time::Duration::from_secs(5),

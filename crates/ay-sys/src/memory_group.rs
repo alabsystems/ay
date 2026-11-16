@@ -32,6 +32,7 @@
 //! are set as fractions of the process limit, not as tight budgets.
 
 use std::cell::Cell;
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -409,7 +410,7 @@ pub fn memory_group_census() -> Vec<MemoryGroupUsage> {
             live_bytes: group.live_bytes(),
         })
         .collect();
-    census.sort_by(|a, b| b.live_bytes.cmp(&a.live_bytes));
+    census.sort_by_key(|usage| Reverse(usage.live_bytes));
     census
 }
 

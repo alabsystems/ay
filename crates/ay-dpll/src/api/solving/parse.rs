@@ -376,6 +376,6 @@ mod tests {
             .parse_smtlib2("(assert 1)")
             .expect_err("SMT-LIB assert requires Bool");
         assert!(format!("{error}").contains("Bool"));
-        assert!(solver.assertions().is_empty());
+        assert_eq!(solver.assertions(), [] as [Term; 0]);
     }
 }

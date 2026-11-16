@@ -357,7 +357,7 @@ impl Solver {
 
         // Seed: mark conflict clause literals as seen.
         // Track if the conflict clause itself is learned (CaDiCaL vivify.cpp:586).
-        debug_assert!(self.min.lrat_to_clear.is_empty());
+        debug_assert_eq!(self.min.lrat_to_clear.len(), 0);
         let conflict_idx = conflict_ref.0 as usize;
         if conflict_idx < self.arena.len() {
             uses_redundant = self.arena.is_learned(conflict_idx);

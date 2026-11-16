@@ -89,8 +89,8 @@ fn product_generation_refuses_malformed_widths_and_small_output_budget() -> Test
     let mut terms = ay_core::TermStore::new();
     let a = terms.mk_var("a", Sort::bitvec(8));
     let b = terms.mk_var("b", Sort::bitvec(9));
-    let bad = terms.mk_app(Symbol::named("bvmul"), &[a, b], Sort::bitvec(8));
-    let eq = terms.mk_app(Symbol::named("="), &[bad, bad], Sort::Bool);
+    let bad = terms.mk_app(Symbol::named("bvmul"), [a, b], Sort::bitvec(8));
+    let eq = terms.mk_app(Symbol::named("="), [bad, bad], Sort::Bool);
     assert!(AlethePrinter::new(&terms)
         .format_bv_packed_identity(ProofId(7), &[eq])
         .is_none());

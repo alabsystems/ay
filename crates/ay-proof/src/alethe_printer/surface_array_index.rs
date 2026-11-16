@@ -41,7 +41,7 @@ impl AlethePrinter<'_> {
         if !matches!(self.terms.sort(store_index), Sort::BitVec(_)) {
             return None;
         }
-        let canonical = ay_core::quote_symbol(name);
+        let canonical = quote_symbol(name);
         let printed = self.format_term(select);
         let [store, read]: [String; 2] = split_application(&printed, "select")?.try_into().ok()?;
         let [base, written, stored]: [String; 3] =

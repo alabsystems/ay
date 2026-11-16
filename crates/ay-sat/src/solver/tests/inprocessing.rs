@@ -1599,7 +1599,7 @@ fn test_backbone_pass_marks_complete_and_advance() {
     plain.set_backbone_passes(false);
     assert!(!plain.backbone());
     assert_eq!(plain.stats.backbone_completed_passes, 0);
-    assert!(plain.cold.backbone_probed_in_pass.is_empty());
+    assert_eq!(plain.cold.backbone_probed_in_pass.len(), 0);
 }
 
 /// The stacked binary backbone finds the failed literal of
@@ -1899,7 +1899,7 @@ fn test_vivify_generations_try_each_clause_once_then_reflag() {
     solver.num_conflicts = solver.inproc_ctrl.vivify.next_conflict;
     let _ = solver.vivify();
     let live: Vec<usize> = solver.arena.active_indices().collect();
-    assert!(!live.is_empty(), "the fixture's clauses stay live");
+    assert_ne!(live.len(), 0, "the fixture's clauses stay live");
     assert!(
         solver.inproc.vivifier.stats.clauses_examined > 0,
         "the learned tiers examine the fixture on the first call"

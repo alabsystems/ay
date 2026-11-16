@@ -6,6 +6,10 @@ use super::*;
 #[test]
 fn cancellation_stops_wide_siblings_for_every_rewriter_container() {
     const WIDTH: usize = 4096;
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the wide fixture intentionally shares one immutable leaf across every rewriter edge"
+    )]
     let args = vec![Arc::new(ChcExpr::Int(1)); WIDTH];
     let cases = [
         (

@@ -361,7 +361,7 @@ fn entry_interior_and_restricted_subsetup_stops_are_sticky_for_both_routes() {
 
 #[test]
 fn every_original_deadline_refuses_before_source_walk_or_callback() {
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let calls = producer_test_counter::count();
     for route in ROUTES {
         let (terms, clause) = fixture(route, Source::Valid);
@@ -477,7 +477,7 @@ fn full_quality_session_captures_each_chain_once_and_replays_fresh_without_produ
         )
         .unwrap();
         assert!(quality.is_complete());
-        assert!(output.is_empty());
+        assert_eq!(output, []);
         assert_eq!(
             prepayments.get(),
             2,

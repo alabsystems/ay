@@ -13,6 +13,51 @@ pub(crate) struct BacktrackReservation {
     buckets: bucket_queue::BacktrackBuckets,
 }
 
+impl VSIDS {
+    pub(crate) fn plan_backtrack_candidate(
+        &self,
+        var: Variable,
+        bucket: bool,
+        plan: &mut BacktrackReservation,
+        owner: &CountedAdmission,
+    ) -> Result<()> {
+        owner.admit(1, 0)?;
+        if self.heap_pos[var.index()] == INVALID_POS {
+            plan.heap = plan
+                .heap
+                .checked_add(1)
+                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        }
+        if bucket {
+            self.bucket_queue
+                .plan_backtrack(var, &self.activities, &mut plan.buckets, owner)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_backtrack(
+        &mut self,
+        plan: BacktrackReservation,
+        owner: &CountedAdmission,
+    ) -> Result<()> {
+        let final_len = self
+            .heap
+            .len()
+            .checked_add(plan.heap)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
+        // One push plus at most floor(log2(final_len)) sift-up iterations per
+        // candidate. Reimplied lambda variables may not need their reservation.
+        let depth = final_len.bit_width() as usize;
+        let work = plan
+            .heap
+            .checked_mul(depth + 1)
+            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
+        owner.admit(work, 0)?;
+        try_reserve(owner, &mut self.heap, plan.heap)?;
+        self.bucket_queue.reserve_backtrack(plan.buckets, owner)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,7 +95,7 @@ mod tests {
             assert_eq!(actual.heap.capacity(), capacity);
         }
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
-        assert!(owner.usage().unwrap().storage_admitted >= 64 * std::mem::size_of::<u32>());
+        assert!(owner.usage().unwrap().storage_admitted >= 64 * size_of::<u32>());
     }
 
     #[test]
@@ -67,50 +112,5 @@ mod tests {
             Err(CountedAdmissionError::StorageExhausted)
         );
         assert_eq!(format!("{actual:?}"), before);
-    }
-}
-
-impl VSIDS {
-    pub(crate) fn plan_backtrack_candidate(
-        &self,
-        var: Variable,
-        bucket: bool,
-        plan: &mut BacktrackReservation,
-        owner: &CountedAdmission,
-    ) -> Result<()> {
-        owner.admit(1, 0)?;
-        if self.heap_pos[var.index()] == INVALID_POS {
-            plan.heap = plan
-                .heap
-                .checked_add(1)
-                .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
-        }
-        if bucket {
-            self.bucket_queue
-                .plan_backtrack(var, &self.activities, &mut plan.buckets, owner)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn reserve_backtrack(
-        &mut self,
-        plan: BacktrackReservation,
-        owner: &CountedAdmission,
-    ) -> Result<()> {
-        let final_len = self
-            .heap
-            .len()
-            .checked_add(plan.heap)
-            .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
-        // One push plus at most floor(log2(final_len)) sift-up iterations per
-        // candidate. Reimplied lambda variables may not need their reservation.
-        let depth = (usize::BITS - final_len.leading_zeros()) as usize;
-        let work = plan
-            .heap
-            .checked_mul(depth + 1)
-            .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
-        owner.admit(work, 0)?;
-        try_reserve(owner, &mut self.heap, plan.heap)?;
-        self.bucket_queue.reserve_backtrack(plan.buckets, owner)
     }
 }

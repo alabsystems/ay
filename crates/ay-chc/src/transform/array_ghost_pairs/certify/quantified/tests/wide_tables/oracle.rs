@@ -230,7 +230,7 @@ pub(super) fn bad_state(source: &QuantifiedChcProblem, table: Table, change: Cha
     let ClauseHead::Predicate(error, args) = &clauses[2].head else {
         panic!("error")
     };
-    assert!(args.is_empty());
+    assert_eq!(args.as_slice(), []);
     assert_eq!(clauses[3].body.predicates, vec![(*error, vec![])]);
     assert!(clauses[3].is_query());
     eval(clauses[2].body.constraint.as_ref().unwrap(), &env) == Value::Bool(true)

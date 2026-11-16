@@ -128,11 +128,11 @@ thread_local! {
 }
 
 fn model_key(model: &FxHashMap<String, SmtValue>) -> usize {
-    model as *const FxHashMap<String, SmtValue> as usize
+    std::ptr::from_ref::<FxHashMap<String, SmtValue>>(model) as usize
 }
 
 fn address(node: &ChcExpr) -> usize {
-    node as *const ChcExpr as usize
+    std::ptr::from_ref::<ChcExpr>(node) as usize
 }
 
 /// Open a scope of `kind` over `roots` under `model`, indexing the roots'

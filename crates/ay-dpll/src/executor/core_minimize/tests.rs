@@ -208,7 +208,9 @@ fn affordable_entry_cost_at_the_boundary_runs_the_pass() {
     // No deadline: remaining = NO_DEADLINE_BUDGET, margin = clamp(remaining/8,
     // 3s, 10s), shrink = remaining - margin.
     let margin = (NO_DEADLINE_BUDGET / 8).clamp(Duration::from_secs(3), Duration::from_secs(10));
-    let shrink_budget = NO_DEADLINE_BUDGET - margin;
+    let shrink_budget = NO_DEADLINE_BUDGET
+        .checked_sub(margin)
+        .expect("the clamped margin fits the no-deadline budget");
     let boundary = shrink_budget / ENTRY_COST_AFFORDABILITY;
     let result = executor
         .minimize_assumption_core(&named, Ok(entry), None, boundary)

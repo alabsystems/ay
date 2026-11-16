@@ -37,7 +37,7 @@ pub(super) fn validate_generic_resolution_args(
             args.len()
         ));
     }
-    for (link, annotation) in args.chunks_exact(2).enumerate() {
+    for (link, annotation) in args.as_chunks::<2>().0.iter().enumerate() {
         if !matches!(terms.get(annotation[1]), TermData::Const(Constant::Bool(_))) {
             return Err(format!(
                 "annotated resolution polarity for link {link} must be true or false"
@@ -158,7 +158,10 @@ fn validate_duplicate_free_directed_fold(
         .ok_or_else(|| "annotated resolution first premise has no printable clause".to_string())?;
     let mut accumulator = unique_exact_clause(terms, first, "first premise")?;
 
-    for (link, (&next_id, annotation)) in premises[1..].iter().zip(args.chunks_exact(2)).enumerate()
+    for (link, (&next_id, annotation)) in premises[1..]
+        .iter()
+        .zip(args.as_chunks::<2>().0)
+        .enumerate()
     {
         let next = premise_clauses.get(&next_id).ok_or_else(|| {
             format!(

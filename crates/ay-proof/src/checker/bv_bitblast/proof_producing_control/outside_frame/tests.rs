@@ -70,7 +70,7 @@ fn every_frame_write_uses_the_checked_free_offset_lemma() {
             assert_eq!(shape.root, f.root);
             assert_eq!(shape.property, f.property);
             assert_eq!(shape.length, u128::from(length));
-            super::super::validate(&f.terms, &[f.clause], &mut || Ok(()))
+            validate(&f.terms, &[f.clause], &mut || Ok(()))
                 .unwrap_or_else(|error| panic!("width={width} length={length}: {error}"));
         }
     }
@@ -85,7 +85,7 @@ fn outside_property_cannot_hide_a_false_sibling_property() {
     let root = app(&mut f.terms, "and", &[f.guard, not_both], Sort::Bool);
     let clause = f.terms.mk_not_raw(root);
     assert!(Shape::recognize(&f.terms, &[clause]).is_some());
-    assert!(super::super::validate(&f.terms, &[clause], &mut || Ok(())).is_err());
+    assert!(validate(&f.terms, &[clause], &mut || Ok(())).is_err());
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn guards_under_disjunction_are_not_positive_facts() {
     let root = app(&mut f.terms, "or", &[f.guard, not_property], Sort::Bool);
     let clause = f.terms.mk_not_raw(root);
     assert!(Shape::recognize(&f.terms, &[clause]).is_none());
-    assert!(super::super::validate(&f.terms, &[clause], &mut || Ok(())).is_err());
+    assert!(validate(&f.terms, &[clause], &mut || Ok(())).is_err());
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn outside_writes_and_overwritten_malformed_values_are_refused() {
         if !malformed {
             assert!(Shape::recognize(&f.terms, &[f.clause]).is_none());
         }
-        assert!(super::super::validate(&f.terms, &[f.clause], &mut || Ok(())).is_err());
+        assert!(validate(&f.terms, &[f.clause], &mut || Ok(())).is_err());
     }
 }
 

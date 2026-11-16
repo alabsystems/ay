@@ -32,6 +32,10 @@ pub(super) struct Cell {
 
 /// An encoded value.
 #[derive(Clone)]
+#[expect(
+    clippy::rc_buffer,
+    reason = "thin Rc<Vec<_>> identity is compared by pointer and preserves the existing allocation and custody shape"
+)]
 pub(super) enum Val {
     Bool(Lit),
     Enum(Rc<Vec<Lit>>),

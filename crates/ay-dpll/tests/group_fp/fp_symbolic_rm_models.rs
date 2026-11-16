@@ -16,6 +16,7 @@
 //! must stay satisfiable.
 
 use ntest::timeout;
+use std::fmt::Write as _;
 
 /// The top-level s-expressions of `text`.
 fn items(text: &str) -> Vec<&str> {
@@ -93,10 +94,10 @@ fn solve_and_replay(formula: &str, mode: &str) -> String {
         format!("(({mode} {printed}))"),
         "get-value must print the mode get-model prints"
     );
-    let pins: String = constants
-        .iter()
-        .map(|(name, value)| format!("(assert (= {name} {value}))"))
-        .collect();
+    let mut pins = String::new();
+    for (name, value) in &constants {
+        write!(&mut pins, "(assert (= {name} {value}))").expect("write to String");
+    }
     let replay = crate::common::solve_vec(&format!("{formula}{pins}(check-sat)"));
     assert_eq!(
         replay.first().map(String::as_str),

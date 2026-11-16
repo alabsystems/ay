@@ -82,11 +82,10 @@
 //! ```
 
 use super::super::eq_transitive::bridged_printed_equality;
-use super::super::{split_application, AlethePrinter};
+use super::super::AlethePrinter;
 use super::PrintedLiteral;
 use ay_core::kani_compat::DetHashSet;
 use ay_core::ProofId;
-use std::rc::Rc;
 
 impl AlethePrinter<'_> {
     /// Try every bridge a printed resolution's unpaired pivot can reach, in

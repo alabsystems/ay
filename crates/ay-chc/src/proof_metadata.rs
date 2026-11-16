@@ -1154,8 +1154,8 @@ impl ChcCheckedReplayObligation {
 
     /// Attach native strict proof-bundle commitments to this obligation row.
     ///
-    /// Used for UNSAT obligations discharged via
-    /// `smtlib_strict_unsat_cert_via_executor`: the row records that AY's
+    /// Used for UNSAT obligations discharged by
+    /// `strict_bundle::discharge_retained`: the row records that AY's
     /// in-process, no-z3 offline checker verified the exact-bound bundle rather
     /// than merely trusting a re-run verdict. It stores only commitments, not
     /// the standalone bundle bytes; Alethe presentation is optional.

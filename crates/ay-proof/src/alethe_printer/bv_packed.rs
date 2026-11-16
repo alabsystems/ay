@@ -48,7 +48,7 @@ mod wire_tests;
 #[cfg(test)]
 mod zero_extend_zero_tests;
 
-use super::AlethePrinter;
+use super::{AlethePrinter, CheckableRule};
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{ProofId, Sort, Symbol, TermData, TermId};
 
@@ -295,19 +295,18 @@ impl PackedProof<'_, '_> {
         premises: &[&str],
         extra: &str,
     ) -> Option<()> {
-        // WIRE-RULE BOUND. Every packed-selector step in this subtree is
-        // printed here, and its rule name is a `&str` argument spelled at one
-        // of ~40 call sites -- several of them SPLICED (`bitblast_{gate}`,
-        // `pbblast_{op}`, `{op}_simplify`), which no static scan can read
-        // back. Refuse anything outside the pinned checker's implemented set
-        // instead: an unknown rule name makes the WHOLE document `invalid`,
-        // strictly worse than the honest hole this `None` leaves in place.
-        // `tests/wire_rule_coverage.rs` probes every `CHECKABLE_ALETHE_RULES`
-        // member against the installed carcara, so this bound is what
-        // connects the emitter to that coverage argument.
-        if !ay_core::is_checkable_alethe_rule(rule) {
-            return None;
-        }
+        let rule = CheckableRule::new(rule)?;
+        self.named_step_with_rule(name, clause, rule, premises, extra)
+    }
+
+    fn named_step_with_rule(
+        &mut self,
+        name: &str,
+        clause: &str,
+        rule: CheckableRule,
+        premises: &[&str],
+        extra: &str,
+    ) -> Option<()> {
         let premises = if premises.is_empty() {
             String::new()
         } else {

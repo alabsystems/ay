@@ -60,9 +60,7 @@ fn callback_panic_cannot_be_laundered_by_an_inner_catching_operation() {
     let calls = Cell::new(0);
     let mut progress = |_, _| {
         calls.set(calls.get() + 1);
-        if calls.get() == 2 {
-            panic!("expected callback panic");
-        }
+        assert!(calls.get() != 2, "expected callback panic");
         true
     };
     let result = ResourceControl {

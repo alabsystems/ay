@@ -79,7 +79,7 @@ fn actions_query_occurrences_and_nullary_predicates_survive_the_candidate_transf
     let lifted = projected
         .lift(&candidate(projected.reduced()), &mut || true)
         .unwrap();
-    assert!(lifted.get(&error).unwrap().vars.is_empty());
+    assert_eq!(lifted.get(&error).unwrap().vars, [] as [ChcVar; 0]);
     same_source(&before, &original);
 }
 
@@ -137,7 +137,7 @@ fn bad_ids_argument_arity_and_child_types_decline_before_scalarization() {
 
 #[test]
 fn conservative_depth_fanout_occurrence_and_signature_caps_decline() {
-    use super::super::admission::{Scan, MAX_ARITY, MAX_DEPTH, MAX_NODES};
+    use super::super::admission::{Scan, MAX_ARITY, MAX_DEPTH};
     // `ChcExpr::not` eliminates double negation, so a chain built with it
     // collapses to a depth-1 constant. Nest explicitly: the leaf of
     // `nested(levels)` sits at depth `levels + 1` (the root is depth 1).
@@ -154,6 +154,10 @@ fn conservative_depth_fanout_occurrence_and_signature_caps_decline() {
     assert!(Scan::default()
         .expression(&nested(MAX_DEPTH), &mut || true)
         .is_none());
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the arity-cap fixture intentionally shares one immutable boolean node across every edge"
+    )]
     let wide = ChcExpr::Op(
         ChcOp::And,
         vec![Arc::new(ChcExpr::Bool(true)); MAX_ARITY + 1],
@@ -164,7 +168,6 @@ fn conservative_depth_fanout_occurrence_and_signature_caps_decline() {
         let child = Arc::new(shared);
         shared = ChcExpr::Op(ChcOp::And, vec![child.clone(), child]);
     }
-    assert!(MAX_NODES < (1 << 14));
     assert!(Scan::default().expression(&shared, &mut || true).is_none());
     let mut large = source(9, false);
     large.declare_predicate("wide", vec![ChcSort::Int; MAX_ARITY + 1]);

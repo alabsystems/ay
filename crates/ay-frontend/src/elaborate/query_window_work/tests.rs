@@ -47,16 +47,16 @@ fn assert_probe_view(context: &Context, roots: &[TermId]) {
         .assertion_finite_set_metadata
         .iter()
         .all(|row| { row == &PublicAssertionMetadata::default() }));
-    assert!(context.assertions_parsed.is_empty());
+    assert_eq!(context.assertions_parsed.len(), 0);
     assert!(!context.retains_parsed_assertions());
-    assert!(context.definitional_pass.parsed.is_empty());
-    assert!(context.objectives.is_empty());
-    assert!(context.objective_finite_set_metadata.is_empty());
-    assert!(context.soft_constraints.is_empty());
-    assert!(context.soft_finite_set_metadata.is_empty());
-    assert!(context.named_terms.is_empty());
-    assert!(context.polymorphic_assertions.is_empty());
-    assert!(context.authored_assertions.is_empty());
+    assert_eq!(context.definitional_pass.parsed.len(), 0);
+    assert_eq!(context.objectives.len(), 0);
+    assert_eq!(context.objective_finite_set_metadata.len(), 0);
+    assert_eq!(context.soft_constraints.len(), 0);
+    assert_eq!(context.soft_finite_set_metadata.len(), 0);
+    assert_eq!(context.named_terms.len(), 0);
+    assert_eq!(context.polymorphic_assertions.len(), 0);
+    assert_eq!(context.authored_assertions.len(), 0);
     assert_eq!(context.materialized_polymorphic_assertions, 0);
     assert!(context.polymorphic_instantiation_complete);
 }

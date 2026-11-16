@@ -28,23 +28,25 @@ impl OracleValue {
 }
 
 fn request(end: Instant) -> ResolutionProofLimits {
-    let mut limits = ResolutionProofLimits::default();
-    limits.deadline = Some(end);
-    limits.max_num_vars = 512;
-    limits.max_input_clauses = 4096;
-    limits.max_input_literals = 12_288;
-    limits.max_input_clause_literals = 16;
-    limits.max_input_bytes = 1_048_576;
-    limits.max_conflicts = Some(4096);
-    limits.max_decisions = Some(8192);
-    limits.solver_clause_db_reduction_threshold_bytes = 1_048_576;
-    limits.max_proof_output_bytes = 1_048_576;
-    limits.max_derived_steps = 4096;
-    limits.max_derived_literals = 12_288;
-    limits.max_hints = 32_768;
-    limits.max_pending_deletions = 4096;
-    limits.max_codec_bytes = 1_048_576;
-    limits.max_backward_reconstruction_bytes = 1_048_576;
+    let mut limits = ResolutionProofLimits {
+        deadline: Some(end),
+        max_num_vars: 512,
+        max_input_clauses: 4096,
+        max_input_literals: 12_288,
+        max_input_clause_literals: 16,
+        max_input_bytes: 1_048_576,
+        max_conflicts: Some(4096),
+        max_decisions: Some(8192),
+        solver_clause_db_reduction_threshold_bytes: 1_048_576,
+        max_proof_output_bytes: 1_048_576,
+        max_derived_steps: 4096,
+        max_derived_literals: 12_288,
+        max_hints: 32_768,
+        max_pending_deletions: 4096,
+        max_codec_bytes: 1_048_576,
+        max_backward_reconstruction_bytes: 1_048_576,
+        ..ResolutionProofLimits::default()
+    };
     limits.validation.deadline = Some(end);
     limits.validation.max_original_clauses = 4096;
     limits.validation.max_original_literals = 12_288;

@@ -80,7 +80,7 @@ fn real_projection_takes_the_midpoint() {
     let a2 = t.mk_le(y, three);
     let m = model(&[(x, num(1)), (y, num(2))]);
     let lits = check_projection(&mut t, &[(a1, true), (a2, true)], &[y], &m);
-    assert!(!lits.is_empty());
+    assert_ne!(lits, [] as [(TermId, bool); 0]);
 }
 
 #[test]

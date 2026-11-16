@@ -151,10 +151,50 @@ fn real_sorted_column_gets_no_integer_divisibility_conflict() {
     let solver = LiaSolver::new(&terms);
     let cached = solver.cached_linear(two_r, one);
     assert!(cached.gcd_divides, "Real column refuted by divisibility");
-    assert!(cached.modular_candidates.is_empty());
+    assert_eq!(
+        cached.modular_candidates.as_slice(),
+        &[] as &[(TermId, BigInt, BigInt)]
+    );
 
     let mut solver = LiaSolver::new(&terms);
     solver.register_atom(eq);
     solver.assert_literal(eq, true);
     assert!(solver.gcd_test().is_none());
+}
+
+/// A barren `gcd_test` verdict is a pure function of the asserted
+/// positive equalities (each atom's cached linear form is
+/// assignment-independent), so the scan stamps the positive-equality
+/// epoch and an inequality-only assertion must not invalidate it.
+/// The stamp is what lets repeat calls skip the scan entirely.
+#[test]
+fn gcd_barren_stamp_survives_inequality_only_assertion() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let ten = terms.mk_int(BigInt::from(10));
+    let x_plus_y = terms.mk_add(vec![x, y]);
+    let eq = terms.mk_eq(x_plus_y, three);
+    let lt = terms.mk_lt(x, ten);
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.register_atom(eq);
+    solver.register_atom(lt);
+    solver.assert_literal(eq, true);
+
+    assert!(solver.gcd_test().is_none(), "x + y = 3 is divisible");
+    let stamp = solver.gcd_barren_pos_eq_epoch;
+    assert_eq!(
+        stamp,
+        Some(solver.assertion_view_cache.pos_eq_epoch()),
+        "barren scan must stamp the positive-equality epoch"
+    );
+
+    solver.assert_literal(lt, true);
+    assert!(solver.gcd_test().is_none());
+    assert_eq!(
+        solver.gcd_barren_pos_eq_epoch, stamp,
+        "an inequality-only assertion must not move the barren stamp"
+    );
 }

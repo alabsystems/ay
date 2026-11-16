@@ -320,8 +320,8 @@ mod tests {
                 InliningBackTranslator::refuted_definition(&satisfiable),
                 Some(false)
             );
-            assert!(!close_nullary(satisfiable)
-                .is_some_and(|closed| closed.formula == ChcExpr::Bool(false)));
+            assert!(close_nullary(satisfiable)
+                .is_none_or(|closed| closed.formula != ChcExpr::Bool(false)));
         }
         let scalar = error_definition(false, true);
         assert_eq!(

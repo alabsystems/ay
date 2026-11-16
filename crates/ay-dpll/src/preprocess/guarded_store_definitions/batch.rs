@@ -21,10 +21,12 @@ pub(crate) struct CheckedActivatedUnit {
 }
 
 impl CheckedActivatedUnit {
+    #[cfg(test)]
     pub(crate) fn unit(&self) -> TermId {
         self.unit
     }
 
+    #[cfg(test)]
     pub(crate) fn proof(&self) -> (&Proof, ProofId) {
         (&self.proof, self.conclusion)
     }
@@ -41,6 +43,7 @@ pub(crate) struct GuardedStoreBatch {
 }
 
 impl GuardedStoreBatch {
+    #[cfg(test)]
     pub(crate) fn original_roots(&self) -> &[TermId] {
         &self.original_roots
     }

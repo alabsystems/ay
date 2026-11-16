@@ -47,7 +47,7 @@ fn judge(premises: &[Premise<'_>], conclusion: &[&str]) -> (Answer, String) {
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     let mut clause = Vec::new();
     for (index, text) in conclusion.iter().enumerate() {
-        let var = terms.mk_var(&format!("c{index}"), Sort::Bool);
+        let var = terms.mk_var(format!("c{index}"), Sort::Bool);
         overrides.insert(var, (*text).to_string());
         clause.push(var);
     }

@@ -58,7 +58,7 @@ fn solve_and_check_lrat(dimacs: &str, checker: &BuiltWorkspaceBinary, label: &st
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof_bytes = writer.into_vec().expect("proof flush");
     let proof_text = String::from_utf8(proof_bytes.clone()).expect("UTF-8 proof");
-    assert!(!proof_text.is_empty(), "{label}: proof must not be empty");
+    assert_ne!(proof_text.len(), 0, "{label}: proof must not be empty");
 
     let (cnf_path, proof_path) = temp_paths(&format!("lrat_{label}"));
     std::fs::write(&cnf_path, dimacs).expect("write CNF");
@@ -103,7 +103,7 @@ fn solve_and_check_drat(dimacs: &str, label: &str) {
     let writer = solver.take_proof_writer().expect("proof writer");
     let proof_bytes = writer.into_vec().expect("proof flush");
     let proof_text = String::from_utf8(proof_bytes.clone()).expect("UTF-8 proof");
-    assert!(!proof_text.is_empty(), "{label}: proof must not be empty");
+    assert_ne!(proof_text.len(), 0, "{label}: proof must not be empty");
 
     let cnf = parse_cnf(dimacs.as_bytes()).expect("parse checker CNF");
     let steps = parse_drat(&proof_bytes).expect("parse DRAT proof");

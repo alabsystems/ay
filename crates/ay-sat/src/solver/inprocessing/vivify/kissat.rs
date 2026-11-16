@@ -55,9 +55,7 @@ impl Solver {
                 continue;
             }
             let shift = 12i32 - len as i32;
-            let score: i64 = if kissat_counts {
-                1
-            } else if shift < 1 {
+            let score: i64 = if kissat_counts || shift < 1 {
                 1
             } else {
                 1i64 << shift

@@ -48,7 +48,7 @@ pub(super) fn exact_sort_work(len: usize) -> Result<usize, ResolutionValidationE
     if len <= 1 {
         return Ok(len);
     }
-    let passes = (usize::BITS - (len - 1).leading_zeros()) as usize;
+    let passes = (len - 1).bit_width() as usize;
     exact_checked_mul(
         len,
         exact_checked_add(passes, 1, ResolutionValidationResource::Work)?,

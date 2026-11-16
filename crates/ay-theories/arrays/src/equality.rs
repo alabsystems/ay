@@ -474,14 +474,6 @@ impl ArraySolver<'_> {
         result
     }
 
-    /// The key `equal_by_affine_form` compares: two terms are affine-equal
-    /// exactly when both have a key and the keys are equal. Lets a caller
-    /// group many terms by affine form instead of comparing them pairwise.
-    pub(crate) fn affine_form_key(&self, term: TermId) -> Option<(u32, BigInt)> {
-        self.affine_canonical(term)
-            .map(|(id, form)| (id, form.1.clone()))
-    }
-
     /// Parse `term` into an affine form over OPAQUE Int leaves (#7956
     /// index-congruence). Where `parse_affine_int_expr` returns `None` on a
     /// UF-application leaf (`(seq_offset a)`), this parser keeps the leaf
@@ -685,9 +677,7 @@ impl ArraySolver<'_> {
         // them no match is claimed.
         let mut used = Vec::new();
         used.try_reserve_exact(neg.len()).ok()?;
-        for _ in 0..neg.len() {
-            used.push(false);
-        }
+        used.resize_with(neg.len(), bool::default);
         for (a, coeff_a) in &pos {
             let mut matched = false;
             for (j, (b, coeff_b)) in neg.iter().enumerate() {

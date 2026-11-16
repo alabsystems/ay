@@ -22,7 +22,7 @@ fn complement_original_relocations_have_native_and_external_proofs() {
             context.process_command(&command).unwrap();
         }
         let parsed = context.assertions_parsed()[0].clone();
-        let root = super::aggregate_tests::raw_fixture_term(&mut context, &parsed);
+        let root = aggregate_tests::raw_fixture_term(&mut context, &parsed);
         let TermData::Not(equality) = *context.terms.get(root) else {
             panic!("negated equality")
         };
@@ -172,7 +172,7 @@ fn complement_publication_shares_the_arithmetic_attempt_cap() {
     let assume = proof.add_assume(root, None);
     let mut lemma = assume;
     for _ in 0..17 {
-        lemma = proof.add_theory_lemma_with_kind("bv", vec![equality], kind.clone());
+        lemma = proof.add_theory_lemma_with_kind("bv", vec![equality], kind);
     }
     proof.add_resolution(vec![], equality, assume, lemma);
     let text =

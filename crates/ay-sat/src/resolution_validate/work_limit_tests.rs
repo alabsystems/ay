@@ -65,8 +65,6 @@ fn replay_control_crossing_and_overflow_remain_distinct_from_work_exhaustion() {
     );
     assert_eq!(meter.consumed_work(), 1_024);
     assert_eq!(polls.get(), 2);
-    drop(meter);
-
     stop.set(false);
     let mut meter = WorkMeter::new(&limits, u64::MAX, &mut should_stop).unwrap();
     let before = polls.get();

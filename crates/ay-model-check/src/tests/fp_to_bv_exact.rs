@@ -225,7 +225,7 @@ fn fp_to_bv_exact_cancellation_after_work_acceptance_cannot_publish_a_value() {
         &value,
         8,
         crate::fp_exact::BvSignedness::Signed,
-        crate::fp::RoundingMode::Rne,
+        fp::RoundingMode::Rne,
     )
     .unwrap()
     .work;

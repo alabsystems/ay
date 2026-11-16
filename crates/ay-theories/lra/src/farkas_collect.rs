@@ -126,8 +126,7 @@ impl LraSolver {
         let mut conflicts = Vec::new();
         let mut found_first = false;
 
-        for var in 0..self.vars.len() {
-            let info = &self.vars[var];
+        for info in &self.vars {
             let (Some(lower), Some(upper)) = (&info.lower, &info.upper) else {
                 continue;
             };

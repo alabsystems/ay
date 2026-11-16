@@ -528,7 +528,7 @@ impl Executor {
                 euf_model
                     .term_values
                     .get(&term_id)
-                    .and_then(super::evaluation_copies::copy_string)
+                    .and_then(|value| super::evaluation_copies::copy_string(value))
             })
     }
 
@@ -591,13 +591,13 @@ impl Executor {
                         euf_model
                             .term_values
                             .get(&term_id)
-                            .and_then(super::evaluation_copies::copy_string)
+                            .and_then(|value| super::evaluation_copies::copy_string(value))
                     })
             } else {
                 euf_model
                     .term_values
                     .get(&term_id)
-                    .and_then(super::evaluation_copies::copy_string)
+                    .and_then(|value| super::evaluation_copies::copy_string(value))
             }
             .or_else(|| {
                 // #uf-table-entry-nonrec: an APP-valued ENTRY atom is

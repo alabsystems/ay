@@ -88,7 +88,7 @@ fn test_build_term_values_map_rejects_incomplete_or_invalid_bv_bits() {
     assert!(SmtContext::build_term_values_map(
         &terms,
         &None,
-        &vec![false; 129],
+        &[false; 129],
         &std::collections::BTreeMap::new(),
         &mappings,
         0,
@@ -99,7 +99,7 @@ fn test_build_term_values_map_rejects_incomplete_or_invalid_bv_bits() {
     assert!(SmtContext::build_term_values_map(
         &terms,
         &None,
-        &vec![false; 128],
+        &[false; 128],
         &std::collections::BTreeMap::new(),
         &mappings,
         0,
@@ -112,7 +112,7 @@ fn test_build_term_values_map_rejects_incomplete_or_invalid_bv_bits() {
     assert!(SmtContext::build_term_values_map(
         &terms,
         &None,
-        &vec![false; 130],
+        &[false; 130],
         &std::collections::BTreeMap::new(),
         &mappings,
         1,

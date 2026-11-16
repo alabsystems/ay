@@ -672,7 +672,7 @@ mod tests {
             RouteAdmissionPacket::default()
         );
         assert_eq!(stats.observer_events_materialized, 0);
-        assert!(ledger.observer_events().is_empty());
+        assert_eq!(ledger.observer_events().len(), 0);
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
             Some("model reconstruction witness missing")
         );
         assert_eq!(stats.observer_events_materialized, 0);
-        assert!(ledger.observer_events().is_empty());
+        assert_eq!(ledger.observer_events().len(), 0);
     }
 
     #[test]

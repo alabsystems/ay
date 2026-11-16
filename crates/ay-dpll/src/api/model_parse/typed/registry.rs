@@ -72,11 +72,7 @@ impl Decoder<'_> {
         }
         let (constructor, fields) = chosen?;
         self.copy(constructor.len())?;
-        self.copy(
-            fields
-                .len()
-                .checked_mul(std::mem::size_of::<ModelValue>())?,
-        )?;
+        self.copy(fields.len().checked_mul(size_of::<ModelValue>())?)?;
         let mut values = Vec::new();
         values.try_reserve_exact(fields.len()).ok()?;
         for (argument, (_, sort)) in arguments.iter().zip(fields) {

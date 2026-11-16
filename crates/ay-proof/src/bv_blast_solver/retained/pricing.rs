@@ -60,7 +60,7 @@ pub(crate) enum PriceError {
     #[error(transparent)]
     Wire(#[from] wire::WireError),
     #[error(transparent)]
-    Resolution(#[from] ay_sat::ResolutionValidationError),
+    Resolution(#[from] ResolutionValidationError),
 }
 
 fn add(a: usize, b: usize) -> Result<usize, PriceError> {
@@ -86,6 +86,10 @@ pub(crate) fn wire_bounds(bytes: usize) -> Result<(usize, usize), PriceError> {
 /// Only ordinary source enters. Decode and source preflight are separately
 /// prepaid by the bridge before entry, including callbacks/EOF and scratch.
 /// The source is the actual lowered clause, not dimensions supplied by wire.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source, backing capacity, independent proof/gate/wire limits, and poll stay explicit"
+)]
 pub(crate) fn price(
     lhs: &BvExpr,
     rhs: &BvExpr,
@@ -102,19 +106,19 @@ pub(crate) fn price(
         .max_work
         .min(u64::try_from(decode_work).map_err(|_| PriceError::Overflow)?);
     narrow.max_storage_bytes = narrow.max_storage_bytes.min(decode_bytes);
-    let decoded = wire::decode(bytes, &narrow, proof, gates, poll).result?;
-    let source = source_bound(lhs, rhs, proof, poll)?;
-    let result = from_dimensions(
-        &source,
-        &decoded,
-        backing_capacity,
-        proof,
-        decode_work,
-        decode_bytes,
-        poll,
-    );
-    drop(decoded);
-    drop(source);
+    let result = {
+        let decoded = wire::decode(bytes, &narrow, proof, gates, poll).result?;
+        let source = source_bound(lhs, rhs, proof, poll)?;
+        from_dimensions(
+            &source,
+            &decoded,
+            backing_capacity,
+            proof,
+            decode_work,
+            decode_bytes,
+            poll,
+        )
+    };
     finish_expr_export(Some(proof), poll)?;
     result
 }
@@ -200,6 +204,10 @@ fn dimensions(
     Ok((rows, literals, hints))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each independently checked retained-storage dimension stays explicit"
+)]
 fn storage_price(
     source: &SourceBound,
     rows: usize,

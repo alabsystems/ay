@@ -33,7 +33,7 @@ fn forced_to_real_site_stops_inside_divider_and_fresh_encoding_matches_legacy() 
     let roots = executor.ctx.assertions.clone();
     let stamp = executor.ctx.source_context_stamp();
     let (fp, mixed) = partition_fp_assertions(&executor.ctx.terms, &roots);
-    assert!(fp.is_empty());
+    assert_eq!(fp, [] as [TermId; 0]);
     assert_eq!(mixed.len(), 1);
     let sites = collect_fp_to_real_sites(&executor.ctx.terms, &mixed);
     assert_eq!(sites.len(), 1);
@@ -81,7 +81,7 @@ fn forced_to_real_site_stops_inside_divider_and_fresh_encoding_matches_legacy() 
         .encode_fp_assertions_controlled(&fp, &sites, &fresh, &|_| {})
         .unwrap();
     assert!(actual.term_to_fp.contains_key(&sites[0].arg));
-    assert!(!actual.base_clauses.is_empty());
+    assert_ne!(actual.base_clauses, [] as [CnfClause; 0]);
     let (expected, _, _) = legacy::encode(&executor, &fp, &sites);
     legacy::assert_same(&actual, &expected);
 }
@@ -173,7 +173,7 @@ fn unsupported_predicate_and_actual_condition_gap_are_not_resource_stops() {
     let selected = terms.mk_ite(opaque, x, y);
     let stop = FpStop::from_executor(&executor);
     let (old_unsupported, _, _) = legacy::encode(&executor, &[unknown], &[]);
-    assert!(old_unsupported.base_clauses.is_empty());
+    assert_eq!(old_unsupported.base_clauses, [] as [CnfClause; 0]);
     assert_eq!(old_unsupported.total_vars, 0);
     assert!(matches!(
         executor.encode_fp_assertions_controlled(&[unknown], &[], &stop, &|_| {}),
@@ -181,7 +181,7 @@ fn unsupported_predicate_and_actual_condition_gap_are_not_resource_stops() {
     ));
     assert_eq!(stop.check(), Ok(()));
     let (old_gap, _, _) = legacy::encode(&executor, &[], &[FpToRealSite { arg: selected }]);
-    assert!(old_gap.base_clauses.is_empty());
+    assert_eq!(old_gap.base_clauses, [] as [CnfClause; 0]);
     assert_eq!(old_gap.total_vars, 0);
     assert!(old_gap.term_to_fp.contains_key(&selected));
     assert!(matches!(

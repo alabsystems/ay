@@ -17,9 +17,7 @@ pub(super) struct Fixture {
 }
 
 pub(super) fn app(exec: &mut Executor, name: &str, args: &[TermId], sort: Sort) -> TermId {
-    exec.ctx
-        .terms
-        .mk_app(Symbol::named(name), args.to_vec(), sort)
+    exec.ctx.terms.mk_app(Symbol::named(name), args, sort)
 }
 
 fn member(exec: &Executor, name: &str) -> (String, Sort) {

@@ -69,6 +69,7 @@ impl<'a> Control<'a> {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn copy_ids(&mut self, source: &[TermId]) -> Result<Vec<TermId>, ProofCheckError> {
         let mut copied = self.reserve_ids(source.len())?;
         // reserve_ids prepaid both the complete traversal and output storage.

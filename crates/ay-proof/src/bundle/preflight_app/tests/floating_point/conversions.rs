@@ -159,7 +159,7 @@ fn stronger_native_builtin_checks_are_explicitly_not_legacy_uf_authentication() 
     let values = fp_entries();
     for name in ["fp.add", "RNE"] {
         let symbol = Symbol::named(name);
-        assert!(crate::bundle::validate_app_signature(
+        assert!(validate_app_signature(
             &values,
             values.len(),
             &symbol,

@@ -254,8 +254,8 @@ fn test_sbva_empty_result_on_no_eligible() {
     let result = engine.run(&arena, &occ, &vals, &var_states, &config);
 
     assert_eq!(result.groups_applied, 0);
-    assert!(result.new_clauses.is_empty());
-    assert!(result.to_delete.is_empty());
+    assert_eq!(result.new_clauses.len(), 0);
+    assert_eq!(result.to_delete.len(), 0);
 }
 
 #[test]

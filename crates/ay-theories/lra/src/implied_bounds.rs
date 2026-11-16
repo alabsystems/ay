@@ -1193,10 +1193,8 @@ impl LraSolver {
                             };
                             let derived_strict = if ub_strict_count >= 2 {
                                 true
-                            } else if ub_strict_count == 1 {
-                                !var_strict
                             } else {
-                                false
+                                ub_strict_count == 1 && !var_strict
                             };
                             // Not tighter than the slot: the apply loop would drop it.
                             if self.derived_bound_not_tighter(

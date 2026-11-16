@@ -62,7 +62,10 @@ fn test_backward_soft_delete_updates_occurrences() {
     let cidx = checker
         .delete_forward(&clause)
         .expect("the tracked clause should be present");
-    assert!(checker.inner.occ_lists[neg_pivot.index()].is_empty());
+    assert_eq!(
+        checker.inner.occ_lists[neg_pivot.index()].as_slice(),
+        &[] as &[usize]
+    );
 
     checker.restore_clause(cidx);
     assert_eq!(checker.inner.occ_lists[neg_pivot.index()], vec![cidx]);

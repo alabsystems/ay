@@ -170,7 +170,7 @@ fn bit_level_hint_chain_closes_by_probing_and_passes_the_strict_checker() {
     let Some(ProofStep::Resolution { clause, .. }) = proof.get_step(empty) else {
         panic!("expected a resolution step for the empty clause");
     };
-    assert!(clause.is_empty());
+    assert_eq!(clause.as_slice(), []);
     assert!(
         !proof.steps.iter().any(|step| matches!(
             step,

@@ -16,12 +16,16 @@ pub enum NativeProofApplication {
     Asserted(Term),
     /// Exact elimination of a tracked assertion's implication guard.
     ModusPonens {
+        /// Indices of the asserted label and implication guard.
         premises: [usize; 2],
+        /// The implication's consequent.
         conclusion: Term,
     },
     /// A genuine resolution step with one unit premise.
     UnitResolution {
+        /// Indices of the resolved proof applications.
         premises: [usize; 2],
+        /// Clause produced by the resolution.
         conclusion: Vec<Term>,
     },
 }
@@ -29,7 +33,9 @@ pub enum NativeProofApplication {
 /// capabilities of the producing Solver; they are never portable raw IDs.
 #[derive(Clone, Debug)]
 pub struct NativeProofDag {
+    /// Proof applications in dependency order.
     pub applications: Vec<NativeProofApplication>,
+    /// Index of the application that proves the DAG's conclusion.
     pub root: usize,
 }
 

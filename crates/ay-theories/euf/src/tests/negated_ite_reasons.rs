@@ -45,6 +45,6 @@ fn negated_ite_reasons_preserve_guard_polarity_and_incremental_scope() {
         }));
         euf.pop();
         assert!(matches!(euf.check(), TheoryResult::Sat));
-        assert!(euf.explain(choice, selected).is_empty());
+        assert_eq!(euf.explain(choice, selected), Vec::<TheoryLit>::new());
     }
 }

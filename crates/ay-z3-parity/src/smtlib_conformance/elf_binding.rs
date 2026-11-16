@@ -6,6 +6,7 @@
 
 use super::*;
 
+#[cfg(target_os = "linux")]
 const MAX_ELF_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DYNAMIC_BYTES: u64 = 64 * 1024;
 const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
@@ -128,6 +129,11 @@ fn parse(data: &[u8]) -> Result<Dynamic, String> {
     if dynamic.size == 0 || dynamic.size > MAX_DYNAMIC_BYTES || dynamic.size % 16 != 0 {
         return Err("invalid or excessive ELF dynamic segment".to_string());
     }
+    let dynamic_bytes = bytes(data, dynamic.offset, dynamic.size)?;
+    let (entries, remainder) = dynamic_bytes.as_chunks::<16>();
+    if !remainder.is_empty() {
+        return Err("invalid or excessive ELF dynamic segment".to_string());
+    }
     let mut strtab = None;
     let mut strsz = None;
     let mut soname = None;
@@ -135,7 +141,7 @@ fn parse(data: &[u8]) -> Result<Dynamic, String> {
     let mut runpath = None;
     let mut needed = Vec::new();
     let mut terminated = false;
-    for entry in bytes(data, dynamic.offset, dynamic.size)?.chunks_exact(16) {
+    for entry in entries {
         let tag = word64(entry, 0)?;
         let value = word64(entry, 8)?;
         match tag {
@@ -236,7 +242,7 @@ fn validate_binding(binary: &Dynamic, library: &Dynamic, selected: &Path) -> Res
         .ok_or("ELF provider binding has no private DT_RPATH")?;
     let paths = rpath.split(':').collect::<Vec<_>>();
     let directory = selected.parent().ok_or("ELF provider has no parent")?;
-    if paths.first().map(|path| Path::new(path)) != Some(directory)
+    if paths.first().map(Path::new) != Some(directory)
         || paths
             .iter()
             .any(|path| path.is_empty() || !Path::new(path).is_absolute())
@@ -249,6 +255,7 @@ fn validate_binding(binary: &Dynamic, library: &Dynamic, selected: &Path) -> Res
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn validate(binary: &Path, library: &Path) -> Result<(), String> {
     let library =
         fs::canonicalize(library).map_err(|error| format!("resolve ELF provider: {error}"))?;
@@ -377,6 +384,14 @@ mod tests {
             assert!(parse(&damaged).is_err(), "offset {offset}");
         }
         assert!(parse(&original[..100]).is_err());
+        let mut partial_dynamic_entry = original.clone();
+        for offset in [120 + 32, 120 + 40] {
+            partial_dynamic_entry[offset..offset + 8].copy_from_slice(&17u64.to_le_bytes());
+        }
+        assert_eq!(
+            parse(&partial_dynamic_entry).unwrap_err(),
+            "invalid or excessive ELF dynamic segment"
+        );
         let mut machine_mismatch = parse(&original).unwrap();
         machine_mismatch.machine = 183;
         let consumer = parse(&image(3, None, &["libz3.so"], Some("/private"), None)).unwrap();

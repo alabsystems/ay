@@ -1973,7 +1973,7 @@ p cnf 3 3
     // Empty clauses (just "0") ARE preserved — they signal UNSAT
     assert_eq!(formula.clauses.len(), 3);
     assert_eq!(formula.clauses[0].len(), 2); // {1, 2}
-    assert!(formula.clauses[1].is_empty()); // empty clause
+    assert_eq!(formula.clauses[1].len(), 0); // empty clause
     assert_eq!(formula.clauses[2].len(), 1); // {-1}
 }
 
@@ -1983,7 +1983,7 @@ fn test_parse_trivially_unsat_empty_clause() {
     let input = "p cnf 0 1\n0\n";
     let formula = parse_str(input).unwrap();
     assert_eq!(formula.clauses.len(), 1);
-    assert!(formula.clauses[0].is_empty());
+    assert_eq!(formula.clauses[0].len(), 0);
     // Verify the solver returns UNSAT
     let mut solver = formula.into_solver();
     assert!(solver.solve().is_unsat());

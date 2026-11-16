@@ -205,9 +205,9 @@ fn sat_warm_state_default_is_empty() {
     let warm = SatWarmState::default();
     assert!(warm.is_empty(), "default warm state should be empty");
     assert!(warm.formula_fingerprint.is_none());
-    assert!(warm.learned_clauses.is_empty());
-    assert!(warm.variable_activities.is_empty());
-    assert!(warm.phase_hints.is_empty());
+    assert_eq!(warm.learned_clauses, [] as [Vec<ay_sat::Literal>; 0]);
+    assert_eq!(warm.variable_activities, [] as [(usize, f64); 0]);
+    assert_eq!(warm.phase_hints, [] as [(usize, bool); 0]);
 }
 
 /// #3762: SatWarmState::extract from a fresh solver produces non-empty state
@@ -218,7 +218,7 @@ fn sat_warm_state_extract_from_fresh_solver() {
     let warm = SatWarmState::extract(&solver);
 
     // Fresh solver has no learned clauses, no activities, no phases.
-    assert!(warm.learned_clauses.is_empty());
+    assert_eq!(warm.learned_clauses, [] as [Vec<ay_sat::Literal>; 0]);
     // VSIDS may have initial activity from constructor, so just check it's valid.
     assert_eq!(warm.prior_conflicts, 0);
 }

@@ -176,6 +176,10 @@ impl<'a, 'p> Blaster<'a, 'p> {
     /// more with every division exact when that abstraction does not print,
     /// unless its sweep refuted it and only the document's size refused it
     /// (`transport/size_refusal.rs`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the complete-blast document schema keeps roots, orientation, unit, and case explicit"
+    )]
     pub(super) fn lemma_document(
         printer: &'p AlethePrinter<'a>,
         id: ProofId,

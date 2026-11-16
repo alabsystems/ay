@@ -58,11 +58,11 @@ impl Default for QuantifierState {
 impl QuantifierState {
     /// Immutable model data conversion shares the existing cumulative plan
     /// storage envelope with all quantifiers in this evaluator.
-    pub(super) fn admit_model_data_storage(&self, bytes: usize) -> super::EvalResult<()> {
+    pub(super) fn admit_model_data_storage(&self, bytes: usize) -> EvalResult<()> {
         let Some(left) = self.plan_bytes_left.get().checked_sub(bytes) else {
             self.plan_bytes_left.set(0);
-            return Err(super::EvalError::resource(
-                super::EvalResource::Work,
+            return Err(EvalError::resource(
+                EvalResource::Work,
                 "model data exceeds original plan storage budget",
             ));
         };

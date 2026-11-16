@@ -63,7 +63,7 @@ pub(super) fn entry(
 
 pub(super) fn sort(len: usize, owner: &CountedAdmission) -> AdmissionResult<()> {
     // Same standard unstable ordering; conservative introsort/heapsort envelope.
-    let levels = (usize::BITS - len.leading_zeros()) as usize;
+    let levels = len.bit_width() as usize;
     let work = len
         .checked_mul(levels.saturating_add(1))
         .and_then(|n| n.checked_mul(64))

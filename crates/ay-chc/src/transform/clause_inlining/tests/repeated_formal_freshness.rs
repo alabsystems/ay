@@ -33,7 +33,10 @@ fn reconstruct(original: &ChcProblem, predicate: PredicateId) -> PredicateInterp
     );
     for clause in transformed.clauses() {
         assert!(clause.is_query());
-        assert!(clause.body.predicates.is_empty());
+        assert_eq!(
+            clause.body.predicates,
+            [] as [(PredicateId, Vec<ChcExpr>); 0]
+        );
         let folded = clause
             .body
             .constraint

@@ -35,9 +35,14 @@ fn unavailable_capacity_keeps_destructor_on_the_original_computation() {
         return;
     }
     let compute = ComputeScope::enter().expect("caller");
-    let mut retained = Vec::new();
+    // Ownership, not inspection, exhausts the spare compute units through this scope.
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+    )]
+    let mut _retained_units = Vec::new();
     while let Some(unit) = compute.try_extra().expect("probe") {
-        retained.push(unit);
+        _retained_units.push(unit);
     }
     let (entered_tx, entered_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();

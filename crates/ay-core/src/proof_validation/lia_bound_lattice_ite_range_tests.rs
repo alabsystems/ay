@@ -129,8 +129,8 @@ fn falsifying_point(
     let total = values.len().pow(u32::try_from(names.len()).unwrap());
     for index in 0..total {
         let mut rest = index;
-        for slot in 0..names.len() {
-            point[slot].1 = values[rest % values.len()];
+        for (_, value) in &mut point {
+            *value = values[rest % values.len()];
             rest /= values.len();
         }
         if clause

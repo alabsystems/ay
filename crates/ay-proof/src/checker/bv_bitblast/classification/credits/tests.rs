@@ -49,7 +49,7 @@ fn mixed_families_share_the_exact_legacy_census_and_single_aggregate_debit() {
         credits.ordinary_ids().collect::<Vec<_>>(),
         [ProofId(1), ProofId(2)]
     );
-    assert!(std::ptr::eq(credits.terms(), &terms));
+    assert!(std::ptr::eq(credits.terms(), &raw const terms));
     assert_eq!(credits.deadline(), end);
     for id in [ProofId(2), ProofId(1)] {
         let credit = credits
@@ -59,8 +59,11 @@ fn mixed_families_share_the_exact_legacy_census_and_single_aggregate_debit() {
             })
             .unwrap();
         assert_eq!(credit.id(), id);
-        assert!(std::ptr::eq(credit.step(), &proof.steps[id.0 as usize]));
-        assert!(std::ptr::eq(credit.terms(), &terms));
+        assert!(std::ptr::eq(
+            credit.step(),
+            &raw const proof.steps[id.0 as usize]
+        ));
+        assert!(std::ptr::eq(credit.terms(), &raw const terms));
         let ProofStep::TheoryLemma { clause, .. } = credit.step() else {
             panic!("fixture")
         };
@@ -115,11 +118,11 @@ fn source_positions_not_names_or_equal_clauses_define_one_use_credits() {
     );
     assert!(std::ptr::eq(
         credits.source_step(ProofId(0)).unwrap(),
-        &proof.steps[0]
+        &raw const proof.steps[0]
     ));
     assert!(credits.source_step(ProofId(2)).is_none());
     for id in [ProofId(0), ProofId(1)] {
-        drop(credits.take(id, &mut |_, _| true).unwrap());
+        let _credit = credits.take(id, &mut |_, _| true).unwrap();
     }
     assert!(matches!(
         credits.take(ProofId(0), &mut |_, _| true),
@@ -154,7 +157,9 @@ fn cheap_nonordinary_wrong_and_unconsumed_ids_cannot_issue_or_complete() {
         assert_eq!(credits.finish(), Err(BvCreditError::Refused));
     }
     let mut credits = prepaid(&proof, &terms);
-    drop(credits.take(ProofId(1), &mut |_, _| true).unwrap());
+    {
+        let _credit = credits.take(ProofId(1), &mut |_, _| true).unwrap();
+    }
     assert_eq!(credits.finish(), Err(BvCreditError::Unconsumed(ProofId(2))));
 }
 
@@ -202,19 +207,20 @@ fn credit_is_source_accounting_not_semantic_or_gate_authority() {
         },
     );
     let mut credits = prepaid(&proof, &terms);
-    let credit = credits.take(ProofId(0), &mut |_, _| true).unwrap();
-    assert_eq!(credit.clause(), [false_claim]);
-    assert!(matches!(
-        credit.step(),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::BvBitBlastGate {
-                gate_type: BvGateType::And,
-                width: 3
-            },
-            ..
-        }
-    ));
-    drop(credit);
+    {
+        let credit = credits.take(ProofId(0), &mut |_, _| true).unwrap();
+        assert_eq!(credit.clause(), [false_claim]);
+        assert!(matches!(
+            credit.step(),
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::BvBitBlastGate {
+                    gate_type: BvGateType::And,
+                    width: 3
+                },
+                ..
+            }
+        ));
+    }
     // Only the separate gate/source/semantic validator may reject this claim.
     assert_eq!(credits.finish(), Ok(()));
 }

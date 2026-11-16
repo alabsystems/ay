@@ -26,10 +26,7 @@ fn compare(terms: &TermStore, clause: &[TermId]) -> bool {
         oracle::bounded_vars(terms, clause)
     );
     assert_eq!(requires_proof_producer(terms, clause), expected);
-    assert_eq!(
-        super::super::bv_bitblast_requires_proof_producer(terms, clause),
-        expected
-    );
+    assert_eq!(bv_bitblast_requires_proof_producer(terms, clause), expected);
     assert_eq!(
         bv_bitblast_requires_proof_producer_with_progress(terms, clause, &mut |work, bytes| {
             assert_eq!((work, bytes), (0, 0));
@@ -272,7 +269,7 @@ fn unsafe_signed_and_repeat_words_refuse_before_bounded_evaluation() {
             } else {
                 Sort::bitvec(width)
             };
-            let operation = terms.mk_app(Symbol::named(name), &[value, value], sort);
+            let operation = terms.mk_app(Symbol::named(name), [value, value], sort);
             assert_eq!(
                 collect_bounded_vars(&terms, &[operation]).is_some(),
                 width < 64,
@@ -281,7 +278,7 @@ fn unsafe_signed_and_repeat_words_refuse_before_bounded_evaluation() {
         }
         let repeat = terms.mk_app(
             Symbol::indexed("repeat", vec![1]),
-            &[value],
+            [value],
             Sort::bitvec(width),
         );
         assert_eq!(

@@ -153,7 +153,7 @@ impl Executor {
         // Both branches select `printed`; no extra lookup/comparison occurs.
         ay_core::safe_eprintln!(
             "[ay-public-uf] seq={} executor={:p} epoch=0x{:x} decision={} term={:?} symbol={:?} arity={} argument_values={} arguments_truncated={} arguments={:?} result_sort={:?} pin={:?} printed={:?} selected={:?} printed_arity={} printed_rows={}",
-            ticket, self as *const Executor, epoch, decision, term, Head(symbol), native_args.len(), arguments.len(), native_args.len() > 8 || arguments.len() > 8,
+            ticket, std::ptr::from_ref(self), epoch, decision, term, Head(symbol), native_args.len(), arguments.len(), native_args.len() > 8 || arguments.len() > 8,
             Arguments { exec: self, terms: native_args, values: arguments }, SortTag(Some(sort)),
             Value { value: pin, sort: Some(sort) }, Value { value: Some(printed), sort: Some(sort) },
             Value { value: Some(printed), sort: Some(sort) }, printed_arity, printed_rows,
@@ -182,7 +182,7 @@ impl Executor {
         let kernel = self.function_row_roots.len();
         ay_core::safe_eprintln!(
             "[ay-public-uf-rows] seq={} executor={:p} epoch=0x{:x} symbol={:?} before={} after={} first_removed={:?} first_kept={:?} root_entries={} working_root_list_counts={:?} reachable={}",
-            ticket, self as *const Executor, epoch, Text(name), before, after, first_removed, first_kept,
+            ticket, std::ptr::from_ref(self), epoch, Text(name), before, after, first_removed, first_kept,
             root_entries, (assertions, assumptions, kernel), reachable,
         );
     }

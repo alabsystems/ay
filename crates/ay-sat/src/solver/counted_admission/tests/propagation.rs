@@ -130,7 +130,7 @@ fn whole_long_watch_transaction_is_admitted_before_any_mutation() {
             Err(SatUnknownReason::ResourceBudget)
         );
         assert_eq!(state(&solver), before);
-        assert!(solver.deferred_replacement_watches.is_empty());
+        assert_eq!(solver.deferred_replacement_watches.len(), 0);
         assert_eq!(original.check(), Err(expected));
     }
 }
@@ -184,7 +184,7 @@ fn destination_region_and_unified_buffer_growth_are_pre_admitted_once() {
     assert_eq!(baseline.search_propagate_counted(), Ok(None));
     assert_eq!(state(&baseline), state(&legacy));
     let used = original.usage().unwrap();
-    assert!(used.storage_admitted > 512 * std::mem::size_of::<u64>());
+    assert!(used.storage_admitted > 512 * size_of::<u64>());
     assert!(used.work_admitted > 512);
     for storage in [used.storage_admitted - 1, used.storage_admitted] {
         let mut solver = make();
@@ -278,7 +278,7 @@ fn later_chain_refusal_preserves_each_completed_watch_transaction() {
         Err(SatUnknownReason::ResourceBudget)
     );
     assert!(solver.qhead > 0 && solver.qhead < solver.trail.len());
-    assert!(solver.deferred_replacement_watches.is_empty());
+    assert_eq!(solver.deferred_replacement_watches.len(), 0);
     for offset in solver.arena.indices() {
         let clause = solver.arena.literals(offset);
         if clause.len() >= 2 {

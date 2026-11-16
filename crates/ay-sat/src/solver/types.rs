@@ -105,7 +105,9 @@ pub struct FactorStats {
     /// ticks the last of them consumed, and how many stopped before their
     /// candidate schedule drained (the budget, not the formula, ended them).
     pub init_calls: u64,
+    /// Ticks consumed by the most recent first-call-bonus run.
     pub init_ticks: u64,
+    /// First-call-bonus runs stopped before their candidate schedule drained.
     pub init_undrained: u64,
 }
 

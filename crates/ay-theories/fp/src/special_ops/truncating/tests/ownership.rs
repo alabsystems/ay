@@ -54,9 +54,7 @@ fn callback_panic_cannot_publish_or_retry_partial_truncating_remainder() {
         calls.set(calls.get() + 1);
         if progress.stage == FpBuildStage::RemainderExponent {
             rows.set(rows.get() + 1);
-            if rows.get() == 2 {
-                panic!("callback interrupted partial construction");
-            }
+            assert_ne!(rows.get(), 2, "callback interrupted partial construction");
         }
         false
     };

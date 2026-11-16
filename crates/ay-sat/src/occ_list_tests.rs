@@ -26,7 +26,7 @@ fn remove_clause_removes_from_all_literals() {
 
     occ.remove_clause(0, &[lit(1), lit(2)]);
     assert_eq!(occ.get(lit(1)), &[1]);
-    assert!(occ.get(lit(2)).is_empty());
+    assert_eq!(occ.get(lit(2)).len(), 0);
     assert_eq!(occ.get(lit(3)), &[1]);
 }
 
@@ -43,8 +43,8 @@ fn clear_empties_all() {
     let mut occ = OccList::new(5);
     occ.add_clause(0, &[lit(1), lit(2)]);
     occ.clear();
-    assert!(occ.get(lit(1)).is_empty());
-    assert!(occ.get(lit(2)).is_empty());
+    assert_eq!(occ.get(lit(1)).len(), 0);
+    assert_eq!(occ.get(lit(2)).len(), 0);
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn position_map_consistency_after_interleaved_ops() {
 
     // Remove the only remaining element
     occ.remove_clause(10, &[lit(1)]);
-    assert!(occ.get(lit(1)).is_empty());
+    assert_eq!(occ.get(lit(1)).len(), 0);
 }
 
 /// Verify clone_from_other produces a correct deep copy with position maps.
@@ -144,7 +144,7 @@ fn clone_from_other_preserves_remove_capability() {
     // Remove from the clone should work (position map is rebuilt)
     dst.remove_clause(1, &[lit(1), lit(3)]);
     assert_eq!(dst.count(lit(1)), 2);
-    assert!(dst.get(lit(3)).is_empty());
+    assert_eq!(dst.get(lit(3)).len(), 0);
     // Source should be unaffected
     assert_eq!(src.count(lit(1)), 3);
 }

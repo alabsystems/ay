@@ -346,6 +346,10 @@ fn scalar_only_nodes_and_unused_predicate_sorts_do_not_consume_datatype_admissio
     // not impose that ceiling on ordinary scalar nodes or unused scalar sorts.
     let mut source = problem();
     source.declare_predicate("unused_scalar", vec![ChcSort::Int; 131_073]);
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the scalar-admission fixture intentionally shares one immutable node to isolate metadata accounting"
+    )]
     let expression = ChcExpr::Op(ChcOp::And, vec![Arc::new(ChcExpr::Bool(true)); 131_073]);
     let guard = AuthenticatedDatatypes::new(&source, &[&expression])
         .expect("scalar work remains outside datatype admission accounting");

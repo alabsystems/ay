@@ -375,7 +375,7 @@ mod context_tests {
         let solver = trivial_sat_solver();
         let ctx = solver.as_context();
         assert_eq!(ctx.decision_level(), 0);
-        assert!(ctx.trail().is_empty());
+        assert_eq!(ctx.trail(), &[] as &[Literal]);
         assert_eq!(ctx.value(Variable::new(1)), None);
         assert_eq!(ctx.var_level(Variable::new(1)), None);
         assert_eq!(ctx.conflicts(), 0);

@@ -268,7 +268,7 @@ fn uncertified_lemmas(terms: &mut TermStore, count: usize) -> Proof {
     let zero = terms.mk_rational(BigRational::from_integer(0.into()));
     let mut proof = Proof::new();
     for index in 0..count {
-        let x = terms.mk_var(&format!("poll_x{index}"), Sort::Real);
+        let x = terms.mk_var(format!("poll_x{index}"), Sort::Real);
         let below = terms.mk_lt(x, zero);
         let above = terms.mk_gt(x, zero);
         proof.add_step(ProofStep::TheoryLemma {

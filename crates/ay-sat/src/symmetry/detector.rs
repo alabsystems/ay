@@ -191,23 +191,13 @@ impl SymmetryDetector {
     /// All emitted constraints have pairwise-disjoint ORIGINAL-variable support
     /// (disjoint groups compose soundly); the aux variables are fresh.
     ///
-    #[cfg(test)]
     /// `fresh_base` is the first unused variable id; aux equal-prefix variables
     /// are allocated sequentially from there. Returns `(clauses, aux_allocated)`;
     /// the caller MUST `ensure_num_vars(fresh_base + aux_allocated)` before adding
     /// the clauses (they reference variables `>= fresh_base`).
-    pub(crate) fn detect_and_encode_composite(
-        &self,
-        clauses: &[Vec<Literal>],
-        fresh_base: u32,
-    ) -> (Vec<Vec<Literal>>, u32) {
-        let (out, aux, _) = self.detect_and_encode_composite_with_chain(clauses, fresh_base);
-        (out, aux)
-    }
-
-    /// As `detect_and_encode_composite`, and the Schreier–Sims chain's summary
-    /// over the generators found (symmetry fixing, step 2: the chain fix-and-cut
-    /// will walk; today only counted).
+    /// The returned Schreier–Sims summary describes the generators found
+    /// (symmetry fixing, step 2: the chain fix-and-cut will walk; today only
+    /// counted).
     pub(crate) fn detect_and_encode_composite_with_chain(
         &self,
         clauses: &[Vec<Literal>],
@@ -449,7 +439,7 @@ impl SymmetryDetector {
 /// variables across all rows are pairwise distinct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // validated alternative infra (group-level row lex-leader); the
-                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite).
+                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite_with_chain).
 pub(crate) struct RowSet {
     pub(crate) rows: Vec<Vec<Variable>>,
 }
@@ -461,7 +451,7 @@ pub(crate) struct RowSet {
 /// swap "anchor ↔ perm(anchor)" that fixes every other variable, and the column
 /// of pair `{a, perm(a)}` is identified by the anchor element `a`.
 #[allow(dead_code)] // validated alternative infra (group-level row lex-leader); the
-                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite).
+                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite_with_chain).
 fn is_clean_swap_with_anchor(
     perm: &BTreeMap<Variable, Variable>,
     anchor: &std::collections::BTreeSet<Variable>,
@@ -491,7 +481,7 @@ fn is_clean_swap_with_anchor(
 /// anchor) and the indices of the involutions it used, or `None` if fewer than
 /// the requested rows can be formed.
 #[allow(dead_code)] // validated alternative infra (group-level row lex-leader); the
-                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite).
+                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite_with_chain).
 fn build_rowset_from_anchor(
     anchor: &std::collections::BTreeSet<Variable>,
     perms: &[BTreeMap<Variable, Variable>],
@@ -547,7 +537,7 @@ fn build_rowset_from_anchor(
 /// disjoint, and the column alignment is fixed by the anchor — see the
 /// soundness note on [`encode_rowset_lex_leader`].
 #[allow(dead_code)] // validated alternative infra (group-level row lex-leader); the
-                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite).
+                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite_with_chain).
 fn detect_row_interchangeability(perms: &[BTreeMap<Variable, Variable>]) -> Vec<RowSet> {
     let supports: Vec<std::collections::BTreeSet<Variable>> =
         perms.iter().map(|p| p.keys().copied().collect()).collect();
@@ -655,7 +645,7 @@ fn emit_eq_prefix_def(
 /// each `e_j` to its forced (iff-defined) value and every clause holds. Hence the
 /// formula is SAT iff the formula ∧ chain ∧ aux-defs is SAT. ∎
 #[allow(dead_code)] // validated alternative infra (group-level row lex-leader); the
-                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite).
+                    // active composite path uses per-generator lex-leader (see detect_and_encode_composite_with_chain).
 fn encode_rowset_lex_leader(rowset: &RowSet, fresh_base: u32) -> (Vec<Vec<Literal>>, u32) {
     let mut clauses: Vec<Vec<Literal>> = Vec::new();
     let mut next = fresh_base;
@@ -707,7 +697,8 @@ fn encode_rowset_lex_leader(rowset: &RowSet, fresh_base: u32) -> (Vec<Vec<Litera
 /// the binary `(x_{w_0} ∨ ¬x_{perm⁻¹(w_0)})`).
 ///
 /// SOUNDNESS for a SET of generators emitted together (the caller's use): see the
-/// multi-generator lex-leader theorem in [`SymmetryDetector::detect_and_encode_composite`].
+/// multi-generator lex-leader theorem in
+/// [`SymmetryDetector::detect_and_encode_composite_with_chain`].
 /// `perm` MUST have passed [`permutation_preserves_formula`] first.
 fn encode_perm_lex_leader(
     perm: &BTreeMap<Variable, Variable>,
@@ -1491,7 +1482,6 @@ fn close_involution(
 /// matches. Each result is gate-verified, so it is sound by construction. This
 /// replaces the naive consecutive/half-split enumerator, which could not find
 /// symmetries on arbitrary variable layouts (e.g. sanitized cliques).
-#[allow(dead_code)] // wired via detect_and_encode_composite.
 fn find_composite_symmetries_backtracking(
     clauses: &[Vec<Literal>],
     formula_counts: &BTreeMap<Vec<u32>, u32>,
@@ -1934,7 +1924,7 @@ mod tests {
         };
         let fresh_base = 6u32;
         let (sbp, aux) = encode_rowset_lex_leader(&rowset, fresh_base);
-        assert!(!sbp.is_empty(), "must emit lex-leader clauses");
+        assert_ne!(sbp.len(), 0, "must emit lex-leader clauses");
         // (k-1) pairs * (n-1) aux each = 2 * 1 = 2 aux equal-prefix vars.
         assert_eq!(aux, 2, "two consecutive pairs, one column-gap each");
 
@@ -2147,7 +2137,7 @@ mod tests {
         let fresh_base = 2;
         let (sbp, aux) = encode_perm_lex_leader(&swap, fresh_base);
         let unique = deduplicate_sbp_clauses(sbp, &existing);
-        assert!(!unique.is_empty(), "the swap must emit an SBP tower");
+        assert_ne!(unique.len(), 0, "the swap must emit an SBP tower");
         assert!(aux > 0, "the full tower must exercise fresh aux clauses");
 
         let to_checker_clause = |clause: &[Literal]| {
@@ -2215,7 +2205,7 @@ mod tests {
         assert_eq!(steps.len(), 4, "two SR units + diagonal + one off-diagonal");
         for lc in &steps {
             let LexClause::Sr { clause, witness } = lc;
-            assert!(!clause.is_empty());
+            assert_ne!(clause.len(), 0);
             assert_eq!(
                 witness.first(),
                 clause.first(),

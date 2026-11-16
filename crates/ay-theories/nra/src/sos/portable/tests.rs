@@ -213,8 +213,8 @@ fn retains_constant_false_source_but_does_not_invent_a_search_decision() {
     let clause = [literal(&mut terms, ">", zero, one)];
     let source = source(&terms, &clause);
     assert_eq!(source.constraints().len(), 1);
-    assert!(source.variables().is_empty());
-    assert!(super::super::search(source.constraints(), source.variables()).is_none());
+    assert_eq!(source.variables(), &[] as &[TermId]);
+    assert!(search(source.constraints(), source.variables()).is_none());
 }
 
 #[test]

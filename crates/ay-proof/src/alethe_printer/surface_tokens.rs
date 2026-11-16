@@ -63,7 +63,6 @@ pub(crate) fn split_alethe_commands_bounded(
     if input.len() > max_bytes {
         return Err(AletheSurfaceParseError::BudgetExceeded);
     }
-    let bytes = input.as_bytes();
     let mut commands = Vec::new();
     let mut index = 0usize;
     while let Some(command) = next_alethe_command_slice(input, &mut index)? {

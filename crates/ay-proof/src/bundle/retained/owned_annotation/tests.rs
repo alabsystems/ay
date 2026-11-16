@@ -205,7 +205,7 @@ fn exact_short_and_zero_limits_cover_coefficient_ownership() {
         }
     }
     let empty = checked("[[]]", farkas);
-    assert!(empty.result.unwrap().coefficients.is_empty());
+    assert_eq!(empty.result.unwrap().coefficients, []);
     assert_eq!(empty.usage.charged_bytes, 0);
 }
 
@@ -282,7 +282,7 @@ fn every_success_and_partial_error_poll_including_cleanup_is_terminal() {
 #[test]
 fn original_deadline_and_sticky_decode_error_prevent_later_acceptance() {
     let expired = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired before progress") },
         |control| lia(raw(MIXED), control),
     );

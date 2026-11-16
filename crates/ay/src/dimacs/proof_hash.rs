@@ -80,6 +80,13 @@ impl ProofHashWorker {
                 let mut hasher = Sha256::new();
                 #[cfg(test)]
                 let mut index = 0;
+                #[cfg_attr(
+                    test,
+                    expect(
+                        clippy::explicit_counter_loop,
+                        reason = "the index selects a test fault; production hashing must not maintain a counter"
+                    )
+                )]
                 for mut chunk in queue {
                     #[cfg(test)]
                     {

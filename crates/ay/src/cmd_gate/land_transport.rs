@@ -5,6 +5,7 @@
 use super::{Runner, Step};
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -229,6 +230,48 @@ fn fetch_with(runner: &mut Runner, agh: &mut impl Agh) -> Result<()> {
 pub(super) fn push(runner: &mut Runner, head: &str, remote: &str) -> Result<bool> {
     push_with(runner, head, remote, &mut Native)
 }
+
+fn dry_run_ref_conflict(receipts: &Path) -> bool {
+    fn read(path: &Path) -> Option<String> {
+        let mut text = String::new();
+        fs::File::open(path)
+            .ok()?
+            .take(65_537)
+            .read_to_string(&mut text)
+            .ok()?;
+        (text.len() <= 65_536).then_some(text)
+    }
+    let Some(output) = read(&receipts.join("dry-run.json")) else {
+        return false;
+    };
+    let Ok(output) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return false;
+    };
+    if output["repo"].as_str() != Some(REPOSITORY)
+        || output["op"].as_str() != Some("ref.update-atomic")
+        || output["dry_run"].as_bool() != Some(true)
+        || output["outcome"].as_str() != Some("refused")
+    {
+        return false;
+    }
+    let Some(stderr) = read(&receipts.join("dry-run-error.json")) else {
+        return false;
+    };
+    // Agh emits its human summary before one structured error. Never infer
+    // permission or side effects from that human text or an exit code alone.
+    let mut errors = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+    let Some(error) = errors.next() else {
+        return false;
+    };
+    errors.next().is_none()
+        && error["error"]["repo"].as_str() == Some(REPOSITORY)
+        && error["error"]["kind"].as_str() == Some("conflict")
+        && error["error"]["exit"].as_u64() == Some(9)
+        && error["error"]["side_effect"].as_str() == Some("none")
+}
+
 fn push_with(runner: &mut Runner, head: &str, remote: &str, agh: &mut impl Agh) -> Result<bool> {
     let head = oid(head)?;
     let remote = oid(remote)?;
@@ -271,8 +314,26 @@ fn push_with(runner: &mut Runner, head: &str, remote: &str, agh: &mut impl Agh) 
                     {"ref": "refs/heads/main", "before": remote, "after": head}
                 ]))?,
             )?;
-            agh.push(runner, &receipts, true)
-                .with_context(|| format!("Agh dry run refused; receipts {}", receipts.display()))?;
+            if let Err(error) = agh.push(runner, &receipts, true) {
+                if dry_run_ref_conflict(&receipts) {
+                    runner.exact_clean(head)?;
+                    fetch_with(runner, agh).with_context(|| {
+                        format!(
+                            "read main after non-writing Agh conflict; receipts {}",
+                            receipts.display()
+                        )
+                    })?;
+                    runner.exact_clean(head)?;
+                    if read_ref(runner, TRACKING)?.as_deref() != Some(remote) {
+                        // No write was attempted. The outer owner must compose
+                        // the new main and qualify its affected read set.
+                        return Ok(false);
+                    }
+                }
+                return Err(error).with_context(|| {
+                    format!("Agh dry run refused; receipts {}", receipts.display())
+                });
+            }
             runner.exact_clean(head)?;
             paths(runner)?;
             if source(runner)? != Source::Private {

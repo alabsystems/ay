@@ -202,7 +202,7 @@ fn shrink_removable_kissat_marks_the_walked_literals_removable() {
 
     let mut solver = removable_kissat_trail(false);
     assert_eq!(solver.find_block_uip(&block, 1), Some(neg(1)));
-    assert!(solver.min.shrink_walked.is_empty());
+    assert_eq!(solver.min.shrink_walked.len(), 0);
 
     let mut solver = removable_kissat_trail(true);
     solver.min.minimize_level_seen[1].count = 2;

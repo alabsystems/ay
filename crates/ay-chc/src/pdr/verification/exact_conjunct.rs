@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 /// `Ok(true)` proves the implication. `Ok(false)` means only "not established".
 /// The caller must not replace a stopped owner and retry with fresh credit.
-pub(crate) fn entails(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner) -> Result<bool> {
+pub(crate) fn entails(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner<'_>) -> Result<bool> {
     let scope = owner.enter();
     let result = check(body, head, owner);
     drop(scope);
@@ -37,7 +37,7 @@ pub(crate) fn entails(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner) -> Resu
     }
 }
 
-fn check(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner) -> Result<bool> {
+fn check(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner<'_>) -> Result<bool> {
     owner.poll()?;
     let mut arena = Arena::new();
     let body = arena.read(body, 0, owner)?;
@@ -68,10 +68,10 @@ fn check(body: &ChcExpr, head: &ChcExpr, owner: &mut Owner) -> Result<bool> {
 }
 
 fn exact(
-    arena: &Arena,
+    arena: &Arena<'_>,
     head: usize,
     assumptions: &HashSet<usize>,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<bool> {
     let mut pending = Vec::new();
     let mut visited = HashSet::new();
@@ -101,7 +101,7 @@ fn exact(
     Ok(true)
 }
 
-fn push(pending: &mut Vec<usize>, id: usize, owner: &mut Owner) -> Result<()> {
+fn push(pending: &mut Vec<usize>, id: usize, owner: &mut Owner<'_>) -> Result<()> {
     owner.admit(1, 4 * std::mem::size_of::<usize>())?;
     pending.try_reserve(1).map_err(|_| Error::Resource)?;
     pending.push(id);

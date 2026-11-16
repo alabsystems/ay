@@ -43,7 +43,7 @@ fn solve(problem: &WeProblem) -> WeOutcome {
     // Internal consistency: every returned assignment must satisfy every
     // equation (the solver's own ground check, independent of the caller's).
     if let WeOutcome::Sat(sols) = &outcome {
-        assert!(!sols.is_empty());
+        assert_ne!(sols.as_slice(), &[] as &[WeAssignment]);
         for sol in sols {
             for e in &problem.equations {
                 assert!(check(sol, e), "candidate {sol:?} violates {e:?}");
@@ -1000,7 +1000,7 @@ fn lan_replace_all2_extended_fragment_unsat() {
 /// word equation whose only solutions use them.
 #[test]
 fn regex_possible_chars_of_a_range_includes_its_surrogates() {
-    let cp = |code: u32| ay_core::smtlib_char(code).expect("in the SMT-LIB alphabet");
+    let cp = |code: u32| smtlib_char(code).expect("in the SMT-LIB alphabet");
     let across = WeRegex::range("\u{d7ff}", &cp(0xD801).to_string());
     let expected: HashSet<char> = [cp(0xD7FF), cp(0xD800), cp(0xD801)].into_iter().collect();
     assert_eq!(regex_possible_chars(&across), Some(expected));

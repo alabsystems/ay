@@ -9,6 +9,7 @@ use crate::executor_types::SolveResult;
 use crate::PropositionalTheory;
 
 use super::super::Executor;
+use super::solve_harness::TheoryModels;
 
 impl Executor {
     /// Solve using propositional theory (pure SAT).

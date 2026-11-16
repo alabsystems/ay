@@ -192,7 +192,7 @@ fn random_instance(rng: &mut Rng) -> (Vec<Atom>, Vec<Vec<(usize, bool)>>) {
     }
     let clauses = (0..3 + rng.below(5))
         .map(|_| {
-            (0..1 + rng.below(3))
+            (0..=rng.below(3))
                 .map(|_| (rng.below(n_atoms as u64), rng.below(2) == 0))
                 .collect()
         })

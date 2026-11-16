@@ -277,8 +277,11 @@ impl Propagation<'_> {
         coefficient: u32,
     ) -> Result<Row, TacticFailure> {
         let factor = self.neg(self.inverse(coefficient)?);
-        let mut out = Row::default();
-        out.constant = self.mul(row.constant, factor)?;
+        let base = Row::default();
+        let mut out = Row {
+            constant: self.mul(row.constant, factor)?,
+            ..base
+        };
         reserve(
             &mut out.terms,
             row.terms.len().saturating_sub(1),

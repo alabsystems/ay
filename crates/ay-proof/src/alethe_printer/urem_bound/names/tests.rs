@@ -31,19 +31,19 @@ fn variables_functions_let_and_quantifier_binders_each_reserve_the_namespace() {
         let name = "@u1_0_existing";
         match kind {
             0 => {
-                terms.mk_var(name, Sort::Bool);
+                let _variable_binding = terms.mk_var(name, Sort::Bool);
             }
             1 => {
-                terms.mk_app(Symbol::named(name), [body], Sort::Bool);
+                let _function_application = terms.mk_app(Symbol::named(name), [body], Sort::Bool);
             }
             2 => {
-                terms.mk_let(vec![(name.into(), body)], body);
+                let _let_binding = terms.mk_let(vec![(name.into(), body)], body);
             }
             3 => {
-                terms.mk_forall(vec![(name.into(), Sort::Bool)], body);
+                let _forall_binding = terms.mk_forall(vec![(name.into(), Sort::Bool)], body);
             }
             _ => {
-                terms.mk_exists(vec![(name.into(), Sort::Bool)], body);
+                let _exists_binding = terms.mk_exists(vec![(name.into(), Sort::Bool)], body);
             }
         }
         let printer = AlethePrinter::new(&terms);
@@ -87,7 +87,7 @@ fn every_rendering_override_channel_reserves_names_even_off_the_theorem_path() {
 fn all_sixty_four_collisions_refuse_without_reusing_a_source_name() {
     let mut terms = TermStore::new();
     for nonce in 0..64 {
-        terms.mk_var(format!("@u1_{nonce:x}_occupied"), Sort::Bool);
+        let _occupied_variable = terms.mk_var(format!("@u1_{nonce:x}_occupied"), Sort::Bool);
     }
     let printer = AlethePrinter::new(&terms);
     assert!(printer.urem_definition_prefix(ProofId(1)).is_none());
@@ -100,7 +100,7 @@ fn all_sixty_four_collisions_refuse_without_reusing_a_source_name() {
 #[test]
 fn original_export_budget_pays_namespace_scans_and_refusal_is_sticky() {
     let mut terms = TermStore::new();
-    terms.mk_var("@u1_0_occupied", Sort::Bool);
+    let _namespace_collision = terms.mk_var("@u1_0_occupied", Sort::Bool);
     let printer = AlethePrinter::new(&terms);
     let expected = printer.urem_definition_prefix(ProofId(1)).unwrap();
     let used = printer.work_used();
@@ -124,7 +124,7 @@ fn original_export_budget_pays_namespace_scans_and_refusal_is_sticky() {
 fn every_original_namespace_observer_cut_refuses_without_a_late_callback() {
     use std::cell::Cell;
     let mut terms = TermStore::new();
-    terms.mk_var("@u1_0_occupied", Sort::Bool);
+    let _namespace_collision = terms.mk_var("@u1_0_occupied", Sort::Bool);
     let calls = Cell::new(0);
     let mut accept = || {
         calls.set(calls.get() + 1);

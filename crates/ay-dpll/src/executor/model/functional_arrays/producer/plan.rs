@@ -70,7 +70,7 @@ fn complete_constructor(exec: &Executor, rhs: TermId) -> bool {
 }
 
 fn hard_facts(exec: &Executor, roots: &[TermId]) -> Option<Facts> {
-    let bytes = roots.len().checked_mul(std::mem::size_of::<TermId>())?;
+    let bytes = roots.len().checked_mul(size_of::<TermId>())?;
     super::super::super::construction_owner::pay_metadata(exec, roots.len(), bytes).ok()?;
     let mut hard = roots.to_vec();
     let mut variables = BTreeSet::new();
@@ -101,7 +101,7 @@ fn hard_facts(exec: &Executor, roots: &[TermId]) -> Option<Facts> {
             {
                 return None;
             }
-            let bytes = args.len().checked_mul(std::mem::size_of::<TermId>())?;
+            let bytes = args.len().checked_mul(size_of::<TermId>())?;
             super::super::super::construction_owner::pay_metadata(exec, args.len(), bytes).ok()?;
             hard.try_reserve(args.len()).ok()?;
             hard.extend(args.iter().copied());

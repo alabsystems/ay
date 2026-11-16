@@ -83,7 +83,7 @@ fn assert_reader(bytes: &[u8], progress: &mut RetainedReplayProgress<'_>) {
     .expect("actual-v4 reader must independently replay the sealed proof");
     let unique = progress.ordered_unique(&checked.assume_terms).unwrap();
     assert!(checked.quality.is_complete());
-    assert!(!unique.is_empty());
+    assert_ne!(unique, [] as [ay_core::TermId; 0]);
     assert!(progress.equal_ids(&unique, bundle.obligation_assertions()));
     drop((unique, checked, bundle));
     progress.check().unwrap();

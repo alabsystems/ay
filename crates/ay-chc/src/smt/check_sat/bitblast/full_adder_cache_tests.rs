@@ -26,7 +26,7 @@ struct Terms {
 
 fn terms(ctx: &mut SmtContext, padding: usize) -> Terms {
     for index in 0..padding {
-        ctx.convert_expr(&ChcExpr::var(ChcVar::new(
+        let _ = ctx.convert_expr(&ChcExpr::var(ChcVar::new(
             format!("unrelated_{index}"),
             ChcSort::BitVec(4),
         )));
@@ -174,7 +174,7 @@ fn structural_restore_keeps_carry_mux_definitions_and_extends_the_full_circuit()
     restored.set_term_to_bits(term_bits);
     assert_eq!(restored.ensure_term_bits(new.sum), Some(sum_bits.clone()));
     assert_eq!(restored.num_vars() + 1, old_next);
-    assert!(restored.clauses().is_empty());
+    assert_eq!(restored.clauses(), []);
     assert_eq!(restored.mux_cache(), &old_mux);
     assert_eq!(restored.bitblast_predicate(new.atom), Some(old_predicate));
 
@@ -189,7 +189,7 @@ fn structural_restore_keeps_carry_mux_definitions_and_extends_the_full_circuit()
     assert!(next_bits.iter().any(|lit| lit.unsigned_abs() >= old_next));
     assert_mux_extension(&restored, &old_mux, old_next);
     let delta = restored.take_clauses();
-    assert!(!delta.is_empty());
+    assert_ne!(delta, [] as [ay_core::CnfClause; 0]);
     // The real caller replays/recaptures old clauses followed by the new delta.
     // capture_cached_bv_state takes this complete circuit, not delta alone.
     let mut complete = cache.clauses.clone();

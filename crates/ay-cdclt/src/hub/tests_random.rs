@@ -33,7 +33,7 @@ fn naive_closure(
     eqs: &[(NodeId, NodeId)],
 ) -> Vec<usize> {
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(p: &mut Vec<usize>, x: usize) -> usize {
+    fn find(p: &mut [usize], x: usize) -> usize {
         let mut r = x;
         while p[r] != r {
             r = p[r];

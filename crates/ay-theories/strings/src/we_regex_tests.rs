@@ -683,7 +683,7 @@ fn outside_class_below_the_least_critical_is_represented() {
     );
     let witness = find_witness(std::slice::from_ref(&r), None).expect("a one-character witness");
     assert_eq!(witness.chars().count(), 1);
-    assert!(ay_core::smtlib_code_point(witness.chars().next().unwrap()) < u32::from('a'));
+    assert!(smtlib_code_point(witness.chars().next().unwrap()) < u32::from('a'));
 }
 
 /// The critical characters are walked in code-point order, so the gap and

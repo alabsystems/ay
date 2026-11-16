@@ -93,9 +93,7 @@ fn caught_callback_panic_cannot_resume_the_same_attempt() {
     let calls = Cell::new(0);
     let mut callback = |_, _| {
         calls.set(calls.get() + 1);
-        if calls.get() == 1 {
-            panic!("SOS callback panic");
-        }
+        assert!(calls.get() != 1, "SOS callback panic");
         true
     };
     {

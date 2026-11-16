@@ -90,7 +90,7 @@ fn later_refutation_decline_restores_all_original_overrides() {
     let mut proof = ay_core::Proof::new();
     assert!(!executor.replace_with_exact_authored_fold_identity_refutation(&mut proof));
     assert_eq!(executor.last_proof_term_overrides, before);
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ay_core::ProofStep; 0]);
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn canonical_preflight_charges_deep_and_shared_dag_refusals() {
         if !accepted {
             executor
                 .proof_source_work
-                .set_remaining_for_test(std::mem::size_of::<TermData>());
+                .set_remaining_for_test(size_of::<TermData>());
             assert!(executor.raw_retry_canonical_work(root).is_none());
             assert_eq!(executor.proof_source_work.remaining_for_test(), 0);
             assert!(executor.raw_retry_canonical_work(root).is_none());
@@ -314,7 +314,7 @@ fn one_visit_allowance_never_walks_the_rest_of_a_deep_or_shared_graph() {
                 executor.ctx.terms.mk_not_raw(root)
             };
         }
-        let visit_cost = std::mem::size_of::<TermData>();
+        let visit_cost = size_of::<TermData>();
         executor
             .proof_source_work
             .set_remaining_for_test(visit_cost);

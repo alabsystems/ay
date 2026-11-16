@@ -913,15 +913,16 @@ mod routing_tests {
         assert_eq!(seen, SolveResult::Unknown);
 
         exec.solve_deadline.set(None);
-        exec.run_dl_attempt(DlUnsatDisposition::Discard, |e| {
-            assert_eq!(
-                e.solve_deadline.get(),
-                None,
-                "no deadline stays no deadline"
-            );
-            Ok(SolveResult::Unknown)
-        })
-        .expect("attempt");
+        let _ = exec
+            .run_dl_attempt(DlUnsatDisposition::Discard, |e| {
+                assert_eq!(
+                    e.solve_deadline.get(),
+                    None,
+                    "no deadline stays no deadline"
+                );
+                Ok(SolveResult::Unknown)
+            })
+            .expect("attempt");
         assert_eq!(exec.solve_deadline.get(), None);
     }
 

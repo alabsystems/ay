@@ -110,6 +110,10 @@ pub(crate) struct Outcome {
 /// A refutation of `cnf` by splitting on the guards its roots leave open,
 /// or `None` — also when no guard is open, where splitting cannot help —
 /// with the conflicts its solver calls spent either way.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the sweep's clauses, roots, definitions, implied set, leaf policy, limits, and owner stay explicit"
+)]
 pub(crate) fn refute(
     gates: Vec<Gate>,
     cnf: &[Vec<Literal>],

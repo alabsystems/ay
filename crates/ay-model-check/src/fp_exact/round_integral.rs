@@ -116,14 +116,13 @@ pub(crate) fn plan(input: &ModelValue, rm: RoundingMode) -> Result<IntegralPlan<
                 return Err("exact FP fields required".into());
             };
             let kept = significand.bits().saturating_sub(cut);
-            let output = if increment {
+            if increment {
                 (kept + 1 + cut).min(u64::from(p))
             } else if kept == 0 {
                 0
             } else {
                 kept + cut
-            };
-            output
+            }
         }
     };
     let retained_exponent = if matches!(result, ResultFields::Fraction { .. }) {

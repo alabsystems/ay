@@ -67,6 +67,10 @@ pub(super) fn run(args: LandArgs) -> Result<i32> {
     // Reject ambient policy replacements rather than silently modifying the
     // caller's environment. Targo provenance and explicit resource caps pass
     // through unchanged, and build-slot bounds compiler concurrency.
+    #[expect(
+        clippy::unnecessary_debug_formatting,
+        reason = "caller-controlled environment names retain exact quoting and escaping"
+    )]
     for (name, value) in std::env::vars_os() {
         if name.to_str().is_some_and(is_policy_override) && !value.is_empty() {
             bail!("ambient policy override {name:?}; use the checked-in Trust policy");

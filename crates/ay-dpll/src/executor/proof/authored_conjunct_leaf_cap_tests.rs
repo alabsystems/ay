@@ -189,7 +189,7 @@ fn the_work_cap_bounds_the_number_of_planned_fragments() {
     let derived = run_wide(&mut exec, &mut proof, WIDE_CONJUNCTS);
 
     assert!(
-        WIDE_ADMITTED < EXPECTED_WORK_CAP,
+        derived < EXPECTED_WORK_CAP,
         "this fixture must exercise the WEIGHTED budget, not the fragment cap"
     );
     assert_eq!(

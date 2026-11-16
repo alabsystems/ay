@@ -53,7 +53,7 @@ use wait_timeout::ChildExt;
 /// search evidently does not poll either cancellation signal on this path. The CLI *looks*
 /// prompt (`-T:5` returns in 7.1 s, `-T:10` in 12.0 s) only because its watchdog thread
 /// terminates the process — so the reliable way to bound this is a child process we can
-/// kill, exactly as `common::run_z3_file` already does for z3.
+/// kill, exactly as `common::z3::run_z3_file` already does for z3.
 ///
 /// Consequence beyond this test: an **embedded/library consumer cannot cancel this NRA
 /// solve promptly**. That cancellation gap remains separate from the soundness fix here.

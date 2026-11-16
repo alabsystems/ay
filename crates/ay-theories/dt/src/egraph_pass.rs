@@ -662,7 +662,7 @@ mod tests {
         match pass.check(&terms, &mut euf) {
             DtPassOutcome::Lemmas(lemmas) => {
                 let clause = &lemmas[0].clause;
-                assert!(!clause.is_empty());
+                assert_ne!(clause.as_slice(), &[] as &[TheoryLit]);
                 for lit in clause {
                     assert!([eq1, eq2].contains(&lit.term));
                     assert!(!lit.value);
@@ -720,7 +720,7 @@ mod tests {
         match pass.check(&terms, &mut euf) {
             DtPassOutcome::Lemmas(lemmas) => {
                 let clause = &lemmas[0].clause;
-                assert!(!clause.is_empty());
+                assert_ne!(clause.as_slice(), &[] as &[TheoryLit]);
                 for lit in clause {
                     assert!([eq1, eq2, eq3].contains(&lit.term));
                     assert!(!lit.value);

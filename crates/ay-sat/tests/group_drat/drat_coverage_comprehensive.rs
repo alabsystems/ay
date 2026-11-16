@@ -59,7 +59,7 @@ fn solve_clauses_and_verify_drat(num_vars: usize, clauses: &[Vec<Literal>], labe
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker
@@ -108,7 +108,7 @@ fn solve_dimacs_and_verify_drat(dimacs_text: &str, label: &str) {
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker

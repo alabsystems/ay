@@ -9,7 +9,7 @@
 //! skips symmetry before any clause is installed. The old generic DPR/full-SR
 //! switches are removed rather than left as certificate-producing experiments.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -39,7 +39,7 @@ fn scratch() -> (PathBuf, DirGuard) {
 
 /// Run AY on `unsat.cnf`, optionally with the composite-symmetry opt-in flag.
 /// Returns `(exit code, stderr)`.
-fn run(dir: &PathBuf, composite: bool, args: &[&str]) -> (i32, String) {
+fn run(dir: &Path, composite: bool, args: &[&str]) -> (i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ay"));
     cmd.arg("solve").args(args).arg(dir.join("unsat.cnf"));
     if composite {

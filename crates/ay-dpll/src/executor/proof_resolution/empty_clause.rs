@@ -436,7 +436,7 @@ pub(crate) fn build_th_resolution_chain(
 ) {
     let (_, current_clause) =
         apply_th_resolution_chain(proof, lemma_id, lemma_clause, &resolution_chain);
-    debug_assert!(current_clause.is_empty());
+    debug_assert_eq!(current_clause.as_slice(), &[] as &[TermId]);
 }
 
 pub(crate) fn apply_th_resolution_chain(

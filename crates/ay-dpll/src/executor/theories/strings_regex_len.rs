@@ -748,7 +748,7 @@ mod w1b_tests {
         // length constraint refutes.
         let star = WeRegex::star(WeRegex::range("x", "z"));
         let cands = Executor::construct_regex_witnesses(&[star], (2, usize::MAX), None);
-        assert!(!cands.is_empty());
+        assert_ne!(cands, [] as [String; 0]);
         assert!(
             cands.iter().all(|c| c.chars().count() >= 2),
             "no candidate below the lower bound: {cands:?}"
@@ -806,7 +806,10 @@ mod w1b_tests {
 
     #[test]
     fn empty_language_yields_no_candidate() {
-        assert!(Executor::construct_regex_witnesses(&[WeRegex::None], (0, 4), None).is_empty());
+        assert_eq!(
+            Executor::construct_regex_witnesses(&[WeRegex::None], (0, 4), None),
+            [] as [String; 0]
+        );
     }
 
     #[test]

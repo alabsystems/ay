@@ -19,7 +19,7 @@ impl PdrSolver {
         // Public verify_model can run without the normal solve/replay lane.
         // Retain both configured tokens and the existing lane/interrupt before
         // the original callback can run or replace the ambient scope.
-        let (ambient, interrupt) = try_lane_cancellation().map_err(|_| Error::Stopped)?;
+        let (ambient, interrupt) = try_lane_cancellation().map_err(|()| Error::Stopped)?;
         let mut cancellation = self.config.effective_cancellation_token();
         if let Some(ambient) = ambient {
             cancellation

@@ -220,10 +220,7 @@ impl PdrSolver {
 
         // All self-loop transitions preserve the equality.
         // But if zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 
     /// Extract disjuncts from a top-level OR expression, returning them as cases.

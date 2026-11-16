@@ -24,7 +24,7 @@ fn equality_style_shared_tag_cycle() {
     // has weight (0, -1) < 0.
     match g.assert_edge(e_lt) {
         AssertOutcome::Conflict(tags) => {
-            assert!(!tags.is_empty());
+            assert_ne!(tags.as_slice(), &[] as &[u64]);
             assert!(tags.contains(&0) && tags.contains(&1), "tags: {tags:?}");
         }
         AssertOutcome::Consistent | AssertOutcome::Refused => panic!("missed the negative cycle"),

@@ -39,7 +39,7 @@ fn live_plain_query_mints_verified_actual_v4_and_preserves_original_bytes() {
     .unwrap();
     let used = progress.ordered_unique(&checked.assume_terms).unwrap();
     assert!(checked.quality.is_complete());
-    assert!(!used.is_empty());
+    assert_ne!(used, [] as [ay_core::TermId; 0]);
     assert!(progress.equal_ids(&used, owner.obligation_assertions()));
     drop((owner, checked, used, query, bundle));
     progress.check().unwrap();

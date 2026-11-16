@@ -1139,9 +1139,6 @@ pub struct MiscCliFlags {
     pub chc_cata_dump_obligations: Option<String>,
     /// `--chc-dump-scalarized <dir>` — dump scalarized problems.
     pub chc_dump_scalarized: Option<String>,
-    /// `--chc-dump-failed-replay-obligation <dir>` — write failing replay
-    /// obligations as runnable scripts.
-    pub chc_dump_failed_replay_obligation: Option<String>,
     /// `--chc-checksat-dump <dir>` — capture timeout-class check
     /// scripts.
     pub chc_checksat_dump: Option<String>,
@@ -1729,7 +1726,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         chc_cata_dump_abstract: None,
         chc_cata_dump_obligations: None,
         chc_dump_scalarized: None,
-        chc_dump_failed_replay_obligation: None,
         chc_checksat_dump: None,
         chc_pdr_dump: None,
         chc_proof_itp_dump: None,

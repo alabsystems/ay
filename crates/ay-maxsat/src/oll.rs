@@ -1076,7 +1076,7 @@ impl TotNode {
     /// Build a balanced tree over the input literals. No clauses are added
     /// until [`TotNode::extend`] is called.
     fn build(lits: &[Literal]) -> TotNode {
-        debug_assert!(!lits.is_empty());
+        debug_assert_ne!(lits, &[] as &[Literal]);
         if lits.len() == 1 {
             return TotNode {
                 outs: vec![lits[0]],
@@ -1364,7 +1364,7 @@ fn gte_build(
     out_budget: &mut i64,
     clause_budget: &mut i64,
 ) -> Option<Vec<(Weight, Literal)>> {
-    debug_assert!(!inputs.is_empty());
+    debug_assert_ne!(inputs, &[] as &[(Literal, Weight)]);
     if inputs.len() == 1 {
         let (lit, w) = inputs[0];
         return Some(vec![(w.min(cap), lit)]);
@@ -1603,7 +1603,7 @@ fn adder_build(
     let mut vecs: Vec<Vec<Option<Literal>>> = inputs
         .iter()
         .map(|&(lit, w)| {
-            (0..Weight::BITS - w.leading_zeros())
+            (0..w.bit_width())
                 .map(|b| if (w >> b) & 1 == 1 { Some(lit) } else { None })
                 .collect()
         })

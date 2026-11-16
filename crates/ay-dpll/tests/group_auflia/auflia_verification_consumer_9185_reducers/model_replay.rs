@@ -85,7 +85,7 @@ pub(super) fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &s
         .map(|(_, rest)| rest.trim_end().trim_end_matches(')').to_string())
         .unwrap_or_else(|| panic!("{label}: a certified SAT must publish a model:\n{output}"));
 
-    if !crate::common::check_z3_or_skip() {
+    if !crate::common::z3::check_z3_or_skip() {
         return;
     }
     let replay = model_replay_script(decls, &model, asserts)
@@ -214,7 +214,7 @@ fn z3_replay_outcome(replay: &str) -> SolverOutcome {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::write(&path, replay).expect("write replay file");
-    let outcome = crate::common::run_z3_file(&path, 20).expect("run z3");
+    let outcome = crate::common::z3::run_z3_file(&path, 20).expect("run z3");
     let _ = std::fs::remove_file(&path);
     outcome
 }
@@ -227,7 +227,7 @@ fn z3_replay_outcome(replay: &str) -> SolverOutcome {
 #[test]
 #[timeout(30_000)]
 fn model_replay_of_abstract_values_rejects_a_falsifying_model() {
-    if !crate::common::check_z3_or_skip() {
+    if !crate::common::z3::check_z3_or_skip() {
         return;
     }
     let decls =

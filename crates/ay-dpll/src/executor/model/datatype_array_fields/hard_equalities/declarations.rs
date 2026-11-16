@@ -58,9 +58,7 @@ impl Executor {
             {
                 continue;
             }
-            let Some(term) = info.term else {
-                return None;
-            };
+            let term = info.term?;
             if !seen_terms.insert(term) {
                 continue;
             }

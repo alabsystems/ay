@@ -5216,7 +5216,7 @@ mod tests {
         let resolved = resolve_substitutions(&raw).expect("resolves");
         // y's resolved expression must be constant 3, with no var references.
         let y_expr = &resolved.iter().find(|(v, _)| *v == y).unwrap().1;
-        assert!(y_expr.terms.is_empty());
+        assert_eq!(y_expr.terms.as_slice(), &[] as &[(TermId, BigRational)]);
         assert_eq!(y_expr.constant, rat(3));
         // Evaluating with z already in the model.
         let model = vec![(z, rat(2))];

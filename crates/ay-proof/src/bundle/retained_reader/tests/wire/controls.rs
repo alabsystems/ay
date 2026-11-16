@@ -130,7 +130,7 @@ fn minimum_of_all_three_original_deadlines_refuses_before_progress() {
     let bytes = boolean_bytes();
     let before = producer_test_counter::count();
     for earliest in 0..3 {
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         let mut outer = limits();
         let mut inner = wire();
         let mut original = end();

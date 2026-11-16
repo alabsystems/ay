@@ -8,7 +8,7 @@ use super::EmissionProgress;
 use ay_core::{ProofId, TheoryLemmaKind};
 use std::cell::Cell;
 
-fn derive_with(p: &mut Proof) -> Option<u32> {
+fn derive_with(p: &mut Proof<'_>) -> Option<u32> {
     let x = p.t.var("x", Sort::Bool);
     let premise = p.assume(x);
     p.derive(&[x], &[Prem::Step(premise)], &[])

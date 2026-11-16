@@ -283,7 +283,7 @@ impl DeletionChecker {
             // derived constraints as `none` and they raise no obligation --
             // which is exactly why these goals were asked for with
             // `add_derived_goals = false`.
-            let mut note = |source: &Rc<DBConstraint>,
+            let note = |source: &Rc<DBConstraint>,
                             image: &Rc<DBConstraint>,
                             out: &mut Vec<(usize, veripb_formula::prelude::PBConstraintEnum)>| {
                 let header = source.header.borrow();

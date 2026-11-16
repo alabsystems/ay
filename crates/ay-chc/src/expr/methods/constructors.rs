@@ -46,7 +46,7 @@ impl ChcExpr {
     /// # Errors
     ///
     /// Returns [`crate::ChcError::InvalidBitVectorWidth`] unless `width` is in
-    /// `1..=`[`crate::MAX_BITVECTOR_WIDTH`]. SMT-LIB does not permit width zero,
+    /// <code>1..=[crate::MAX_BITVECTOR_WIDTH]</code>. SMT-LIB does not permit width zero,
     /// and the upper bound prevents an untrusted typed input from allocating a
     /// `width / 128`-node literal tree without limit.
     pub fn bitvec_from_biguint(value: &num_bigint::BigUint, width: u32) -> crate::ChcResult<Self> {

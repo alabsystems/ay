@@ -5130,7 +5130,7 @@ mod tests {
         assert!(manifest
             .available_capability_codes
             .contains(&"model_blocking"));
-        assert!(manifest.blocked_capability_codes.is_empty());
+        assert_eq!(manifest.blocked_capability_codes, [] as [&str; 0]);
         assert!(manifest
             .api_symbols
             .contains(&"ay_dpll::api::Solver::try_assert_model_blocking_clause_for_consumer"));
@@ -5695,7 +5695,10 @@ mod tests {
         );
         assert!(report.accepted_for_consumer);
         assert!(report.all_contracts_fail_closed);
-        assert!(report.issues.is_empty());
+        assert_eq!(
+            report.issues,
+            [] as [SymbolicExecutionContractManifestHealthIssue; 0]
+        );
 
         let json = report.to_json_value();
         assert_eq!(
@@ -5726,11 +5729,17 @@ mod tests {
         assert_eq!(round_trip_report.status, report.status);
         assert_eq!(round_trip_report.diagnostic(), report.diagnostic());
         assert!(round_trip_report.accepted_for_consumer);
-        assert!(round_trip_report.issues.is_empty());
+        assert_eq!(
+            round_trip_report.issues,
+            [] as [SymbolicExecutionContractManifestHealthIssue; 0]
+        );
 
         assert_eq!(key_value_report.status, report.status);
         assert!(key_value_report.accepted_for_consumer);
-        assert!(key_value_report.issues.is_empty());
+        assert_eq!(
+            key_value_report.issues,
+            [] as [SymbolicExecutionContractManifestHealthIssue; 0]
+        );
     }
 
     #[test]

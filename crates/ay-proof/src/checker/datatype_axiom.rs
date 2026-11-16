@@ -55,7 +55,11 @@ pub(crate) type DatatypeDecls<'a> = &'a [(String, Vec<String>)];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatatypeMemberSignature {
-    /// Exact internal constructor, selector, or tester identity.
+    /// Exact internal constructor, selector, or tester identity: raw symbol
+    /// text, which is empty for the SMT-LIB symbol `||`. The strict checker
+    /// (`validate_datatype_signature_context_with_progress`) admits an empty
+    /// identity through the same duplicate, ambiguity, exactness and
+    /// occurrence checks as any other, never by its spelling.
     pub identity: String,
     /// Exact argument sorts, in declaration order.
     pub argument_sorts: Vec<Sort>,

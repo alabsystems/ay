@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::{cell::Cell, time::Duration};
+use std::{cell::Cell, fmt::Write as _, time::Duration};
 
 mod controls;
 
@@ -46,7 +46,11 @@ fn checked(bytes: &[u8]) -> TransportOutcome<OuterView<'_>> {
 }
 
 fn escaped(value: &str) -> String {
-    value.bytes().map(|byte| format!("\\u{byte:04x}")).collect()
+    let mut escaped = String::new();
+    for byte in value.bytes() {
+        write!(escaped, "\\u{byte:04x}").expect("writing to a String cannot fail");
+    }
+    escaped
 }
 
 fn present(term: NullableTerm<'_>) -> &RawValue {

@@ -62,7 +62,12 @@ fn mixed() -> Mixed {
 }
 
 fn shared_relation(values: &[u64]) -> bool {
-    values[0] != values[1] || values[2..].chunks_exact(2).all(|pair| pair[0] == pair[1])
+    values[0] != values[1]
+        || values[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| pair[0] == pair[1])
 }
 
 #[test]
@@ -162,7 +167,7 @@ fn known_equal_constant_guards_reuse_exact_pairs_not_merely_normalized_indices()
     let roots: Vec<_> = a.into_iter().chain(b).chain(c).chain(d).collect();
     let bv = encode(&executor, &roots);
     let cnf = Circuit::new(&executor, &bv, &roots, None, &roots, &BTreeMap::new());
-    cnf.check_relation(|v| v.chunks_exact(2).all(|pair| pair[0] == pair[1]));
+    cnf.check_relation(|v| v.as_chunks::<2>().0.iter().all(|pair| pair[0] == pair[1]));
     assert_eq!(cnf.num_vars, bv.num_vars() + 2);
     assert_eq!(cnf.axioms.len(), 10); // Two unit guards + four equalities.
     assert_eq!(

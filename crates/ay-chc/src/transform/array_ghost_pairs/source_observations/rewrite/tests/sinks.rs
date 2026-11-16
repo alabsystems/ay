@@ -30,7 +30,7 @@ fn nullary_and_scalar_heads_keep_actual_wide_and_narrow_query_indices() {
             let token = CancellationToken::new();
             let control = control(&token);
             let layout = Layout::analyze(&source, &control).unwrap();
-            assert!(layout.axes(PredicateId::new(1)).unwrap().is_empty());
+            assert_eq!(layout.axes(PredicateId::new(1)).unwrap(), []);
             let raw = problem(&source, &layout, &control).unwrap();
             let clause = &raw.clauses()[0];
             assert!(matches!(clause.head, ClauseHead::Predicate(..)));

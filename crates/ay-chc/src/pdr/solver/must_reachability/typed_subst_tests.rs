@@ -81,14 +81,17 @@ fn equality_halves_are_sort_aware() {
         .all(|h| matches!(h, ChcExpr::Op(ChcOp::Implies, _)) && !is_ill_typed(h)));
 
     // Mixed or non-scalar sorts: no weakening rather than an ill-typed atom.
-    assert!(PdrSolver::equality_halves(&ChcExpr::eq(ivar("x"), bvar("p"))).is_empty());
+    assert_eq!(
+        PdrSolver::equality_halves(&ChcExpr::eq(ivar("x"), bvar("p"))),
+        [] as [ChcExpr; 0]
+    );
     let arr = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
     let arr_eq = ChcExpr::eq(
         ChcExpr::var(ChcVar::new("a", arr.clone())),
         ChcExpr::var(ChcVar::new("b", arr)),
     );
-    assert!(PdrSolver::equality_halves(&arr_eq).is_empty());
-    assert!(PdrSolver::equality_halves(&bvar("p")).is_empty());
+    assert_eq!(PdrSolver::equality_halves(&arr_eq), [] as [ChcExpr; 0]);
+    assert_eq!(PdrSolver::equality_halves(&bvar("p")), [] as [ChcExpr; 0]);
 }
 
 #[test]

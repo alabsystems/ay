@@ -94,7 +94,7 @@ fn flatness_min_zone_certificate_end_to_end() {
     );
     // Every multiplier is over an asserted point constraint with a positive
     // coefficient (dual feasibility).
-    assert!(!cert.atoms.is_empty());
+    assert_ne!(cert.atoms, [] as [ay_lra::CertificateAtom; 0]);
     for entry in &cert.atoms {
         assert!(
             entry.coeff > BigRational::from(BigInt::from(0)),
@@ -289,7 +289,7 @@ fn md7_int_indicator_minimize_certificate_end_to_end() {
         cert.verify(&exec.ctx.terms, obj_term),
         "independent certificate check must pass: {cert:?}"
     );
-    assert!(!cert.atoms.is_empty());
+    assert_ne!(cert.atoms, [] as [ay_lra::CertificateAtom; 0]);
     for entry in &cert.atoms {
         assert!(
             entry.coeff > BigRational::from(BigInt::from(0)),

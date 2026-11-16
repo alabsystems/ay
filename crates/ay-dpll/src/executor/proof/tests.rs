@@ -383,6 +383,7 @@ mod authored_source_surface;
 mod carcara_surface_export_table;
 mod conjunct_eval;
 mod decline_attribution;
+mod dt_empty_identity;
 mod semantic_token_census;
 mod source_work;
 mod unbounded_census;

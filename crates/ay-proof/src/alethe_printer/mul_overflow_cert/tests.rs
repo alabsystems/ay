@@ -97,7 +97,7 @@ fn eval_node(t: &Terms, g: T, env: &[(T, u128)], memo: &mut Vec<Option<u128>>) -
         Op::Lit(bits) => bits.iter().rev().fold(0, |v, &b| v * 2 + u128::from(b)),
         Op::Not => 1 - a[0],
         Op::And => a.iter().product(),
-        Op::Or => u128::from(a.iter().any(|&x| x == 1)),
+        Op::Or => u128::from(a.contains(&1)),
         Op::Neg => mask(a[0].wrapping_neg()),
         Op::Eq => u128::from(a[0] == a[1]),
         Op::Ite => {

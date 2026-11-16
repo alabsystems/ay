@@ -736,7 +736,6 @@ impl QuantifierManager {
             var_names,
             generation,
             head,
-            unconditional: false,
         });
         self.demand.total_parked += 1;
     }

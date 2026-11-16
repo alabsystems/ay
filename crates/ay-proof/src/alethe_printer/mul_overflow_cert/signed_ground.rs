@@ -13,12 +13,12 @@ use super::proof::{Prem, Proof, S};
 use super::signed::Signed;
 use super::term::{Op, T};
 
-pub(super) fn not(p: &mut Proof, x: T) -> T {
+pub(super) fn not(p: &mut Proof<'_>, x: T) -> T {
     p.t.not(x)
 }
 
 /// `lit` when `pos`, its negation otherwise.
-pub(super) fn lit(p: &mut Proof, x: T, pos: bool) -> T {
+pub(super) fn lit(p: &mut Proof<'_>, x: T, pos: bool) -> T {
     if pos {
         x
     } else {
@@ -29,7 +29,7 @@ pub(super) fn lit(p: &mut Proof, x: T, pos: bool) -> T {
 /// `(= c v)` by `evaluate` for a ground `c` and a value `v` spelled as a
 /// literal or a concatenation of literals; the checker evaluates only into
 /// a literal, so a concatenation is reached through its literal.
-pub(super) fn eval(p: &mut Proof, c: T, v: T) -> S {
+pub(super) fn eval(p: &mut Proof<'_>, c: T, v: T) -> S {
     let Some(l) = literal(p, v).filter(|&l| l != v) else {
         return eq_step(p, c, v, "evaluate", &[]);
     };
@@ -40,7 +40,7 @@ pub(super) fn eval(p: &mut Proof, c: T, v: T) -> S {
 }
 
 /// The literal of a literal or of a concatenation of literals.
-fn literal(p: &mut Proof, v: T) -> Option<T> {
+fn literal(p: &mut Proof<'_>, v: T) -> Option<T> {
     match p.t.op(v) {
         Op::Lit(_) => Some(v),
         Op::Concat => {
@@ -60,7 +60,7 @@ fn literal(p: &mut Proof, v: T) -> Option<T> {
 /// The value of a sign-bit atom `(= ((_ extract n-1 n-1) w) v)` once `w` is
 /// a known ground word: `eqw` is `(= w g)`; the step `(cl atom)` or
 /// `(cl (not atom))`.
-pub(super) fn sign_of_ground(p: &mut Proof, atom: T, eqw: S) -> Option<S> {
+pub(super) fn sign_of_ground(p: &mut Proof<'_>, atom: T, eqw: S) -> Option<S> {
     let (ex, v) = (p.t.args(atom)[0], p.t.args(atom)[1]);
     let g = p.t.args(p.unit(eqw))[1];
     let Op::Extract(hi, lo) = *p.t.op(ex) else {
@@ -92,7 +92,7 @@ pub(super) fn sign_of_ground(p: &mut Proof, atom: T, eqw: S) -> Option<S> {
 
 /// `(= word target)` for a word spelled as a concatenation of `target`'s
 /// extracts: both sides bit-blast to the same `@bit_of` projections.
-pub(super) fn reassembled(p: &mut Proof, word: T, target: T) -> Option<S> {
+pub(super) fn reassembled(p: &mut Proof<'_>, word: T, target: T) -> Option<S> {
     let mut bl = Blaster::new(&[], &[]);
     let (wb, ws) = bl.blast(p, word)?;
     let (tb, ts) = bl.blast(p, target)?;
@@ -105,7 +105,13 @@ pub(super) fn reassembled(p: &mut Proof, word: T, target: T) -> Option<S> {
 
 /// `(= (bvmul ..) z)` for a product with a zero operand `which` (0 or 1),
 /// given `(= operand z)`.
-pub(super) fn zero_product(p: &mut Proof, s: &Signed, prod: T, which: usize, hz: S) -> Option<S> {
+pub(super) fn zero_product(
+    p: &mut Proof<'_>,
+    s: &Signed,
+    prod: T,
+    which: usize,
+    hz: S,
+) -> Option<S> {
     let n = s.n();
     let l0 = p.t.lit(super::bits::zero(n));
     let ez = eval(p, s.z, l0);

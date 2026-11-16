@@ -169,7 +169,7 @@ fn quoted_datatype_names_authorize_their_exact_bare_carrier_only() {
     let guard = RenderedDatatypeGuard::new(&executor);
     let constructor_tokens: HashSet<String> = HashSet::default();
     let accepts = |token: &str| {
-        super::datatype_cell_authority::exact_datatype_carrier_token(
+        datatype_cell_authority::exact_datatype_carrier_token(
             &guard,
             &constructor_tokens,
             &sort,
@@ -194,14 +194,12 @@ fn quoted_datatype_names_authorize_their_exact_bare_carrier_only() {
         assert!(!accepts(declined), "{declined:?} must not be a carrier");
     }
     let foreign = Sort::Uninterpreted("GuardCell".to_string());
-    assert!(
-        !super::datatype_cell_authority::exact_datatype_carrier_token(
-            &guard,
-            &constructor_tokens,
-            &foreign,
-            "@Quoted Cell!0",
-        )
-    );
+    assert!(!datatype_cell_authority::exact_datatype_carrier_token(
+        &guard,
+        &constructor_tokens,
+        &foreign,
+        "@Quoted Cell!0",
+    ));
 }
 
 #[test]

@@ -577,9 +577,9 @@ fn self_check_rejects_adversarial_mutations() {
     assert!(f.accepts(&f.text));
 }
 
-/// The two edits the pinned checker ACCEPTS and that really are valid proofs of
-/// the same bound. Asserting they still self-check is what keeps the battery
-/// above honest: a self-check that refused everything would "catch" all 19
+/// The edit the pinned checker ACCEPTS and that really is a valid proof of the
+/// same bound. Asserting it still self-checks is what keeps the battery above
+/// honest: a self-check that refused everything would "catch" all 20
 /// mutations and be worthless.
 ///
 /// It is an arithmetic no-op on the row it touches: the `2 d` row normalizes to
@@ -589,16 +589,15 @@ fn self_check_rejects_adversarial_mutations() {
 #[test]
 fn self_check_accepts_the_checker_verified_no_ops() {
     let f = fixture(4, 2);
-    for (name, text) in [(
+    let (name, text) = (
         "spurious saturation after a division",
         f.text.replacen(" 2 d ;", " 2 d s ;", 1),
-    )] {
-        assert!(
-            f.accepts(&text),
-            "{name}: the pinned checker verifies this; refusing it would make the \
-             mutation battery meaningless"
-        );
-    }
+    );
+    assert!(
+        f.accepts(&text),
+        "{name}: the pinned checker verifies this; refusing it would make the \
+         mutation battery meaningless"
+    );
 }
 
 /// The floor row is the load-bearing claim: it must be the objective vector at

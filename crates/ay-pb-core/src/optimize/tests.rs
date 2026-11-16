@@ -1045,7 +1045,7 @@ fn test_native_core_guided_seeding_iterates_on_residual_softs() {
 
     assert_eq!(status, Some(LowerBoundStatus::Complete(7)));
     assert_eq!(lower_bound, 7);
-    assert!(active_softs.is_empty());
+    assert_eq!(active_softs.as_slice(), &[] as &[WeightedSoftLiteral]);
     assert_eq!(learned_clauses.len(), 2);
     assert!(learned_clauses.iter().any(|clause| {
         clause.len() == 2
@@ -1076,7 +1076,7 @@ fn test_native_core_guided_seed_fails_closed_when_probe_is_satisfiable() {
         .extract_weighted_core_guided_state()
         .expect("SAT-assumption fallback should still complete");
     assert_eq!(extracted.status, LowerBoundStatus::Complete(0));
-    assert!(extracted.learned_clauses.is_empty());
+    assert_eq!(extracted.learned_clauses.as_slice(), &[] as &[Vec<Literal>]);
 }
 
 #[test]

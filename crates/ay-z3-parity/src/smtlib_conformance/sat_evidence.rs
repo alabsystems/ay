@@ -615,11 +615,15 @@ fn model_from_output(output: &str) -> Result<&str, String> {
         let tree = parse_sexp(raw).map_err(|error| error.to_string())?;
         if tree.is_symbol("sat") && status == 0 && model.is_none() {
             status += 1;
-        } else if tree.is_symbol("success") {
-        } else if tree.as_list().is_some() && status == 1 && model.replace(raw).is_none() {
-        } else {
-            return Err("unexpected or duplicate model response".to_string());
+            continue;
         }
+        if tree.is_symbol("success") {
+            continue;
+        }
+        if tree.as_list().is_some() && status == 1 && model.replace(raw).is_none() {
+            continue;
+        }
+        return Err("unexpected or duplicate model response".to_string());
     }
     if status != 1 {
         return Err("model producer did not report exactly one SAT result".to_string());
@@ -709,8 +713,8 @@ pub(super) fn run(
                 .run_external_transcript_scrubbed_with_file_limit(
                     ay,
                     [
-                        std::ffi::OsString::from("--z3-mode"),
-                        std::ffi::OsString::from("--quiet"),
+                        OsString::from("--z3-mode"),
+                        OsString::from("--quiet"),
                         producer_path.as_os_str().to_owned(),
                     ],
                     b"",
@@ -748,7 +752,7 @@ pub(super) fn run(
                 .run_external_transcript_scrubbed(
                     z3,
                     [
-                        std::ffi::OsString::from("-smt2"),
+                        OsString::from("-smt2"),
                         verifier_path.as_os_str().to_owned(),
                     ],
                     b"",
@@ -875,10 +879,7 @@ pub(super) fn replay(
         resources
             .run_external_transcript_scrubbed(
                 z3,
-                [
-                    std::ffi::OsString::from("-smt2"),
-                    input.as_os_str().to_owned(),
-                ],
+                [OsString::from("-smt2"), input.as_os_str().to_owned()],
                 b"",
                 timeout,
                 "official corpus retained independent model replay",

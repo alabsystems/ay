@@ -79,7 +79,7 @@ fn draining_and_importing_preserve_the_retained_cnf_namespace() -> TestResult {
     assert_eq!(retained.len(), 2);
     assert_eq!(first.make_or(f, a), a);
     assert_eq!(first.make_xor(t, a), -a);
-    assert!(first.clauses().is_empty());
+    assert_eq!(first.clauses().len(), 0);
 
     let mut next = FpSolver::new(&terms);
     next.import_cache(cache);
@@ -87,7 +87,7 @@ fn draining_and_importing_preserve_the_retained_cnf_namespace() -> TestResult {
     let out = next.make_ite(a, -f, -t);
     assert_eq!(out, a);
     assert_eq!(next.num_vars(), before);
-    assert!(next.clauses().is_empty());
+    assert_eq!(next.clauses().len(), 0);
     check_cnf(next.num_vars(), &retained, 1, |bits| {
         Ok(value(bits, out)? == value(bits, a)?)
     })?;

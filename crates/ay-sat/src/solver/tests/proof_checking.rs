@@ -998,12 +998,7 @@ fn test_mark_empty_clause_with_level0_hints_emits_non_empty_lrat_chain() {
         tokens[2], "0",
         "empty clause LRAT line must include a non-empty hint chain: {empty_clause_line}"
     );
-    super::proof_lrat::verify_lrat_with_external_checker(
-        2,
-        &clauses,
-        &proof,
-        "root conflict helper",
-    );
+    proof_lrat::verify_lrat_with_external_checker(2, &clauses, &proof, "root conflict helper");
 }
 
 struct AlwaysFailOnWrite;

@@ -799,7 +799,7 @@ fn simplify_constants_bounded_on_deep_expression() {
     }
 
     let result = expr.simplify_constants();
-    assert!(!result.to_string().is_empty());
+    assert_ne!(result.to_string(), "");
 }
 
 #[test]

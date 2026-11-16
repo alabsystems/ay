@@ -23,7 +23,7 @@ fn every_small_cap_preserves_legacy_post_add_prefix_and_new_arena_ids() {
 fn empty_and_already_known_closures_do_not_preemptively_apply_the_root_cap() {
     let (empty, reads) = compare(Fixture::empty(), 0);
     assert_eq!(reads.added_roots(), 0);
-    assert!(empty.roots.is_empty());
+    assert_eq!(empty.roots, [] as [TermId; 0]);
     let (full, _) = compare(fixtures::folded(), MAX_LATE_ARRAY_READS);
     let roots = full.roots.clone();
     let (again, reads) = compare(full, 0);

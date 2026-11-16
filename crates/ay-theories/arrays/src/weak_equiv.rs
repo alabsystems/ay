@@ -59,8 +59,8 @@ pub(crate) struct WeakEdge {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WeakEquivGraph {
     adj: HashMap<TermId, Vec<WeakEdge>>,
-    /// Lazily computed undirected component labels (mode `All`):
-    /// node -> component id. The graph is immutable once built (a
+    /// Lazily computed undirected all-edge component labels: node -> component
+    /// id. The graph is immutable once built (a
     /// rebuild produces a fresh graph), so labels are computed at
     /// most once and `weakly_connected` becomes O(1) after the first
     /// call instead of a per-pair BFS — measured on QF_AX swap files
@@ -72,8 +72,6 @@ pub(crate) struct WeakEquivGraph {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum TraversalMode {
-    /// All edges (strong, unreasoned, store).
-    All,
     /// Only reason-carrying edges (Strong + Store); paths can justify lemmas.
     Reasoned,
     /// Only strong edges (reasoned or not); no store hops.
@@ -83,7 +81,6 @@ enum TraversalMode {
 impl WeakEquivGraph {
     fn edge_allowed(kind: &WeakEdgeKind, mode: TraversalMode) -> bool {
         match mode {
-            TraversalMode::All => true,
             TraversalMode::Reasoned => !matches!(kind, WeakEdgeKind::StrongUnreasoned),
             TraversalMode::Strong => !matches!(kind, WeakEdgeKind::Store { .. }),
         }
@@ -128,9 +125,9 @@ impl WeakEquivGraph {
         None
     }
 
-    /// Compute undirected component labels for mode `All` once.
+    /// Compute undirected component labels across all edge kinds once.
     /// `push_undirected_edge` inserts every edge in both directions,
-    /// so reachability under `All` is exactly component membership.
+    /// so all-edge reachability is exactly component membership.
     fn ensure_component_labels(&self) {
         if self.components.borrow().is_some() {
             return;

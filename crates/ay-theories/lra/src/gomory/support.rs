@@ -148,10 +148,6 @@ impl LraSolver {
         false
     }
 
-    pub(super) fn abs_ceil_coeff(coeff: &BigRational) -> BigInt {
-        coeff.ceil().numer().abs()
-    }
-
     /// Add a Gomory cut as a constraint.
     ///
     /// When `cut.reasons` is empty and `reason` is a sentinel, the cut has no

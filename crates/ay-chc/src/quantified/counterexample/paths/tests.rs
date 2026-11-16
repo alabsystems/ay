@@ -72,13 +72,13 @@ fn path_search_preserves_raw_false_constraints_but_refuses_nonlinear_or_rootless
             HornClause::query(ClauseBody::predicates_only(vec![(p, vec![])])),
         ]
     });
-    assert!(paths(&rootless).is_empty());
+    assert_eq!(paths(&rootless), [] as [std::vec::Vec<usize>; 0]);
 }
 
 #[test]
 fn path_count_and_prefix_caps_preserve_only_real_complete_candidates() {
     let source = problem(|p| {
-        let mut clauses: Vec<_> = (0..MAX_PREFIXES + 1)
+        let mut clauses: Vec<_> = (0..=MAX_PREFIXES)
             .map(|_| HornClause::fact(ChcExpr::Bool(true), p, vec![]))
             .collect();
         clauses.push(HornClause::query(ClauseBody::predicates_only(vec![(

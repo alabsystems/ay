@@ -25,7 +25,7 @@ fn empty_encoding(state: &IncrementalFpState) {
     assert!(state.linked_predicate_vars.is_empty());
     assert!(state.linked_bool_inputs.is_empty());
     assert!(state.reuse_probe.is_none());
-    assert!(state.fp_relevance_cache.is_empty());
+    assert_eq!(state.fp_relevance_cache, [] as [Option<bool>; 0]);
     assert_eq!(state.solves, 0);
 }
 

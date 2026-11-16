@@ -610,3 +610,104 @@ fn test_large_array_store_chain_replacement_still_allowed_8140() {
     assert_eq!(pass.substitutions().get(&next).copied(), Some(chain));
     assert_eq!(assertions[1], terms.true_term());
 }
+
+#[test]
+fn test_solve_linear_int_sum_equality_for_unit_coefficient_var() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let ten = terms.mk_int(BigInt::from(10));
+    let three = terms.mk_int(BigInt::from(3));
+
+    // (= (+ x y) 10) has no isolated variable: direct substitution finds
+    // nothing. Linear solving orients it as x -> 10 - y (z3 solve-eqs /
+    // arith-fixed-eqs behaviour on post-normalization rows).
+    let sum = terms.mk_add(vec![x, y]);
+    let eq_sum = terms.mk_eq(sum, ten);
+    let eq_x = terms.mk_eq(x, three);
+
+    let mut plain_assertions = vec![eq_sum];
+    let mut plain = VariableSubstitution::new_skip_arrays();
+    assert!(!plain.apply(&mut terms, &mut plain_assertions));
+    assert!(plain.substitutions().is_empty());
+
+    let mut assertions = vec![eq_sum, eq_x];
+    let mut pass = VariableSubstitution::new_skip_arrays();
+    pass.set_solve_linear_equalities(true);
+    assert!(pass.apply(&mut terms, &mut assertions));
+    let replacement = pass
+        .substitutions()
+        .get(&x)
+        .copied()
+        .expect("x solved from the sum row");
+    assert!(!VariableSubstitution::contains_var(&terms, replacement, x));
+    // The solved row itself collapses to true and the use site is rewritten.
+    assert_eq!(assertions[0], terms.true_term());
+    let expected_use = terms.mk_eq(replacement, three);
+    assert_eq!(assertions[1], expected_use);
+}
+
+#[test]
+fn test_solve_linear_int_nonunit_coefficients_not_solved() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let two = terms.mk_int(BigInt::from(2));
+    let ten = terms.mk_int(BigInt::from(10));
+
+    // 2x + 2y = 10: neither variable has a unit coefficient, so no integer
+    // solved form exists and the row must be left untouched.
+    let two_x = terms.mk_mul(vec![two, x]);
+    let two_y = terms.mk_mul(vec![two, y]);
+    let sum = terms.mk_add(vec![two_x, two_y]);
+    let eq = terms.mk_eq(sum, ten);
+
+    let mut assertions = vec![eq];
+    let mut pass = VariableSubstitution::new_skip_arrays();
+    pass.set_solve_linear_equalities(true);
+    assert!(!pass.apply(&mut terms, &mut assertions));
+    assert!(pass.substitutions().is_empty());
+    assert_eq!(assertions, vec![eq]);
+}
+
+#[test]
+fn test_solve_linear_real_nonunit_coefficient_solved() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let two = terms.mk_rational(BigRational::from_integer(BigInt::from(2)));
+    let ten = terms.mk_rational(BigRational::from_integer(BigInt::from(10)));
+
+    // Over Real any nonzero coefficient solves: 2x + y = 10 gives
+    // x -> 5 - y/2 exactly (rational coefficients, no division node).
+    let two_x = terms.mk_mul(vec![two, x]);
+    let sum = terms.mk_add(vec![two_x, y]);
+    let eq = terms.mk_eq(sum, ten);
+
+    let mut assertions = vec![eq];
+    let mut pass = VariableSubstitution::new_skip_arrays();
+    pass.set_solve_linear_equalities(true);
+    assert!(pass.apply(&mut terms, &mut assertions));
+    assert!(pass.substitutions().contains_key(&x));
+    assert_eq!(assertions[0], terms.true_term());
+}
+
+#[test]
+fn test_solve_linear_occurs_check_rejects_self_referential_row() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let five = terms.mk_int(BigInt::from(5));
+
+    // x + x*y = 5: the monomial leaf contains x, so the solved form for x
+    // would mention x; the occurs check must reject it.
+    let prod = terms.mk_mul(vec![x, y]);
+    let sum = terms.mk_add(vec![x, prod]);
+    let eq = terms.mk_eq(sum, five);
+
+    let mut assertions = vec![eq];
+    let mut pass = VariableSubstitution::new_skip_arrays();
+    pass.set_solve_linear_equalities(true);
+    assert!(!pass.apply(&mut terms, &mut assertions));
+    assert!(pass.substitutions().is_empty());
+}

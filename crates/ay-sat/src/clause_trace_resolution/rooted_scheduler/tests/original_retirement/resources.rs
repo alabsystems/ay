@@ -105,7 +105,7 @@ fn original_retirement_hint_decline_and_opposed_root_fallback_restore_scratch() 
     );
     assert_eq!(root.assign, baseline);
     assert!(root.index_retired.is_clear());
-    assert!(root.row_trail.is_empty());
+    assert_eq!(root.row_trail.len(), 0);
     assert!(root.cand_reason.iter().all(|&reason| reason == 0));
     let mut expired = ResolutionValidationLimits::unbounded();
     expired.deadline = Some(Instant::now());

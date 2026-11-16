@@ -920,7 +920,6 @@ mod tests {
     /// Independently re-verify an installed assignment satisfies every row
     /// equation and bound (mirrors the anchors; catches an install/verify skew).
     fn assignment_is_feasible(s: &LraSolver) -> bool {
-        let n = s.vars.len();
         for row in &s.rows {
             let mut acc = InfRational::from_rat(row.constant.clone());
             for (v, c) in &row.coeffs {
@@ -930,8 +929,7 @@ mod tests {
                 return false;
             }
         }
-        for v in 0..n {
-            let info = &s.vars[v];
+        for info in &s.vars {
             if let Some(l) = &info.lower {
                 if info.value.lt_bound(&l.value, l.strict, BoundType::Lower) {
                     return false;

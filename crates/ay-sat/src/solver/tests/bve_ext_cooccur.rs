@@ -254,15 +254,15 @@ fn the_reconstruction_regressions_stay_unsat_under_the_switch() {
         let dimacs = std::fs::read_to_string(&path).expect("read");
         let formula = crate::parse_dimacs(&dimacs).expect("parse");
         let mut solver = formula.into_solver();
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(false));
         solver.set_interrupt(flag.clone());
         let timeout_flag = flag.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(60));
-            timeout_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            timeout_flag.store(true, Ordering::Relaxed);
         });
         let result = solver
-            .solve_interruptible(move || flag.load(std::sync::atomic::Ordering::Relaxed))
+            .solve_interruptible(move || flag.load(Ordering::Relaxed))
             .into_inner();
         assert!(
             !matches!(result, SatResult::Sat(_)),

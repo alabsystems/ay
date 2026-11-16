@@ -13339,7 +13339,7 @@ fn render_int_lia_parsed(
             // rendered.
             ("mod", 2) => {
                 let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
-                if !parsed_nonzero_int_literal(&args[1], context) {
+                if !parsed_nonzero_int_literal(&args[1]) {
                     return None;
                 }
                 let (b, _) = render_int_lia_parsed(&args[1], vars, context)?;
@@ -13347,7 +13347,7 @@ fn render_int_lia_parsed(
             }
             ("div", 2) => {
                 let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
-                if !parsed_nonzero_int_literal(&args[1], context) {
+                if !parsed_nonzero_int_literal(&args[1]) {
                     return None;
                 }
                 let (b, _) = render_int_lia_parsed(&args[1], vars, context)?;
@@ -13361,11 +13361,11 @@ fn render_int_lia_parsed(
 
 /// True if `t` is an integer literal other than 0: a numeral, an undeclared
 /// negative-literal symbol such as `-3`, or `(- n)` of one.
-fn parsed_nonzero_int_literal(t: &PTerm, context: &ay_frontend::Context) -> bool {
+fn parsed_nonzero_int_literal(t: &PTerm) -> bool {
     match t {
         PTerm::Const(PConst::Numeral(_)) => parsed_numeral(t).is_some_and(|value| value != 0),
         PTerm::App(op, args) if op == "-" && args.len() == 1 => {
-            parsed_nonzero_int_literal(&args[0], context)
+            parsed_nonzero_int_literal(&args[0])
         }
         _ => false,
     }
@@ -13634,7 +13634,7 @@ struct EufLiaLin {
 /// `Symbol`. A declared numeric-looking surface name is not a literal: quoted
 /// `|-1|` is a legal constant/function name and declaration resolution precedes
 /// ay's lenient signed-literal fallback.
-fn euf_lia_i64_literal(t: &PTerm, context: &ay_frontend::Context) -> Option<i64> {
+fn euf_lia_i64_literal(t: &PTerm) -> Option<i64> {
     match t {
         PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
         _ => None,
@@ -13778,7 +13778,7 @@ fn euf_lia_match_uf_value(
     if !cbr_is_int_constant(context, arg) || !cbr_is_int_unary_function(context, g) {
         return None;
     }
-    let val = euf_lia_i64_literal(tail, context)?;
+    let val = euf_lia_i64_literal(tail)?;
     Some((g.clone(), arg.clone(), val))
 }
 

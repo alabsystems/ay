@@ -406,11 +406,11 @@ mod tests {
     /// header word it now occupies, and must not disturb `used`.
     #[test]
     fn wide_score_round_trips_past_the_old_five_bit_ceiling() {
-        let mut arena = crate::clause_arena::ClauseArena::new();
+        let mut arena = ClauseArena::new();
         let off = arena.add(
             &[
-                crate::literal::Literal::positive(crate::literal::Variable(0)),
-                crate::literal::Literal::positive(crate::literal::Variable(1)),
+                Literal::positive(Variable(0)),
+                Literal::positive(Variable(1)),
             ],
             true,
         );

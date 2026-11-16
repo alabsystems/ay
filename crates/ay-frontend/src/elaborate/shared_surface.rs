@@ -108,7 +108,7 @@ impl SharedSurfaceElaboration<'_> {
     pub fn node_index(&self, context: &Context, source: &Term) -> Option<usize> {
         self.current(context).then_some(())?;
         self.locations
-            .get(&(source as *const Term as usize))
+            .get(&(std::ptr::from_ref::<Term>(source) as usize))
             .copied()
     }
 
@@ -329,7 +329,10 @@ impl Context {
         if !closed || !active.current(self) || !active.charge(1, 0) {
             return Err(refused());
         }
-        let Some(&index) = active.locations.get(&(source as *const Term as usize)) else {
+        let Some(&index) = active
+            .locations
+            .get(&(std::ptr::from_ref::<Term>(source) as usize))
+        else {
             // A syntax-sensitive helper may create a different temporary AST.
             // It cannot borrow an original node's authority or escape metering.
             return Err(refused());
@@ -468,7 +471,7 @@ impl<'context, 'source> Builder<'context, 'source> {
             self.local.push(local);
             index
         };
-        let pointer = source as *const Term as usize;
+        let pointer = std::ptr::from_ref::<Term>(source) as usize;
         self.locations.insert(pointer, index);
         Some((index, nodes, tokens))
     }

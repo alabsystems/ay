@@ -185,7 +185,7 @@ fn canonicalize_atoms(text: &str) -> String {
             }
             _ => {
                 let end = text[i..]
-                    .find(|c: char| matches!(c, ' ' | '(' | ')' | '"' | '|'))
+                    .find([' ', '(', ')', '"', '|'])
                     .map_or(bytes.len(), |len| i + len);
                 out.push_str(&canonical_atom(&text[i..end]));
                 i = end;

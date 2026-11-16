@@ -846,9 +846,7 @@ impl ArraySolver<'_> {
         // them no match is claimed.
         let mut used = Vec::new();
         used.try_reserve_exact(map2.len()).ok()?;
-        for _ in 0..map2.len() {
-            used.push(false);
-        }
+        used.resize_with(map2.len(), bool::default);
         let mut all_reasons = Vec::new();
 
         for (idx1, val1, store_reasons1) in map1 {

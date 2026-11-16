@@ -18,14 +18,14 @@
 //! and the verdicts, oracle versions and runtimes in
 //! the development design notes.
 //!
-//! * **Sign fix-up** ([`FpSolver::bv_div_family`]) — AY normalises to
+//! * **Sign fix-up** ([`FpSolver::bv_div_family_with_control`]) — AY normalises to
 //!   magnitudes, calls the unsigned divider **once**, and fixes the sign;
 //!   SMT-LIB instead defines `bvsdiv`/`bvsrem`/`bvsmod` by a four-way case split
 //!   over four divider calls. That the two agree holds for *any* function in the
 //!   divider's place, so obligations `U3`/`U4`/`U5` state it with the divider
 //!   uninterpreted: **`unsat` at width 32 on z3 4.16.0, cvc5 1.3.0 and bitwuzla
 //!   0.9.1**, with mutants `U3N`/`U4N`/`U5N` `sat` on all three.
-//! * **Unsigned divider** ([`FpSolver::bv_udiv_urem`], pre-existing) —
+//! * **Unsigned divider** ([`FpSolver::bv_udiv_urem_with_control`], pre-existing) —
 //!   obligations `O1`/`O2` and the fused `O6`/`O7` are `unsat` on all three
 //!   oracles at widths 4, 8, 12 and 16, and `O1` also at 20. The direct miter
 //!   does not scale to 32 (bitwuzla: 4 s / 45 s / 556 s / >600 s at 12 / 16 /
@@ -41,13 +41,13 @@
 use ay_core::term::{Symbol, TermId};
 use ay_core::CnfLit;
 
-use crate::construction::control::{uninterrupted, BuildControl};
+use crate::construction::control::BuildControl;
 use crate::construction::FpBuildStage;
 
 use super::FpSolver;
 
-/// The five SMT-LIB division/remainder operators [`FpSolver::bv_div_family`]
-/// bit-blasts.
+/// The five SMT-LIB division/remainder operators
+/// [`FpSolver::bv_div_family_with_control`] bit-blasts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BvDivOp {
     Udiv,
@@ -79,17 +79,6 @@ impl FpSolver<'_> {
     /// check is a redundancy guard rather than a conversion: a term whose
     /// declared sort disagrees fails closed instead of being blasted at the
     /// wrong width.
-    pub(crate) fn bitblast_bv_div_app(
-        &mut self,
-        sym: &Symbol,
-        args: &[TermId],
-        expected_sz: usize,
-    ) -> Option<Vec<CnfLit>> {
-        uninterrupted(|control| {
-            self.bitblast_bv_div_app_with_control(sym, args, expected_sz, control)
-        })
-    }
-
     pub(crate) fn bitblast_bv_div_app_with_control<C: BuildControl>(
         &mut self,
         sym: &Symbol,
@@ -129,10 +118,6 @@ impl FpSolver<'_> {
     /// Emit the circuit for `op` over already-blasted operand bits.
     ///
     /// See the module docs for what is proven and where.
-    pub(crate) fn bv_div_family(&mut self, op: BvDivOp, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
-        uninterrupted(|control| self.bv_div_family_with_control(op, a, b, control))
-    }
-
     pub(crate) fn bv_div_family_with_control<C: BuildControl>(
         &mut self,
         op: BvDivOp,

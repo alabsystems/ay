@@ -157,7 +157,7 @@ fn expired_v6_original_deadline_refuses_before_callbacks_or_search() {
     assert!(matches!(
         replay_versioned(
             &owned,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| {
                 calls += 1;
                 true

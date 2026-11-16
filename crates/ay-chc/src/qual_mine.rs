@@ -1443,7 +1443,10 @@ mod tests {
             ClauseHead::Predicate(p, vec![ChcExpr::var(x)]),
         ));
         let mined = MinedQualifiers::mine(&problem);
-        assert!(mined.for_predicate(p, &[bv_var("a0", 8)]).is_empty());
+        assert_eq!(
+            mined.for_predicate(p, &[bv_var("a0", 8)]),
+            [] as [ChcExpr; 0]
+        );
     }
 
     /// vmt skeleton (4 Bools + BV data): the mixed class (g) emits the full

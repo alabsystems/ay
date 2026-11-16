@@ -433,7 +433,7 @@ fn test_resolution_leaked_checked_stack_cleared() {
     );
 
     // Verify full cleanup.
-    assert!(checker.checked_stack.is_empty());
+    assert_eq!(checker.checked_stack.as_slice(), &[] as &[usize]);
     assert!(checker.checked_lits.iter().all(|&b| !b));
 }
 

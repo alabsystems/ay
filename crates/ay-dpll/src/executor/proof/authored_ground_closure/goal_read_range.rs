@@ -368,7 +368,7 @@ impl Executor {
                 TheoryLemmaKind::EufReflexive,
             )
         };
-        Some(DerivedUnit { literal, step })
+        Some(DerivedUnit { step, literal })
     }
 
     pub(super) fn emit_ground_read_range(

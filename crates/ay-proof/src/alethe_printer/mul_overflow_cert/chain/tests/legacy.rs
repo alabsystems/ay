@@ -8,7 +8,7 @@
 use super::*;
 
 pub(super) fn covered_state(
-    p: &Proof,
+    p: &Proof<'_>,
     reach: &[&Vec<bool>],
     chosen: &[Vec<(usize, bool)>],
     s: &[bool],
@@ -29,7 +29,7 @@ pub(super) fn covered_state(
 }
 
 pub(super) fn invariant(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     atoms: &[T],
     reach: &HashSet<Vec<bool>>,
     prem: &[Prem],

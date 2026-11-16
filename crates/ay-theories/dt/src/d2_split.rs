@@ -588,7 +588,7 @@ mod tests {
         assert!(clause.iter().all(|l| atoms.contains(&l.term)));
         // One-shot: second call emits nothing.
         let again = pass.fixpoint_splits(&terms, &mut euf, &assignments);
-        assert!(again.is_empty());
+        assert_eq!(again.as_slice(), &[] as &[TheoryLemma]);
     }
 
     /// A base whose class is committed (merged with a constructor constant)
@@ -602,9 +602,11 @@ mod tests {
         euf.assert_literal(eq, true);
         let _ = euf.check();
         let assignments: HashMap<TermId, bool> = HashMap::default();
-        assert!(pass
-            .fixpoint_splits(&terms, &mut euf, &assignments)
-            .is_empty());
+        assert_eq!(
+            pass.fixpoint_splits(&terms, &mut euf, &assignments)
+                .as_slice(),
+            &[] as &[TheoryLemma]
+        );
         // Fresh e-graph without the merge: now it splits.
         let mut euf2 = EufSolver::new(&terms);
         let _ = euf2.check();
@@ -623,9 +625,11 @@ mod tests {
         let _ = euf.check();
         let mut assignments: HashMap<TermId, bool> = HashMap::default();
         assignments.insert(atoms[0], true);
-        assert!(pass
-            .fixpoint_splits(&terms, &mut euf, &assignments)
-            .is_empty());
+        assert_eq!(
+            pass.fixpoint_splits(&terms, &mut euf, &assignments)
+                .as_slice(),
+            &[] as &[TheoryLemma]
+        );
     }
 
     /// Structural validation rejects malformed families: wrong sort, wrong

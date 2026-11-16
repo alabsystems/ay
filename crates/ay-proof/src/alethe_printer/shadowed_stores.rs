@@ -130,13 +130,16 @@ impl Derivation<'_, '_> {
     }
 
     fn step(&mut self, clause: &str, rule: &str, premises: &[&str]) -> Option<String> {
-        // WIRE-RULE BOUND: every step of this derivation is printed here, so
-        // no name outside the pinned checker's implemented set can reach the
-        // wire. See `PackedProof::named_step` for the full rationale and
-        // `tests/wire_rule_coverage.rs` for the probe that re-proves the set.
-        if !ay_core::is_checkable_alethe_rule(rule) {
-            return None;
-        }
+        let rule = CheckableRule::new(rule)?;
+        self.step_with_rule(clause, rule, premises)
+    }
+
+    fn step_with_rule(
+        &mut self,
+        clause: &str,
+        rule: CheckableRule,
+        premises: &[&str],
+    ) -> Option<String> {
         let id = self.fresh();
         let suffix = if premises.is_empty() {
             String::new()

@@ -42,7 +42,7 @@ fn range_source(width: u32) -> String {
 fn candidate(executor: &mut Executor, roots: &[TermId]) -> Proof {
     let mut control = Control::capture(executor, &|| false).unwrap();
     let found = collect::occurrences(executor, roots, &mut control).unwrap();
-    assert!(!found.is_empty());
+    assert_ne!(found, [] as [(TermId, TermId, u32); 0]);
     augmented(
         &mut executor.ctx.terms,
         &executor.proof_source_work,
@@ -232,9 +232,10 @@ fn shadowed_name_and_wrong_operand_sort_never_gain_theorem_authority() {
         .ctx
         .register_symbol("bvurem".into(), var, Sort::bitvec(4));
     let mut control = Control::capture(&executor, &|| false).unwrap();
-    assert!(collect::occurrences(&executor, &roots, &mut control)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        collect::occurrences(&executor, &roots, &mut control).unwrap(),
+        [] as [(TermId, TermId, u32); 0]
+    );
     let (mut executor, _) = fixture("(declare-const x (_ BitVec 4))");
     let x = executor.ctx.terms.find_var("x").unwrap();
     let boolean = executor.ctx.terms.mk_bool(true);
@@ -248,10 +249,9 @@ fn shadowed_name_and_wrong_operand_sort_never_gain_theorem_authority() {
             .ctx
             .terms
             .mk_app(Symbol::named("="), vec![x, malformed], Sort::Bool);
-    assert!(
-        collect::occurrences(&executor, &[malformed_root], &mut control)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        collect::occurrences(&executor, &[malformed_root], &mut control).unwrap(),
+        [] as [(TermId, TermId, u32); 0]
     );
 }
 

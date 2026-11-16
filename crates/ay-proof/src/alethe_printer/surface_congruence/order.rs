@@ -189,7 +189,7 @@ impl AlethePrinter<'_> {
                 &norm,
                 &printed_left,
                 &canonical_left,
-                authored_assume::EquivalenceDirection::SurfaceToCanonical,
+                EquivalenceDirection::SurfaceToCanonical,
                 &mut steps,
             ) {
                 return None;
@@ -210,7 +210,7 @@ impl AlethePrinter<'_> {
                 &norm,
                 &printed_right,
                 &canonical_right,
-                authored_assume::EquivalenceDirection::CanonicalToSurface,
+                EquivalenceDirection::CanonicalToSurface,
                 &mut steps,
             ) {
                 return None;

@@ -17,7 +17,7 @@ pub(super) struct Native<'cnf, 'terms> {
 impl<'cnf, 'terms> Native<'cnf, 'terms> {
     pub(super) fn from_cnf(cnf: &'cnf CountedCnf<'terms>) -> Self {
         cnf.check().unwrap();
-        assert!(cnf.theory_atoms().is_empty());
+        assert_eq!(cnf.theory_atoms(), []);
         let mut proof = Proof::new();
         let assumptions: Vec<_> = cnf
             .roots()

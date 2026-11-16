@@ -72,8 +72,8 @@ fn test_baseline_already_correct_returns_empty_set() {
 
     assert!(result.baseline_already_correct);
     assert!(!result.outside_flag_set);
-    assert!(result.minimal_flags.is_empty());
-    assert!(result.subsystems.is_empty());
+    assert_eq!(result.minimal_flags, Vec::<String>::new());
+    assert_eq!(result.subsystems, Vec::<String>::new());
     // Exactly one trial (the baseline probe).
     assert_eq!(result.trials, 1);
     assert_eq!(runner.call_count(), 1);
@@ -117,7 +117,7 @@ fn test_outside_flag_set_detected() {
 
     assert!(!result.baseline_already_correct);
     assert!(result.outside_flag_set);
-    assert!(result.minimal_flags.is_empty());
+    assert_eq!(result.minimal_flags, Vec::<String>::new());
     // We should have run baseline + all-flags probe only.
     assert_eq!(result.trials, 2);
 }

@@ -480,7 +480,7 @@ fn bv_offset_spines_deep_identical_base_is_borrowed_and_opaque() {
     assert_eq!(before, t.len());
     assert_eq!(charges[0], (WORK, BYTES));
     assert!(charges[1..].iter().all(|x| *x == (0, 0)));
-    assert!(std::mem::size_of::<Inspector<'_, '_>>() <= 128);
+    assert!(size_of::<Inspector<'_, '_>>() <= 128);
 }
 
 fn from_plan(t: &mut TermStore, ast: &serde_json::Value) -> TermId {

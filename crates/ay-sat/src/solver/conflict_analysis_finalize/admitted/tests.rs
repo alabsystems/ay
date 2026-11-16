@@ -117,16 +117,16 @@ fn counters(s: &Solver) -> [u64; 8] {
 
 fn clean(s: &mut Solver) {
     assert!(s.var_data.iter().all(|vd| !vd.is_seen()));
-    assert!(s.min.minimize_to_clear.is_empty());
+    assert_eq!(s.min.minimize_to_clear.len(), 0);
     assert!(s.min.minimize_flags.iter().all(|&flags| flags == 0));
-    assert!(s.min.minimize_levels_to_clear.is_empty());
-    assert!(s.conflict.clause_buf_mut().is_empty());
-    assert!(s.conflict.analyzed_vars().is_empty());
+    assert_eq!(s.min.minimize_levels_to_clear.len(), 0);
+    assert_eq!(s.conflict.clause_buf_mut().len(), 0);
+    assert_eq!(s.conflict.analyzed_vars().len(), 0);
     assert_eq!(s.conflict.learned_count(), 0);
     assert!(s.ws_shrink_entries.is_empty() && s.ws_shrink_result.is_empty());
     assert!(s.ws_shrink_block_lits.is_empty() && s.ws_shrink_chain.is_empty());
     assert!(s.min.shrink_walked.is_empty() && s.reap.is_empty());
-    assert!(s.bump_order_sort_buf.is_empty());
+    assert_eq!(s.bump_order_sort_buf.len(), 0);
 }
 
 #[test]

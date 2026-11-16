@@ -1201,10 +1201,10 @@ fn primary_checked_conflict_blocks_only_within_its_scope() {
         BlockingClauseResult::Added {
             extra_original_ids, ..
         } => {
-            assert!(extra_original_ids.is_empty());
+            assert_eq!(extra_original_ids, [] as [(usize, u64); 0]);
         }
         _ => panic!("verified fully mapped primary must be admitted"),
-    };
+    }
     assert!(solver.solve().into_inner().is_unsat());
     assert!(solver.pop());
     solver.add_clause(vec![SatLiteral::positive(SatVariable::new(0))]);

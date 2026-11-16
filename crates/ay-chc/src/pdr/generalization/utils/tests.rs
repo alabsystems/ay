@@ -218,7 +218,10 @@ fn test_extract_disequalities_is_bounded_on_dags() {
             vec![Arc::clone(&barren), Arc::clone(&barren)],
         ));
     }
-    assert!(extract_disequalities(&barren, usize::MAX).is_empty());
+    assert_eq!(
+        extract_disequalities(&barren, usize::MAX),
+        [] as [(ChcExpr, ChcExpr); 0]
+    );
 
     let diseq = Arc::new(ChcExpr::not(eq.as_ref().clone()));
     let mut shared = Arc::clone(&diseq);

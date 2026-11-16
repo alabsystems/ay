@@ -101,7 +101,7 @@ pub(crate) struct Kernel<'t> {
     pub(crate) final_sat: bool,
 }
 
-impl<'t> Kernel<'t> {
+impl Kernel<'_> {
     /// Run `f` on plug-in `id` with a context lending the term store (K3).
     fn call<R>(
         &mut self,

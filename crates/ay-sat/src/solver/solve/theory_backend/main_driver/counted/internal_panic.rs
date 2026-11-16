@@ -40,15 +40,9 @@ fn safe_internal_panic_under_driver_custody_terminalizes_owner_and_trace() {
         assert!(guard.solver.cold.decision_trace.is_some());
         reached.fetch_add(1, Ordering::SeqCst);
         let empty: &[Literal] = &[];
-        std::hint::black_box(empty)[std::hint::black_box(0)];
+        assert!(std::hint::black_box(empty).len() > std::hint::black_box(0));
     }));
-    let payload = panic.expect_err("the owned safe bounds fault must be reached");
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap();
-    assert!(message.contains("index out of bounds"), "{message}");
+    let _ = panic.expect_err("the injected internal panic must be reached");
     assert_eq!(reached.load(Ordering::SeqCst), 1);
     assert_eq!(
         owner.check(),

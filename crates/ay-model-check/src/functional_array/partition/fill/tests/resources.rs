@@ -106,7 +106,9 @@ fn original_fill_end_and_stop_refusal_survive_raw_reset() {
     stopped.store(false, Ordering::Release);
     assert!(owner.clone().check().is_err());
     let expired = super::owner(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a current instant has an earlier representable second"),
         1_000_000,
         128 * 1024 * 1024,
     );

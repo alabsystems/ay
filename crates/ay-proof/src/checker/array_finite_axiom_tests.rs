@@ -103,7 +103,7 @@ fn finite_array_kind_is_complete_native_quality_not_trust() {
     assert!(quality.is_complete());
     assert_eq!(quality.theory_lemma_count, 1);
     assert_eq!(quality.trust_count, 0);
-    assert!(quality.trust_theory_kinds.is_empty());
+    assert_eq!(quality.trust_theory_kinds, []);
 }
 
 #[test]

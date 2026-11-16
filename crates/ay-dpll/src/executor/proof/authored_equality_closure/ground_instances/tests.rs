@@ -136,7 +136,7 @@ fn closed_guard_is_evaluated_and_distinct_constants_close() {
 fn ground_equality_chain_closes_on_distinct_constants() {
     let mut exec = authored(CONSTANT_CHAIN);
     let proof = closes(&mut exec);
-    assert!(forall_inst_args(&exec, &proof).is_empty());
+    assert_eq!(forall_inst_args(&exec, &proof), [] as [Vec<String>; 0]);
     assert_eq!(rule_count(&proof, &AletheRule::Evaluate), 1);
     assert!(rule_count(&proof, &AletheRule::EqTransitive) >= 2);
 }

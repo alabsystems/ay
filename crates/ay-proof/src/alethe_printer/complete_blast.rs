@@ -105,7 +105,7 @@ mod transport;
 mod traversal;
 mod zero_extend;
 
-use super::AlethePrinter;
+use super::{AlethePrinter, CheckableRule};
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId};
 use circuit::{Circuit, SRef, ShiftOp};
@@ -214,7 +214,7 @@ struct Word {
 enum ClauseEmit {
     /// Printed by [`Blaster::emit_planned_clause`] when the refutation uses it.
     Rule {
-        rule: &'static str,
+        rule: CheckableRule,
         args: Option<String>,
         premises: Vec<String>,
     },
@@ -223,6 +223,20 @@ enum ClauseEmit {
     /// The assumed root. It is never a premise: the transported chain carries
     /// `(not A)` in every clause instead, which is the same assumption.
     Root,
+}
+
+impl ClauseEmit {
+    fn rule(rule: &str, args: Option<String>, premises: Vec<String>) -> Option<Self> {
+        Some(Self::Rule {
+            rule: CheckableRule::new(rule)?,
+            args,
+            premises,
+        })
+    }
+
+    fn bare(rule: &str) -> Option<Self> {
+        Self::rule(rule, None, Vec::new())
+    }
 }
 
 /// One clause handed to the SAT engine, with the derivation that licenses it.
@@ -510,10 +524,6 @@ impl<'a, 'p> Blaster<'a, 'p> {
 // ------------------------------------------------------------------- words
 
 impl Blaster<'_, '_> {
-    fn word(&self, index: usize) -> &Word {
-        &self.words[index]
-    }
-
     fn word_ref(&self, index: usize) -> String {
         self.words[index].reference.clone()
     }
@@ -905,21 +915,8 @@ impl Blaster<'_, '_> {
         // than opaque `@bit_of` projections of a compound operand.
         let congruence = self.step_name(".cg");
         let rule_step = self.step_name(".bb");
-        let premises = blasted
-            .operand_steps
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let premises = blasted.operand_steps.to_vec().join(" ");
         let bbterm = self.bbterm(&bits);
-        // WIRE-RULE BOUND: `Blasted::rule` is chosen by `blast_operation`'s
-        // operator tables. Refuse any name outside the pinned checker's
-        // implemented set rather than print it -- an unknown rule makes the
-        // whole document `invalid`, while this `None` leaves the honest hole.
-        // See `PackedProof::named_step` and `tests/wire_rule_coverage.rs`.
-        if !ay_core::is_checkable_alethe_rule(blasted.rule) {
-            return None;
-        }
         let respelled = if let WordOp::ZeroExtend { zero, arg } = op {
             self.zero_extend_identity(&reference, zero, arg, &congruence, &blasted)?
         } else {
@@ -969,7 +966,7 @@ impl Blaster<'_, '_> {
                     }
                     bits = next;
                 }
-                (bits, self.blasted_application(head, args, rule))
+                (bits, self.blasted_application(head, args, rule)?)
             }
             WordOp::Add(args) => {
                 let mut bits = self.words[args[0]].bits.clone();
@@ -982,7 +979,7 @@ impl Blaster<'_, '_> {
                 }
                 (
                     bits,
-                    self.blasted_application("bvadd", args, "bitblast_add"),
+                    self.blasted_application("bvadd", args, "bitblast_add")?,
                 )
             }
             WordOp::Mul(args) => {
@@ -996,7 +993,7 @@ impl Blaster<'_, '_> {
                 }
                 (
                     bits,
-                    self.blasted_application("bvmul", args, "bitblast_mult"),
+                    self.blasted_application("bvmul", args, "bitblast_mult")?,
                 )
             }
             WordOp::Not(arg) => {
@@ -1007,7 +1004,7 @@ impl Blaster<'_, '_> {
                     .collect::<Option<Vec<_>>>()?;
                 (
                     bits,
-                    self.blasted_application("bvnot", &[*arg], "bitblast_not"),
+                    self.blasted_application("bvnot", &[*arg], "bitblast_not")?,
                 )
             }
             WordOp::Neg(arg) => {
@@ -1015,7 +1012,7 @@ impl Blaster<'_, '_> {
                 let bits = self.circuit.negate_bits(&source)?;
                 (
                     bits,
-                    self.blasted_application("bvneg", &[*arg], "bitblast_neg"),
+                    self.blasted_application("bvneg", &[*arg], "bitblast_neg")?,
                 )
             }
             WordOp::Concat(args) => {
@@ -1028,7 +1025,7 @@ impl Blaster<'_, '_> {
                 }
                 (
                     bits,
-                    self.blasted_application("concat", args, "bitblast_concat"),
+                    self.blasted_application("concat", args, "bitblast_concat")?,
                 )
             }
             WordOp::ZeroExtend { zero, arg } => {
@@ -1041,7 +1038,7 @@ impl Blaster<'_, '_> {
                 // prints (and reports) in `new_word`.
                 (
                     bits,
-                    self.blasted_application("concat", &[*zero, *arg], "bitblast_concat"),
+                    self.blasted_application("concat", &[*zero, *arg], "bitblast_concat")?,
                 )
             }
             WordOp::Extract { low, arg } => {
@@ -1059,7 +1056,7 @@ impl Blaster<'_, '_> {
                     Blasted {
                         blasted_application: format!("((_ extract {high} {low}) {source_bb})"),
                         operand_steps: vec![self.words[*arg].step.clone()],
-                        rule: "bitblast_extract",
+                        rule: CheckableRule::new("bitblast_extract")?,
                     },
                 )
             }
@@ -1079,7 +1076,7 @@ impl Blaster<'_, '_> {
                     Blasted {
                         blasted_application: format!("((_ sign_extend {by}) {source_bb})"),
                         operand_steps: vec![self.words[*arg].step.clone()],
-                        rule: "bitblast_sign_extend",
+                        rule: CheckableRule::new("bitblast_sign_extend")?,
                     },
                 )
             }
@@ -1122,7 +1119,7 @@ impl Blaster<'_, '_> {
             ShiftOp::LShr => "bvlshr",
             ShiftOp::AShr => "bvashr",
         };
-        Some((bits, self.blasted_application(head, &[x, y], rule)))
+        Some((bits, self.blasted_application(head, &[x, y], rule)?))
     }
 
     /// Whether a `bvashr` instance stays inside the domain where the pinned
@@ -1156,7 +1153,17 @@ impl Blaster<'_, '_> {
         true
     }
 
-    fn blasted_application(&self, head: &str, operands: &[usize], rule: &'static str) -> Blasted {
+    fn blasted_application(&self, head: &str, operands: &[usize], rule: &str) -> Option<Blasted> {
+        let rule = CheckableRule::new(rule)?;
+        Some(self.blasted_application_with_rule(head, operands, rule))
+    }
+
+    fn blasted_application_with_rule(
+        &self,
+        head: &str,
+        operands: &[usize],
+        rule: CheckableRule,
+    ) -> Blasted {
         let mut application = format!("({head}");
         let mut steps = Vec::with_capacity(operands.len());
         for operand in operands {
@@ -1179,7 +1186,7 @@ struct Blasted {
     blasted_application: String,
     /// The steps that justify those replacements, in argument order.
     operand_steps: Vec<String>,
-    rule: &'static str,
+    rule: CheckableRule,
 }
 
 // ------------------------------------------------------------------- atoms
@@ -1309,10 +1316,7 @@ impl Blaster<'_, '_> {
             AtomKind::UnsignedLessThan => ("bvult", "bitblast_ult"),
             AtomKind::SignedLessThan => ("bvslt", "bitblast_slt"),
         };
-        // WIRE-RULE BOUND: see `PackedProof::named_step`.
-        if !ay_core::is_checkable_alethe_rule(rule) {
-            return None;
-        }
+        let rule = CheckableRule::new(rule)?;
         let body = format!("({head} {} {})", self.word_ref(left), self.word_ref(right));
         let atom = self.circuit.theory(body);
         let blasted = match kind {
@@ -1420,16 +1424,6 @@ impl Blaster<'_, '_> {
     fn plan(&mut self, lits: Vec<SRef>, emit: ClauseEmit) -> Option<()> {
         if self.planned.len() >= MAX_PLANNED_CLAUSES {
             return None;
-        }
-        // WIRE-RULE BOUND: `transport::print_planned` prints
-        // `ClauseEmit::Rule`'s name verbatim, and every planned clause is
-        // recorded here. Refuse a name the pinned checker does not implement
-        // rather than transport a document it would answer `unknown rule`
-        // for. See `PackedProof::named_step` and `tests/wire_rule_coverage.rs`.
-        if let ClauseEmit::Rule { rule, .. } = &emit {
-            if !ay_core::is_checkable_alethe_rule(rule) {
-                return None;
-            }
         }
         self.planned.push(PlannedClause { lits, emit });
         Some(())

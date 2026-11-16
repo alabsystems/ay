@@ -69,11 +69,12 @@ pub(super) fn with_owner(cases: usize, run: impl FnOnce(&mut WorkBudget<'_>)) {
         left_bytes = left_bytes.checked_sub(bytes).ok_or(QueryError::Exhausted)?;
         Ok(())
     };
-    let mut budget = WorkBudget::with_admission(work, &mut admission);
-    budget.charge(0).unwrap();
-    run(&mut budget);
-    budget.charge(0).unwrap();
-    drop(budget);
+    {
+        let mut budget = WorkBudget::with_admission(work, &mut admission);
+        budget.charge(0).unwrap();
+        run(&mut budget);
+        budget.charge(0).unwrap();
+    }
     admission(0, 0).unwrap(); // Same captured end after the ledger is dropped.
 }
 

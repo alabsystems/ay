@@ -1033,7 +1033,7 @@ fn test_proof_cycle_shed_follows_the_opt_outs() {
     // The env-signal leg of `competition_mode` is not exercised here; the
     // certifying expectations below hold only when no harness signal is
     // present in the test environment.
-    if crate::competition_mode::competition_env_active() {
+    if competition_mode::competition_env_active() {
         return;
     }
     // Shed: the explicit opt-outs, and nothing else. `--rigor fast` gets

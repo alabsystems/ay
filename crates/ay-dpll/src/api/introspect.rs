@@ -131,7 +131,7 @@ impl Solver {
     pub fn declared_symbols_in(
         &self,
         roots: &[Term],
-    ) -> Result<std::collections::BTreeSet<String>, super::types::SolverError> {
+    ) -> Result<std::collections::BTreeSet<String>, SolverError> {
         let terms = self.terms();
         // Binder scopes: (enclosing scope, names bound here). Scope 0 is the
         // top level; a binder's body is walked in a fresh child scope, and a

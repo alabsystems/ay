@@ -60,7 +60,11 @@ impl NormalizeBvArith {
             ("extract", &[high, low])
                 if low > 0
                     && low == term_width
-                    && high.checked_add(1) == low.checked_mul(2)
+                    && {
+                        let extracted_end = high.checked_add(1);
+                        let double_width = low.checked_mul(2);
+                        extracted_end == double_width
+                    }
                     && source_width > high =>
             {
                 // source may be WIDER than 2*low (e.g. a 32x32 product

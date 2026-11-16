@@ -116,7 +116,10 @@ fn does_not_treat_nonlinear_constrained_or_nonnullary_input_as_transparent() {
         1,
         "only the guarded clause is a source"
     );
-    assert!(std::ptr::eq(slice.anchors[0], &problem.clauses()[1]));
+    assert!(std::ptr::eq(
+        slice.anchors[0],
+        &raw const problem.clauses()[1]
+    ));
 }
 
 #[test]

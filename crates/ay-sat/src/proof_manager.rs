@@ -2068,8 +2068,8 @@ impl ProofManager {
         file_hints_buf: &mut Vec<u64>,
         seen: &mut DetHashSet<u64>,
     ) {
-        debug_assert!(file_hints_buf.is_empty());
-        debug_assert!(seen.is_empty());
+        debug_assert_eq!(file_hints_buf.len(), 0);
+        debug_assert_eq!(seen.len(), 0);
         file_hints_buf.reserve(hints.len());
         for &hint in hints {
             if self.lrat_id_usable_as_hint(hint) && seen.insert(hint) {

@@ -97,9 +97,7 @@ impl<'a, 'budget, 'owner> IndexedModelCells<'a, 'budget, 'owner> {
     ) -> Result<Self, QueryError> {
         let bytes = maximum_rows
             .checked_mul(
-                std::mem::size_of::<Row<'a>>()
-                    + std::mem::size_of::<Node<'a>>()
-                    + std::mem::size_of::<ModelCellRow<'a>>(),
+                size_of::<Row<'a>>() + size_of::<Node<'a>>() + size_of::<ModelCellRow<'a>>(),
             )
             .ok_or_else(|| work.refuse_exhaustion())?;
         work.admit(maximum_rows, bytes)?;

@@ -210,7 +210,7 @@ fn complete_declarations_and_source_identity_are_borrowed_in_canonical_order() {
     );
     assert_eq!(functions[0].arg_sorts(), &[ChcSort::BitVec(136)]);
     assert_eq!(functions[0].result_sort(), &ChcSort::BitVec(1));
-    assert!(functions[1].arg_sorts().is_empty());
+    assert_eq!(functions[1].arg_sorts(), []);
     assert_eq!(functions[1].result_sort(), &ChcSort::BitVec(136));
 }
 
@@ -234,7 +234,7 @@ fn raw_clause_order_false_queries_and_all_attached_payloads_are_exact_borrows() 
             clause.body_predicates(),
             raw[index].body.predicates.as_slice()
         ));
-        assert!(std::ptr::eq(clause.head(), &raw[index].head));
+        assert!(std::ptr::eq(clause.head(), &raw const raw[index].head));
         assert!(std::ptr::eq(
             clause.premises(),
             problem.premises()[index].as_slice()
@@ -323,8 +323,8 @@ fn empty_declarations_and_fixedpoint_flag_need_no_reconstruction() {
     assert!(view.clauses().next().unwrap().constraint().is_none());
     assert!(view.clause(1).is_none());
     assert!(view.predicates().is_empty());
-    assert!(view.datatype_declarations().is_empty());
-    assert!(view.function_declarations().is_empty());
+    assert_eq!(view.datatype_declarations(), []);
+    assert_eq!(view.function_declarations(), []);
     assert!(!view.is_fixedpoint_format());
     let fixedpoint = QuantifiedChcProblem::parse_smtlib(
         "(set-logic HORN) (declare-rel P ()) (rule P) (query P)",
@@ -342,7 +342,7 @@ fn empty_declarations_and_fixedpoint_flag_need_no_reconstruction() {
 fn registry_transfer_keeps_the_already_admitted_vector_allocation() {
     let declarations = declarations();
     let registry = Registry::new(&declarations).unwrap();
-    let first = registry.record_sorts().next().unwrap() as *const ChcSort;
+    let first = std::ptr::from_ref(registry.record_sorts().next().unwrap());
     let records = registry.into_record_sorts();
     assert_eq!(records.as_ptr(), first);
     assert_eq!(records.len(), 3);

@@ -16,7 +16,7 @@ impl BvSolver<'_> {
     /// for all BV constraints it contains. The assertion is assumed to be true.
     pub fn bitblast_assertion(&mut self, term: TermId) {
         if !self.encoding_complete() {
-            return ();
+            return;
         }
 
         self.process_assertion(term, true);

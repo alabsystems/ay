@@ -172,7 +172,7 @@ fn test_process_trace_ample_step_budget_still_derives() {
     let step = proof.get_step(empty_id).expect("final step exists");
     match step {
         ProofStep::Resolution { clause, .. } | ProofStep::Step { clause, .. } => {
-            assert!(clause.is_empty());
+            assert_eq!(clause.as_slice(), []);
         }
         other => panic!("expected resolution/step, got {other:?}"),
     }
@@ -1168,7 +1168,7 @@ fn exact_original_fragment_binds_indexed_clausification_by_id() {
     else {
         panic!("expected an exact and_pos step");
     };
-    assert!(premises.is_empty());
+    assert_eq!(premises.as_slice(), []);
     assert_eq!(binding.clause, SatProofManager::normalize_clause(clause));
 }
 
@@ -2204,7 +2204,7 @@ fn test_process_trace_empty_clause_rup_replay_no_trust() {
     let Some(ProofStep::Resolution { clause, .. }) = proof.get_step(empty_id) else {
         panic!("expected the empty clause to be a resolution step");
     };
-    assert!(clause.is_empty());
+    assert_eq!(clause.as_slice(), []);
     // The proof must contain no Trust steps at all.
     let trust_steps = proof
         .steps
@@ -2253,7 +2253,7 @@ fn rejection_probe_preserves_failfast_meter_store_and_next_fragment() {
         let annotations = vec![
             None,
             None,
-            Some(ay_core::ClausificationProof {
+            Some(ClausificationProof {
                 rule: AletheRule::False,
                 source_term: false_term,
             }),
@@ -2335,7 +2335,7 @@ fn exact_original_fragment_growth_precharge_follows_selected_cone() {
         let limit = terms.true_memory_bytes() + 64 * 1024;
         let mut var_to_term = HashMap::default();
         var_to_term.insert(0, false_term);
-        let annotations = vec![Some(ay_core::ClausificationProof {
+        let annotations = vec![Some(ClausificationProof {
             rule: AletheRule::False,
             source_term: false_term,
         })];

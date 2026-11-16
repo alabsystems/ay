@@ -522,7 +522,7 @@ mod tests {
             "a mismatched claimed instance must not receive authority"
         );
         assert_eq!(exec.ctx.assertions, vec![forall]);
-        assert!(exec.active_support_axioms.is_empty());
+        assert_eq!(exec.active_support_axioms, [] as [ay_core::TheoryLit; 0]);
         assert_eq!(exec.proof_tracker.num_steps(), proof_steps_before);
 
         assert!(exec.append_cegqi_ground_instance(forall, &values, p_zero));

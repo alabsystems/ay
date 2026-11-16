@@ -175,8 +175,8 @@ fn emitted_bytes_replay_under_the_shared_interpreter() {
     let instance = k3_instance([1, 1, 1]);
     let proof = certify_opt_lin_handshake_parity(&instance, &K3_INCUMBENT, 1)
         .expect("on-family instance must certify");
-    assert!(super::self_check(&proof, &instance, &K3_INCUMBENT, 1, 9));
-    assert!(!super::self_check(&proof, &instance, &K3_INCUMBENT, 1, 8));
+    assert!(self_check(&proof, &instance, &K3_INCUMBENT, 1, 9));
+    assert!(!self_check(&proof, &instance, &K3_INCUMBENT, 1, 8));
 }
 
 /// A 5-row line graph family member with slack weights all 2: path

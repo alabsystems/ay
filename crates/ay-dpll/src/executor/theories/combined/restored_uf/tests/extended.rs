@@ -292,9 +292,10 @@ fn unwinding_a_late_admission_callback_cannot_publish_a_partial_model() {
             &mut lia,
             &mut |_, _| {
                 current += 1;
-                if current == calls {
-                    panic!("owned late admission unwind discriminator")
-                }
+                assert!(
+                    current != calls,
+                    "owned late admission unwind discriminator"
+                );
                 Ok(())
             },
         );

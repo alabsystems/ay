@@ -128,11 +128,10 @@ impl ArraySolver<'_> {
         // marks position 0 in the freshly-emptied log.
         let open_scopes = self.scopes.len();
         let mut merge_scopes = Vec::new();
-        // Capacity hint only: if it fails, the pushes grow the vector.
+        // Capacity hint only: if it fails, resize allocates the zero marks as
+        // the old pushes did.
         let _ = merge_scopes.try_reserve_exact(open_scopes);
-        for _ in 0..open_scopes {
-            merge_scopes.push(0);
-        }
+        merge_scopes.resize_with(open_scopes, usize::default);
         self.array_var_merge_scopes = merge_scopes;
         // The affine normal-form / interning memo (`affine_cache`) is a pure
         // function of the immutable `TermStore` term DAG — it carries no

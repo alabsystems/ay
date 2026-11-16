@@ -134,7 +134,7 @@ fn exact_rem_u32_digits_keeps_complete_strict_proof_in_native_diagnostic() {
         .expect("requested proof")
         .expect("source-bound proof export");
     phase("source-bound-export");
-    assert!(!document.is_empty());
+    assert_ne!(document, "");
     assert!(
         !document.contains(":rule hole") && !document.contains(":rule trust"),
         "native completeness must not conceal an unproved exported step"

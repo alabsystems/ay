@@ -44,7 +44,7 @@ impl Context {
         // Replacement snapshots clone only this scalar SymbolInfo: its
         // argument vectors/internal-name are empty; the fresh declaration's
         // Arc marker is shared, not reallocated per scope.
-        owner.admit(work, 2 * std::mem::size_of::<usize>())?;
+        owner.admit(work, 2 * size_of::<usize>())?;
         owner.check()?;
         Ok(())
     }

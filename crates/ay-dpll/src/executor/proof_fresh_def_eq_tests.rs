@@ -65,7 +65,7 @@ fn lane_guard_mutation_ledger_names_a_test_per_guard() {
     for (guard, test) in LANE_GUARD_MUTATION_LEDGER {
         assert!(!guard.is_empty() && !test.is_empty());
     }
-    assert!(!RECORDED_NEGATIVE.is_empty());
+    assert_ne!(RECORDED_NEGATIVE, "");
 }
 
 /// `purify_bool_args`' own target shape: a COMPOUND Boolean argument of an

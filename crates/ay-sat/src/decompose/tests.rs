@@ -394,7 +394,7 @@ fn test_rewrite_proof_log_carries_clause_idx() {
     let vals = vec![0i8; 6];
     let rw = rewrite_clauses(&clauses, &scc.reprs, &vals);
 
-    assert!(!rw.actions.is_empty(), "actions should record mutations");
+    assert_ne!(rw.actions.len(), 0, "actions should record mutations");
 
     // Helper: extract clause_idx from any mutation variant.
     let idx_of = |m: &ClauseMutation| match m {

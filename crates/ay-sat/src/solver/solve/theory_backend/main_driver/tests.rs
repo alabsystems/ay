@@ -36,7 +36,7 @@ fn unsat() -> Solver {
     }
     s.initialize_watches();
     assert!(s.process_initial_clauses().is_none());
-    assert!(s.trail.is_empty());
+    assert_eq!(s.trail.len(), 0);
     assert!(!s.cold.ic3_mode && s.chrono_enabled);
     s
 }
@@ -86,10 +86,10 @@ fn assignments(s: &Solver) -> Vec<VarData> {
 }
 fn clean(s: &Solver) {
     assert!(s.var_data.iter().all(|v| !v.is_seen()));
-    assert!(s.conflict.analyzed_vars().is_empty());
+    assert_eq!(s.conflict.analyzed_vars().len(), 0);
     assert_eq!(s.conflict.learned_count(), 0);
-    assert!(s.min.level_seen_to_clear.is_empty());
-    assert!(s.min.minimize_to_clear.is_empty());
+    assert_eq!(s.min.level_seen_to_clear.len(), 0);
+    assert_eq!(s.min.minimize_to_clear.len(), 0);
 }
 fn refused(s: &Solver, owner: &CountedAdmission) {
     assert!(owner.usage().unwrap().refusal.is_some());

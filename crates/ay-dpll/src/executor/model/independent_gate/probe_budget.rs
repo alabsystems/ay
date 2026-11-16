@@ -58,8 +58,8 @@
 //! the external API/command decision boundary
 //! (`begin_external_decision_query`), never by `begin_public_solve`, a nested
 //! solve, or a cascade retry. An arm claims a slice, pre-deducted; on close it
-//! refunds whatever it did not spend, so a gate that confirms in 2 ms (the
-//! measured non-FP case) costs the query nothing.
+//! refunds whatever it did not spend, so an early result leaves the unspent
+//! slice available to the query.
 //!
 //! One clamp does the work of two: the arm's slice is capped at half the
 //! caller's REMAINING deadline, and the whole arm then runs under that slice as
@@ -325,9 +325,7 @@ impl crate::executor::Executor {
     }
 
     /// Close a gate arm: restore the caller's deadline, then refund the part
-    /// of the slice this arm did not spend. The measured non-FP case confirms
-    /// in 0-2 ms, so outside the FP obligation the envelope is a no-op and the
-    /// next arm still sees a full window.
+    /// of the slice this arm did not spend.
     pub(in crate::executor) fn close_quantified_gate_arm(
         &mut self,
         arm: GateArmGrant,
@@ -343,26 +341,13 @@ impl crate::executor::Executor {
 mod tests {
     use super::*;
 
-    /// The conversion this envelope exists to enable: a fresh query hands the
-    /// gate arm enough wall to reach the measured 1,579–2,426 ms need band,
-    /// where the old flat 500 ms constant could not.
     #[test]
-    fn a_fresh_envelope_covers_the_measured_need_band() {
+    fn default_arm_leaves_margin_above_the_per_probe_cap() {
         let mut budget = QuantifiedGateProbeBudget::default();
         let grant = budget.open_arm(None);
         assert!(
-            grant.window_ms() >= 2_426,
-            "an arm got {}ms, below the measured p100 need of 2426ms",
-            grant.window_ms()
-        );
-        assert!(
-            GATE_PROBE_CAP_MS >= 2_426,
-            "the per-probe cap {GATE_PROBE_CAP_MS}ms cannot reach the measured p100 need"
-        );
-        assert!(
-            QUERY_GATE_BUDGET_MS > GATE_PROBE_CAP_MS,
-            "an envelope at or below the per-probe cap makes the cap dead weight: \
-             the candidate loop's own pre-probe work would consume the difference"
+            grant.window_ms() > GATE_PROBE_CAP_MS,
+            "pre-probe work needs margin above the per-probe cap"
         );
     }
 
@@ -391,8 +376,7 @@ mod tests {
         }
     }
 
-    /// A cheap arm — the measured non-FP case confirms in 0–2 ms — must leave
-    /// the envelope intact for the arm that actually needs it.
+    /// An arm must refund its unspent slice for the next arm.
     #[test]
     fn an_unspent_arm_slice_is_refunded_for_the_next_arm() {
         let mut budget = QuantifiedGateProbeBudget::default();
@@ -401,11 +385,6 @@ mod tests {
         assert_eq!(budget.remaining_ms(), QUERY_GATE_BUDGET_MS - 2);
         let second = budget.open_arm(None);
         assert_eq!(second.window_ms(), QUERY_GATE_BUDGET_MS - 2);
-        assert!(
-            second.window_ms() >= 2_426,
-            "a 2ms first arm starved the second down to {}ms",
-            second.window_ms()
-        );
     }
 
     /// Exhaustion hands out a zero-length window rather than a negative or

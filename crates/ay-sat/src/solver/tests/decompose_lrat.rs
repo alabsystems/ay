@@ -569,7 +569,7 @@ fn test_lrat_decompose_preflight_rejects_missing_source_id_before_mutation() {
     assert_eq!(preflight.dry_run_emitted, 0);
     assert_eq!(preflight.dry_run_rejected, 1);
     assert_eq!(preflight.missing_source_id, 1);
-    assert!(solver.decompose_lrat_dry_run_sidecars().is_empty());
+    assert_eq!(solver.decompose_lrat_dry_run_sidecars().len(), 0);
     let ledger = solver.preprocessing_transaction_stats();
     assert_eq!(ledger.fail_closed, 1);
     assert_eq!(ledger.proof_obligation_rejected, 1);
@@ -631,7 +631,7 @@ fn test_lrat_decompose_preflight_rejects_missing_chain_edge_id_before_mutation()
     assert_eq!(preflight.dry_run_emitted, 0);
     assert_eq!(preflight.dry_run_rejected, 1);
     assert_eq!(preflight.missing_chain_edge_id, 1);
-    assert!(solver.decompose_lrat_dry_run_sidecars().is_empty());
+    assert_eq!(solver.decompose_lrat_dry_run_sidecars().len(), 0);
     let ledger = solver.preprocessing_transaction_stats();
     assert_eq!(ledger.fail_closed, 1);
     assert_eq!(ledger.proof_obligation_rejected, 1);

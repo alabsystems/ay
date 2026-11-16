@@ -29,7 +29,7 @@ fn no_candidate(executor: &mut Executor) -> Result<SolveResult> {
 }
 
 fn unknown_with_stale_candidate(executor: &mut Executor) -> Result<SolveResult> {
-    candidate(executor)?;
+    let _ = candidate(executor)?;
     executor.last_result = Some(SolveResult::Unknown);
     Ok(SolveResult::Unknown)
 }
@@ -133,7 +133,7 @@ fn deferred_proposal_is_validated_only_after_original_roots_are_restored() {
         )
         .unwrap();
     assert_eq!(proposed, SolveResult::Sat);
-    assert!(executor.ctx.assertions.is_empty());
+    assert_eq!(executor.ctx.assertions, [] as [TermId; 0]);
     assert!(
         !executor.last_model_validated,
         "stale producer evidence is retired"
@@ -245,7 +245,7 @@ fn scoped_publication_preserves_a_held_stop_for_both_owners() {
         assert!(executor.last_model.is_none());
         assert!(!executor.last_model_validated);
         assert!(executor.last_sat_certificate.is_none());
-        assert!(executor.ctx.assertions.is_empty());
+        assert_eq!(executor.ctx.assertions, [] as [TermId; 0]);
     }
 }
 

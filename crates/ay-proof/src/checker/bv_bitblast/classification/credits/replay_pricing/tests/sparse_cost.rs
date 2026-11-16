@@ -46,14 +46,15 @@ fn sparse_aggregate_includes_native_u_but_expression_allowance_cannot_borrow_it(
         })
         .unwrap();
     assert_eq!(paid, [(price.work, price.bytes), (0, 0)]);
-    let allowance = credits
-        .take(ProofId(0), &mut |_, _| true)
-        .unwrap()
-        .into_allowance();
-    assert_eq!(allowance.work_limit(), expression as u64);
-    assert!(allowance.work_limit() < price.work as u64);
-    assert_eq!(allowance.deadline(), end);
-    drop(allowance);
+    {
+        let allowance = credits
+            .take(ProofId(0), &mut |_, _| true)
+            .unwrap()
+            .into_allowance();
+        assert_eq!(allowance.work_limit(), expression as u64);
+        assert!(allowance.work_limit() < price.work as u64);
+        assert_eq!(allowance.deadline(), end);
+    }
     credits.finish().unwrap();
     assert_eq!(producer_test_counter::count(), before);
 }
@@ -73,7 +74,9 @@ fn sparse_credit_reuse_bad_ids_and_refusal_poison_the_same_original_owner() {
                 Err(BvCreditError::UnknownStep(ProofId(99)))
             )),
             1 => {
-                drop(paid.take(ProofId(0), &mut |_, _| true).unwrap());
+                {
+                    let _credit = paid.take(ProofId(0), &mut |_, _| true).unwrap();
+                }
                 assert!(matches!(
                     paid.take(ProofId(0), &mut |_, _| true),
                     Err(BvCreditError::AlreadyTaken(ProofId(0)))
@@ -249,7 +252,7 @@ fn sparse_original_earlier_wire_deadline_and_low_resource_owners_are_not_renewed
     let (terms, proof) = sparse_fixture();
     let payloads = capture(&terms, &proof);
     let mut wire = transport_wire_limits(end());
-    wire.deadline = Instant::now() - Duration::from_secs(1);
+    wire.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let mut callbacks = 0;
     assert!(plan(&terms, &proof)
         .refine_replay(&payloads, end(), Some(wire), &mut |_, _| {

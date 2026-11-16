@@ -13,10 +13,11 @@ const TEST_ROW: Row = Row {
 
 #[test]
 fn disabled_probe_does_not_observe_clock_context_sink_or_result() {
+    let deadline = Instant::now() + Duration::from_secs(60);
     let returned = observe(
         false,
         Phase::Solve,
-        ReplayLimit::Legacy,
+        ReplayLimit::Until(deadline),
         || panic!("disabled context"),
         &mut || panic!("disabled clock"),
         &mut |_| panic!("disabled sink"),
@@ -131,12 +132,12 @@ fn unwind_emits_one_pair_and_restores_nested_row_context() {
         observe(
             true,
             Phase::ParseShape,
-            ReplayLimit::Legacy,
+            ReplayLimit::Until(start + Duration::from_secs(60)),
             || ROW.with(Cell::get),
             &mut || start,
             &mut |event| events.push(event),
             || panic!("opaque phase"),
-            |_: &()| Outcome::Ok,
+            |()| Outcome::Ok,
         );
     }));
     assert!(caught.is_err());
@@ -164,7 +165,7 @@ fn expired_snapshot_is_only_metadata_and_never_polls_cancellation() {
     let mut events = Vec::new();
     let actual: Result<usize, usize> = observe(
         true,
-        Phase::Hash,
+        Phase::Recheck,
         ReplayLimit::Cancellable {
             deadline: start,
             cancellation: &cancellation,
@@ -200,8 +201,8 @@ fn opaque_results_never_enter_diagnostic_events() {
         let mut events = Vec::new();
         let actual = observe(
             true,
-            Phase::Serialize,
-            ReplayLimit::Legacy,
+            Phase::ExactExport,
+            ReplayLimit::Until(start + Duration::from_secs(60)),
             || TEST_ROW,
             &mut || start,
             &mut |event| events.push(event),
@@ -257,9 +258,7 @@ fn cleanup_guards_bracket_existing_owner_drop_on_return_and_unwind() {
                 };
                 let _start = cleanup.start_on_drop();
                 assert!(cleanup.start.get().is_none());
-                if unwind {
-                    panic!("opaque owner operation");
-                }
+                assert!(!unwind, "opaque owner operation");
                 37
             }));
             assert_eq!(result.is_err(), unwind);

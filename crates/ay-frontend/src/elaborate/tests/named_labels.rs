@@ -8,9 +8,11 @@
 
 use super::*;
 
+type LabelStep = (Result<()>, Option<LabelFailure>);
+
 /// Process every command, returning each result and the label outcome read
 /// after it.
-fn run(input: &str) -> (Context, Vec<(Result<()>, Option<LabelFailure>)>) {
+fn run(input: &str) -> (Context, Vec<LabelStep>) {
     let mut ctx = Context::new();
     let results = parse(input)
         .unwrap()
@@ -75,7 +77,7 @@ fn a_rejected_assertion_keeps_the_labels_before_the_rejection() {
         run("(declare-const x Int)(assert (and (! (> x 0) :named a) (! (< x 0) :named a)))");
     assert_eq!(results[1].1, Some(LabelFailure::Exact));
     assert!(ctx.fun_defs.contains_key("a"));
-    assert!(ctx.assertions.is_empty());
+    assert_eq!(ctx.assertions.len(), 0);
 }
 
 #[test]

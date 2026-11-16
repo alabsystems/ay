@@ -210,7 +210,7 @@ fn round_to_integral_val(f: Fmt, rm: RoundingMode, a: &Val) -> Option<Val> {
     let n = BigRational::from_integer(round_magnitude_to_integer(rm, *neg, q));
     // Only formats with emax < sb - 1 can round past their largest finite
     // value here; IEEE 754 does not define that case.
-    (n <= f.max_finite()).then(|| Val::Fin(*neg, n))
+    (n <= f.max_finite()).then_some(Val::Fin(*neg, n))
 }
 
 fn min_max_val(a: &Val, b: &Val, want: Ordering) -> Option<Val> {
@@ -241,58 +241,58 @@ fn unary(a: &Value, op: impl FnOnce(Fmt, &Val) -> Option<Val>) -> Option<Value> 
 }
 
 /// `(fp.add rm a b)`.
-pub fn add(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn add(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |f, x, y| Some(add_val(f, rm, x, y)))
 }
 
 /// `(fp.sub rm a b)`: `a + (-b)`, exactly (IEEE 754 §5.4.1).
-pub fn sub(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn sub(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
     add(rm, a, &neg(b)?)
 }
 
 /// `(fp.mul rm a b)`.
-pub fn mul(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn mul(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |f, x, y| Some(mul_val(f, rm, x, y)))
 }
 
 /// `(fp.div rm a b)`.
-pub fn div(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn div(rm: RoundingMode, a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |f, x, y| Some(div_val(f, rm, x, y)))
 }
 
 /// `(fp.fma rm a b c)`: `a * b + c` rounded once.
-pub fn fma(rm: RoundingMode, a: &Value, b: &Value, c: &Value) -> Option<Value> {
+pub(crate) fn fma(rm: RoundingMode, a: &Value, b: &Value, c: &Value) -> Option<Value> {
     let f = same_format(&[a, b, c])?;
     encode(f, &fma_val(f, rm, &decode(a), &decode(b), &decode(c)))
 }
 
 /// `(fp.sqrt rm a)`.
-pub fn sqrt(rm: RoundingMode, a: &Value) -> Option<Value> {
+pub(crate) fn sqrt(rm: RoundingMode, a: &Value) -> Option<Value> {
     unary(a, |f, x| Some(sqrt_val(f, rm, x)))
 }
 
 /// `(fp.rem a b)`, the IEEE remainder.
-pub fn rem(a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn rem(a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |_, x, y| Some(rem_val(x, y)))
 }
 
 /// `(fp.roundToIntegral rm a)`.
-pub fn round_to_integral(rm: RoundingMode, a: &Value) -> Option<Value> {
+pub(crate) fn round_to_integral(rm: RoundingMode, a: &Value) -> Option<Value> {
     unary(a, |f, x| round_to_integral_val(f, rm, x))
 }
 
 /// `(fp.min a b)`; `None` on `+0`/`-0`, which SMT-LIB leaves unspecified.
-pub fn min(a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn min(a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |_, x, y| min_max_val(x, y, Ordering::Less))
 }
 
 /// `(fp.max a b)`; `None` on `+0`/`-0`, which SMT-LIB leaves unspecified.
-pub fn max(a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn max(a: &Value, b: &Value) -> Option<Value> {
     binary(a, b, |_, x, y| min_max_val(x, y, Ordering::Greater))
 }
 
 /// `(fp.neg a)`; NaN stays the one NaN.
-pub fn neg(a: &Value) -> Option<Value> {
+pub(crate) fn neg(a: &Value) -> Option<Value> {
     unary(a, |_, x| {
         Some(match x {
             Val::Nan => Val::Nan,
@@ -303,7 +303,7 @@ pub fn neg(a: &Value) -> Option<Value> {
 }
 
 /// `(fp.abs a)`.
-pub fn abs(a: &Value) -> Option<Value> {
+pub(crate) fn abs(a: &Value) -> Option<Value> {
     unary(a, |_, x| {
         Some(match x {
             Val::Nan => Val::Nan,
@@ -314,7 +314,7 @@ pub fn abs(a: &Value) -> Option<Value> {
 }
 
 /// `((_ to_fp eb sb) rm a)` for a FloatingPoint `a` of any format.
-pub fn to_fp_from_fp(rm: RoundingMode, a: &Value, eb: u32, sb: u32) -> Option<Value> {
+pub(crate) fn to_fp_from_fp(rm: RoundingMode, a: &Value, eb: u32, sb: u32) -> Option<Value> {
     Fmt::of(a)?;
     let target = Fmt::checked(eb, sb)?;
     let value = match decode(a) {
@@ -326,13 +326,18 @@ pub fn to_fp_from_fp(rm: RoundingMode, a: &Value, eb: u32, sb: u32) -> Option<Va
 
 /// `((_ to_fp eb sb) rm x)` for an exact Real, Int or bit-vector value `x`
 /// (an exact zero is `+0`).
-pub fn to_fp_from_rational(rm: RoundingMode, x: &BigRational, eb: u32, sb: u32) -> Option<Value> {
+pub(crate) fn to_fp_from_rational(
+    rm: RoundingMode,
+    x: &BigRational,
+    eb: u32,
+    sb: u32,
+) -> Option<Value> {
     let target = Fmt::checked(eb, sb)?;
     encode(target, &round_signed(target, rm, x))
 }
 
 /// `(fp.to_real a)`; `None` on NaN and the infinities (unspecified).
-pub fn to_real(a: &Value) -> Option<BigRational> {
+pub(crate) fn to_real(a: &Value) -> Option<BigRational> {
     Fmt::of(a)?;
     match decode(a) {
         Val::Fin(n, q) => Some(signed(n, &q)),
@@ -354,14 +359,14 @@ fn to_integer(rm: RoundingMode, a: &Value) -> Option<BigInt> {
 
 /// `((_ fp.to_ubv w) rm a)`; `None` when unspecified (NaN, an infinity, or a
 /// rounded value outside `[0, 2^w)`).
-pub fn to_ubv(rm: RoundingMode, a: &Value, w: u32) -> Option<BigInt> {
+pub(crate) fn to_ubv(rm: RoundingMode, a: &Value, w: u32) -> Option<BigInt> {
     let n = to_integer(rm, a)?;
     (!n.is_negative() && n < (BigInt::one() << w)).then_some(n)
 }
 
 /// `((_ fp.to_sbv w) rm a)` as the `w`-bit two's-complement pattern; `None`
 /// when unspecified (NaN, an infinity, or outside `[-2^(w-1), 2^(w-1))`).
-pub fn to_sbv(rm: RoundingMode, a: &Value, w: u32) -> Option<BigInt> {
+pub(crate) fn to_sbv(rm: RoundingMode, a: &Value, w: u32) -> Option<BigInt> {
     let n = to_integer(rm, a)?;
     let half = BigInt::one() << w.checked_sub(1)?;
     if n < -half.clone() || n >= half {

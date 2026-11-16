@@ -51,13 +51,10 @@ impl Mbp {
             } => {
                 let mut replaced = false;
                 for (existing_idx, existing) in &mut entries {
-                    match crate::expr::smt_values_equal(existing_idx, &idx)? {
-                        true => {
-                            *existing = val.clone();
-                            replaced = true;
-                            break;
-                        }
-                        false => {}
+                    if crate::expr::smt_values_equal(existing_idx, &idx)? {
+                        *existing = val.clone();
+                        replaced = true;
+                        break;
                     }
                 }
                 if !replaced {
@@ -83,12 +80,9 @@ impl Mbp {
         for (idx_val, lhs_val) in &lhs_entries {
             let mut rhs_val_at_idx = &rhs_default;
             for (key, value) in rhs_entries.iter().rev() {
-                match crate::expr::smt_values_equal(key, idx_val)? {
-                    true => {
-                        rhs_val_at_idx = value;
-                        break;
-                    }
-                    false => {}
+                if crate::expr::smt_values_equal(key, idx_val)? {
+                    rhs_val_at_idx = value;
+                    break;
                 }
             }
             if !crate::expr::smt_values_equal(lhs_val, rhs_val_at_idx)? {
@@ -99,12 +93,9 @@ impl Mbp {
         for (idx_val, rhs_val) in &rhs_entries {
             let mut in_lhs = false;
             for (key, _) in lhs_entries.iter().rev() {
-                match crate::expr::smt_values_equal(key, idx_val)? {
-                    true => {
-                        in_lhs = true;
-                        break;
-                    }
-                    false => {}
+                if crate::expr::smt_values_equal(key, idx_val)? {
+                    in_lhs = true;
+                    break;
                 }
             }
             if !in_lhs && !crate::expr::smt_values_equal(rhs_val, &lhs_default)? {

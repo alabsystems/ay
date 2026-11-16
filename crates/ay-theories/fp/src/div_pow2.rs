@@ -22,7 +22,7 @@
 //! under a quantifier whose decision procedure has to refute through the
 //! divider.
 //!
-//! This is the same move [`FpSolver::try_make_fma_zero_factor`] makes for
+//! This is the same move [`FpSolver::try_make_fma_zero_factor_with_control`] makes for
 //! `fma` with a zero multiplicand: recognise a constant operand at decompose
 //! time and emit a cheaper — but semantically identical — circuit.
 //!
@@ -74,7 +74,9 @@
 use ay_core::term::{Constant, TermData, TermId};
 use num_bigint::BigInt;
 
-use super::construction::control::{uninterrupted, BuildControl};
+#[cfg(test)]
+use super::construction::control::uninterrupted;
+use super::construction::control::BuildControl;
 use super::construction::FpBuildStage;
 use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand};
 
@@ -278,6 +280,7 @@ impl FpSolver<'_> {
     /// See the module docs for why the two are the same value for every input
     /// and every rounding mode, and for the measured reason it is worth
     /// recognising.
+    #[cfg(test)]
     pub(crate) fn try_make_div_by_power_of_two(
         &mut self,
         x_term: TermId,

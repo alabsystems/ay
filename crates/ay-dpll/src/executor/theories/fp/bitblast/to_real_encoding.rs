@@ -104,7 +104,7 @@ impl Executor {
         stop.check()?;
         let build_error = |error| FpRealEncodingError::Stopped(stop.refuse_build_error(error));
         let mut should_stop =
-            |progress| checkpoint(stop, observe, FpRealPhase::Construction(progress)).is_err();
+            |progress| checkpoint(stop, observe, FpRealPhase::construction(progress)).is_err();
         let mut fp = FpConstruction::new(solver, &mut should_stop).map_err(build_error)?;
 
         // A term present only below fp.to_real still needs an actual FP cache

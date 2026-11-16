@@ -204,10 +204,10 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
                 hash,
                 id,
                 TermEntry {
-                    field_presence,
                     term,
                     sort,
                     stamp,
+                    field_presence,
                 },
                 prepared,
             )

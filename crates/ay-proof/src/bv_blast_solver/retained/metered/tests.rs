@@ -307,7 +307,7 @@ fn every_capture_and_replay_poll_including_final_cleanup_is_terminal() {
 fn every_participating_deadline_is_intersected_before_any_work() {
     let produced = capture_identity(1_000_000).unwrap();
     let a = BvExpr::leaf("a", 1);
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for expired in 0..5 {
         let (mut proof, mut gates, mut wire) = limits();
         let mut end = wire.deadline;

@@ -22,7 +22,7 @@ fn overloaded_source(reachable: bool) -> ChcProblem {
 fn selector_overloads_validate_and_replay_by_domain() {
     let problem = overloaded_source(true);
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     let Some(ChcEngineResult::Unsafe(candidate)) = run(&problem, None, None, None) else {
@@ -78,7 +78,7 @@ fn selector_overloads_do_not_legalize_duplicate_fields_in_one_datatype() {
     )
     .expect("retain duplicate declarations for source validation");
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Err(Error::InvalidSource)
     );
     assert!(matches!(
@@ -97,7 +97,7 @@ fn selector_overloads_do_not_legalize_constructor_collisions() {
     )
     .expect("retain constructor collisions for source validation");
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Err(Error::InvalidSource)
     );
     assert!(matches!(
@@ -124,7 +124,7 @@ fn selector_overloads_do_not_hide_later_duplicate_fields() {
     for index in 0..32 {
         let problem = mixed_declarations(index, "(bad (duplicate Bool) (duplicate Bool))");
         assert_eq!(
-            validate_source(&problem, &mut Owner::capture().expect("owner")),
+            validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
             Err(Error::InvalidSource),
             "declaration-name permutation {index}"
         );
@@ -140,7 +140,7 @@ fn selector_overloads_do_not_hide_later_constructor_collisions() {
     for index in 0..32 {
         let problem = mixed_declarations(index, "(shared (other Bool))");
         assert_eq!(
-            validate_source(&problem, &mut Owner::capture().expect("owner")),
+            validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
             Err(Error::InvalidSource),
             "declaration-name permutation {index}"
         );
@@ -174,7 +174,7 @@ fn typed_selector_source(reachable: bool) -> ChcProblem {
 fn selector_overloads_read_the_correct_field_index_and_result_sort() {
     let problem = typed_selector_source(true);
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     let Some(ChcEngineResult::Unsafe(candidate)) = run(&problem, None, None, None) else {
@@ -189,7 +189,7 @@ fn selector_overloads_read_the_correct_field_index_and_result_sort() {
 fn selector_overloads_never_refute_the_matching_values() {
     let problem = typed_selector_source(false);
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     assert!(run(&problem, None, None, None).is_none());
@@ -218,19 +218,19 @@ fn selector_overloads_replay_the_selected_datatype_ite_arm() {
 
     let plain = ite_selector_source("y", "#x05");
     let derivation =
-        crate::compact_datatype_route::derive(&plain, &mut Owner::capture().expect("owner"))
+        crate::compact_datatype_route::derive(&plain, &mut Owner::<'_>::capture().expect("owner"))
             .expect("plain projection")
             .expect("real error with the selected value nine");
     let original = ite_selector_source("(ite choose x y)", "#x05");
     assert_eq!(
-        validate_source(&original, &mut Owner::capture().expect("owner")),
+        validate_source(&original, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     assert_eq!(
         validate(
             &original,
             &derivation,
-            &mut Owner::capture().expect("owner")
+            &mut Owner::<'_>::capture().expect("owner")
         ),
         Ok(())
     );
@@ -239,11 +239,15 @@ fn selector_overloads_replay_the_selected_datatype_ite_arm() {
     // concrete value must still come from the selected else-arm.
     let safe = ite_selector_source("(ite choose x y)", "#x09");
     assert_eq!(
-        validate_source(&safe, &mut Owner::capture().expect("owner")),
+        validate_source(&safe, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     assert_eq!(
-        validate(&safe, &derivation, &mut Owner::capture().expect("owner")),
+        validate(
+            &safe,
+            &derivation,
+            &mut Owner::<'_>::capture().expect("owner")
+        ),
         Err(Error::InvalidDerivation)
     );
 }
@@ -264,7 +268,7 @@ fn selector_overloads_typecheck_both_datatype_ite_arms() {
     }
     let mut problem = ite_selector_source("(ite choose x y)", "#x05");
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Ok(())
     );
     assert!(problem
@@ -272,7 +276,7 @@ fn selector_overloads_typecheck_both_datatype_ite_arms() {
         .iter_mut()
         .any(|clause| { clause.body.constraint.as_mut().is_some_and(corrupt_else) }));
     assert_eq!(
-        validate_source(&problem, &mut Owner::capture().expect("owner")),
+        validate_source(&problem, &mut Owner::<'_>::capture().expect("owner")),
         Err(Error::InvalidSource)
     );
 }
@@ -282,12 +286,18 @@ fn selector_overloads_reject_a_candidate_with_another_datatype_owner() {
     use crate::ground_derivation::compact::{validate, ValueId, ValueNode};
 
     let problem = typed_selector_source(true);
-    let mut derivation =
-        crate::compact_datatype_route::derive(&problem, &mut Owner::capture().expect("owner"))
-            .expect("typed projection")
-            .expect("real error");
+    let mut derivation = crate::compact_datatype_route::derive(
+        &problem,
+        &mut Owner::<'_>::capture().expect("owner"),
+    )
+    .expect("typed projection")
+    .expect("real error");
     assert_eq!(
-        validate(&problem, &derivation, &mut Owner::capture().expect("owner")),
+        validate(
+            &problem,
+            &derivation,
+            &mut Owner::<'_>::capture().expect("owner")
+        ),
         Ok(())
     );
     let other = derivation
@@ -316,7 +326,11 @@ fn selector_overloads_reject_a_candidate_with_another_datatype_owner() {
     }
     assert!(changed, "mutate an actual A binding, not an unused node");
     assert_eq!(
-        validate(&problem, &derivation, &mut Owner::capture().expect("owner")),
+        validate(
+            &problem,
+            &derivation,
+            &mut Owner::<'_>::capture().expect("owner")
+        ),
         Err(Error::InvalidValue)
     );
 }

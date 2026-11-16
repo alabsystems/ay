@@ -205,7 +205,7 @@ mod tests {
             vec![("y".to_string(), "n".to_string())],
             "{captured}"
         );
-        assert!(captured.evaluate_steps.is_empty());
+        assert_eq!(captured.evaluate_steps, Vec::<String>::new());
         // The binder route refuses through the same entry point every runner
         // calls, not only through the scan.
         assert_eq!(

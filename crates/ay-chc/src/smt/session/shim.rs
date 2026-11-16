@@ -216,7 +216,7 @@ impl HornSmt {
         let expired = || deadline.is_some_and(|d| Instant::now() >= d);
 
         // 2. Eligibility for EVERY conjunct first (nothing asserted otherwise).
-        let kind = self.cfg().theory;
+        let kind = TheoryKind::Lra;
         for c in conjuncts {
             if let Err(k) = eligible(c, kind, Rung::Rung1) {
                 return self.reject(UnknownReason::Unsupported(k));
@@ -335,10 +335,10 @@ pub(crate) fn session_eligible(expr: &ChcExpr) -> bool {
 /// The session the router creates lazily on the first Search-lane query.
 /// Rung 1 is `TheoryKind::Lra` only (eligibility rejects every Int var, so an
 /// Int problem falls through to the legacy bridge on every query at the cost
-/// of one feature scan); the problem's sorts pick `Lia` from Rung 2. Datatype
+/// of one feature scan). No LIA session carrier is constructed. Datatype
 /// declarations are not carried (DT is not eligible).
 pub(crate) fn new_session_for(_ctx: &SmtContext) -> Box<HornSmt> {
-    Box::new(HornSmt::new(SessionConfig::new(TheoryKind::Lra), None))
+    Box::new(HornSmt::new(SessionConfig::new(), None))
 }
 
 /// The caller context's contribution to the session budget: `check_timeout`

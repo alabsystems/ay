@@ -66,3 +66,27 @@ fn a_satisfiable_pair_of_derived_comparisons_stays_a_hole() {
         );
     }
 }
+
+#[test]
+fn an_unchecked_order_rule_is_refused_before_any_document_state_changes() {
+    let terms = TermStore::new();
+    let printer = AlethePrinter::new(&terms);
+    let mut blaster = Blaster::new(&printer, ProofId(7), "@order_".into());
+    let out_of_range = SRef::pos(u32::MAX);
+    let before_next = blaster.next_id;
+    let before_steps = blaster.steps.clone();
+    let before_text = blaster.text_used;
+    let before_planned = blaster.planned.len();
+    let before_work = printer.work_used();
+
+    assert_eq!(
+        blaster.equate(out_of_range, out_of_range, "invented"),
+        None,
+        "rule conversion must refuse before the circuit references are read"
+    );
+    assert_eq!(blaster.next_id, before_next);
+    assert_eq!(blaster.steps, before_steps);
+    assert_eq!(blaster.text_used, before_text);
+    assert_eq!(blaster.planned.len(), before_planned);
+    assert_eq!(printer.work_used(), before_work);
+}

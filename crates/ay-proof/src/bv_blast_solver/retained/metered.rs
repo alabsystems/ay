@@ -26,6 +26,10 @@ pub(crate) fn capture(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source terms, three independent limit owners, allowance, and poll stay explicit"
+)]
 pub(crate) fn replay(
     lhs: &BvExpr,
     rhs: &BvExpr,

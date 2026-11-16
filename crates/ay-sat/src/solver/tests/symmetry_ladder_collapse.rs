@@ -28,19 +28,19 @@ fn shuffled_ladder_colouring(
     let s = |v: usize, i: usize| Variable((colours * n + (colours - 1) * v + i) as u32);
     let num_vars = colours * n + (colours - 1) * n;
     let mut clauses: Vec<Vec<Literal>> = Vec::new();
-    for v in 0..n {
+    for (v, sigma) in orders.iter().enumerate() {
         // At-least-one colour.
         clauses.push((0..colours).map(|c| Literal::positive(x(v, c))).collect());
         // Shuffled sequential AMO ladder.
-        let sigma = &orders[v];
         assert_eq!(sigma.len(), colours);
         clauses.push(vec![
             Literal::negative(x(v, sigma[0])),
             Literal::positive(s(v, 0)),
         ]);
-        for i in 1..colours - 1 {
+        for (offset, &colour) in sigma[1..colours - 1].iter().enumerate() {
+            let i = offset + 1;
             clauses.push(vec![
-                Literal::negative(x(v, sigma[i])),
+                Literal::negative(x(v, colour)),
                 Literal::positive(s(v, i)),
             ]);
             clauses.push(vec![

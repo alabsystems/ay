@@ -18,7 +18,7 @@ use super::{decode, encode, same_format, Val};
 /// mismatched/unrepresentable formats. NaN, infinite dividend, or zero divisor
 /// produce logical NaN; a finite dividend modulo infinity is unchanged.
 /// Signed zero and every finite nonzero result keep the dividend's sign.
-pub fn truncating_rem(a: &Value, b: &Value) -> Option<Value> {
+pub(crate) fn truncating_rem(a: &Value, b: &Value) -> Option<Value> {
     let format = same_format(&[a, b])?;
     let value = match (decode(a), decode(b)) {
         (Val::Nan, _) | (_, Val::Nan) | (Val::Inf(_), _) => Val::Nan,

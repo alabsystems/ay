@@ -253,7 +253,7 @@ fn certificate_constant_objective() {
 
     assert!(matches!(result, OptimizationResult::Optimal(v) if v == rat(7)));
     let cert = cert.expect("empty certificate for constant objective");
-    assert!(cert.atoms.is_empty());
+    assert_eq!(cert.atoms, []);
     assert_eq!(cert.bound, rat(7));
     let seven = terms.mk_rational(rat(7));
     assert!(cert.verify(&terms, seven));

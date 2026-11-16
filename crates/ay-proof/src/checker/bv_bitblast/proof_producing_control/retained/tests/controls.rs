@@ -80,7 +80,7 @@ fn every_capture_and_replay_poll_is_terminal_including_final_cleanup() {
 fn all_absolute_deadlines_intersect_and_missing_deadline_cannot_grant_time() {
     let (terms, clause) = identity();
     let payload = capture(&terms, clause);
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for operation in [Operation::Capture, Operation::Replay] {
         for expired in 0..4 {
             let end = deadline();
@@ -170,7 +170,7 @@ fn deadline_intersection_changes_no_numeric_field() {
     proof.resolution.max_decisions = Some(0);
     proof.resolution.validation.max_work = 0;
     gates.max_work = 0;
-    let earliest = end - Duration::from_secs(10);
+    let earliest = end.checked_sub(Duration::from_secs(10)).unwrap();
     let mut callback = || true;
     let mut control = Control::new(earliest, &mut callback);
     let (actual_proof, actual_gates) = effective_limits(&proof, &gates, &mut control).unwrap();
@@ -224,9 +224,7 @@ fn caught_callback_panic_and_nested_stop_cannot_resume() {
     let calls = Cell::new(0);
     let mut callback = || {
         calls.set(calls.get() + 1);
-        if calls.get() == 2 {
-            panic!("caught nested callback panic");
-        }
+        assert!(calls.get() != 2, "caught nested callback panic");
         true
     };
     let mut control = Control::new(deadline(), &mut callback);

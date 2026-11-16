@@ -20,9 +20,8 @@
 //!   premise only inside a derivation it completes.
 
 use super::{
-    export_alethe_with_printer_to, render_unverifiable,
-    try_export_alethe_with_authored_surfaces_to, AlethePrintError, AletheStreamError, HashMap,
-    Proof, TermId, TermStore,
+    export_alethe_with_printer_to, render_unverifiable, AlethePrintError, AletheStreamError,
+    HashMap, Proof, TermId, TermStore,
 };
 use crate::alethe_printer::{AlethePrinter, CompleteBlastAsk};
 

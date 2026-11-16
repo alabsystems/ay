@@ -32,7 +32,7 @@ pub(crate) struct Lift {
     fact: S,
 }
 
-fn words(p: &mut Proof, m: u32, x: &[T], e: &[T]) -> Words {
+fn words(p: &mut Proof<'_>, m: u32, x: &[T], e: &[T]) -> Words {
     let (n, nn, ff) = (2 * m, 4 * m, p.t.ff);
     let mut xb = x.to_vec();
     xb.resize(n as usize, ff);
@@ -57,13 +57,13 @@ fn words(p: &mut Proof, m: u32, x: &[T], e: &[T]) -> Words {
     }
 }
 
-fn zv(p: &mut Proof, m: u32, v: T) -> T {
+fn zv(p: &mut Proof<'_>, m: u32, v: T) -> T {
     let z = p.t.lit(bits::zero(2 * m));
     p.t.concat(&[z, v])
 }
 
 /// `(and (= (concat 0 V) W) (not (bvult C V)))`.
-fn inv(p: &mut Proof, m: u32, v: T, w: T, c: T) -> T {
+fn inv(p: &mut Proof<'_>, m: u32, v: T, w: T, c: T) -> T {
     let z = zv(p, m, v);
     let e = p.t.eq(z, w);
     let u = p.t.ult(c, v);
@@ -72,7 +72,7 @@ fn inv(p: &mut Proof, m: u32, v: T, w: T, c: T) -> T {
 }
 
 /// `(K, PREV, CUR)` of the stage with multiplicand bits `x` and suffix bits `e`.
-fn shape(p: &mut Proof, m: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
+fn shape(p: &mut Proof<'_>, m: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
     let n = 2 * m;
     let w = words(p, m, x, e);
     let (v, vp) = (p.t.mul(w.x128, w.yd), p.t.mul(w.x128, w.ydp));
@@ -90,7 +90,7 @@ fn shape(p: &mut Proof, m: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
 }
 
 impl Lift {
-    pub(crate) fn new(p: &mut Proof, m: u32, prefix: &str) -> Option<Self> {
+    pub(crate) fn new(p: &mut Proof<'_>, m: u32, prefix: &str) -> Option<Self> {
         let n = 2 * m;
         let x: Vec<T> = (0..m)
             .map(|i| p.t.var(&format!("{prefix}x{i}"), Sort::Bool))
@@ -120,7 +120,7 @@ impl Lift {
         Some(lift)
     }
 
-    fn prove(&self, p: &mut Proof, k: T, prev: T, cur: T) -> Option<S> {
+    fn prove(&self, p: &mut Proof<'_>, k: T, prev: T, cur: T) -> Option<S> {
         let m = self.m;
         let (n, nn) = (2 * m, 4 * m);
         let w = words(p, m, &self.x, &self.e);
@@ -178,7 +178,7 @@ impl Lift {
     }
 
     /// `(= V (bvadd V' V' (bvmul X e0word)))` from the bit decomposition of the suffix.
-    fn decompose(p: &mut Proof, yd: T, ydp: T, e0w: T, x: T, v: T, vp: T) -> Option<S> {
+    fn decompose(p: &mut Proof<'_>, yd: T, ydp: T, e0w: T, x: T, v: T, vp: T) -> Option<S> {
         let sum = p.t.add(&[ydp, ydp, e0w]);
         let dec_t = p.t.eq(yd, sum);
         let dec = lin1(p, &[], dec_t, &LinOpts::default())?;
@@ -190,7 +190,7 @@ impl Lift {
         Some(trans(p, &[c1, p1]))
     }
 
-    fn case(&self, p: &mut Proof, c: &Case<'_>, positive: bool) -> Option<S> {
+    fn case(&self, p: &mut Proof<'_>, c: &Case<'_>, positive: bool) -> Option<S> {
         let nn = 4 * self.m;
         let v1 = p.t.mul(c.w.x128, c.ye0);
         let w1 = p.t.mul(c.w.zx, c.ze0);
@@ -227,7 +227,7 @@ impl Lift {
     }
 
     /// `(= V (bvadd V' V' t))` (or without `t` when it is zero).
-    fn settle(p: &mut Proof, vp: T, v1: T, v1r: T, v1s: S, r1: S, positive: bool) -> Option<S> {
+    fn settle(p: &mut Proof<'_>, vp: T, v1: T, v1r: T, v1s: S, r1: S, positive: bool) -> Option<S> {
         let a = p.t.add(&[vp, vp, v1]);
         let b = p.t.add(&[vp, vp, v1r]);
         let c = eq_step(p, a, b, "cong", &[v1s]);
@@ -240,7 +240,7 @@ impl Lift {
     }
 
     /// Run the Horner instances for `x * y`; returns the final invariant step and `(V_0, W_0)`.
-    pub(crate) fn run(&self, p: &mut Proof, xb: &[T], yb: &[T]) -> Option<(S, T, T)> {
+    pub(crate) fn run(&self, p: &mut Proof<'_>, xb: &[T], yb: &[T]) -> Option<(S, T, T)> {
         let (m, ff) = (self.m, p.t.ff);
         let n = 2 * m;
         let cs = consts(m);
@@ -276,7 +276,7 @@ impl Lift {
         Some((fact, v0, w0))
     }
 
-    fn base(&self, p: &mut Proof, w: &Words, prev: T, n: u32) -> Option<S> {
+    fn base(&self, p: &mut Proof<'_>, w: &Words, prev: T, n: u32) -> Option<S> {
         let nn = 2 * n;
         let (l0n, l0nn) = (p.t.lit(bits::zero(n)), p.t.lit(bits::zero(nn)));
         let (vp, wp) = (p.t.mul(w.x128, w.ydp), p.t.mul(w.zx, w.zydp));
@@ -306,7 +306,7 @@ impl Lift {
 }
 
 /// `(= (bvmul x d) 0)` from `(= d 0)`.
-fn zero_product(p: &mut Proof, prod: T, x: T, zero: T, dz: S) -> S {
+fn zero_product(p: &mut Proof<'_>, prod: T, x: T, zero: T, dz: S) -> S {
     let xz = p.t.mul(x, zero);
     let a = eq_step(p, prod, xz, "cong", &[dz]);
     let b = eq_step(p, xz, zero, "poly_simp", &[]);

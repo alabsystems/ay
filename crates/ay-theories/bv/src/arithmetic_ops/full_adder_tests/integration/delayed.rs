@@ -16,7 +16,9 @@ fn operation(store: &mut TermStore, name: &str, a: TermId, b: TermId) -> TermId 
 
 fn check_equivalences(clauses: &[CnfClause], placeholders: &[CnfLit]) {
     let suffix = &clauses[clauses.len() - 2 * placeholders.len()..];
-    for (&placeholder, pair) in placeholders.iter().zip(suffix.chunks_exact(2)) {
+    let (pairs, remainder) = suffix.as_chunks::<2>();
+    assert_eq!(remainder, &[] as &[CnfClause]);
+    for (&placeholder, pair) in placeholders.iter().zip(pairs) {
         let forward = pair[0].literals();
         assert_eq!(forward.len(), 2);
         assert_eq!(forward[0], -placeholder);
@@ -35,7 +37,7 @@ fn check_values(
 ) {
     let mask = (1_u64 << placeholders.len()) - 1;
     let high = 1_u64 << (placeholders.len() - 1);
-    let circuit = Circuit::new(solver);
+    let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
     for (av, bv) in [
         (0, 0),
         (mask, 0),
@@ -77,7 +79,7 @@ fn delayed_snapshots_constrain_original_placeholders_after_full_circuit_restorat
         assert!(original.has_unresolved_delayed_ops());
         // Only distinct variable operands and unconstrained result bits exist.
         assert_eq!(original.num_vars(), 3 * width);
-        assert!(original.clauses().is_empty());
+        assert_eq!(original.clauses(), &[] as &[CnfClause]);
         let snapshot = original
             .take_delayed_state()
             .expect("actual delayed snapshot");
@@ -99,7 +101,8 @@ fn delayed_snapshots_constrain_original_placeholders_after_full_circuit_restorat
         let clauses = restored.build_delayed_circuit(0);
         assert!(!restored.has_unresolved_delayed_ops());
         assert!(restored.take_delayed_state().is_none());
-        assert!(restored.clauses().is_empty()); // The public API returns, not retains, CNF.
+        // The public API returns, not retains, CNF.
+        assert_eq!(restored.clauses(), &[] as &[CnfClause]);
         assert!(
             !restored.mux_children().is_empty(),
             "{name} must build real gates"

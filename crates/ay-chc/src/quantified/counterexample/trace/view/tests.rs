@@ -40,13 +40,22 @@ fn repeated_occurrences_join_complete_clauses_and_contiguous_borrowed_values() {
     assert!(view.step(3).is_none());
     assert!(view.step(usize::MAX).is_none());
     assert_eq!(steps[2].premise_steps(), &[0, 1]);
-    assert!(steps[0].premise_steps().is_empty());
+    assert_eq!(steps[0].premise_steps(), &[] as &[usize]);
     assert_eq!(steps[0].bindings().len(), 3);
     assert_eq!(steps[1].bindings().len(), 3);
     assert_eq!(steps[2].bindings().len(), 4);
-    assert!(std::ptr::eq(steps[0].bindings(), &trace.bindings()[..3]));
-    assert!(std::ptr::eq(steps[1].bindings(), &trace.bindings()[3..6]));
-    assert!(std::ptr::eq(steps[2].bindings(), &trace.bindings()[6..]));
+    assert!(std::ptr::eq(
+        steps[0].bindings(),
+        &raw const trace.bindings()[..3]
+    ));
+    assert!(std::ptr::eq(
+        steps[1].bindings(),
+        &raw const trace.bindings()[3..6]
+    ));
+    assert!(std::ptr::eq(
+        steps[2].bindings(),
+        &raw const trace.bindings()[6..]
+    ));
     assert!(std::ptr::eq(
         steps[0].clause().head(),
         steps[1].clause().head()
@@ -114,7 +123,7 @@ fn matrix_only_locals_and_shadowed_groups_remain_distinct_and_complete() {
         view.source().clause(2).unwrap().constraint(),
         Some(ChcExpr::Bool(false))
     ));
-    assert!(view.function_models().is_empty());
+    assert_eq!(view.function_models(), []);
 }
 
 #[test]
@@ -158,7 +167,7 @@ fn bodyless_query_has_one_complete_step_and_an_empty_assignment() {
     let step = view.step(0).unwrap();
     assert_eq!(view.steps().count(), 1);
     assert!(step.bindings().is_empty());
-    assert!(step.premise_steps().is_empty());
+    assert_eq!(step.premise_steps(), &[] as &[usize]);
     assert!(step.source_binding("i").is_none());
     assert_eq!(step.clause().source_query_ordinal(), Some(0));
 }

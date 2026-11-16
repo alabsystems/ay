@@ -55,7 +55,7 @@ fn test_hnf_simple() {
     let (det, basis) = result.unwrap();
     // det = gcd of 2x2 minors
     assert!(!det.is_zero());
-    assert!(!basis.is_empty());
+    assert_ne!(basis.as_slice(), &[] as &[usize]);
 }
 
 #[test]

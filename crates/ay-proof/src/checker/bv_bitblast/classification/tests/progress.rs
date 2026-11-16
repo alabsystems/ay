@@ -149,8 +149,8 @@ fn caught_callback_panic_cannot_become_a_cheap_classification() {
             }
             true
         },
-        |poll| {
-            let caught = catch_unwind(AssertUnwindSafe(|| poll()));
+        |mut poll| {
+            let caught = catch_unwind(AssertUnwindSafe(&mut poll));
             assert_eq!(*caught.unwrap_err().downcast::<u32>().unwrap(), 74);
             assert_eq!(poll(), Err(ProofCheckError::ResourceLimit));
             Ok(false)

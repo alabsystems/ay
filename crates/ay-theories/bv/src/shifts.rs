@@ -105,7 +105,7 @@ impl BvSolver<'_> {
         let log2_n = if n.is_power_of_two() {
             n.trailing_zeros() as usize // exact log2
         } else {
-            (usize::BITS - n.leading_zeros()) as usize // ceil(log2)
+            n.bit_width() as usize // ceil(log2)
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {
@@ -168,7 +168,7 @@ impl BvSolver<'_> {
         let log2_n = if n.is_power_of_two() {
             n.trailing_zeros() as usize
         } else {
-            (usize::BITS - n.leading_zeros()) as usize
+            n.bit_width() as usize
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {
@@ -249,7 +249,7 @@ impl BvSolver<'_> {
         let log2_n = if n.is_power_of_two() {
             n.trailing_zeros() as usize
         } else {
-            (usize::BITS - n.leading_zeros()) as usize
+            n.bit_width() as usize
         };
 
         for (i, &bi) in b.iter().enumerate().take(log2_n) {

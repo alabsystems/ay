@@ -125,7 +125,7 @@ fn inherited_cancel_has_its_exact_cause_and_parent_reset_cannot_revive_it() {
 }
 
 #[test]
-fn original_limit_expiry_and_retained_legacy_wall_have_the_same_precise_cause() {
+fn original_limit_expiry_has_the_precise_cause() {
     let mut callback = || true;
     assert_eq!(
         RetainedReplayProgress::new(ReplayLimit::Until(Instant::now()), &mut callback).err(),
@@ -136,7 +136,8 @@ fn original_limit_expiry_and_retained_legacy_wall_have_the_same_precise_cause() 
         calls.set(calls.get() + 1);
         true
     };
-    let mut owner = RetainedReplayProgress::new(ReplayLimit::Legacy, &mut callback).unwrap();
+    let mut owner =
+        RetainedReplayProgress::new(ReplayLimit::Until(deadline()), &mut callback).unwrap();
     let before = calls.get();
     owner.deadline = Instant::now(); // Exercise the actual existing wall gate.
     assert_eq!(

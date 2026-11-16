@@ -12,7 +12,7 @@ use std::sync::{
     Arc,
 };
 
-fn extraction_query(result: ExecResult<SolveResult>) -> std::result::Result<(), QueryError> {
+fn extraction_query(result: ExecResult<SolveResult>) -> Result<(), QueryError> {
     match result {
         Err(ExecutorError::ModelExtraction(error)) => Err(error),
         _ => Err(QueryError::Invalid("fixture expected terminal extraction")),

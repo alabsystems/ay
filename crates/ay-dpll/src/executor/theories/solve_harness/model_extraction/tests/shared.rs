@@ -27,7 +27,7 @@ fn shared_refusal_pops_frame_without_evaluating_placeholder_maps_or_model() {
     let models = Cell::new(0);
     let cleanups = Cell::new(0);
     let model = Vec::<bool>::new();
-    let result: ExecResult<SolveResult> = 'shared: loop {
+    let result: ExecResult<SolveResult> = 'shared: {
         pipeline_store_sat_model!('shared, exec, sat,
             observed(&models, &model).clone(),
             observed(&maps, &ttv), observed(&maps, &vtt), 0,
@@ -58,7 +58,7 @@ fn shared_refusal_unsets_terms_before_return_without_model_storage() {
     let mut timing = crate::dpll_support::SplitLoopTimingStats::default();
     let ttv = DetHashMap::<TermId, u32>::default();
     let vtt = DetHashMap::<u32, TermId>::default();
-    let result: ExecResult<SolveResult> = 'shared: loop {
+    let result: ExecResult<SolveResult> = 'shared: {
         pipeline_store_sat_model!('shared, exec, sat, Vec::<bool>::new(),
             ttv, vtt, 0, timing, theory, _theory,
             Err::<TheoryModels, _>(QueryError::Invalid("array closure not prepared")),

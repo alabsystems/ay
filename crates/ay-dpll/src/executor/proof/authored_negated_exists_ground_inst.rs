@@ -55,7 +55,7 @@
 //! re-derives from `E` itself. The refinability flag is untouched.
 //!
 //! NOTHING IS TAKEN ON THE PRODUCER'S WORD. The witness tuple is a pure hint:
-//! `validate_forall_inst` re-derives binder/argument arity and sorts, argument
+//! `validate_forall_inst_with_progress` re-derives binder/argument arity and sorts, argument
 //! groundness w.r.t. the source binders, and the EXACT simultaneous
 //! substitution; `validate_qnt_neg_exists` re-derives that `F` is the exact De
 //! Morgan dual of `E`; the probe's ground steps are replayed by the outer

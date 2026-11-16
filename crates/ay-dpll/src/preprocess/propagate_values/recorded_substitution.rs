@@ -49,9 +49,7 @@ impl RecordedVariableSubstitution {
         };
         let stamp = self.begin();
         let before = stamp.and_then(|_| {
-            let bytes = assertions
-                .len()
-                .checked_mul(std::mem::size_of::<TermId>())?;
+            let bytes = assertions.len().checked_mul(size_of::<TermId>())?;
             (self.progress)(assertions.len(), bytes).then(|| assertions.clone())
         });
         let changed = apply(&mut pass, terms, assertions);

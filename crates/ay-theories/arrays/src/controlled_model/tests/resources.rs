@@ -95,7 +95,9 @@ fn observed_original_raw_stop_remains_sticky_after_reset() {
 fn expired_original_deadline_never_becomes_a_new_relative_timer() {
     let owner = OriginalAdmission::new(
         FiniteAdmissionGrant::new(10_000_000, 10_000_000),
-        Instant::now() - Duration::from_secs(1),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a current instant has an earlier representable second"),
         Arc::new(|| false),
     );
     let source = model();
@@ -145,7 +147,6 @@ fn final_zero_debit_poll_revokes_the_unpublished_complete_owned_copy() {
         work.charge(0),
         Err(QueryError::Interrupted(StopReason::Cancelled))
     );
-    drop(work);
     assert_eq!(polls.get(), expected_polls);
 }
 
@@ -197,7 +198,6 @@ fn typed_nontext_keys_refuse_before_any_owned_storage_request() {
             QueryError::Exhausted
         );
         assert_eq!(work.charge(0), Err(QueryError::Exhausted));
-        drop(work);
         assert_eq!(bytes.get(), 0);
     }
 }
@@ -251,7 +251,6 @@ fn real_utf8_copy_frontier_refuses_without_publishing_partial_owned_data() {
         work.charge(0),
         Err(QueryError::Interrupted(StopReason::Cancelled))
     );
-    drop(work);
     assert_eq!(frontier.get(), 3);
     assert_eq!(source.default.as_ref().unwrap().len(), 4000);
 }
@@ -271,7 +270,6 @@ fn indexed_construction_work_and_storage_one_short_refuse_the_whole_result() {
         ArrayModel::try_from_indexed_rows(input(&original, &observations), &mut work).unwrap();
     assert_eq!(accepted.array_values[&TermId(7)].stores[0].1, "committed");
     drop(accepted);
-    drop(work);
     let (units, bytes) = totals.get();
     for (limit, storage) in [(units - 1, bytes), (units, bytes - 1)] {
         let owner = OriginalAdmission::new(

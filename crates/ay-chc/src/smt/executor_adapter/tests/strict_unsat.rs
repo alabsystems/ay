@@ -3,7 +3,11 @@
 
 //! Exact-query authority tests for the native strict UNSAT replay adapter.
 
-use super::super::{smtlib_strict_unsat_cert_via_executor, split_leading_set_logic};
+use super::super::{smtlib_strict_unsat_cert_via_executor_until, split_leading_set_logic};
+
+fn hang_deadline() -> ay_core::time::Instant {
+    ay_core::time::Instant::now() + std::time::Duration::from_mins(1)
+}
 
 #[test]
 fn strict_unsat_consumer_compares_ordered_unique_assumes() {
@@ -44,7 +48,7 @@ fn strict_unsat_obligation_exports_bound_recheckable_evidence() {
         (assert (< x 3))\n\
         (check-sat)\n\
         (exit)\n";
-    let cert = smtlib_strict_unsat_cert_via_executor(script, None)
+    let cert = smtlib_strict_unsat_cert_via_executor_until(script, hang_deadline())
         .expect("the exact contradictory obligation must publish strict evidence");
     assert!(matches!(
         &cert.strict_verdict,
@@ -124,7 +128,7 @@ fn strict_unsat_obligation_rejects_sat_without_evidence() {
         (assert (> x 5))\n\
         (check-sat)\n";
     assert!(
-        smtlib_strict_unsat_cert_via_executor(script, None).is_none(),
+        smtlib_strict_unsat_cert_via_executor_until(script, hang_deadline()).is_none(),
         "SAT must fail closed at the UNSAT-only adapter boundary"
     );
 }
@@ -179,7 +183,7 @@ fn strict_unsat_obligation_rejects_non_plain_query_shapes() {
             (check-sat)\n",
     ] {
         assert!(
-            smtlib_strict_unsat_cert_via_executor(non_plain, None).is_none(),
+            smtlib_strict_unsat_cert_via_executor_until(non_plain, hang_deadline()).is_none(),
             "non-plain replay query must fail closed: {non_plain}"
         );
     }

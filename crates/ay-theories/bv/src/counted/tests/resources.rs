@@ -223,7 +223,7 @@ fn deep_shared_source_uses_paid_postorder_not_segmented_recursive_unfolding() {
         encoder.literal(leaf).unwrap()
     );
     assert_eq!(encoder.num_vars().unwrap(), 1);
-    assert!(encoder.clauses().unwrap().is_empty());
+    assert_eq!(encoder.clauses().unwrap(), &[] as &[CnfClause]);
     encoder.finish().unwrap();
 }
 

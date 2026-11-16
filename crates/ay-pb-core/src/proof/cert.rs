@@ -636,7 +636,7 @@ pub fn certify_opt_lin_bounds_pb_interruptible(
     //    refute them in practical budgets). Every learned constraint is a
     //    checked `pol`/`rup` step over {input rows + soli row}; the
     //    contradiction row id is kept for the conclusion hint.
-    let route_started = std::time::Instant::now();
+    let route_started = Instant::now();
     let mut solver = crate::cdcl::PbCdclSolver::with_appended_proof_tap_interruptible(
         &augmented,
         writer,

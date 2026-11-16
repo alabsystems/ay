@@ -269,6 +269,7 @@ impl CertifiedConstInterpEntry {
     /// body. Never a "best effort" value: a caller that cannot evaluate a
     /// symbolic body at an argument point must fail closed, not substitute a
     /// constant that was never certified.
+    #[cfg(test)]
     pub(in crate::executor) fn constant_value(&self) -> Option<TermId> {
         match &self.body {
             CertifiedConstInterpBody::Constant { value, .. } => Some(*value),

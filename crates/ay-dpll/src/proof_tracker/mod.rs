@@ -1543,9 +1543,15 @@ impl crate::incremental_state::IncrementalSubsystem for ProofTracker {
             self.proof.named_steps = named_steps;
             true
         } else {
-            debug_assert!(self.scope_assumption_maps.is_empty());
+            debug_assert_eq!(
+                self.scope_assumption_maps.as_slice(),
+                &[] as &[HashMap<TermId, ProofId>]
+            );
             debug_assert!(self.scope_lemma_maps.is_empty());
-            debug_assert!(self.scope_named_steps.is_empty());
+            debug_assert_eq!(
+                self.scope_named_steps.as_slice(),
+                &[] as &[HashMap<String, ProofId>]
+            );
             false
         }
     }

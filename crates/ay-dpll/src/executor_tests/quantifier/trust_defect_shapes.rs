@@ -49,5 +49,5 @@ fn solve_one(input: &str) -> String {
 /// differently and the pin silently stops measuring what it names. Every
 /// `fromBits` below uses the bridge's own spelling.
 fn from_bits_f64(bv: &str) -> String {
-    format!("(fp ((_ extract 63 63) {bv}) ((_ extract 62 52) {bv}) ((_ extract 51 0) {bv}))",)
+    format!("(fp ((_ extract 63 63) {bv}) ((_ extract 62 52) {bv}) ((_ extract 51 0) {bv}))")
 }

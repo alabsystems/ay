@@ -69,14 +69,14 @@ fn all_small_arithmetic_outputs_are_forced_by_concrete_inputs() {
             let a = fresh_word(&mut solver, width);
             let b = fresh_word(&mut solver, width);
             let outputs = current(&mut solver, &a, &b, operation);
-            let circuit = Circuit::new(&solver);
+            let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
             let mut old = BvSolver::new(&store);
             let old_a = fresh_word(&mut old, width);
             let old_b = fresh_word(&mut old, width);
             assert_eq!(a, old_a);
             assert_eq!(b, old_b);
             let old_outputs = previous(&mut old, &old_a, &old_b, operation);
-            let old_circuit = Circuit::new(&old);
+            let old_circuit = Circuit::from_clauses(old.num_vars(), old.clauses());
             for av in 0..1_u64 << width {
                 for bv in 0..1_u64 << width {
                     let fixes = [fix_word(&a, av), fix_word(&b, bv)].concat();
@@ -107,7 +107,7 @@ fn small_shift_add_multiplication_exercises_adders_without_const_case_bypass() {
         let a = fresh_word(&mut solver, width);
         let b = fresh_word(&mut solver, width);
         let out = solver.bitblast_mul_shift_add(&a, &b);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         for av in 0..1_u64 << width {
             for bv in 0..1_u64 << width {
                 let model = circuit.propagate(&[fix_word(&a, av), fix_word(&b, bv)].concat());
@@ -139,8 +139,10 @@ fn constant_circuits_preserve_values_and_frozen_uncompressed_paths() {
                     let old_outputs = previous(&mut old, &old_a, &old_b, operation);
                     // Every output bit must be forced by the emitted CNF,
                     // including fully folded constant outputs.
-                    let model = Circuit::new(&solver).propagate(&[]);
-                    let old_model = Circuit::new(&old).propagate(&[]);
+                    let model =
+                        Circuit::from_clauses(solver.num_vars(), solver.clauses()).propagate(&[]);
+                    let old_model =
+                        Circuit::from_clauses(old.num_vars(), old.clauses()).propagate(&[]);
                     let actual: Vec<_> = outputs
                         .iter()
                         .map(|word| word_value(&model, word))

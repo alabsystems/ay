@@ -5,14 +5,11 @@
 //! Primitive full-adder checks over emitted CNF, without a SAT solver.
 
 use super::*;
+use crate::cnf_test_support::{bit_value, word_value, Circuit};
 
-#[path = "../tests/division_carry/cnf.rs"]
-mod cnf;
 mod integration;
 mod legacy;
 mod reset;
-
-use cnf::{bit_value, word_value, Circuit};
 
 fn setup_store() -> TermStore {
     TermStore::new()
@@ -93,7 +90,7 @@ fn every_signed_aliased_and_constant_triple_forces_exact_full_adder_truth() {
                 let (inputs, alphabet) = input_alphabet(&mut solver);
                 let args = [alphabet[ai], alphabet[bi], alphabet[ci]];
                 let output = solver.full_adder(args[0], args[1], args[2]);
-                let circuit = Circuit::new(&solver);
+                let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
                 for assignment in 0..8 {
                     let model = circuit.propagate(&fix_word(&inputs, assignment));
                     assert_full_adder_truth(&model, args, output);
@@ -124,7 +121,7 @@ fn constant_input_calls_preserve_frozen_outputs_and_exact_clause_order() {
                 assert_eq!(output, previous, "literal indices {ai}/{bi}/{ci}");
                 assert_eq!(counts(&solver), counts(&old));
                 assert_eq!(solver.clauses(), old.clauses());
-                let circuit = Circuit::new(&solver);
+                let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
                 for assignment in 0..8 {
                     let model = circuit.propagate(&fix_word(&inputs, assignment));
                     assert_full_adder_truth(&model, args, output);
@@ -150,8 +147,8 @@ fn cold_distinct_inputs_use_three_gates_twelve_clauses_and_thirty_six_literals()
         let old_before = counts(&old);
         let previous = legacy::full_adder(&mut old, args[0], args[1], args[2]);
         assert_eq!(count_delta(counts(&old), old_before), (5, 17, 45));
-        let circuit = Circuit::new(&solver);
-        let old_circuit = Circuit::new(&old);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
+        let old_circuit = Circuit::from_clauses(old.num_vars(), old.clauses());
         for assignment in 0..8 {
             let fixes = fix_word(&inputs, assignment);
             assert_full_adder_truth(&circuit.propagate(&fixes), args, output);
@@ -231,8 +228,8 @@ fn captured_xor_mux_provenance_reconstructs_the_full_cnf_and_exact_gate_truth() 
         // emission may use the reverse operand order. Compare full clause
         // multisets rather than pretending that literal ordering is identical.
         assert_eq!(canonical_clauses(&rebuilt), canonical_clauses(&solver));
-        let original_circuit = Circuit::new(&solver);
-        let rebuilt_circuit = Circuit::new(&rebuilt);
+        let original_circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
+        let rebuilt_circuit = Circuit::from_clauses(rebuilt.num_vars(), rebuilt.clauses());
         for assignment in 0..8 {
             let fixes = fix_word(&inputs, assignment);
             let model = original_circuit.propagate(&fixes);

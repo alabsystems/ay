@@ -550,7 +550,10 @@ fn test_extract_euf_chain_empty() {
             terms.entry_stamp(id).expect("test term must be live"),
         )
     });
-    assert!(chain.is_empty());
+    assert_eq!(
+        chain,
+        [] as [crate::api::types::annotated_core::CongruenceStep; 0]
+    );
 }
 
 // ---- ModelProvenance tests ----
@@ -642,7 +645,7 @@ fn test_model_provenance_accessors() {
     assert!(prov.is_empty());
     assert_eq!(prov.len(), 0);
     assert!(prov.get("anything").is_none());
-    assert!(prov.decisions().is_empty());
+    assert_eq!(prov.decisions(), [] as [&VariableProvenance; 0]);
 }
 
 /// Test that Boolean propagation produces a non-Default reason (#8153).

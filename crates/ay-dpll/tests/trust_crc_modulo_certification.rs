@@ -33,10 +33,10 @@ fn crc_source_queries_authenticate_before_solver_dispatch() {
         assert_eq!(problem.matches("(check-sat)").count(), 1);
         let commands = parse(&problem.replace("(check-sat)", "")).expect("source parses");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("install source")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("install source"),
+            [] as [String; 0]
+        );
         let context = executor.context();
         let deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(5);
         let result =

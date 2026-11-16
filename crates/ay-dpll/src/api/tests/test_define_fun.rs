@@ -964,7 +964,10 @@ fn native_definitional_forall_adopts_exact_macro_and_prints_model() {
     let details = solver.check_sat_with_details();
     let artifact =
         solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
-    assert!(artifact.function_declarations.is_empty());
+    assert_eq!(
+        artifact.function_declarations,
+        [] as [NativeReplayFunctionDeclaration; 0]
+    );
     assert!(
         artifact.replay_gaps.is_empty(),
         "{:?}",

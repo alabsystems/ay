@@ -98,7 +98,7 @@ fn full_refutation_captures_once_and_fresh_reader_never_searches() {
     assert_eq!(quality.hole_count, 0);
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].step, 1);
-    assert!(!payloads[0].payload.is_empty());
+    assert_ne!(payloads[0].payload.as_slice(), &[] as &[u8]);
     let before_replay = producer_test_counter::count();
     let (terms, proof, assertion) = fixture(0);
     let (replayed, fresh_payloads) = run(
@@ -111,7 +111,7 @@ fn full_refutation_captures_once_and_fresh_reader_never_searches() {
     )
     .unwrap();
     assert_eq!(replayed, quality);
-    assert!(fresh_payloads.is_empty());
+    assert_eq!(fresh_payloads, []);
     assert_eq!(producer_test_counter::count(), before_replay);
 }
 

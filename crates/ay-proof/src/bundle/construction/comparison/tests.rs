@@ -43,7 +43,7 @@ fn trace(bundle: &SerializableProofBundle, proof: &Proof) -> Vec<(usize, usize)>
 #[test]
 fn comparison_preserves_all_raw_step_fields_without_validating_them() {
     let (bundle, proof) = fixture();
-    assert!(!trace(&bundle, &proof).is_empty());
+    assert_ne!(trace(&bundle, &proof), []);
     assert!(re_check_bundle_strict(&bundle).is_err());
     for index in 0..proof.steps.len() {
         let mut changed = proof.clone();

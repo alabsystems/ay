@@ -60,7 +60,7 @@ impl Policy for root::Counted<'_> {
     fn sort(&self, values: &mut [(usize, Literal, u64)]) -> AdmissionResult<()> {
         // Sealed core ipnsort: two log partitions, small-sort <=32, then
         // heapsort; identical ordinary equal-key behavior and no heap buffer.
-        let levels = (usize::BITS - values.len().leading_zeros()) as usize + 1;
+        let levels = values.len().bit_width() as usize + 1;
         let work = values
             .len()
             .checked_mul(levels)

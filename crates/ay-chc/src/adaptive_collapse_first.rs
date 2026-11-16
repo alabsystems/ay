@@ -30,7 +30,7 @@
 //! through to today's `MultiPredComplex` ladder with whatever budget is left.
 //! An incomplete collapse (predicates remain) never enters the route.
 //!
-//! The verified verdict then passes through `finalize_verified_result` like
+//! The verified verdict then passes through the bounded finalization boundary like
 //! every other adaptive answer, and the CLI's own validation battery on top of
 //! that is unchanged.
 

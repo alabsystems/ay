@@ -160,9 +160,9 @@ fn exponential_dag_hash_eq_vars_scan_are_linear() {
     assert_fast("hash", t);
 
     let t = Instant::now();
-    assert!(*a == *b);
+    assert_eq!(*a, *b);
     let c = ite_chain(60, "z");
-    assert!(*a != *c);
+    assert_ne!(*a, *c);
     assert_fast("eq", t);
 
     let t = Instant::now();

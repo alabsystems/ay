@@ -174,7 +174,7 @@ fn fresh_query_terms_preserve_data_but_scope_roundtrip_never_revives_old_package
     let model = source.model();
     let before = source.ctx.source_context_stamp();
     let scalar = source.ctx.terms.mk_bitvec(11.into(), 64);
-    source
+    let _ = source
         .ctx
         .terms
         .mk_app(Symbol::named("bvadd"), [scalar, scalar], Sort::bitvec(64));

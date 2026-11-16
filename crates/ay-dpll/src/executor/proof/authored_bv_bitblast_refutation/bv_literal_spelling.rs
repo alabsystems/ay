@@ -140,7 +140,7 @@ pub(in crate::executor::proof) fn literal_normalization_work(root: &FrontendTerm
     let mut pending = vec![root];
     let mut work = 0usize;
     while let Some(term) = pending.pop() {
-        work = work.checked_add(std::mem::size_of::<FrontendTerm>())?;
+        work = work.checked_add(size_of::<FrontendTerm>())?;
         match term {
             FrontendTerm::Const(FrontendConstant::Hexadecimal(text)) => {
                 work = work.checked_add(text.len().checked_mul(32)?)?;

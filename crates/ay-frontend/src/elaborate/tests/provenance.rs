@@ -659,7 +659,7 @@ fn standalone_declaration_binding_accepts_an_ordinary_nullary_constant() {
         .expect("an ordinary nullary declaration has exact source identity");
 
     assert_eq!(checked.symbol(), &Symbol::named("c"));
-    assert!(checked.parameter_sorts().is_empty());
+    assert_eq!(checked.parameter_sorts().len(), 0);
     assert_eq!(checked.result_sort(), &Sort::Int);
     assert!(context.projection_binding_still_current(&checked));
 }

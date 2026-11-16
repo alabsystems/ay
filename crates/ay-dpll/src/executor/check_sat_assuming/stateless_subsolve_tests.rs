@@ -111,8 +111,7 @@ fn assert_session_lanes_back(exec: &Executor, what: &str) {
 }
 
 /// Which lanes the window starts on, per session kind — never the session's:
-/// in incremental mode an empty theory lane (origin/main's
-/// `solve_without_persistent_encoding`); outside it a COPY of the session's
+/// in incremental mode an empty theory lane; outside it a COPY of the session's
 /// lanes (the marks are copied), also under the default posture's
 /// best-effort proof tracker; when a checked certificate is demanded
 /// (`--self-check`), no lanes at all (a copy logs no proof). The session's
@@ -181,7 +180,7 @@ fn scoped_window_lanes_are_continued_for_the_same_window_only() {
     exec.ctx.assertions = window;
 
     exec.scope_root_depths = None;
-    let _ = exec.with_scope_root_depths(|this| {
+    exec.with_scope_root_depths(|this| {
         let _ = this.solve_scoped_window(window_solve);
     });
     assert_eq!(
@@ -207,24 +206,4 @@ fn scoped_window_missing_a_root_gets_no_copy_of_the_session() {
     let _ = exec.solve_scoped_window(window_solve);
     assert_eq!(take_seen(), [(None, None)]);
     assert_session_lanes_back(&exec, "subset window");
-}
-
-/// The quantified route's helper (origin/main ec28f5b4f8, unchanged here)
-/// swaps the lanes only in incremental mode; outside it the solve runs on the
-/// session's own lanes. The scoped route does not use it.
-#[test]
-fn quantified_route_helper_swaps_lanes_only_in_incremental_mode() {
-    let mut exec = marked_session(true, false);
-    let _ = take_seen();
-    let _ = exec.solve_without_persistent_encoding(window_solve);
-    assert_eq!(take_seen(), [(Some(0), None)]);
-    assert_session_lanes_back(&exec, "incremental");
-
-    let mut exec = marked_session(false, false);
-    let _ = exec.solve_without_persistent_encoding(window_solve);
-    assert_eq!(
-        take_seen(),
-        [(Some(SESSION_THEORY_MARK), Some(SESSION_BV_MARK))],
-        "outside incremental mode the session's own lanes"
-    );
 }

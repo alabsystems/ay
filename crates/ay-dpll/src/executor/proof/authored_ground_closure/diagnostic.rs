@@ -201,6 +201,6 @@ mod tests {
             )
         );
         assert!(exec.last_proof.is_none());
-        assert!(exec.last_proof_raw_original_assertions.is_empty());
+        assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     }
 }

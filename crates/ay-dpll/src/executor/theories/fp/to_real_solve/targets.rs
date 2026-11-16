@@ -60,7 +60,7 @@ impl Executor {
             fp_arg_to_real_var.entry(site.arg).or_insert_with(|| {
                 self.ctx
                     .terms
-                    .mk_var(&format!("__fp_target_{i}"), Sort::Real)
+                    .mk_var(format!("__fp_target_{i}"), Sort::Real)
             });
             self.fp_real_checkpoint(stop, observe, FpRealPhase::Rewrite)?;
         }

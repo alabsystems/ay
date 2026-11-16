@@ -45,7 +45,7 @@ fn fixture(chrono: bool, ic3: bool) -> Solver {
         assert!(s.search_propagate().is_none());
     }
     assert_eq!(s.trail.len(), 7);
-    assert!(s.var_data[1].reason != s.var_data[0].reason);
+    assert_ne!(s.var_data[1].reason, s.var_data[0].reason);
     s.stable_mode = true;
     s.no_conflict_until = s.trail.len();
     s.target_trail_len = 0;
@@ -178,7 +178,7 @@ fn chrono_lambda_reimplication_grows_real_reason_marks_and_compacts_in_order() {
     attach(&mut actual, &test_owner(10_000_000, 10_000_000));
     assert_eq!(actual.backtrack_counted(1), Ok(()));
     assert_eq!(state(&actual), state(&expected));
-    assert!(!actual.reason_clause_marks.is_empty());
+    assert_ne!(actual.reason_clause_marks.len(), 0);
 }
 
 #[test]

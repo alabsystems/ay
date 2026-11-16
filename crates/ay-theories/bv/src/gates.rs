@@ -310,12 +310,11 @@ impl BvSolver<'_> {
         {
             self.xor_cache.insert(key, out);
         }
-        if self.capture_gate_provenance {
-            if !self.encoding.was_stopped()
-                && counted::memory::map(&mut self.xor_children, &self.encoding)
-            {
-                self.xor_children.insert(out, key);
-            }
+        if self.capture_gate_provenance
+            && !self.encoding.was_stopped()
+            && counted::memory::map(&mut self.xor_children, &self.encoding)
+        {
+            self.xor_children.insert(out, key);
         }
         out
     }
@@ -444,12 +443,11 @@ impl BvSolver<'_> {
         {
             self.mux_cache.insert(key, out);
         }
-        if self.capture_gate_provenance {
-            if !self.encoding.was_stopped()
-                && counted::memory::map(&mut self.mux_children, &self.encoding)
-            {
-                self.mux_children.insert(out, key);
-            }
+        if self.capture_gate_provenance
+            && !self.encoding.was_stopped()
+            && counted::memory::map(&mut self.mux_children, &self.encoding)
+        {
+            self.mux_children.insert(out, key);
         }
         out
     }

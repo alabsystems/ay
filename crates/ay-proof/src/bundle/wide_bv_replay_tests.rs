@@ -9,9 +9,9 @@ fn bounded_mask_claim(width: u32, operator: &str, comparison: &str) -> Serializa
     let mut terms = TermStore::new();
     let x = terms.mk_var("wide-independent-input", Sort::bitvec(width));
     let mask = terms.mk_bitvec(BigInt::from(15), width);
-    let masked = terms.mk_app(Symbol::named(operator), &[x, mask], Sort::bitvec(width));
+    let masked = terms.mk_app(Symbol::named(operator), [x, mask], Sort::bitvec(width));
     let bound = terms.mk_bitvec(BigInt::from(16), width);
-    let theorem = terms.mk_app(Symbol::named(comparison), &[masked, bound], Sort::Bool);
+    let theorem = terms.mk_app(Symbol::named(comparison), [masked, bound], Sort::Bool);
     let assumption = terms.mk_not_raw(theorem);
     let mut proof = Proof::new();
     let assumed = proof.add_assume(assumption, None);

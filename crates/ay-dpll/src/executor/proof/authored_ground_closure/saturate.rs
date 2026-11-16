@@ -129,7 +129,7 @@ impl Executor {
     /// proof authority: every selected equality still spends a recognizer
     /// probe and must pass strict derivation before installation. Unsupported
     /// hints preserve the existing proposal scan.
-    fn ground_evaluation_value_hint(&self, term: TermId) -> Option<num_bigint::BigInt> {
+    fn ground_evaluation_value_hint(&self, term: TermId) -> Option<BigInt> {
         let mut pending = vec![term];
         let mut work = MAX_CLOSED_TERM_WORK;
         while let Some(current) = pending.pop() {

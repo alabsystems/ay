@@ -26,7 +26,7 @@ fn below_the_shed_share_nothing_happens() {
         || panic!("no purge below the shed share"),
         || panic!("no shed below the shed share"),
     );
-    assert!(events.is_empty());
+    assert_eq!(events, Vec::<GovernorEvent>::new());
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn a_second_shed_waits_for_the_first_to_settle_unless_urgent() {
         || false,
         || panic!("the first shed is still settling"),
     );
-    assert!(settling.is_empty());
+    assert_eq!(settling, Vec::<GovernorEvent>::new());
 
     let urgent = governor.poll_with(
         start + Duration::from_millis(20),
@@ -139,5 +139,5 @@ fn no_budget_never_polls() {
         || panic!("no purge"),
         || panic!("no shed"),
     );
-    assert!(events.is_empty());
+    assert_eq!(events, Vec::<GovernorEvent>::new());
 }

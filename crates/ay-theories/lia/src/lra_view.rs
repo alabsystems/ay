@@ -25,50 +25,62 @@ pub struct LraSolverView<'s> {
 }
 
 impl<'s> LraSolverView<'s> {
+    /// Returns the term store currently bound to the borrowed LRA solver.
     pub fn terms(self) -> &'s TermStore {
         self.inner.terms()
     }
 
+    /// Returns the term's current materialized value, if it is registered.
     pub fn get_value(self, term: TermId) -> Option<BigRational> {
         self.inner.get_value(term)
     }
 
+    /// Returns the term's current value and any tight-bound reasons that fix it.
     pub fn get_value_with_reasons(self, term: TermId) -> Option<(BigRational, Vec<TheoryLit>)> {
         self.inner.get_value_with_reasons(term)
     }
 
+    /// Returns cloned lower and upper bounds for the term, if it is registered.
     pub fn get_bounds(self, term: TermId) -> Option<(Option<Bound>, Option<Bound>)> {
         self.inner.get_bounds(term)
     }
 
+    /// Borrows the term's lower and upper bounds without cloning their reasons.
     pub fn get_bounds_ref(self, term: TermId) -> Option<(Option<&'s Bound>, Option<&'s Bound>)> {
         self.inner.get_bounds_ref(term)
     }
 
+    /// Reports whether the term has a registered tableau value.
     pub fn has_value(self, term: TermId) -> bool {
         self.inner.has_value(term)
     }
 
+    /// Reports whether tableau analysis derived a lower or upper bound for the term.
     pub fn has_implied_bounds(self, term: TermId) -> bool {
         self.inner.has_implied_bounds(term)
     }
 
+    /// Compares the term's current materialized value with zero.
     pub fn value_sign(self, term: TermId) -> Option<Ordering> {
         self.inner.value_sign(term)
     }
 
+    /// Returns the number of tableau rows currently held by the solver.
     pub fn row_count(self) -> usize {
         self.inner.row_count()
     }
 
+    /// Returns the generation covering all state observed by phase hints.
     pub fn phase_state_epoch(self) -> u64 {
         self.inner.phase_state_epoch()
     }
 
+    /// Collects contradictory variable bounds, optionally skipping the first conflict.
     pub fn collect_all_bound_conflicts(self, skip_first: bool) -> Vec<TheoryConflict> {
         self.inner.collect_all_bound_conflicts(skip_first)
     }
 
+    /// Returns the mapping from term IDs to internal LRA variable IDs.
     pub fn term_to_var(self) -> &'s DetHashMap<TermId, u32> {
         self.inner.term_to_var()
     }
@@ -85,22 +97,27 @@ pub struct LraSolverMut<'s, 'a> {
 }
 
 impl<'a> LraSolverMut<'_, 'a> {
+    /// Binds the term store used by the next delegated LRA operation batch.
     pub fn set_terms(&mut self, terms: &'a TermStore) {
         self.owner.lra.set_terms(terms);
     }
 
+    /// Clears the term-store binding after a delegated operation batch.
     pub fn unset_terms(&mut self) {
         self.owner.lra.unset_terms();
     }
 
+    /// Registers the term if necessary and returns its internal LRA variable ID.
     pub fn ensure_var_registered(&mut self, term: TermId) -> u32 {
         self.owner.lra.ensure_var_registered(term)
     }
 
+    /// Adds a Gomory cut with the supplied fallback reason.
     pub fn add_gomory_cut(&mut self, cut: &GomoryCut, reason: TermId) {
         self.owner.lra.add_gomory_cut(cut, reason);
     }
 
+    /// Adds a rational-coefficient cut with the supplied justification.
     pub fn add_cut_rat(
         &mut self,
         coeffs: Vec<(u32, Rational)>,
@@ -114,14 +131,17 @@ impl<'a> LraSolverMut<'_, 'a> {
             .add_cut_rat(coeffs, bound, is_lower, reasons, reason);
     }
 
+    /// Runs the delegated LRA consistency check.
     pub fn check(&mut self) -> TheoryResult {
         self.owner.lra.check()
     }
 
+    /// Asserts a fixed term value justified by the supplied theory literals.
     pub fn assert_tight_bound(&mut self, term: TermId, value: &BigRational, reasons: &[TheoryLit]) {
         self.owner.lra.assert_tight_bound(term, value, reasons);
     }
 
+    /// Restores the model equality and disequality proposal deduplication state.
     pub fn import_model_equality_proposal_state(
         &mut self,
         equality_pairs: DetHashSet<(TermId, TermId)>,
@@ -132,10 +152,12 @@ impl<'a> LraSolverMut<'_, 'a> {
             .import_model_equality_proposal_state(equality_pairs, disequality_pairs);
     }
 
+    /// Disables all delegated theory propagation when `disabled` is true.
     pub fn set_no_theory_propagation(&mut self, disabled: bool) {
         self.owner.lra.set_no_theory_propagation(disabled);
     }
 
+    /// Disables implied-bound derivation during BCP checks when `disabled` is true.
     pub fn set_no_bcp_implied_bounds(&mut self, disabled: bool) {
         self.owner.lra.set_no_bcp_implied_bounds(disabled);
     }

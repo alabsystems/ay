@@ -21,7 +21,7 @@ fn test_dip_manager_new() {
     // reimplementation with proper DRAT proof support.
     assert!(!mgr.enabled);
     assert_eq!(mgr.extension_var_count, 0);
-    assert!(mgr.extension_var_defs.is_empty());
+    assert_eq!(mgr.extension_var_defs.len(), 0);
 }
 
 #[test]

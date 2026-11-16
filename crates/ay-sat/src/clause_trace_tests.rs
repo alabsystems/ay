@@ -50,7 +50,7 @@ fn four_entry_trace() -> ClauseTrace {
 #[test]
 fn test_clause_trace_basic() {
     let mut trace = ClauseTrace::new();
-    assert!(trace.is_empty());
+    assert_eq!(trace.len(), 0);
     assert!(!trace.has_empty_clause());
 
     // Add an original clause
@@ -64,13 +64,13 @@ fn test_clause_trace_basic() {
     );
     assert_eq!(trace.len(), 1);
     assert!(trace.entries().at(0).is_original);
-    assert!(trace.entries().at(0).resolution_hints.is_empty());
+    assert_eq!(trace.entries().at(0).resolution_hints.len(), 0);
 
     // Add a learned clause
     trace.add_clause(2, vec![Literal::positive(Variable(2))], false);
     assert_eq!(trace.len(), 2);
     assert!(!trace.entries().at(1).is_original);
-    assert!(trace.entries().at(1).resolution_hints.is_empty());
+    assert_eq!(trace.entries().at(1).resolution_hints.len(), 0);
 
     // Add empty clause
     trace.add_clause(3, vec![], false);
@@ -180,7 +180,7 @@ fn test_clause_trace_atomic_hints_regression_4435() {
     trace.add_clause_with_hints(101, vec![], false, vec![5, 6]);
     let empty_entry = trace.entries().at(1);
     assert_eq!(empty_entry.id, 101);
-    assert!(empty_entry.clause.is_empty());
+    assert_eq!(empty_entry.clause.len(), 0);
     assert_eq!(empty_entry.resolution_hints, vec![5, 6]);
     assert!(trace.has_empty_clause());
 }
@@ -318,7 +318,7 @@ fn clause_trace_hint_replacement_respects_exact_capacity_boundary() {
 fn clause_trace_impossible_preallocation_fails_closed() {
     let trace = ClauseTrace::with_capacity(usize::MAX);
     assert!(trace.is_truncated());
-    assert!(trace.is_empty());
+    assert_eq!(trace.len(), 0);
     assert_eq!(trace.used_bytes(), 0);
     assert_eq!(trace.meta.capacity(), 0);
 }

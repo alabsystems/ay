@@ -43,7 +43,7 @@
 //!   member's run).
 //!
 //! NOTHING IS TAKEN ON THE PRODUCER'S WORD. Matching and guard selection are
-//! hints: `validate_forall_inst` re-derives the substitution and groundness,
+//! hints: `validate_forall_inst_with_progress` re-derives the substitution and groundness,
 //! `validate_ground_evaluate` the closed guard, `validate_euf_transitive` /
 //! `validate_euf_congruent` every chain edge, and the endpoint recognizer the
 //! constant disequality. The candidate replaces the proof only through the

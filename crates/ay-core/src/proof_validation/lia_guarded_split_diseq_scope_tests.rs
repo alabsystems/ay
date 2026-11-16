@@ -24,7 +24,10 @@ fn rejects_real_sorted_parity_clause() {
     // arithmetic stays integral: q0 = 0, 2·q2 = 1, r3 = 1.
     let (two_q0, two_q2, r3) = (0i64, 1i64, 1i64);
     assert_eq!(two_q2 + r3, two_q0 + 2, "witness: 2q2 + r3 = 2q0 + 2");
-    assert!(r3 < 2 && 0 <= r3 && r3 != 0, "witness falsifies the rest");
+    assert!(
+        (0..2).contains(&r3) && r3 != 0,
+        "witness falsifies the rest"
+    );
 
     let mut terms = TermStore::new();
     let q0 = terms.mk_var("q0", Sort::Real);

@@ -4598,6 +4598,7 @@ impl BmcSolver {
         outcome
     }
 
+    #[cfg(test)]
     fn defs_by_head(&self) -> FxHashMap<PredicateId, Vec<usize>> {
         let mut defs: FxHashMap<PredicateId, Vec<usize>> = FxHashMap::default();
         for (idx, clause) in self.problem.clauses().iter().enumerate() {

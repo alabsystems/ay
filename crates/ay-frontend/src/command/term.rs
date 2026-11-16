@@ -243,38 +243,6 @@ impl Term {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Term;
-    use crate::sexp::parse_sexp;
-
-    #[test]
-    fn legacy_z3_match_cases_parse_as_standard_match_cases() {
-        let standard = Term::from_sexp(
-            &parse_sexp("(match o ((none 0) ((some x) x)))").expect("standard fixture"),
-        )
-        .expect("standard match parses");
-        let legacy = Term::from_sexp(
-            &parse_sexp("(match o (case none 0) (case (some x) x))").expect("legacy fixture"),
-        )
-        .expect("legacy match parses");
-
-        assert_eq!(legacy, standard);
-    }
-
-    #[test]
-    fn legacy_z3_match_rejects_malformed_or_mixed_cases() {
-        for input in [
-            "(match o (case none))",
-            "(match o (case none 0 extra))",
-            "(match o (case none 0) ((some x) x))",
-        ] {
-            let sexp = parse_sexp(input).expect("rejection fixture is an s-expression");
-            assert!(Term::from_sexp(&sexp).is_err(), "must reject {input}");
-        }
-    }
-}
-
 /// An SMT-LIB parsed constant token.
 ///
 /// This is the parser-level, string-preserving representation used by
@@ -658,5 +626,37 @@ impl Term {
         let args: Result<Vec<_>, _> = items[args_start..].iter().map(Self::from_sexp).collect();
 
         Ok(Self::App(func_name, args?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Term;
+    use crate::sexp::parse_sexp;
+
+    #[test]
+    fn legacy_z3_match_cases_parse_as_standard_match_cases() {
+        let standard = Term::from_sexp(
+            &parse_sexp("(match o ((none 0) ((some x) x)))").expect("standard fixture"),
+        )
+        .expect("standard match parses");
+        let legacy = Term::from_sexp(
+            &parse_sexp("(match o (case none 0) (case (some x) x))").expect("legacy fixture"),
+        )
+        .expect("legacy match parses");
+
+        assert_eq!(legacy, standard);
+    }
+
+    #[test]
+    fn legacy_z3_match_rejects_malformed_or_mixed_cases() {
+        for input in [
+            "(match o (case none))",
+            "(match o (case none 0 extra))",
+            "(match o (case none 0) ((some x) x))",
+        ] {
+            let sexp = parse_sexp(input).expect("rejection fixture is an s-expression");
+            assert!(Term::from_sexp(&sexp).is_err(), "must reject {input}");
+        }
     }
 }

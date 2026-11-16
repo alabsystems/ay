@@ -450,10 +450,9 @@ impl TermStore {
             if let Some((const_term, sum_term)) = const_and_sum {
                 if matches!(self.get(sum_term), TermData::App(Symbol::Named(name), args)
                     if name == "+" && args.len() >= 2)
+                    && self.mul_reentry_within_budget(sum_term)
                 {
-                    if self.mul_reentry_within_budget(sum_term) {
-                        return self.mk_mul_distribute_const_add_dag(const_term, sum_term);
-                    }
+                    return self.mk_mul_distribute_const_add_dag(const_term, sum_term);
                 }
             }
         }

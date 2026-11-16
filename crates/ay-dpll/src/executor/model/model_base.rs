@@ -392,7 +392,7 @@ impl Model {
         {
             return Err(FormulaNeutralFunctionDefaultReadError::SignatureConflict);
         }
-        Ok(Some(super::evaluation_copies::copy(entry.value())))
+        Ok(Some(evaluation_copies::copy(entry.value())))
     }
 
     pub(in crate::executor) fn formula_neutral_function_defaults_are_current(

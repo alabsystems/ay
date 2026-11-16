@@ -179,6 +179,7 @@ impl<'a> LiaSolver<'a> {
             max_gomory_iterations: 8,
             hnf_iterations: 0,
             hnf_barren_fingerprint: None,
+            gcd_barren_pos_eq_epoch: None,
             max_hnf_iterations: 50, // HNF is more expensive, limit more
             seen_hnf_cuts: HashSet::default(),
             seen_hnf_cuts_trail: Vec::new(),

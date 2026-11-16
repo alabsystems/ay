@@ -25,12 +25,14 @@ fn commands(exec: &mut Executor, source: &str) -> Vec<String> {
 
 fn fixture() -> Executor {
     let mut exec = Executor::new();
-    assert!(commands(
-        &mut exec,
-        "(set-option :produce-models true) (set-logic QF_UFLIA)
+    assert_eq!(
+        commands(
+            &mut exec,
+            "(set-option :produce-models true) (set-logic QF_UFLIA)
         (declare-const x Int) (declare-fun f (Int) Int) (declare-fun p (Int) Bool)"
-    )
-    .is_empty());
+        ),
+        [] as [String; 0]
+    );
     exec
 }
 
@@ -267,8 +269,8 @@ fn reset_retires_the_model_assumptions_and_all_captured_root_windows() {
     assert!(exec.last_model.is_none());
     assert!(exec.last_assumptions.is_none());
     assert!(exec.independent_gate_authored_assertions.is_none());
-    assert!(exec.function_row_roots.is_empty());
-    assert!(exec.ctx.assertions.is_empty());
+    assert_eq!(exec.function_row_roots, [] as [ay_core::TermId; 0]);
+    assert_eq!(exec.ctx.assertions, [] as [ay_core::TermId; 0]);
     commands(&mut exec, "(set-option :produce-models true) (set-logic QF_UFLIA) (declare-fun fresh (Int) Int) (assert (= (fresh 4) 40))");
     assert_eq!(commands(&mut exec, "(check-sat)"), ["sat"]);
     let public = commands(&mut exec, "(get-model)");
@@ -359,7 +361,7 @@ fn row_retention_never_turns_an_incorrect_public_witness_into_sat_authority() {
         .as_mut()
         .unwrap();
     let table = euf.function_tables.get_mut("f").unwrap();
-    assert!(!table.is_empty());
+    assert_ne!(table.as_slice(), []);
     // Candidate DATA corruption changes only the published UF interpretation.
     // Its old pins remain intact to detect a hybrid pin-preference waiver.
     for (_, result) in table {

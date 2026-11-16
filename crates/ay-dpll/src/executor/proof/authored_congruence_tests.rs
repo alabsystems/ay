@@ -285,8 +285,8 @@ fn current_query_assumption_roots_need_no_authored_assertion_row() {
     let mut executor = Executor::new();
     let (canonical, negated) = comparison_surface_fixture(&mut executor);
     executor.last_assumptions = Some(vec![canonical, negated]);
-    assert!(executor.ctx.assertions_parsed().is_empty());
-    assert!(executor.ctx.assertions.is_empty());
+    assert_eq!(executor.ctx.assertions_parsed(), []);
+    assert_eq!(executor.ctx.assertions, [] as [TermId; 0]);
 
     let mut proof = Proof::new();
     let positive = proof.add_assume(canonical, None);
@@ -747,7 +747,7 @@ fn an_over_cap_assumption_ledger_withholds_the_assumption_arm() {
     let mut assumptions = vec![canonical; support::MAX_AUTHORED_ORIGINAL_INDEX_ROWS];
     assumptions.push(negated);
     executor.last_assumptions = Some(assumptions);
-    assert!(executor.ctx.assertions_parsed().is_empty());
+    assert_eq!(executor.ctx.assertions_parsed(), []);
 
     let mut proof = Proof::new();
     let positive = proof.add_assume(canonical, None);
@@ -1178,7 +1178,7 @@ fn retained_but_empty_source_ledger_suppresses_external_publication() {
     executor
         .ctx
         .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
-    assert!(executor.ctx.assertions_parsed().is_empty());
+    assert_eq!(executor.ctx.assertions_parsed(), []);
     // Turning retention back on does not retroactively recreate the missing
     // prefix. It changes this from intentional retention-off state into a
     // retained-but-misaligned ledger, which must never authenticate export.

@@ -337,9 +337,9 @@ fn test_add_learned_clause_keeps_binary_order() {
 
 fn learned_tail_reorder_fixture(clause_len: usize) -> (Solver, Vec<Literal>) {
     let mut solver: Solver = Solver::new(clause_len);
-    for i in 0..clause_len {
-        solver.var_data[i].level = 0;
-        solver.var_data[i].trail_pos = 0;
+    for data in &mut solver.var_data[..clause_len] {
+        data.level = 0;
+        data.trail_pos = 0;
     }
     solver.var_data[0].level = 99;
     solver.var_data[0].trail_pos = 99;
@@ -570,9 +570,10 @@ fn test_bcp_learned_1963_tail_reorder_budget_applies_within_budget() {
 fn test_bcp_learned_1963_tail_reorder_budget_skips_high_swap_clause() {
     let clause_len = 32usize;
     let (mut solver, lits) = learned_tail_reorder_fixture(clause_len);
-    for i in 2..clause_len {
-        solver.var_data[i].level = i as u32;
-        solver.var_data[i].trail_pos = i as u32;
+    for (offset, data) in solver.var_data[2..clause_len].iter_mut().enumerate() {
+        let index = offset + 2;
+        data.level = index as u32;
+        data.trail_pos = index as u32;
     }
     solver.set_bcp_learned_1963_tail_reorder_swap_budget(Some(256));
 
@@ -743,14 +744,14 @@ fn test_lrat_chain_functions_exist_and_are_callable() {
 
     // lrat_reverse_hints: static method, no allocation concern
     let empty_result = Solver::lrat_reverse_hints(&[]);
-    assert!(empty_result.is_empty());
+    assert_eq!(empty_result.len(), 0);
 
     // Verify the solver has packed minimize_flags array (#5089)
     assert_eq!(solver.min.minimize_flags.len(), 10);
 
     // Verify LRAT bits are packed into minimize_flags (#5089, #4579)
     assert_eq!(solver.min.minimize_flags.len(), 10);
-    assert!(solver.min.lrat_to_clear.is_empty());
+    assert_eq!(solver.min.lrat_to_clear.len(), 0);
 }
 
 #[test]
@@ -961,7 +962,7 @@ fn test_add_conflict_learned_clause_fmla_fail_closed_reserves_without_forward_em
         let export = &exports[0];
         assert_eq!(export.checker_visible_id, learned_id);
         assert_eq!(export.checker_visible_lrat_hints, vec![8, 7, 3, 2, 6, 1]);
-        assert!(export.materializer_rows.is_empty());
+        assert_eq!(export.materializer_rows.len(), 0);
         assert!(!export.proof_out_emitted);
         assert_eq!(
             export.materialization_status,
@@ -1376,7 +1377,7 @@ fn test_fmla_fail_closed_empty_learned_chain_retains_materializer_diagnostic() {
     let authority_records = proof_manager.learned_lrat_authority_records();
     assert_eq!(authority_records.len(), 1);
     assert_eq!(authority_records[0].checker_visible_id, learned_id);
-    assert!(authority_records[0].raw_resolution_chain.is_empty());
+    assert_eq!(authority_records[0].raw_resolution_chain.len(), 0);
     assert_eq!(authority_records[0].lrat_hints, vec![0, materializer_id]);
     assert_eq!(
         authority_records[0].materializer_dependency_ids,
@@ -1503,7 +1504,7 @@ fn test_fmla_unchecked_empty_learned_chain_retains_materializer_diagnostic() {
     let authority_records = proof_manager.learned_lrat_authority_records();
     assert_eq!(authority_records.len(), 1);
     assert_eq!(authority_records[0].checker_visible_id, learned_id);
-    assert!(authority_records[0].raw_resolution_chain.is_empty());
+    assert_eq!(authority_records[0].raw_resolution_chain.len(), 0);
     assert_eq!(authority_records[0].lrat_hints, vec![0, materializer_id]);
     assert_eq!(
         authority_records[0].materializer_dependency_ids,
@@ -1559,7 +1560,7 @@ fn test_non_fmla_decompose_materializer_does_not_block_forward_learned_lrat_emit
 
     let proof_manager = solver.proof_manager.as_ref().expect("proof manager");
     assert!(!proof_manager.has_lrat_authority_fail_closed());
-    assert!(proof_manager.learned_lrat_authority_records().is_empty());
+    assert_eq!(proof_manager.learned_lrat_authority_records().len(), 0);
 
     let writer = solver
         .take_proof_writer()
@@ -4058,7 +4059,7 @@ fn test_collect_resolution_chain_reuses_persistent_marks() {
     solver.vals[c.index()] = 1;
     solver.vals[c.negated().index()] = -1;
 
-    assert!(solver.min.lrat_to_clear.is_empty(), "worklist starts empty");
+    assert_eq!(solver.min.lrat_to_clear.len(), 0, "worklist starts empty");
     assert!(
         solver.min.minimize_flags.iter().all(|&f| f & LRAT_A == 0),
         "LRAT_A bits start clear"
@@ -4067,7 +4068,7 @@ fn test_collect_resolution_chain_reuses_persistent_marks() {
     // collect_resolution_chain must reuse persistent marks and clean up.
     let chain =
         solver.collect_resolution_chain(ClauseRef(idx_c2 as u32), None, &det_hash_set_new());
-    assert!(!chain.is_empty(), "chain should contain reason clause IDs");
+    assert_ne!(chain.len(), 0, "chain should contain reason clause IDs");
     assert_eq!(
         solver.min.minimize_flags.len(),
         3,

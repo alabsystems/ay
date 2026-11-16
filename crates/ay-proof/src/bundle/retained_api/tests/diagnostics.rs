@@ -84,7 +84,7 @@ fn healthy_reader_keeps_exact_old_result_and_callback_trace() {
     let before = producer_test_counter::count();
     let (result, trace, diagnostic) = paired(&bytes, transport_limits(), end(), Admission::Healthy);
     assert!(result.unwrap().1.quality.is_complete());
-    assert!(!trace.is_empty());
+    assert_ne!(trace, []);
     assert_eq!(diagnostic.first_failure(), None);
     assert_eq!(diagnostic.terminal(), Some(RetainedReadTerminal::Healthy));
     assert_eq!(diagnostic.reported_error(), None);
@@ -167,7 +167,7 @@ fn entry_callback_and_original_deadline_refusal_do_not_invent_a_decoder_cause() 
         Admission::Healthy,
     );
     assert!(matches!(result, Err(ProofCheckError::Cancelled)));
-    assert!(trace.is_empty());
+    assert_eq!(trace, []);
     assert_eq!(
         diagnostic.first_failure(),
         Some(RetainedReadFailure {

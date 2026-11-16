@@ -131,7 +131,7 @@ impl Executor {
         let direct = classes.iter().filter(|class| {
             class.members.get(&cell) == Some(&cell_stamp) && cell_sort == &class.cell_sort
         });
-        let mut direct = direct.peekable();
+        let mut direct = direct;
         let class = if let Some(class) = direct.next() {
             if direct.next().is_some() {
                 return None;

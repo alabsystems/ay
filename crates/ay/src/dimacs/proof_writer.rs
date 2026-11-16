@@ -156,7 +156,7 @@ impl Write for SolverDimacsProofWriter {
                 if failed.load(Ordering::Acquire) {
                     return Ok(buffer.len());
                 }
-                #[cfg(test)]
+                #[cfg(all(test, target_os = "linux"))]
                 if take_injected_optional_dimacs_writer_failure() {
                     safe_eprintln!(
                         "c Warning: optional synthesized DIMACS proof {path} stopped recording after an injected write failure; solver verdict remains authoritative"

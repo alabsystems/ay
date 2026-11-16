@@ -4,7 +4,7 @@
 use super::*;
 use ay_core::ProofStep;
 
-mod fixtures;
+pub(super) mod fixtures;
 use fixtures::{app, Fixture};
 
 #[test]

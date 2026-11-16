@@ -24,10 +24,10 @@ fn format_sort_handles_core_sorts_and_quoting() {
 
 #[test]
 fn format_symbol_quotes_reserved_words_and_formats_indices() {
-    assert_eq!(format_symbol(&Symbol::named("x")), "x");
-    assert_eq!(format_symbol(&Symbol::named("let")), "|let|");
+    assert_eq!(format_symbol_owned(&Symbol::named("x"), None), "x");
+    assert_eq!(format_symbol_owned(&Symbol::named("let"), None), "|let|");
     assert_eq!(
-        format_symbol(&Symbol::indexed("extract", vec![7, 4])),
+        format_symbol_owned(&Symbol::indexed("extract", vec![7, 4]), None),
         "(_ extract 7 4)"
     );
 }

@@ -159,9 +159,15 @@ pub(super) fn bundle_matches_proof(
     proof: &Proof,
     bundle: &SerializableProofBundle,
 ) -> bool {
-    proof_roots_match_exact_query(executor, exact_roots, proof_roots)
-        && canonical_bv_lia_proof_matches(executor, proof, proof_roots)
-        && proof.steps == bundle.steps
+    let roots_match = proof_roots_match_exact_query(executor, exact_roots, proof_roots);
+    if !roots_match {
+        return false;
+    }
+    let canonical_proof_match = canonical_bv_lia_proof_matches(executor, proof, proof_roots);
+    if !canonical_proof_match {
+        return false;
+    }
+    proof.steps == bundle.steps
         && bundle.obligation_assertions == exact_roots
         && term_entries_match(&executor.ctx.terms, &bundle.term_entries)
         && bundle.true_term == Some(executor.ctx.terms.true_term())

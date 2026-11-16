@@ -669,7 +669,7 @@ fn test_provenance_axiom_empty() {
     let prov = BoundProvenance::Axiom;
     let mut out = Vec::new();
     prov.collect_reasons(&mut out);
-    assert!(out.is_empty());
+    assert_eq!(out, []);
 }
 
 /// SharedEquality provenance collects all non-sentinel reasons.

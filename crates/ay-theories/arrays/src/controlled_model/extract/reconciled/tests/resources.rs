@@ -79,9 +79,10 @@ fn caught_original_callback_panic_revokes_retry_without_source_mutation() {
         FiniteAdmissionGrant::new(1_000_000, 128 << 20),
         end,
         Arc::new(move || {
-            if armed.load(Ordering::Acquire) {
-                panic!("controlled test callback panic");
-            }
+            assert!(
+                !armed.load(Ordering::Acquire),
+                "controlled test callback panic"
+            );
             false
         }),
     );
@@ -95,7 +96,9 @@ fn caught_original_callback_panic_revokes_retry_without_source_mutation() {
 
 #[test]
 fn already_expired_original_end_refuses_first_work_and_every_later_attempt() {
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("a current instant has an earlier representable second");
     let fixture = Fixture::new();
     let solver = fixture.solver();
     let values = fixture.values();

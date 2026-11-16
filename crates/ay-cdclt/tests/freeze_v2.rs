@@ -7,7 +7,7 @@
 //! level-0 units, `Send`), KC25 (the default and the lane-parity profiles).
 
 use ay_cdclt::{Engine, EngineConfig, Guard, SearchProfile, Verdict};
-use ay_core::{Sort, TermId, TermStore, TheoryLit};
+use ay_core::{Sort, StrengthenId, TermId, TermStore, TheoryLit};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
@@ -75,7 +75,7 @@ fn assumptions_answer_with_their_failed_core_in_one_search_each() {
 
     let outcome = engine.check(&mut terms, &[p, y_ge_0], &guard);
     assert_eq!(outcome.verdict, Verdict::Sat, "{:?}", outcome.reason);
-    assert!(outcome.failed.is_empty());
+    assert_eq!(outcome.failed.as_slice(), &[] as &[TermId]);
     assert_eq!(engine.atom_value(p), Some(true));
     assert_eq!(outcome.stats.solve_calls, 1);
 
@@ -141,7 +141,7 @@ fn level_zero_units_are_reported() {
         "{:?}",
         outcome.level0_units
     );
-    assert!(outcome.sigma.is_empty());
+    assert_eq!(outcome.sigma.as_slice(), &[] as &[StrengthenId]);
 }
 
 /// KC2 / KC7: the engine owns no borrow, so it is built before the store

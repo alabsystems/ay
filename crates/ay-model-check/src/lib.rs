@@ -446,7 +446,7 @@ pub trait ModelView {
     /// No verdict or publication authority accompanies it. An error records
     /// stale/conflicting ownership and must not fall back to per-read pins.
     /// Existing views decline this optional representation by default.
-    fn array_snapshot(&self, _t: TermId) -> Result<Option<std::sync::Arc<ArraySnapshot>>, String> {
+    fn array_snapshot(&self, _t: TermId) -> Result<Option<Arc<ArraySnapshot>>, String> {
         Ok(None)
     }
 

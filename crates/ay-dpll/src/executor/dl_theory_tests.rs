@@ -198,7 +198,7 @@ fn conflict_names_the_asserted_literals() {
     };
     // Non-empty, duplicate-free, and every literal is one we asserted with the
     // polarity we asserted it at (the DPLL layer negates these verbatim).
-    assert!(!lits.is_empty());
+    assert_ne!(lits, [] as [TheoryLit; 0]);
     let mut sorted = lits.clone();
     sorted.sort_unstable();
     sorted.dedup();

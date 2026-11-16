@@ -208,7 +208,7 @@ fn walk<'a>(
         if !open() {
             return None;
         }
-        if !seen.insert(expr as *const ChcExpr) {
+        if !seen.insert(std::ptr::from_ref::<ChcExpr>(expr)) {
             continue;
         }
         inspect(expr)?;

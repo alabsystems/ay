@@ -27,7 +27,10 @@ mod tests;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FpRealPhase {
     Tseitin,
+    #[cfg(test)]
     Construction(FpBuildProgress),
+    #[cfg(not(test))]
+    Construction,
     CongruenceScan,
     CongruencePlan,
     ClauseTransfer,
@@ -45,6 +48,20 @@ pub(super) enum FpRealPhase {
     Rewrite,
     TargetPreparation,
     Publication,
+}
+
+impl FpRealPhase {
+    pub(super) fn construction(progress: FpBuildProgress) -> Self {
+        #[cfg(test)]
+        {
+            Self::Construction(progress)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = progress;
+            Self::Construction
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

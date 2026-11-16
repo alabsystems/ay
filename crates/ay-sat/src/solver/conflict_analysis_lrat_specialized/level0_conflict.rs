@@ -84,7 +84,7 @@ impl Solver {
     fn record_lrat_level0_conflict_chain(&mut self, conflict_ref: ClauseRef) {
         match self.record_lrat_level0_conflict_admitted(
             conflict_ref,
-            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+            &conflict_analysis_minimize_lrat::root::Ordinary,
         ) {
             Ok(()) => (),
             Err(never) => match never {},

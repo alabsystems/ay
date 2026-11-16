@@ -65,11 +65,6 @@ pub(crate) fn format_sort_surface_owned(
     }
 }
 
-/// Format a `Symbol` (function/constant name) for SMT-LIB output.
-pub(crate) fn format_symbol(sym: &Symbol) -> String {
-    format_symbol_owned(sym, None)
-}
-
 pub(crate) fn format_symbol_owned(sym: &Symbol, owner: Owner<'_>) -> String {
     match sym {
         Symbol::Named(name) => output::quote(owner, name),
@@ -87,7 +82,7 @@ pub(crate) fn format_symbol_owned(sym: &Symbol, owner: Owner<'_>) -> String {
         }
         // All current Symbol variants handled above (#5692).
         // Wildcard covers future variants from #[non_exhaustive].
-        other => unreachable!("unhandled Symbol variant in format_symbol(): {other:?}"),
+        other => unreachable!("unhandled Symbol variant in format_symbol_owned(): {other:?}"),
     }
 }
 

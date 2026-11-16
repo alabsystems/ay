@@ -46,16 +46,13 @@ impl Ring<'_, '_> {
         let required = out.len().checked_add(extra)?;
         if required > out.capacity() {
             let target = required.max(out.capacity().max(4).checked_mul(2)?);
-            self.pay(out.len(), target.checked_mul(std::mem::size_of::<T>())?)?;
+            self.pay(out.len(), target.checked_mul(size_of::<T>())?)?;
             if out.try_reserve_exact(target - out.len()).is_err() {
                 *self.fuel = 0;
                 return None;
             }
             if out.capacity() > target {
-                self.pay(
-                    0,
-                    (out.capacity() - target).checked_mul(std::mem::size_of::<T>())?,
-                )?;
+                self.pay(0, (out.capacity() - target).checked_mul(size_of::<T>())?)?;
             }
         }
         Some(())
@@ -493,7 +490,7 @@ fn reserve<T>(
             fuel,
             progress,
             out.len(),
-            capacity.checked_mul(std::mem::size_of::<T>())?,
+            capacity.checked_mul(size_of::<T>())?,
         )?;
         if out.try_reserve_exact(capacity - out.len()).is_err() {
             *fuel = 0;
@@ -504,7 +501,7 @@ fn reserve<T>(
                 fuel,
                 progress,
                 0,
-                (out.capacity() - capacity).checked_mul(std::mem::size_of::<T>())?,
+                (out.capacity() - capacity).checked_mul(size_of::<T>())?,
             )?;
         }
     }
@@ -652,12 +649,12 @@ mod tests {
         let y = terms.mk_var("y", Sort::FiniteField(field));
         let xx = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, x],
+            [x, x],
             Sort::FiniteField(field),
         );
         let xy = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, y],
+            [x, y],
             Sort::FiniteField(field),
         );
         let a = terms.mk_finite_field(square, field);
@@ -735,7 +732,7 @@ mod tests {
         clause.push(terms.mk_not_raw(foreign));
         assert!(replay(&terms, &clause, &mut 100_000, &mut |_, _| true).is_none());
         clause.pop();
-        let bad = terms.mk_app(Symbol::Named("=".into()), &[boolean, other], Sort::Bool);
+        let bad = terms.mk_app(Symbol::Named("=".into()), [boolean, other], Sort::Bool);
         clause.push(terms.mk_not_raw(bad));
         assert!(replay(&terms, &clause, &mut 100_000, &mut |_, _| true).is_none());
     }
@@ -782,7 +779,7 @@ mod tests {
         );
         let nary = terms.mk_app(
             Symbol::Named("=".into()),
-            &[args[0], args[1], args[1]],
+            [args[0], args[1], args[1]],
             Sort::Bool,
         );
         let equivalent = [terms.mk_not_raw(nary), clause[1]];
@@ -792,7 +789,7 @@ mod tests {
         );
         let nary_distinct = terms.mk_app(
             Symbol::Named("distinct".into()),
-            &[args[0], args[1], args[1]],
+            [args[0], args[1], args[1]],
             Sort::Bool,
         );
         let not_nary = terms.mk_not_raw(nary_distinct);
@@ -835,7 +832,7 @@ mod tests {
             );
             let square = terms.mk_app(
                 Symbol::Named("ff.mul".into()),
-                &[x, x],
+                [x, x],
                 Sort::FiniteField(field),
             );
             let square0 = terms.mk_eq(square, zero);
@@ -862,7 +859,7 @@ mod tests {
         terms.register_declared_function("ff.mul");
         let application = terms.mk_app(
             Symbol::Named("ff.mul".into()),
-            &[x, x],
+            [x, x],
             Sort::FiniteField(field),
         );
         // SAT: x=0 and the uninterpreted function maps (0,0) to 1.

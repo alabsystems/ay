@@ -87,6 +87,10 @@ impl AuthoredQuery {
     /// This does not check theory semantics or authenticate the supplied draft.
     /// Refusal returns the exact draft in [`ValidationFailure`]; its disposal
     /// remains caller-owned and is not claimed to have bounded total latency.
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal must return the exact caller-owned draft without allocating after the original grant refuses"
+    )]
     pub fn validate(
         draft: QueryDraft,
         work: &mut WorkBudget<'_>,

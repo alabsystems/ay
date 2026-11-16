@@ -297,11 +297,7 @@ impl BvSolver<'_> {
                 return Vec::new();
             }
             // `value` is a `u64`, but BV widths can exceed 64. Treat higher bits as 0.
-            let bit_set = if i < u64::BITS as usize {
-                (value >> i) & 1 == 1
-            } else {
-                false
-            };
+            let bit_set = i < u64::BITS as usize && (value >> i) & 1 == 1;
             let var = if bit_set {
                 // Use negation of cached false literal so that `is_known_true`
                 // recognizes constant-true bits flowing through gates.

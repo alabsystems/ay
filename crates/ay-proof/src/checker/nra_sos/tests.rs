@@ -197,5 +197,5 @@ fn strict_dispatch_publishes_only_fully_checked_clause() {
     assert!(
         super::super::validate_step(&terms, &mut derived, ProofId(0), &step, false, None).is_err()
     );
-    assert!(derived.is_empty());
+    assert_eq!(derived, []);
 }

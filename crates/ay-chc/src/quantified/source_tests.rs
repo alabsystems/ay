@@ -389,6 +389,10 @@ fn bounded_occurrences_depth_names_and_collection_counts_refuse_then_retry() {
         deep = op(ChcOp::Not, vec![deep]);
     }
     assert!(standalone(vec![premise("i", 8, deep)]).is_err());
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the quantified cap fixture intentionally shares one immutable boolean node to isolate occurrence accounting"
+    )]
     let wide = ChcExpr::Op(ChcOp::And, vec![Arc::new(ChcExpr::Bool(true)); 65_536]);
     assert!(standalone(vec![premise("i", 8, wide)]).is_err());
     assert!(standalone(vec![premise(&"x".repeat(16_385), 8, ChcExpr::Bool(true))]).is_err());

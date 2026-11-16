@@ -18,7 +18,7 @@ fn admit_slot<T>(values: &mut Vec<T>, work: &mut WorkBudget<'_>) -> Result<(), Q
         // before asking Vec for exactly this next slot.
         work.admit(
             next,
-            next.checked_mul(std::mem::size_of::<T>())
+            next.checked_mul(size_of::<T>())
                 .ok_or(QueryError::Exhausted)?,
         )?;
         values
@@ -246,7 +246,7 @@ impl Executor {
         work.admit(
             count,
             count
-                .checked_mul(std::mem::size_of::<TermId>())
+                .checked_mul(size_of::<TermId>())
                 .ok_or(QueryError::Exhausted)?,
         )?;
         let mut census = Vec::with_capacity(count);

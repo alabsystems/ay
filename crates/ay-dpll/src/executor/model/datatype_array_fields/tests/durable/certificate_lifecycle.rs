@@ -120,11 +120,13 @@ fn legacy_import_work_exhaustion_preserves_w6_and_discards_partial_rows() {
     let declarations =
         ay_frontend::parse("(declare-datatype LegacyW6 ((legacy-w6 (legacy-payload String))))")
             .expect("legacy-work datatype parses");
-    assert!(fixture
-        .executor
-        .execute_all(&declarations)
-        .expect("legacy-work datatype declaration executes")
-        .is_empty());
+    assert_eq!(
+        fixture
+            .executor
+            .execute_all(&declarations)
+            .expect("legacy-work datatype declaration executes"),
+        [] as [String; 0]
+    );
     let legacy_sort = Sort::Uninterpreted("LegacyW6".to_string());
     let legacy_constructor = fixture
         .executor
@@ -206,7 +208,7 @@ fn legacy_import_work_exhaustion_preserves_w6_and_discards_partial_rows() {
 fn oversized_authored_scope_fails_closed_and_recovers() {
     let mut fixture = build_fixture();
     let original_roots = fixture.executor.independent_gate_query_roots().unwrap();
-    let oversized_roots: Vec<_> = (0..(MAX_EXACT_ARRAY_FIELD_TERMS + 1))
+    let oversized_roots: Vec<_> = (0..=MAX_EXACT_ARRAY_FIELD_TERMS)
         .map(|ordinal| {
             fixture
                 .executor

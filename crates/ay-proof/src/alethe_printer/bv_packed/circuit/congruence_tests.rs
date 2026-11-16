@@ -79,8 +79,8 @@ fn congruence_checks_widths_source_spelling_and_output_budget() -> TestResult {
     let mut terms = ay_core::TermStore::new();
     let x = terms.mk_var("x", Sort::bitvec(8));
     let y = terms.mk_var("y", Sort::bitvec(9));
-    let bad = terms.mk_app(Symbol::named("bvmul"), &[x, y], Sort::bitvec(8));
-    let eq = terms.mk_app(Symbol::named("="), &[bad, bad], Sort::Bool);
+    let bad = terms.mk_app(Symbol::named("bvmul"), [x, y], Sort::bitvec(8));
+    let eq = terms.mk_app(Symbol::named("="), [bad, bad], Sort::Bool);
     assert!(AlethePrinter::new(&terms)
         .format_bv_packed_identity(ProofId(7), &[eq])
         .is_none());

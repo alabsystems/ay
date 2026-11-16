@@ -68,9 +68,9 @@ fn a_reversed_comparison_with_a_shorthand_under_not_is_bridged() {
                 .map(|(conclusion, _)| conclusion)
                 .expect("a clause");
             assert!(
-                crate::alethe_printer::printed_simplify::printed_comp_simplify_holds(
+                printed_simplify::printed_comp_simplify_holds(
                     &[conclusion],
-                    &crate::alethe_printer::la_generic_surface::StepDefinitions::NONE
+                    &la_generic_surface::StepDefinitions::NONE
                 ),
                 "{step}"
             );

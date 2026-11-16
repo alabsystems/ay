@@ -52,7 +52,7 @@ fn check_psd(matrix: &[Vec<BigRational>], meter: &mut WorkMeter<'_>) -> Result<(
     let n = matrix.len();
     meter.charge_private_allocation(
         n * n,
-        n * n * size_of::<BigRational>() + n * size_of::<Vec<BigRational>>(),
+        n * n * size_of::<BigRational>() + size_of_val(matrix),
     )?;
     let mut work = Vec::new();
     work.try_reserve_exact(n)

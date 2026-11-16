@@ -66,8 +66,7 @@ ay-jit = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
-# Determinism seams for the counted-search regression and the explicit
-# resource_clock_qualification benchmark; development targets only.
+# Determinism seams for the counted-search regression; development targets only.
 ay-core = { workspace = true, features = ["determinism-seams"] }
 ay-test-support.workspace = true
 proptest.workspace = true
@@ -83,8 +82,4 @@ rand_chacha.workspace = true
 
 [[bench]]
 name = "incremental_bench"
-harness = false
-
-[[bench]]
-name = "resource_clock_qualification"
 harness = false

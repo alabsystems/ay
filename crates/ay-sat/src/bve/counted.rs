@@ -8,7 +8,7 @@ use ay_core::original_query::CountedAdmission;
 impl BVE {
     /// Construct the normal initial state under the invocation's original owner.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         Ok(Self {
             // Sized on first use: `OccList::add_clause` grows to cover each
             // literal it sees, and `get` is bounds-safe, so nothing has to

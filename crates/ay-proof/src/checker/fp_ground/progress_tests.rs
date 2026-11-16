@@ -193,11 +193,12 @@ fn local_remaining_bound_precedes_a_whole_argument_inspection() {
         calls += 1;
         true
     };
-    let mut meter = Meter::with_local_limit(&mut caller, 2);
-    assert!(meter.inspect(3).is_none());
-    assert!(meter.refused());
-    assert!(meter.node().is_none());
-    drop(meter);
+    {
+        let mut meter = Meter::with_local_limit(&mut caller, 2);
+        assert!(meter.inspect(3).is_none());
+        assert!(meter.refused());
+        assert!(meter.node().is_none());
+    }
     assert_eq!(
         calls, 0,
         "an over-bound source vector never begins its walk"

@@ -4550,10 +4550,11 @@ mod singleton_sort_closure_tests {
 
     fn register_singleton_datatype(exec: &mut Executor) {
         let commands = parse("(declare-datatype D1 ((c)))").expect("parse singleton datatype");
-        assert!(exec
-            .execute_all(&commands)
-            .expect("register singleton datatype")
-            .is_empty());
+        assert_eq!(
+            exec.execute_all(&commands)
+                .expect("register singleton datatype"),
+            [] as [String; 0]
+        );
     }
 
     fn singleton_sort() -> Sort {

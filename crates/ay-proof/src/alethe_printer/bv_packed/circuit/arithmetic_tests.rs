@@ -108,13 +108,13 @@ fn arithmetic_rejects_bad_widths_and_unbound_condition() {
     for malformed in [
         terms.mk_app(
             Symbol::indexed("sign_extend", vec![1]),
-            &[word],
+            [word],
             Sort::bitvec(8),
         ),
-        terms.mk_app(Symbol::named("bvsub"), &[word, bit], Sort::bitvec(8)),
-        terms.mk_app(Symbol::named("ite"), &[word, word, word], Sort::bitvec(8)),
+        terms.mk_app(Symbol::named("bvsub"), [word, bit], Sort::bitvec(8)),
+        terms.mk_app(Symbol::named("ite"), [word, word, word], Sort::bitvec(8)),
     ] {
-        let eq = terms.mk_app(Symbol::named("="), &[malformed, word], Sort::Bool);
+        let eq = terms.mk_app(Symbol::named("="), [malformed, word], Sort::Bool);
         let root = terms.mk_not_raw(eq);
         let negative = terms.mk_not_raw(root);
         assert!(AlethePrinter::new(&terms)

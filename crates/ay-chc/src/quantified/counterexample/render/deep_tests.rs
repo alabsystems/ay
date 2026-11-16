@@ -4,14 +4,12 @@
 //! Deep/wide topology checks with an independent emitted-text SMT evaluator.
 
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 use crate::quantified::QuantifiedHornClause;
 use crate::{CancellationToken, ChcOp, ChcProblem, ChcSort, ClauseBody};
 use ay_core::time::Instant;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[path = "tests/oracle.rs"]
-mod oracle;
 
 fn premise(value: bool) -> UniversalPremise {
     UniversalPremise::new(
@@ -90,7 +88,7 @@ fn sixty_six_occurrence_chain_retains_every_original_premise_and_no_bound_local(
     let positive = render_case(&source(1, true), &indices, &edges);
     assert_eq!(oracle::models(&positive), vec![Vec::<u64>::new()]);
     let negative = render_case(&source(1, false), &indices, &edges);
-    assert!(oracle::models(&negative).is_empty());
+    assert_eq!(oracle::models(&negative), [] as [std::vec::Vec<u64>; 0]);
     let token = CancellationToken::new();
     let control = SourceControl::new(Instant::now() + Duration::from_secs(30), &token);
     let mut skipped = edges;

@@ -11,7 +11,7 @@ impl Executor {
     /// Never descending into a `forall`/`exists`/`let` body is what makes the
     /// harvest safe to hand to the strict validator: no variable bound by the
     /// quantifier being instantiated can appear in the result, so no proposal
-    /// can capture. This decides NOTHING — `validate_forall_inst` re-checks
+    /// can capture. This decides NOTHING — `validate_forall_inst_with_progress` re-checks
     /// groundness (`argument_is_ground_for`) and the exact substitution on
     /// whatever this returns, so an over-eager harvest costs a declined
     /// candidate and never buys an accepted one.
@@ -60,7 +60,7 @@ impl Executor {
     /// Four steps, all strict-checkable and none of them trusted: the authored
     /// `assume`, a premiseless `forall_inst` carrying the positional arguments,
     /// Boolean `or` clausification, and one resolution against the assume.
-    /// `validate_forall_inst` re-derives the whole substitution from the clause
+    /// `validate_forall_inst_with_progress` re-derives the whole substitution from the clause
     /// and the arguments, so this producer asserts nothing.
     fn derive_authored_forall_instance_unit(
         &mut self,
@@ -159,7 +159,7 @@ impl Executor {
     ///   `false_control_left_inverse_ground_non_injectivity_unsat_2774`.
     ///
     /// Nothing about either arm is decided producer-side.
-    /// `validate_forall_inst` re-derives the exact simultaneous substitution
+    /// `validate_forall_inst_with_progress` re-derives the exact simultaneous substitution
     /// and the groundness of every argument; `validate_euf_transitive` BFSes
     /// the premise equality graph for a genuine path between the conclusion's
     /// two endpoints (a chain that does not connect is rejected there);

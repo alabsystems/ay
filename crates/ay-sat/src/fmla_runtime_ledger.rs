@@ -2568,7 +2568,7 @@ mod tests {
             transaction.guarded_equivalence.reverse_clause_lits,
             vec![-27_217, -5_185, 3_889]
         );
-        assert!(transaction.witness_checker_failures.is_empty());
+        assert_eq!(transaction.witness_checker_failures.len(), 0);
 
         let stats = ledger.stats();
         assert_eq!(stats.records_emitted, 6);

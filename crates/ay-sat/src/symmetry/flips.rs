@@ -672,7 +672,7 @@ mod tests {
     fn a_lone_clause_pins_its_variables() {
         let clauses = cnf(&[&[1, 2], &[1, -2, 3]]);
         let (gens, stats) = run(&clauses, 3);
-        assert!(gens.is_empty(), "{stats:?}");
+        assert_eq!(gens.len(), 0, "{stats:?}");
         // Single-pattern groups pin their variables before any elimination.
         assert_eq!(stats.pinned, 3, "{stats:?}");
         assert_eq!(stats.equations, 0, "{stats:?}");
@@ -692,7 +692,7 @@ mod tests {
         // Twice (1 2), once (-1 -2): no flip maps the multiset to itself.
         let clauses = cnf(&[&[1, 2], &[1, 2], &[-1, -2]]);
         let (gens, stats) = run(&clauses, 2);
-        assert!(gens.is_empty(), "{stats:?}");
+        assert_eq!(gens.len(), 0, "{stats:?}");
     }
 
     #[test]
@@ -709,7 +709,7 @@ mod tests {
             &[-4, -6],
         ]);
         let (gens, _) = run(&clauses, 6);
-        assert!(gens.is_empty());
+        assert_eq!(gens.len(), 0);
     }
 
     #[test]

@@ -59,7 +59,7 @@ fn native_sos_dto_preserves_ordered_positions_through_public_serde() {
 fn public_snapshot_reconstruction_preserves_ids_and_raw_metadata() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("snapshot_x", Sort::Int);
-    terms.mk_int(BigInt::from(1) << 1024usize);
+    let _large_integer = terms.mk_int(BigInt::from(1) << 1024usize);
     let (mut work, mut bytes) = (0, 0);
     let mut progress = |w, b| {
         work += w;
@@ -110,7 +110,7 @@ fn public_snapshot_operations_share_the_callers_cumulative_envelope() {
 #[test]
 fn public_snapshot_cancellation_cannot_return_partial_evidence() {
     let mut terms = TermStore::new();
-    terms.mk_string("unused".repeat(1024));
+    let _unused_string = terms.mk_string("unused".repeat(1024));
     let mut polls = 0;
     terms
         .entries_snapshot_with_progress(&mut |_, _| {
@@ -153,7 +153,7 @@ fn public_snapshot_copy_does_not_authenticate_or_repair_boolean_handles() {
 #[test]
 fn public_name_restoration_moves_authority_without_changing_the_term_snapshot() {
     let mut source = TermStore::new();
-    source.mk_var("external_witness", Sort::Int);
+    let _external_witness = source.mk_var("external_witness", Sort::Int);
     let entries = source.entries_snapshot();
     let ids = source.boolean_constant_ids();
     let raw = TermStore::from_entries(entries.clone(), ids.0, ids.1, source.var_counter());

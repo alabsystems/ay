@@ -308,10 +308,7 @@ impl PdrSolver {
         }
 
         // If zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 
     /// Discover sum upper bounds (A + B <= c) for pairs of integer variables.
@@ -581,9 +578,6 @@ impl PdrSolver {
             }
         }
 
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 }

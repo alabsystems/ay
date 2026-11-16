@@ -318,6 +318,10 @@ fn depth_and_fanout_caps_decline_before_recursive_work_or_rewrite() {
     }
     let hint = LemmaHint::new(id, formula, 0, "depth-cap");
     assert!(Admitted::new(&[hint], &mut || true).is_none());
+    #[expect(
+        clippy::rc_clone_in_vec_init,
+        reason = "the fanout fixture intentionally shares one immutable boolean node across every edge"
+    )]
     let formula = ChcExpr::Op(ChcOp::And, vec![Arc::new(ChcExpr::Bool(true)); 65]);
     assert!(
         Admitted::new(&[LemmaHint::new(id, formula, 0, "fanout-cap")], &mut || {

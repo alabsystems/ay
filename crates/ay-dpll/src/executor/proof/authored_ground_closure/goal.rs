@@ -245,7 +245,7 @@ impl Executor {
     fn proved_goal_disjunct_for_phase(
         &self,
         closure: &GroundClosure,
-        facts: &facts::FactBase,
+        facts: &FactBase,
         term: TermId,
         depth: usize,
         work: &mut usize,

@@ -1407,7 +1407,7 @@ mod finish_verified_result_tests {
         solver.executor.set_memory_limit(Some(usize::MAX));
         solver.set_timeout(Some(Duration::from_secs(10)));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            solver.check_sat_interruptible(|| panic!("initial caller callback"));
+            let _ = solver.check_sat_interruptible(|| panic!("initial caller callback"));
         }));
         assert!(outcome.is_err());
         assert_eq!(solver.executor.current_solve_deadline(), Some(deadline));

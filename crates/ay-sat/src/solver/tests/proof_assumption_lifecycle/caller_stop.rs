@@ -180,7 +180,7 @@ fn successful_flush_stop_still_clears_and_melts_original_temporary_constraint() 
             state.caller_stop.load(Ordering::Relaxed)
         });
         assert_caller_unknown(&solver, &result);
-        assert!(solver.cold.constraint.is_empty());
+        assert_eq!(solver.cold.constraint.len(), 0);
         assert!(!solver.failed_constraint());
         assert!(!solver.is_frozen(Variable::new(0)));
         assert!(!solver.has_empty_clause);
@@ -278,7 +278,7 @@ fn empty_constraint_final_callback_stops_after_original_cleanup() {
         2,
         "entry, then final admission after early raw cleanup"
     );
-    assert!(solver.cold.constraint.is_empty());
+    assert_eq!(solver.cold.constraint.len(), 0);
     assert!(!solver.failed_constraint());
     assert!(!solver.has_empty_clause);
     assert!(solver
@@ -297,13 +297,13 @@ fn observed_entry_refusal_is_not_repolled_or_carried_into_a_fresh_attempt() {
         polls.set(count);
         count == 1
     };
-    let refused = solver.solve_with_assumptions_interruptible(&[], &stop_once);
+    let refused = solver.solve_with_assumptions_interruptible(&[], stop_once);
     assert_caller_unknown(&solver, &refused);
     assert_eq!(polls.get(), 1);
-    assert!(solver.cold.constraint.is_empty());
+    assert_eq!(solver.cold.constraint.len(), 0);
     assert!(!solver.is_frozen(Variable::new(0)));
     assert!(solver
-        .solve_with_assumptions_interruptible(&[], &stop_once)
+        .solve_with_assumptions_interruptible(&[], stop_once)
         .is_sat());
 }
 
@@ -328,7 +328,7 @@ fn late_gate_retires_owned_recording_without_duplicate_terminal_or_replay_bypass
     });
     assert_caller_unknown(&solver, &result);
     assert_eq!(std::fs::metadata(path).expect("retained trace").len(), 0);
-    assert!(crate::decision_trace::read_trace(path).is_err());
+    assert!(decision_trace::read_trace(path).is_err());
     assert!(
         !solver.disable_decision_trace(),
         "the rejected writer was already detached"

@@ -421,7 +421,7 @@ fn test_memory_bytes() {
 fn test_with_capacity() {
     let arena = ClauseArena::with_capacity(100, 500);
     assert_eq!(arena.num_clauses(), 0);
-    assert!(arena.is_empty());
+    assert_eq!(arena.len(), 0);
     assert!(arena.memory_bytes() > 48);
 }
 
@@ -429,7 +429,7 @@ fn test_with_capacity() {
 fn test_compact_empty_arena() {
     let mut arena = ClauseArena::new();
     let remapping = arena.compact();
-    assert!(remapping.is_empty());
+    assert_eq!(remapping.len(), 0);
     assert_eq!(arena.num_clauses(), 0);
 }
 
@@ -441,7 +441,7 @@ fn test_compact_all_deleted() {
     arena.delete(off0);
     arena.delete(off1);
     let remapping = arena.compact();
-    assert!(remapping.is_empty());
+    assert_eq!(remapping.len(), 0);
     assert_eq!(arena.num_clauses(), 0);
     assert_eq!(arena.total_words(), 0);
 }

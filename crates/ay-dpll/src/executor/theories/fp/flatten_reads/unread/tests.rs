@@ -137,10 +137,9 @@ fn abstains_under_a_quantifier() {
 #[test]
 fn drops_a_definition_chain_longer_than_the_round_cap() {
     const LINKS: usize = 200;
-    assert!(LINKS > MAX_ROUNDS);
     let mut terms = TermStore::new();
     let xs: Vec<TermId> = (0..=LINKS)
-        .map(|k| terms.mk_var(&format!("x{k}"), bv_array()))
+        .map(|k| terms.mk_var(format!("x{k}"), bv_array()))
         .collect();
     let zero = terms.mk_bitvec(BigInt::from(0), 64);
     let read = terms.mk_select(xs[0], zero);
@@ -152,6 +151,7 @@ fn drops_a_definition_chain_longer_than_the_round_cap() {
 
     let elimination =
         eliminate_unread_array_equalities(&mut terms, &roots).expect("the whole chain goes");
+    assert!(elimination.definitions.len() > MAX_ROUNDS);
     assert_eq!(elimination.definitions.len(), LINKS);
     assert_eq!(elimination.definitions[0], (xs[LINKS], xs[LINKS - 1]));
     assert_eq!(elimination.definitions[LINKS - 1], (xs[1], xs[0]));
@@ -168,7 +168,7 @@ fn drops_a_definition_chain_longer_than_the_round_cap() {
 fn drops_an_unread_store_chain_down_to_the_read_base() {
     let mut terms = TermStore::new();
     let ms: Vec<TermId> = (0..=5)
-        .map(|k| terms.mk_var(&format!("m{k}"), bv_array()))
+        .map(|k| terms.mk_var(format!("m{k}"), bv_array()))
         .collect();
     let zero = terms.mk_bitvec(BigInt::from(0), 64);
     let read = terms.mk_select(ms[0], zero);

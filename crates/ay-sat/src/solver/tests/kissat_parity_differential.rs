@@ -90,9 +90,9 @@ fn all_parity_switches() -> ay_core::SatAbSwitches {
 fn solve(
     num_vars: usize,
     clauses: &[Vec<Literal>],
-    switches: ay_core::SatAbSwitches,
+    switches: &ay_core::SatAbSwitches,
 ) -> (Option<bool>, u64) {
-    let _switches = ay_core::sat_ab_test_override::set(switches);
+    let _switches = ay_core::sat_ab_test_override::set(*switches);
     let mut solver = Solver::new(num_vars);
     solver.set_bve_enabled(true);
     solver.set_congruence_enabled(true);
@@ -126,8 +126,8 @@ fn kissat_parity_switches_agree_with_the_defaults() {
     let mut hardest = 0;
     for seed in 0..12u64 {
         let clauses = mixed_formula(300, 30, 1_250, seed);
-        let (default, _) = solve(300, &clauses, ay_core::SatAbSwitches::default());
-        let (kissat, conflicts) = solve(300, &clauses, all_parity_switches());
+        let (default, _) = solve(300, &clauses, &ay_core::SatAbSwitches::default());
+        let (kissat, conflicts) = solve(300, &clauses, &all_parity_switches());
         assert_eq!(kissat, default, "seed {seed}");
         answered += usize::from(default.is_some());
         hardest = hardest.max(conflicts);
@@ -144,9 +144,9 @@ fn kissat_parity_switches_agree_with_the_defaults() {
 fn solve_default_route(
     num_vars: usize,
     clauses: &[Vec<Literal>],
-    switches: ay_core::SatAbSwitches,
+    switches: &ay_core::SatAbSwitches,
 ) -> Option<bool> {
-    let _switches = ay_core::sat_ab_test_override::set(switches);
+    let _switches = ay_core::sat_ab_test_override::set(*switches);
     let mut solver = Solver::new(num_vars);
     let input =
         crate::VariantInput::new(num_vars, clauses.len(), crate::VariantProofMode::Disabled);
@@ -179,15 +179,15 @@ fn solve_default_route(
 fn kissat_parity_switches_agree_on_the_default_route() {
     for seed in 0..6u64 {
         let dense = mixed_formula(50, 0, 1_200, 1_000 + seed);
-        let default = solve_default_route(50, &dense, ay_core::SatAbSwitches::default());
-        let kissat = solve_default_route(50, &dense, all_parity_switches());
+        let default = solve_default_route(50, &dense, &ay_core::SatAbSwitches::default());
+        let kissat = solve_default_route(50, &dense, &all_parity_switches());
         assert!(default.is_some());
         assert_eq!(kissat, default, "dense seed {seed}");
     }
     for seed in 0..6u64 {
         let clauses = mixed_formula(250, 25, 1_040, 2_000 + seed);
-        let default = solve_default_route(250, &clauses, ay_core::SatAbSwitches::default());
-        let kissat = solve_default_route(250, &clauses, all_parity_switches());
+        let default = solve_default_route(250, &clauses, &ay_core::SatAbSwitches::default());
+        let kissat = solve_default_route(250, &clauses, &all_parity_switches());
         assert!(default.is_some());
         assert_eq!(kissat, default, "threshold seed {seed}");
     }

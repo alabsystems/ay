@@ -10,7 +10,6 @@
 
 use super::*;
 use std::ffi::OsString;
-use std::io::Read as _;
 
 pub(super) const LEGACY_SHA256: &str =
     "edd0457d7eb71132ac505297ad493c3b0b3a52e9938108d9b365157277bd2bdf";

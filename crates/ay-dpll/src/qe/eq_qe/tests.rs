@@ -175,7 +175,7 @@ fn random_formula(
 /// with brute force on the original under EVERY assignment of the constants.
 #[test]
 fn elimination_is_equivalent_on_random_equality_formulas() {
-    let mut rng = Lcg(0xe9_0e_1234);
+    let mut rng = Lcg(0xe90e_1234);
     let mut quantified = 0;
     for round in 0..400 {
         let mut terms = TermStore::new();

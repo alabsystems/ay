@@ -82,7 +82,7 @@ fn test_convex_closure_sum_invariant() {
     cc.add_data_point(&[10, 0]);
 
     let result = cc.compute();
-    assert!(!result.equalities.is_empty());
+    assert_ne!(result.equalities, [] as [ChcExpr; 0]);
     // Should find x + y = 10
 }
 
@@ -115,7 +115,7 @@ fn test_convex_closure_divisibility() {
     let result = cc.compute();
 
     // Should find: x mod 2 = 0
-    assert!(!result.divisibility.is_empty());
+    assert_ne!(result.divisibility, [] as [ChcExpr; 0]);
 }
 
 #[test]

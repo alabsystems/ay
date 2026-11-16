@@ -20,11 +20,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-mod z3;
-pub(crate) use z3::{
-    assert_z3_sat_or_known_status, check_z3_or_skip, run_z3_file, solve_with_z3,
-    solve_with_z3_file, z3_oracle,
-};
+pub(crate) mod z3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SolverOutcome {

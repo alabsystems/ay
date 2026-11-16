@@ -48,8 +48,7 @@ fn fresh_lifo_class_order_and_last_rank_tie_match_the_legacy_winner() {
         .unwrap();
     let winner = *class
         .iter()
-        .filter(|&&t| t == fixture.arrays[0] || t == fixture.arrays[1])
-        .last()
+        .rfind(|&&t| t == fixture.arrays[0] || t == fixture.arrays[1])
         .unwrap();
     assert_eq!(
         output.array_values[&fixture.arrays[2]],
@@ -112,7 +111,7 @@ fn tracked_const_empty_default_propagates_some_empty_not_none() {
     let missing = terms.mk_var("missing", Sort::array(Sort::Int, Sort::Int));
     let index = terms.mk_var("i", Sort::Int);
     for array in [constant, missing] {
-        terms.mk_app(Symbol::named("select"), [array, index], Sort::Int);
+        let _read = terms.mk_app(Symbol::named("select"), [array, index], Sort::Int);
     }
     let equality = terms.mk_eq(constant, missing);
     let mut solver = ArraySolver::new(&terms);
@@ -177,7 +176,7 @@ fn read_poison_flags_stay_local_while_missing_class_members_receive_data() {
     same(&output, &solver.extract_model(&values));
     assert!(output.read_conflicted.contains(&fixture.arrays[0]));
     assert!(!output.read_conflicted.contains(&fixture.arrays[2]));
-    assert!(output.array_values[&fixture.arrays[0]].stores.is_empty());
+    assert_eq!(output.array_values[&fixture.arrays[0]].stores.len(), 0);
     assert_eq!(
         output.array_values[&fixture.arrays[2]],
         output.array_values[&fixture.arrays[1]]
@@ -260,7 +259,7 @@ fn nested_class_sorts_are_refused_without_guessing_congruence_names() {
     let b = terms.mk_var("b", outer);
     let i = terms.mk_var("i", Sort::Int);
     for array in [a, b] {
-        terms.mk_app(Symbol::named("select"), [array, i], inner.clone());
+        let _read = terms.mk_app(Symbol::named("select"), [array, i], inner.clone());
     }
     let equality = terms.mk_eq(a, b);
     let mut solver = ArraySolver::new(&terms);

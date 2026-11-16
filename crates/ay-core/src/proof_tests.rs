@@ -262,7 +262,7 @@ fn proof_add_and_get_steps_and_named_assumes() {
             assert_eq!(rule, &AletheRule::Resolution);
             assert_eq!(clause, &vec![TermId::new(2), TermId::new(3)]);
             assert_eq!(premises, &vec![h1]);
-            assert!(args.is_empty());
+            assert_eq!(args.as_slice(), &[]);
         }
         other => panic!("unexpected step: {other:?}"),
     }

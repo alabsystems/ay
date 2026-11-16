@@ -34,7 +34,7 @@ pub(crate) fn reserve_vec<T>(
         .checked_add(values.len())
         .ok_or_else(|| owner.refuse(CountedAdmissionError::WorkExhausted))?;
     let bytes = target
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     // Charge the new logical allocation and the possible existing-value copy.
     // Allocator-internal metadata/RSS is still governed by the memory owner.
@@ -109,7 +109,7 @@ impl WatchedLists {
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             let next = end
                 .checked_add(count)
-                .filter(|n| *n <= u32::MAX as usize)
+                .filter(|n| u32::try_from(*n).is_ok())
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             owner.admit(count.saturating_add(old.len as usize), 0)?;
             if next > capacity {
@@ -121,7 +121,7 @@ impl WatchedLists {
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
                 capacity = next.max(grown).max(4);
                 let bytes = capacity
-                    .checked_mul(std::mem::size_of::<u64>())
+                    .checked_mul(size_of::<u64>())
                     .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
                 owner.admit(capacity.saturating_add(end), bytes)?;
             }
@@ -167,7 +167,7 @@ impl WatchedLists {
                 .max(2);
             end = end
                 .checked_add(capacity)
-                .filter(|end| *end <= u32::MAX as usize)
+                .filter(|end| u32::try_from(*end).is_ok())
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             // Copy the old region and initialize the complete new region.
             owner.admit(

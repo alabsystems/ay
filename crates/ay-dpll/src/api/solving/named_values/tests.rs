@@ -122,7 +122,10 @@ fn request_caps_are_admitted_before_lookup_and_owned_text() {
     assert!(admit_names(&[&exact]).is_ok());
     assert!(admit_names(&[&exact, ""]).is_err());
     assert!(admit_names(&[&format!("{exact}x")]).is_err());
-    assert!(solver.named_value_requests(&[]).unwrap().is_empty());
+    assert_eq!(
+        solver.named_value_requests(&[]).unwrap(),
+        [] as [(String, TermId); 0]
+    );
     assert_eq!(solver.terms().len(), parsed("").terms().len());
 }
 
@@ -134,9 +137,11 @@ fn sort_metadata_inspection_is_shared_bounded_and_does_not_normalize_widths() {
     for _ in 0..MAX_SORT_DEPTH {
         deep = Sort::array(Sort::Bool, deep);
     }
-    assert!(admit_sort(&deep, 0, &mut MAX_SORT_WORK).is_some());
+    let mut deep_work = MAX_SORT_WORK;
+    assert!(admit_sort(&deep, 0, &mut deep_work).is_some());
     let deeper = Sort::array(Sort::Bool, deep);
-    assert!(admit_sort(&deeper, 0, &mut MAX_SORT_WORK).is_none());
+    let mut deeper_work = MAX_SORT_WORK;
+    assert!(admit_sort(&deeper, 0, &mut deeper_work).is_none());
     let mut work = 2;
     assert!(admit_sort(&Sort::Bool, 0, &mut work).is_some());
     assert!(admit_sort(&Sort::Bool, 0, &mut work).is_some());
@@ -154,8 +159,10 @@ fn sort_metadata_inspection_is_shared_bounded_and_does_not_normalize_widths() {
             Sort::array(Sort::bitvec(2), Sort::Int),
         ),
     ] {
-        assert!(matching_sorts(&declared, &actual, &mut MAX_SORT_WORK).is_none());
-        assert!(matching_sorts(&declared, &declared, &mut MAX_SORT_WORK).is_some());
+        let mut mismatch_work = MAX_SORT_WORK;
+        assert!(matching_sorts(&declared, &actual, &mut mismatch_work).is_none());
+        let mut match_work = MAX_SORT_WORK;
+        assert!(matching_sorts(&declared, &declared, &mut match_work).is_some());
     }
 }
 

@@ -2881,7 +2881,7 @@ mod tests {
             &wcnf,
             &dir.path().join("c"),
             // Cost 1: falsify soft (x1); x3 must be false.
-            &vec![false, false, true, false],
+            &[false, false, true, false],
             1,
             &[],
             &[SatCore {

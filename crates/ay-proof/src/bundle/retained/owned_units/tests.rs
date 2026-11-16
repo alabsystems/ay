@@ -287,7 +287,7 @@ fn every_success_and_malformed_payload_callback_refuses_through_final_cleanup() 
 #[test]
 fn original_deadline_and_caught_progress_panic_are_terminal() {
     let result = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired") },
         |control| bv_gate(raw(r#""Add""#), control),
     );
@@ -298,9 +298,7 @@ fn original_deadline_and_caught_progress_panic_are_terminal() {
         end(),
         &mut |_, bytes| {
             calls.set(calls.get() + 1);
-            if bytes > 0 {
-                panic!("name admission");
-            }
+            assert!(bytes == 0, "name admission");
             true
         },
         |control| {

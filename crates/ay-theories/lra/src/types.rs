@@ -143,7 +143,9 @@ pub(crate) use bound_state::{
     IntervalEndpoint, RowPrecision, TableauRow, VarInfo,
 };
 pub use bound_state::{Bound, BoundProvenance, BoundReasons, VarStatus};
-pub(crate) use dense_sets::{DenseIdxSet, DenseU32Set, DENSE_SET_STAMP_LIMIT};
+#[cfg(test)]
+pub(crate) use dense_sets::DENSE_SET_STAMP_LIMIT;
+pub(crate) use dense_sets::{DenseIdxSet, DenseU32Set};
 // Re-exported here so existing `use types::LinearExpr` imports continue to work.
 pub use crate::linear_expr::LinearExpr;
 

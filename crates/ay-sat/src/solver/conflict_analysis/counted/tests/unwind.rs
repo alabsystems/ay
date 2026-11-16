@@ -80,7 +80,7 @@ fn explicit_scope_abandonment_discards_pending_trace_without_late_flush() {
         .begin_counted_standard_analysis(reference)
         .unwrap()
         .unwrap();
-    assert!(!scope.learned_clause().is_empty());
+    assert_ne!(scope.learned_clause().len(), 0);
     drop(scope);
     clean(&s);
     no_flush(s, &path);
@@ -180,7 +180,7 @@ fn post_analysis_owned_scope_operation_panic_retires_live_scratch_without_flush(
             .unwrap()
             .unwrap();
         assert!(scope.retirement.active);
-        assert!(!scope.retirement.solver.conflict.analyzed_vars().is_empty());
+        assert_ne!(scope.retirement.solver.conflict.analyzed_vars().len(), 0);
         assert!(scope
             .retirement
             .solver

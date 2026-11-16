@@ -139,7 +139,7 @@ fn assert_aligned_free_y_trace(result: &PdrResult) {
     let monotone =
         head_xs.windows(2).all(|w| w[0] < w[1]) || head_xs.windows(2).all(|w| w[0] > w[1]);
     assert!(monotone, "steps are in chain order: {head_xs:?}");
-    assert!(!ys.is_empty());
+    assert_ne!(ys, [] as [i64; 0]);
     assert!(
         ys.iter().all(|y| *y == ys[0]),
         "y must be carried unchanged along the trace, got {ys:?}"

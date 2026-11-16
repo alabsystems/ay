@@ -99,7 +99,7 @@ fn test_eliminate_no_mod_div_unchanged() {
 
     let result = eliminate_int_mod_div_by_constant(&mut terms, &[sum]);
 
-    assert!(result.constraints.is_empty());
+    assert_eq!(result.constraints, [] as [TermId; 0]);
     assert_eq!(result.rewritten.len(), 1);
     assert_eq!(result.rewritten[0], sum);
 }
@@ -149,7 +149,7 @@ fn test_eliminate_mod_by_zero_returns_unconstrained_fresh_var() {
     // but unspecified value). We model it as a FRESH Int variable with NO
     // constraints — NOT pinned to `x`, which would wrongly refute models that
     // assign it any other value (#div0).
-    assert!(result.constraints.is_empty());
+    assert_eq!(result.constraints, [] as [TermId; 0]);
     assert_eq!(result.rewritten.len(), 1);
     assert!(result.introduced_unconstrained_div_mod);
     // The result is a fresh variable, not the dividend and not a constant.
@@ -172,7 +172,7 @@ fn test_eliminate_div_by_zero_returns_unconstrained_fresh_var() {
     // SMT-LIB Ints: `(div x 0)` is TOTAL but UNCONSTRAINED. We model it as a
     // FRESH Int variable with NO constraints — NOT pinned to 0, which would
     // wrongly refute models that assign it any other value (#div0).
-    assert!(result.constraints.is_empty());
+    assert_eq!(result.constraints, [] as [TermId; 0]);
     assert_eq!(result.rewritten.len(), 1);
     assert!(result.introduced_unconstrained_div_mod);
     // The result is a fresh variable, not the constant 0.
@@ -237,10 +237,11 @@ fn test_frontend_single_underscore_literal_witness_name_cannot_capture_internal_
     let mut exec = Executor::new();
     let declarations = parse("(set-logic QF_NIA)(declare-const x Int)")
         .expect("initial declarations should parse");
-    assert!(exec
-        .execute_all(&declarations)
-        .expect("initial declarations should execute")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&declarations)
+            .expect("initial declarations should execute"),
+        [] as [String; 0]
+    );
     let x = exec
         .ctx
         .symbol_info("x")
@@ -274,10 +275,11 @@ fn test_frontend_single_underscore_symbolic_witness_name_cannot_capture_internal
          (declare-const y Int)",
     )
     .expect("initial declarations should parse");
-    assert!(exec
-        .execute_all(&declarations)
-        .expect("initial declarations should execute")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&declarations)
+            .expect("initial declarations should execute"),
+        [] as [String; 0]
+    );
     let x = exec
         .ctx
         .symbol_info("x")

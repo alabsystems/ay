@@ -75,10 +75,10 @@ fn repeated_scans_do_not_reinspect_or_recharge_stamped_dag() {
 fn enum_constructor_select_noop_is_not_recharged_on_closure_replay() {
     let mut exec = Executor::new();
     let commands = parse("(declare-datatype E ((e0) (e1)))").expect("parse enum datatype");
-    assert!(exec
-        .execute_all(&commands)
-        .expect("register enum datatype")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("register enum datatype"),
+        [] as [String; 0]
+    );
     let enum_sort = Sort::Uninterpreted("E".to_owned());
     let array = exec.ctx.terms.mk_var(
         "enum_noop_array",

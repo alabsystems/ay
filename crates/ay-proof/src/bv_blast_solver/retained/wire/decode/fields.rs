@@ -23,7 +23,7 @@ impl<'de> DeserializeSeed<'de> for Key<'_, '_, '_> {
     }
 }
 
-impl<'de> Visitor<'de> for Key<'_, '_, '_> {
+impl Visitor<'_> for Key<'_, '_, '_> {
     type Value = Field;
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a retained row field")

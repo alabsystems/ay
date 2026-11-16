@@ -205,7 +205,7 @@ fn bool_const_array_ite_checks_both_branches_without_folded_fixtures() {
     builder.finish().unwrap();
     let closure = CountedArrayReadClosure::derive(&mut terms, &[root], &original).unwrap();
     assert_eq!((closure.reads().len(), closure.steps().len()), (3, 4));
-    assert!(closure.unresolved().is_empty());
+    assert_eq!(closure.unresolved().len(), 0);
     for guard in [false, true] {
         for index in [false, true] {
             let assignment = [(condition, Value::Bool(guard)), (at, Value::Bool(index))];

@@ -255,7 +255,7 @@ impl ProofView {
             return Err(InterpolantFailure::NoProof);
         };
         match step_clause(&proof.steps[root]) {
-            Some(clause) if clause.is_empty() => {}
+            Some([]) => {}
             _ => return Err(InterpolantFailure::NoProof),
         }
         let mut seen = vec![false; n];

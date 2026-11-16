@@ -34,7 +34,7 @@ fn a_live_stop_interrupts_a_deadline_free_search_at_existing_checkpoints() {
     assert!(!search.run(None));
     assert_eq!(polls.load(Ordering::Relaxed), 3);
     assert_eq!(search.step, 2 * DEADLINE_POLL_STEPS);
-    assert!(!search.unsat.is_empty());
+    assert_ne!(search.unsat, Vec::<u32>::new());
 }
 
 #[test]

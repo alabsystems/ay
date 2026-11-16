@@ -3187,9 +3187,9 @@ impl Executor {
                         TermData::Forall(..) | TermData::Exists(..)
                     )
             });
-        for idx in 0..base_term_len {
+        for (idx, is_live) in live[..base_term_len].iter().copied().enumerate() {
             debug_assert!(u32::try_from(idx).is_ok(), "term id overflow");
-            if !live[idx] {
+            if !is_live {
                 continue;
             }
             let term = TermId::new(idx as u32);

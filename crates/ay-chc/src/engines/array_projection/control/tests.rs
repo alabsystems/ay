@@ -121,7 +121,10 @@ fn original_expiry_stays_terminal_after_clock_or_scope_restoration() {
     assert!(!owner.open_at(now));
     assert_eq!(owner.probe_deadline_at(now), None);
     let mut ambient_owner = {
-        let _smt = crate::smt::ScopedSmtDeadline::install_until(now - Duration::from_secs(1));
+        let _smt = crate::smt::ScopedSmtDeadline::install_until(
+            now.checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports a one-second offset"),
+        );
         Owner::capture(&configured(), Some(original))
     };
     assert!(!ambient_owner.open());
@@ -135,7 +138,9 @@ fn shorter_probe_clock_can_expire_without_poisoning_original_owner() {
     let _original = crate::smt::ScopedSolveDeadline::new(Some(original));
     let mut owner = Owner::capture(&configured(), Some(original));
     {
-        let expired = now - Duration::from_secs(1);
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset");
         let _probe = crate::smt::ScopedSolveDeadline::new(Some(expired));
         let _smt = crate::smt::ScopedSmtDeadline::install_until(expired);
         assert!(crate::smt::smt_deadline_expired());
@@ -234,7 +239,11 @@ fn search_timeout_cannot_relax_base_probe_or_original_deadline() {
     );
     assert_eq!(
         owner
-            .search_config(&base, now - Duration::from_secs(1))
+            .search_config(
+                &base,
+                now.checked_sub(Duration::from_secs(1))
+                    .expect("fixture instant supports a one-second offset"),
+            )
             .solve_timeout,
         Some(Duration::ZERO)
     );

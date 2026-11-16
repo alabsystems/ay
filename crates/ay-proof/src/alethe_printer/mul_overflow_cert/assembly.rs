@@ -51,13 +51,13 @@ pub(crate) struct Ds {
     pub(crate) zero: S,
 }
 
-fn w(p: &mut Proof, t: T) -> T {
+fn w(p: &mut Proof<'_>, t: T) -> T {
     let b = p.t.bits(t);
     p.t.bb(&b)
 }
 
 impl<'a> Asm<'a> {
-    pub(crate) fn new(p: &mut Proof, c: &'a Ctx, sc: School, mono: Mono) -> Option<Self> {
+    pub(crate) fn new(p: &mut Proof<'_>, c: &'a Ctx, sc: School, mono: Mono) -> Option<Self> {
         let r = &c.row;
         let nn = 4 * r.m;
         let l0 = p.t.lit(bits::zero(nn));
@@ -96,7 +96,7 @@ impl<'a> Asm<'a> {
         })
     }
 
-    fn yz(&self, p: &mut Proof) -> T {
+    fn yz(&self, p: &mut Proof<'_>) -> T {
         let ff = p.t.ff;
         let apb = p.t.bits(self.c.row.ap);
         let eqs: Vec<T> = apb.iter().map(|&b| p.t.eq(b, ff)).collect();
@@ -104,7 +104,7 @@ impl<'a> Asm<'a> {
     }
 
     /// `(= Ap ONE)` under `az`, `(= Ap A)` under `(not az)`, as `@bbterm` words.
-    fn ap_value(&self, p: &mut Proof, val: bool, h: S) -> Option<S> {
+    fn ap_value(&self, p: &mut Proof<'_>, val: bool, h: S) -> Option<S> {
         let r = &self.c.row;
         let cv = if val { p.t.tt } else { p.t.ff };
         let e = p.t.eq(r.az, cv);
@@ -124,7 +124,7 @@ impl<'a> Asm<'a> {
     }
 
     /// `(cl (not yz))`: the divisor `A'` is never zero.
-    fn nonzero(&self, p: &mut Proof) -> Option<S> {
+    fn nonzero(&self, p: &mut Proof<'_>) -> Option<S> {
         let r = &self.c.row;
         let yz = self.yz(p);
         let apb = p.t.bits(r.ap);
@@ -170,9 +170,9 @@ impl<'a> Asm<'a> {
     }
 }
 
-impl<'a> Asm<'a> {
+impl Asm<'_> {
     /// The division spec for `(bvudiv P A')`, connected to the schoolbook's words.
-    fn ds(&self, p: &mut Proof, dl: &DivLemma, nyz: S) -> Option<Ds> {
+    fn ds(&self, p: &mut Proof<'_>, dl: &DivLemma, nyz: S) -> Option<Ds> {
         let r = &self.c.row;
         let n = r.n();
         let split = dl.split_instance(p, r.p, r.ap)?;
@@ -219,7 +219,7 @@ impl<'a> Asm<'a> {
     }
 
     /// `(cl hz)` from `(cl (= (bvmul 2^n ZH)-shifted ZERO))` over the shifted word `s1`.
-    pub(crate) fn hz_from_shifted(&self, p: &mut Proof, s1z: S) -> Option<S> {
+    pub(crate) fn hz_from_shifted(&self, p: &mut Proof<'_>, s1z: S) -> Option<S> {
         let r = &self.c.row;
         let n = r.n() as usize;
         let bf = bit_facts(p, s1z)?;
@@ -230,7 +230,7 @@ impl<'a> Asm<'a> {
     }
 
     /// (F1) `az => hz`.
-    fn f1(&self, p: &mut Proof, sh1: S) -> Option<S> {
+    fn f1(&self, p: &mut Proof<'_>, sh1: S) -> Option<S> {
         let r = &self.c.row;
         let (n, nn) = (r.n(), 4 * r.m);
         let a = p.anchor(&[]);
@@ -281,7 +281,7 @@ impl<'a> Asm<'a> {
     }
 
     /// Under `(not az)`: `(= ZYp ZA)` and `(= W(Ap) A128)`.
-    pub(crate) fn ap_eq_a(&self, p: &mut Proof, ds: &Ds, hn: S) -> Option<(S, S)> {
+    pub(crate) fn ap_eq_a(&self, p: &mut Proof<'_>, ds: &Ds, hn: S) -> Option<(S, S)> {
         let n = self.c.row.n();
         let s3 = self.ap_value(p, false, hn)?;
         let za = z(p, n, self.a128);
@@ -295,9 +295,9 @@ impl<'a> Asm<'a> {
     }
 }
 
-impl<'a> Asm<'a> {
+impl Asm<'_> {
     /// (F2) `(not az), qb => hz`.
-    fn f2(&self, p: &mut Proof, ds: &Ds, sh1: S) -> Option<S> {
+    fn f2(&self, p: &mut Proof<'_>, ds: &Ds, sh1: S) -> Option<S> {
         let r = &self.c.row;
         let (n, nn) = (r.n(), 4 * r.m);
         let a = p.anchor(&[]);
@@ -350,7 +350,7 @@ impl<'a> Asm<'a> {
 
     pub(crate) fn run(
         &self,
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         dl: &DivLemma,
         h0: Option<S>,
         final_id: Option<&str>,
@@ -372,7 +372,7 @@ impl<'a> Asm<'a> {
 
     /// `(cl (= (not hz) (and (not az) (not qb))))` (F1, F2, F3 combined) and
     /// `(cl (or (not (= P Z)) (= Q Z)))` from the division lemma's instance.
-    pub(crate) fn equivalence(&self, p: &mut Proof, dl: &DivLemma) -> Option<(S, S)> {
+    pub(crate) fn equivalence(&self, p: &mut Proof<'_>, dl: &DivLemma) -> Option<(S, S)> {
         let r = &self.c.row;
         let nyz = self.nonzero(p)?;
         let ds = self.ds(p, dl, nyz)?;

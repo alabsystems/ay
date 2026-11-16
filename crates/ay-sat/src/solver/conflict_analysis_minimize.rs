@@ -65,9 +65,9 @@ impl Solver {
         // Fold of the shrink prescan (#8790): every tracked variable below the
         // conflict level is exactly a learned-clause literal, so a non-UIP
         // level reaching count 2 — or a tracked literal with a stale trail
-        // position — is precisely what
-        // `learned_clause_has_repeated_non_uip_level` would detect at
-        // finalize. (Its non-falsified and level-0 branches cannot fire for
+        // position — is precisely what `repeated_level_admitted` detects when
+        // `finalize_repeated_level_admitted` validates the cached result. (Its
+        // non-falsified and level-0 branches cannot fire for
         // tracked variables: learned literals are falsified with level > 0 at
         // add time and neither vals nor levels change during analysis.)
         if var_level != self.decision_level && (old_count >= 1 || tpos as usize >= self.trail.len())
@@ -97,6 +97,7 @@ impl Solver {
 
     /// The ordinary cached CaDiCaL recursion and its exact flag/abort ordering.
     /// Shared with the original-owner counted continuation, not reimplemented.
+    #[cfg(test)]
     pub(super) fn is_redundant_cached(&mut self, lit: Literal, depth: u32) -> bool {
         match self.redundant_admitted(lit, depth, &admitted::Ordinary) {
             Ok(redundant) => redundant,

@@ -189,7 +189,7 @@ fn tombstone_history_uses_actual_table_storage_as_the_probe_bound() {
     }
     store.rollback_to(checkpoint);
     let table = store.hash_cons.allocation_size();
-    let expected = table / std::mem::size_of::<(u64, Vec<TermId>)>() + 32;
+    let expected = table / size_of::<(u64, Vec<TermId>)>() + 32;
     assert_eq!(store.controlled_slots(), Ok(expected));
     assert!(table > 0);
     let term = app(&store);

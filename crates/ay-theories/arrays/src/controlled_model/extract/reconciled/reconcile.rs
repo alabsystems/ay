@@ -42,10 +42,12 @@ fn one(
         solver,
         values,
         &state.model,
-        &members,
-        &bases,
-        &unwritten,
-        &chains,
+        chains::DefaultSources {
+            members: &members,
+            bases: &bases,
+            unwritten: &unwritten,
+            chains: &chains,
+        },
         work,
     )?;
     for &base in &bases {

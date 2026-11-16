@@ -289,7 +289,7 @@ fn every_recorded_swap_is_a_binary_equality() {
         let TermData::App(head, args) = exec.ctx.terms.get(node) else {
             panic!("a swap on a non-application");
         };
-        assert!(super::super::build::is_binary_equality(
+        assert!(build::is_binary_equality(
             head,
             args,
             exec.ctx.terms.sort(node)

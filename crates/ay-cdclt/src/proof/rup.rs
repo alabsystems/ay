@@ -285,7 +285,7 @@ mod tests {
         let d = p
             .derive(&[], &[0, 1], |n| clauses.get(n).map(Vec::as_slice))
             .expect("refutation");
-        assert!(d.result.is_empty());
+        assert_eq!(d.result.as_slice(), &[] as &[Literal]);
         assert_eq!(d.links.len(), 1);
     }
 }

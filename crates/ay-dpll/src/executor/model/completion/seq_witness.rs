@@ -151,7 +151,7 @@ impl Executor {
             .checked_mul(256)
             .and_then(|nodes| {
                 root_count
-                    .checked_mul(2 * std::mem::size_of::<TermId>())?
+                    .checked_mul(2 * size_of::<TermId>())?
                     .checked_add(nodes)
             })
         else {
@@ -283,9 +283,7 @@ impl Executor {
                             .len()
                             .checked_add(1)
                             .and_then(|entries| {
-                                entries.checked_mul(
-                                    4 * (std::mem::size_of::<(TermId, EvalValue)>() + 16),
-                                )
+                                entries.checked_mul(4 * (size_of::<(TermId, EvalValue)>() + 16))
                             })
                     else {
                         self.record_evaluation_stop(
@@ -354,7 +352,7 @@ impl Executor {
                     let bytes = pending
                         .len()
                         .checked_add(args.len())?
-                        .checked_mul(2 * std::mem::size_of::<TermId>())?;
+                        .checked_mul(2 * size_of::<TermId>())?;
                     if !evaluation_copies::pay(args.len(), bytes)
                         || !evaluation_copies::validate(self)
                     {
@@ -507,7 +505,7 @@ impl Executor {
                     .len()
                     .checked_add(1)
                     .and_then(|entries| {
-                        entries.checked_mul(4 * (std::mem::size_of::<(TermId, EvalValue)>() + 16))
+                        entries.checked_mul(4 * (size_of::<(TermId, EvalValue)>() + 16))
                     });
                 let Some(bytes) = bytes else {
                     self.record_evaluation_stop(crate::executor_types::UnknownOrigin::MemoryBudget);
@@ -560,7 +558,7 @@ impl Executor {
         let count = model.completed_values.len();
         let bytes = count
             .checked_add(1)?
-            .checked_mul(4 * (std::mem::size_of::<(TermId, EvalValue)>() + 16))?;
+            .checked_mul(4 * (size_of::<(TermId, EvalValue)>() + 16))?;
         if !evaluation_copies::pay(count, bytes) || !evaluation_copies::validate(self) {
             return None;
         }

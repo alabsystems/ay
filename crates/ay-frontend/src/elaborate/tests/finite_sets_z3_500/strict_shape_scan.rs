@@ -17,7 +17,7 @@ fn nested_let_assertion(depth: usize, leaf: &str) -> String {
     for _ in 0..depth {
         script.push_str("))");
     }
-    script.push_str(")");
+    script.push(')');
     script
 }
 

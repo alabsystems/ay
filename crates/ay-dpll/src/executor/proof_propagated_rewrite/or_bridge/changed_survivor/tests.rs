@@ -24,7 +24,7 @@ fn changed_survivor_requires_original_licenses_current_stamps_and_exact_target()
         let mut fixture = Fixture::recorded();
         let target = match mutation {
             0 => {
-                fixture.originals.remove(0);
+                let _ = fixture.originals.remove(0);
                 fixture.target
             }
             1 => {
@@ -44,42 +44,41 @@ fn changed_survivor_refusal_rolls_back_both_attempts_without_refunding_work() {
     let mut fixture = Fixture::recorded();
     let wrong = fixture.terms.mk_var("wrong after", Sort::Bool);
     let source_set = fixture.originals.iter().copied().collect();
-    let mut cx = PlanCx::new(
-        &source_set,
-        &fixture.originals,
-        &fixture.records,
-        &fixture.entries,
-        &[],
-        true,
-    );
-    let before_id = cx.chain.add_assume(fixture.before, None);
-    let mark = cx.mark();
-    let mut planner = PropagationChainPlanner {
-        terms: &mut fixture.terms,
-    };
-    assert!(planner
-        .plan_or_elimination_bridge(&mut cx, fixture.before, before_id, wrong, 1)
-        .is_none());
-    assert_eq!(cx.mark(), mark);
-    assert!(
-        cx.budget < PLAN_NODE_BUDGET,
-        "failed legacy and changed-survivor work remains spent"
-    );
-    assert!(cx.clause_memo.values().all(|id| (id.0 as usize) < mark));
-    assert!(cx
-        .eq_memo
-        .values()
-        .all(|value| !matches!(value, Some(EqRes::Changed { id, .. }) if id.0 as usize >= mark)));
-    assert!(cx.in_progress.is_empty() && cx.eq_in_progress.is_empty());
+    {
+        let mut cx = PlanCx::new(
+            &source_set,
+            &fixture.originals,
+            &fixture.records,
+            &fixture.entries,
+            &[],
+            true,
+        );
+        let before_id = cx.chain.add_assume(fixture.before, None);
+        let mark = cx.mark();
+        let mut planner = PropagationChainPlanner {
+            terms: &mut fixture.terms,
+        };
+        assert!(planner
+            .plan_or_elimination_bridge(&mut cx, fixture.before, before_id, wrong, 1)
+            .is_none());
+        assert_eq!(cx.mark(), mark);
+        assert!(
+            cx.budget < PLAN_NODE_BUDGET,
+            "failed legacy and changed-survivor work remains spent"
+        );
+        assert!(cx.clause_memo.values().all(|id| (id.0 as usize) < mark));
+        assert!(cx.eq_memo.values().all(
+            |value| !matches!(value, Some(EqRes::Changed { id, .. }) if id.0 as usize >= mark)
+        ));
+        assert!(cx.in_progress.is_empty() && cx.eq_in_progress.is_empty());
 
-    cx.budget = 0;
-    assert!(planner
-        .plan_or_elimination_bridge(&mut cx, fixture.before, before_id, fixture.after, 1)
-        .is_none());
-    assert_eq!(cx.mark(), mark);
-    assert_eq!(cx.budget, 0);
-    drop(planner);
-    drop(cx);
+        cx.budget = 0;
+        assert!(planner
+            .plan_or_elimination_bridge(&mut cx, fixture.before, before_id, fixture.after, 1)
+            .is_none());
+        assert_eq!(cx.mark(), mark);
+        assert_eq!(cx.budget, 0);
+    }
     let target = fixture.target;
     let (proof, conclusion) = fixture
         .plan(target, PLAN_NODE_BUDGET)
@@ -91,7 +90,7 @@ fn changed_survivor_refusal_rolls_back_both_attempts_without_refunding_work() {
 fn changed_survivor_fanout_is_refused_before_new_walk_or_proof_growth() {
     let mut terms = TermStore::new();
     let args: Vec<_> = (0..=MAX_CHANGED_SURVIVOR_ARGS)
-        .map(|i| terms.mk_var(&format!("wide{i}"), Sort::Bool))
+        .map(|i| terms.mk_var(format!("wide{i}"), Sort::Bool))
         .collect();
     let before = terms.mk_app(Symbol::named("or"), &args, Sort::Bool);
     let roots = [before];
@@ -139,7 +138,7 @@ fn non_and_recorded_parent_and_unlicensed_record_cycles_cannot_project_units() {
             .is_none());
         assert!(cx.in_progress.is_empty() && cx.eq_in_progress.is_empty());
         cx.rollback(0);
-        assert!(cx.chain.steps.is_empty());
+        assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
     }
 }
 
@@ -184,5 +183,5 @@ fn exact_reorder_needs_a_changed_argument_and_the_exact_argument_set() {
             &[EqRes::Unchanged, EqRes::Unchanged]
         )
         .is_none());
-    assert!(cx.chain.steps.is_empty());
+    assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
 }

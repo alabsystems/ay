@@ -7,40 +7,7 @@
 use super::super::dt_construct_budget::MAX_OPAQUE_DT_COLLECTION_ROOTS;
 use super::*;
 
-#[derive(Clone, Copy)]
-enum ExtensionalityEvidencePurpose {
-    RequestedWitnesses,
-    CommittedDemand,
-}
-
 impl Executor {
-    /// Recover only direct, generation-site-authenticated outer-array witness
-    /// literals whose cells are exact single-constructor datatypes carrying an
-    /// array field. These roots preserve the committed cell disequality while
-    /// total datatype construction chooses concrete field-array candidates.
-    pub(in crate::executor::model) fn authenticated_datatype_array_extensionality_roots(
-        &self,
-        model: &Model,
-    ) -> Option<Vec<TermId>> {
-        self.authenticated_datatype_array_extensionality(model)
-            .map(|evidence| evidence.roots)
-    }
-
-    /// The same generation-site proof as
-    /// [`Self::authenticated_datatype_array_extensionality_roots`], retaining
-    /// the exact stamped cell operands that may authorize total-DT
-    /// construction. A root without its validated cells is never an override
-    /// capability.
-    pub(in crate::executor::model) fn authenticated_datatype_array_extensionality(
-        &self,
-        model: &Model,
-    ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
-        self.datatype_array_extensionality_evidence(
-            model,
-            ExtensionalityEvidencePurpose::RequestedWitnesses,
-        )
-    }
-
     /// Select only witnesses demanded by this candidate's committed SAT
     /// assignment from the eager, syntactic emission over-approximation.
     /// An unassigned or true equality grants neither roots nor cells. This is
@@ -50,17 +17,6 @@ impl Executor {
     pub(in crate::executor::model) fn collect_demanded_datatype_array_extensionality(
         &self,
         model: &Model,
-    ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
-        self.datatype_array_extensionality_evidence(
-            model,
-            ExtensionalityEvidencePurpose::CommittedDemand,
-        )
-    }
-
-    fn datatype_array_extensionality_evidence(
-        &self,
-        model: &Model,
-        purpose: ExtensionalityEvidencePurpose,
     ) -> Option<AuthenticatedDatatypeArrayExtensionality> {
         if self.array_ext_shadow.emitted.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
             return None;
@@ -84,15 +40,12 @@ impl Executor {
                 Err(()) => return None,
             };
             let equality = self.committed_sat_bool(model, entry.eq_term);
-            if matches!(purpose, ExtensionalityEvidencePurpose::CommittedDemand)
-                && equality != Some(false)
-            {
+            if equality != Some(false) {
                 // Shape and birth validation precede selection, including for
                 // an unselected row. Missing assignments supply no evidence.
                 continue;
             }
-            if equality != Some(false)
-                || self.committed_sat_bool(model, entry.not_sel_eq) != Some(true)
+            if self.committed_sat_bool(model, entry.not_sel_eq) != Some(true)
                 || self.committed_sat_bool(model, cell_equality) != Some(false)
             {
                 return None;

@@ -101,7 +101,7 @@ fn test_set_resolution_hints_updates_first_duplicate_id_only() {
     assert!(trace.set_resolution_hints(5, vec![100]));
 
     // rfind updates the last (most recent) entry with the matching ID
-    assert!(trace.entries().at(0).resolution_hints.is_empty());
+    assert_eq!(trace.entries().at(0).resolution_hints.len(), 0);
     assert_eq!(trace.entries().at(1).resolution_hints, vec![100]);
 }
 
@@ -136,7 +136,7 @@ fn test_empty_clause_detection_via_atomic_api() {
 #[test]
 fn test_with_capacity_boundary() {
     let mut trace = ClauseTrace::with_capacity(0);
-    assert!(trace.is_empty());
+    assert_eq!(trace.len(), 0);
     assert_eq!(trace.len(), 0);
 
     // Adding entries beyond initial capacity should work
@@ -144,7 +144,7 @@ fn test_with_capacity_boundary() {
     assert_eq!(trace.len(), 1);
 
     let mut trace2 = ClauseTrace::with_capacity(1000);
-    assert!(trace2.is_empty());
+    assert_eq!(trace2.len(), 0);
     trace2.add_clause(1, vec![Literal::positive(Variable::new(0))], true);
     assert_eq!(trace2.len(), 1);
 }

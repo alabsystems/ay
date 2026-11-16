@@ -37,15 +37,15 @@ fn successful_model_publication_does_not_flush_pending_decision_output() {
         s.declare_counted_complete_assignment_sat(&admission),
         Ok(SatResult::Sat(vec![true, false, true]))
     );
-    assert!(
+    assert_ne!(
         s.cold
             .decision_trace
             .as_ref()
             .unwrap()
             .decision_test_snapshot()
             .1
-            .len()
-            > 0
+            .len(),
+        0
     );
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 9);
     s.cold

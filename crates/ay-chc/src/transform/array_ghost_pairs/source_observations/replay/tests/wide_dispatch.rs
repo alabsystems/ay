@@ -19,7 +19,7 @@ fn a_wide_uf_free_source_cannot_be_discharged_by_a_false_finite_hint() {
          (rule (=> (P table) error)) (query error)",
     )
     .unwrap();
-    assert!(source.function_declarations().is_empty());
+    assert_eq!(source.function_declarations(), []);
     let token = CancellationToken::new();
     let live = SourceControl::new(deadline, &token);
     let layout = super::super::super::Layout::analyze(&source, &live).unwrap();

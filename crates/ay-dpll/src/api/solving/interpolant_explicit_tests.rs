@@ -304,7 +304,7 @@ fn unreachable_trust_step_is_ignored() {
     let s3 = proof.add_resolution(vec![not_b1], fc.a1, s0, s2);
     let _ = proof.add_resolution(Vec::new(), fc.b1, s1, s3);
     assert_eq!(ProofView::build(&proof).map(|v| v.trust_steps), Ok(0));
-    run(
+    let _ = run(
         &mut fc.terms,
         &proof,
         &fc.groups,

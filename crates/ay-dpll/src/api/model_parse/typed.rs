@@ -116,14 +116,14 @@ impl<'ctx> Decoder<'ctx> {
     }
 
     fn input(&mut self, root: &SExpr) -> Option<()> {
-        self.copy(std::mem::size_of::<&SExpr>())?;
+        self.copy(size_of::<&SExpr>())?;
         let mut stack = vec![root];
         while let Some(value) = stack.pop() {
             self.charge(1)?;
             match value {
                 SExpr::List(children) => {
                     self.charge(children.len())?;
-                    self.copy(children.len().checked_mul(std::mem::size_of::<&SExpr>())?)?;
+                    self.copy(children.len().checked_mul(size_of::<&SExpr>())?)?;
                     stack.try_reserve_exact(children.len()).ok()?;
                     stack.extend(children);
                 }
@@ -147,7 +147,7 @@ impl<'ctx> Decoder<'ctx> {
         if depth > MAX_DEPTH {
             return None;
         }
-        self.copy(std::mem::size_of::<ModelValue>())?;
+        self.copy(size_of::<ModelValue>())?;
         match sort {
             Sort::Bool => match value {
                 SExpr::True => Some(ModelValue::Bool(true)),

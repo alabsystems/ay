@@ -32,6 +32,10 @@ struct TableRow {
     value_term: TermId,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the owned row preserves exact model-construction custody without another allocation"
+)]
 enum RowOutcome {
     Row(TableRow),
     Skip,

@@ -81,7 +81,10 @@ fn missing_or_expired_original_clock_never_creates_a_probe() {
     assert_eq!(absent.probe_deadline_at(now), None);
     let mut expired = Owner::capture(&config(), Some(now));
     assert_eq!(expired.probe_deadline_at(now), None);
-    assert!(!expired.open_at(now - Duration::from_secs(1)));
+    assert!(!expired.open_at(
+        now.checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset")
+    ));
 }
 
 #[test]

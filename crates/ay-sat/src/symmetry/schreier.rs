@@ -21,7 +21,7 @@
 //! chain rests on the generators being verified formula automorphisms, which
 //! `detector::permutation_preserves_formula` guarantees upstream.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 
 /// A permutation of `u32` points given by its support: sorted `(x, image)`
 /// pairs for every moved point.
@@ -138,8 +138,8 @@ impl Level {
             let x = self.orbit[i];
             for &gi in &self.generators {
                 let y = pool[gi].apply(x);
-                if !self.schreier.contains_key(&y) {
-                    self.schreier.insert(y, (gi, x));
+                if let Entry::Vacant(entry) = self.schreier.entry(y) {
+                    entry.insert((gi, x));
                     self.orbit.push(y);
                 }
             }
@@ -392,21 +392,6 @@ impl SchreierSims {
             }
         }
         uf
-    }
-
-    #[cfg(test)]
-    /// The chain's strong generators at `level` (those fixing base[..level]).
-    pub(crate) fn level_generators(&self, level: usize) -> Vec<&Perm> {
-        self.levels
-            .get(level)
-            .map(|l| l.generators.iter().map(|&gi| &self.pool[gi]).collect())
-            .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    /// Strong generators stored (each once).
-    pub(crate) fn pool_len(&self) -> usize {
-        self.pool.len()
     }
 
     /// The orbit of base[`level`] under the level's group (the points a

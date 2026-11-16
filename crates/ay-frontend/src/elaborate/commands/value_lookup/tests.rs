@@ -35,7 +35,7 @@ fn source_constant_lookup_is_borrowed_and_does_not_redeclare() {
         let (term, declared) = context.source_constant_for_value(name).unwrap();
         let info = context.symbol_info(name).unwrap();
         assert_eq!(Some(term), info.term);
-        assert!(std::ptr::eq(declared, &info.sort));
+        assert!(std::ptr::eq(declared, &raw const info.sort));
         assert_eq!(declared, &sort);
         assert_eq!(context.terms.sort(term), declared);
     }
@@ -97,7 +97,7 @@ fn definitions_native_registrations_and_aliases_are_not_source_constants() {
     );
     let term = context.source_constant_for_value("x").unwrap().0;
     context.register_symbol("alias".into(), term, Sort::Int);
-    context.register_native_global_constant("native".into(), Sort::Int);
+    let _ = context.register_native_global_constant("native".into(), Sort::Int);
     for name in ["f", "fixed", "alias", "native"] {
         assert!(context.source_constant_for_value(name).is_none(), "{name}");
     }

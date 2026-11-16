@@ -41,6 +41,7 @@ use super::{
     workspace_root, CarcaraSurface, Executor,
 };
 use ntest::timeout;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// The smallest two-binding form: one `let` over the assumed array equality.
@@ -77,11 +78,10 @@ const LET_FREE_TWIN: &str = "(set-logic QF_AUFLIA)
 /// The problem-scoped document and its surface verdict; a `hole` or `trust`
 /// step fails the test.
 fn certificate(label: &str, problem: &str) -> (String, CarcaraSurface) {
-    let session: String = problem
-        .lines()
-        .filter(|line| line.trim() != "(exit)")
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let mut session = String::new();
+    for line in problem.lines().filter(|line| line.trim() != "(exit)") {
+        writeln!(&mut session, "{line}").expect("write to String");
+    }
     let script = format!("(set-option :produce-proofs true)\n{session}");
     let commands = parse(&script).unwrap_or_else(|e| panic!("{label}: {e}"));
     let mut exec = Executor::new();
@@ -119,7 +119,13 @@ fn let_spelling_is_confined_to_bridges(document: &str) -> bool {
             else {
                 return false;
             };
-            id.ends_with(".a") || id.ends_with(".l") || id.ends_with(".e")
+            #[expect(
+                clippy::case_sensitive_file_extension_comparisons,
+                reason = "Alethe proof-step suffixes are case-sensitive identifiers, not filesystem extensions"
+            )]
+            let is_authored_bridge_step =
+                id.ends_with(".a") || id.ends_with(".l") || id.ends_with(".e");
+            is_authored_bridge_step
         })
 }
 

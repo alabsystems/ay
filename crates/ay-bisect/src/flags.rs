@@ -150,6 +150,6 @@ mod tests {
     #[test]
     fn test_subsystems_for_empty() {
         let out = subsystems_for(&[]);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<String>::new());
     }
 }

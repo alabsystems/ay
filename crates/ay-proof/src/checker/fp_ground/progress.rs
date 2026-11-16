@@ -134,7 +134,7 @@ impl<'a> Meter<'a> {
         Some(value.abs())
     }
 
-    pub(super) fn to_integer(&mut self, value: &BigRational) -> Option<BigInt> {
+    pub(super) fn rational_to_integer(&mut self, value: &BigRational) -> Option<BigInt> {
         self.numeric(Self::rational_bits(value)?)?;
         Some(value.to_integer())
     }
@@ -214,7 +214,7 @@ impl<'a> Meter<'a> {
     }
 
     pub(super) fn integer(&mut self, value: u128) -> Option<BigInt> {
-        self.numeric(u64::from(u128::BITS - value.leading_zeros()))?;
+        self.numeric(u64::from(value.bit_width()))?;
         Some(BigInt::from(value))
     }
 
@@ -248,7 +248,7 @@ impl<'a> Meter<'a> {
         Some(BigRational::new(numerator, denominator))
     }
 
-    pub(super) fn from_integer(&mut self, value: BigInt) -> Option<BigRational> {
+    pub(super) fn rational_from_integer(&mut self, value: BigInt) -> Option<BigRational> {
         self.numeric(value.bits().checked_add(1)?)?;
         Some(BigRational::from_integer(value))
     }

@@ -2687,12 +2687,12 @@ impl Executor {
             evaluation_copies::EvaluationCopyScope::enter(self).map_err(|_| unavailable())?;
         let metadata = point
             .len()
-            .checked_mul(std::mem::size_of::<TermId>() + std::mem::size_of::<(usize, usize)>())
+            .checked_mul(size_of::<TermId>() + size_of::<(usize, usize)>())
             .and_then(|bytes| {
                 frame
                     .relax_vars
                     .len()
-                    .checked_mul(std::mem::size_of::<TermId>())
+                    .checked_mul(size_of::<TermId>())
                     .and_then(|vars| bytes.checked_add(vars))
             })
             .ok_or_else(unavailable)?;
@@ -2736,7 +2736,7 @@ impl Executor {
             // buffers. Price only the numeric comparisons actually constructed.
             if copies_scalar {
                 scalar_bytes = scalar_bytes
-                    .checked_add(std::mem::size_of::<BigRational>())
+                    .checked_add(size_of::<BigRational>())
                     .ok_or_else(unavailable)?;
                 for bits in [value.numer().bits(), value.denom().bits()] {
                     let bytes = bits
@@ -3032,7 +3032,6 @@ impl Executor {
                     .iter()
                     .map(|group| group.id.clone())
                     .collect::<Vec<_>>();
-        let soft_terms: Vec<TermId> = softs.iter().map(|s| s.term).collect();
         let soft_weights: Vec<u64> = softs.iter().map(|s| s.weight).collect();
         let total_weight = soft_weights
             .iter()
@@ -3928,10 +3927,7 @@ impl Executor {
         let Ok(scope) = evaluation_copies::EvaluationCopyScope::enter(self) else {
             return Ok(None);
         };
-        let Some(metadata) = objectives
-            .len()
-            .checked_mul(std::mem::size_of::<BigRational>())
-        else {
+        let Some(metadata) = objectives.len().checked_mul(size_of::<BigRational>()) else {
             return Ok(None);
         };
         if !evaluation_copies::pay(objectives.len(), metadata) || !evaluation_copies::validate(self)
@@ -3963,7 +3959,7 @@ impl Executor {
                     limb_bytes(value.denom().bits())
                         .and_then(|denominator| numerator.checked_add(denominator))
                 })
-                .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<BigInt>()))
+                .and_then(|bytes| bytes.checked_add(2 * size_of::<BigInt>()))
             else {
                 return Ok(None);
             };
@@ -3997,7 +3993,7 @@ impl Executor {
         };
         let Some(bytes) = payload.checked_mul(scalar_buffers).and_then(|bytes| {
             root_slots
-                .checked_mul(std::mem::size_of::<TermId>())
+                .checked_mul(size_of::<TermId>())
                 .and_then(|metadata| bytes.checked_add(metadata))
         }) else {
             return Ok(None);

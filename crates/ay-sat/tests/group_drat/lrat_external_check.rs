@@ -394,7 +394,7 @@ fn solve_and_validate_lrat_configured(
         .take_proof_writer()
         .expect("Proof writer should exist");
     let proof = String::from_utf8(writer.into_vec().expect("proof flush")).expect("Valid UTF-8");
-    assert!(!proof.is_empty(), "{label}: LRAT proof must not be empty");
+    assert_ne!(proof.len(), 0, "{label}: LRAT proof must not be empty");
     validate_lrat_proof_text(dimacs, &proof, lrat_checker, label)
 }
 
@@ -939,7 +939,7 @@ p cnf 16 28
         .take_proof_writer()
         .expect("Proof writer should exist");
     let proof_bytes = writer.into_vec().expect("proof flush");
-    assert!(!proof_bytes.is_empty(), "DRAT proof must not be empty");
+    assert_ne!(proof_bytes.len(), 0, "DRAT proof must not be empty");
     super::common::verify_drat_proof(dimacs, &proof_bytes, "drat_decompose_honored");
 }
 
@@ -1801,8 +1801,8 @@ fn test_lrat_binary_vs_text_cross_validate_php43() {
     );
 
     // Both proofs must be non-empty and different formats.
-    assert!(!text_proof.is_empty());
-    assert!(!binary_proof.is_empty());
+    assert_ne!(text_proof, "");
+    assert_ne!(binary_proof, [] as [u8; 0]);
     // Binary is typically smaller than text (LEB128 vs decimal ASCII).
     eprintln!(
         "Cross-validation: text={} bytes, binary={} bytes",

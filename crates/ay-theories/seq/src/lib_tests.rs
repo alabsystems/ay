@@ -109,7 +109,7 @@ fn test_seq_solver_empty_model() {
 
     let model = solver.extract_model();
     assert!(model.values.contains_key(&s));
-    assert!(model.values[&s].is_empty());
+    assert_eq!(model.values[&s].as_slice(), &[] as &[String]);
 }
 
 // ============================================================================
@@ -147,7 +147,7 @@ fn test_seq_solver_reset() {
     // After reset, solver should be clean
     assert!(matches!(solver.check(), TheoryResult::Sat));
     assert!(solver.unit_cache.is_empty());
-    assert!(solver.empty_cache.is_empty());
+    assert_eq!(solver.empty_cache.as_slice(), &[] as &[TermId]);
 }
 
 /// Unit-empty conflict reversed (empty = unit) should still detect UNSAT.

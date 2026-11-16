@@ -40,7 +40,7 @@ fn original_retirement_reuses_only_cursor_capacity_and_checked_layout() {
     let before = meter.consumed_work();
     declined.mark(0, &mut meter).unwrap();
     assert!(!declined.contains(0, &mut meter).unwrap());
-    assert!(declined.0.is_empty());
+    assert_eq!(declined.0.len(), 0);
     assert_eq!(
         meter.consumed_work(),
         before,

@@ -234,5 +234,5 @@ fn av_dump_verdicts() {
         "LADDER NOT EXERCISED: only {} cases performed any bisection",
         stats.with_bisection
     );
-    assert!(stats.wrong.is_empty());
+    assert_eq!(stats.wrong.as_slice(), &[] as &[String]);
 }

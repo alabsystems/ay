@@ -925,7 +925,7 @@ impl BitBlast {
         if n.is_power_of_two() {
             n.trailing_zeros() as usize
         } else {
-            (usize::BITS - n.leading_zeros()) as usize
+            n.bit_width() as usize
         }
     }
 

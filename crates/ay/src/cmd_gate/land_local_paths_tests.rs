@@ -155,6 +155,8 @@ fn missing_resolution_or_unconnected_local_source_cannot_claim_scoped_coverage()
                 .find(|node| node.id == "bridge")
                 .unwrap()
                 .dependencies
+                .as_mut()
+                .unwrap()
                 .clear();
         }
         assert!(
@@ -240,10 +242,10 @@ fn resolved_ids_and_development_cycles_keep_the_actual_consumer_identity() {
         .iter_mut()
         .find(|node| node.id == "bridge")
         .unwrap()
-        .dependencies = vec![id.into()];
+        .dependencies = Some(vec![id.into()]);
     let leaf = nodes.iter_mut().find(|node| node.id == "leaf").unwrap();
     leaf.id = id.into();
-    leaf.dependencies = vec!["bridge".into()];
+    leaf.dependencies = Some(vec!["bridge".into()]);
     let plan = plan::select(
         root.path(),
         &metadata,
@@ -294,12 +296,14 @@ fn foreign_provenance_does_not_hide_the_physical_workspace_owner() {
         .find(|node| node.id == "consumer")
         .unwrap()
         .dependencies
+        .as_mut()
+        .unwrap()
         .clear();
     nodes
         .iter_mut()
         .find(|node| node.id == "unrelated")
         .unwrap()
-        .dependencies = vec!["bridge".into()];
+        .dependencies = Some(vec!["bridge".into()]);
     let plan = plan::select(
         root.path(),
         &metadata,
@@ -332,17 +336,19 @@ fn all_declared_importers_of_one_shared_input_are_retained() {
         .iter_mut()
         .find(|node| node.id == "consumer")
         .unwrap()
-        .dependencies = vec!["leaf".into()];
+        .dependencies = Some(vec!["leaf".into()]);
     nodes
         .iter_mut()
         .find(|node| node.id == "unrelated")
         .unwrap()
-        .dependencies = vec!["bridge".into()];
+        .dependencies = Some(vec!["bridge".into()]);
     nodes
         .iter_mut()
         .find(|node| node.id == "bridge")
         .unwrap()
         .dependencies
+        .as_mut()
+        .unwrap()
         .clear();
     let plan = plan::select(
         root.path(),
@@ -411,4 +417,62 @@ fn declared_data_provenance_cannot_hide_workspace_compiler_configuration() {
     .unwrap();
     assert!(plan.broad_compile);
     assert!(runtime_packages(&plan).contains("consumer"));
+}
+
+#[test]
+fn cli_dependency_closure_crosses_workspace_importers_and_excludes_disjoint_packages() {
+    let (root, mut metadata) = fixture();
+    metadata.packages[0].name = "ay".into();
+    metadata.packages[0].targets[0].name = "ay".into();
+    metadata.packages[0].targets[0].kind = vec!["bin".into()];
+    metadata.workspace_members.push("bridge".into());
+    metadata.resolve.as_mut().unwrap().nodes[0].features = vec!["cli".into(), "bench".into()];
+    let graph = Graph::read(root.path(), &metadata).unwrap();
+    assert!(graph.cli_depends_on("leaf"));
+    assert!(graph.cli_depends_on("bridge"));
+    assert!(graph.cli_depends_on("consumer"));
+    assert!(!graph.cli_depends_on("unrelated"));
+    assert!(graph.cli_depends_on("unknown-owner"));
+}
+
+#[test]
+fn cli_dependency_narrowing_requires_known_features_and_complete_resolution() {
+    let (root, mut metadata) = fixture();
+    metadata.packages[0].name = "ay".into();
+    metadata.packages[0].targets[0].name = "ay".into();
+    metadata.packages[0].targets[0].kind = vec!["bin".into()];
+    assert!(Graph::read(root.path(), &metadata)
+        .unwrap()
+        .cli_depends_on("unrelated"));
+    metadata.resolve.as_mut().unwrap().nodes[0].features = vec!["cli".into(), "bench".into()];
+    metadata
+        .resolve
+        .as_mut()
+        .unwrap()
+        .nodes
+        .retain(|node| node.id != "bridge");
+    assert!(Graph::read(root.path(), &metadata)
+        .unwrap()
+        .cli_depends_on("unrelated"));
+    metadata.resolve.as_mut().unwrap().nodes[0].dependencies = None;
+    assert!(Graph::read(root.path(), &metadata)
+        .unwrap()
+        .cli_depends_on("unrelated"));
+    metadata.resolve = None;
+    assert!(Graph::read(root.path(), &metadata)
+        .unwrap()
+        .cli_depends_on("unrelated"));
+}
+
+#[test]
+fn cli_dependency_cycles_terminate_without_hiding_reachable_owners() {
+    let (root, mut metadata) = fixture();
+    metadata.packages[0].name = "ay".into();
+    metadata.packages[0].targets[0].name = "ay".into();
+    metadata.packages[0].targets[0].kind = vec!["bin".into()];
+    metadata.resolve.as_mut().unwrap().nodes[0].features = vec!["cli".into(), "bench".into()];
+    metadata.resolve.as_mut().unwrap().nodes[2].dependencies = Some(vec!["bridge".into()]);
+    let graph = Graph::read(root.path(), &metadata).unwrap();
+    assert!(graph.cli_depends_on("leaf"));
+    assert!(!graph.cli_depends_on("unrelated"));
 }

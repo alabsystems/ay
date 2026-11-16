@@ -17,9 +17,8 @@
 //! verdict; an `Unknown` verdict means "keep the literal".
 //!
 //! `OracleBackend` lives in `pdr/config.rs` (it is a field of the `pub`
-//! `SpacerLane`) and is re-exported here. The `Session` backend (R4) degrades
-//! to `Legacy` on this branch (`oracle_backend` is `Legacy` while
-//! `incremental_pdr_enabled()` is false); every query below is legacy.
+//! `SpacerLane`) and is re-exported here. `Session` is currently a route and
+//! accounting label; every query below retains the legacy implementation.
 
 #![allow(dead_code, unused)]
 

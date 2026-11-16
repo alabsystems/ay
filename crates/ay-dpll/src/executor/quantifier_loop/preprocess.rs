@@ -3198,6 +3198,7 @@ fn trigger_group_covers_names(terms: &TermStore, group: &[TermId], names: &[&str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::query_state::SkolemInstanceRecord;
     use ay_core::{ProofId, ProofStep, Sort, Symbol, TermData};
     use ay_frontend::parse;
     use num_bigint::BigInt;
@@ -3253,10 +3254,10 @@ mod tests {
         )
         .expect("valid bounded existential");
         let mut exec = Executor::new();
-        assert!(exec
-            .execute_all(&commands)
-            .expect("setup commands execute")
-            .is_empty());
+        assert_eq!(
+            exec.execute_all(&commands).expect("setup commands execute"),
+            [] as [String; 0]
+        );
         let original = exec.ctx.assertions[0];
 
         let processed = exec.process_quantifiers();
@@ -3301,10 +3302,10 @@ mod tests {
         .expect("valid bounded existential");
         let mut exec = Executor::new();
         exec.set_produce_proofs(true);
-        assert!(exec
-            .execute_all(&commands)
-            .expect("setup commands execute")
-            .is_empty());
+        assert_eq!(
+            exec.execute_all(&commands).expect("setup commands execute"),
+            [] as [String; 0]
+        );
         let original = exec.ctx.assertions[0];
         let TermData::Exists(vars, body, _) = exec.ctx.terms.get(original).clone() else {
             panic!("fixture asserts a top-level exists");
@@ -3316,7 +3317,10 @@ mod tests {
             vec![original],
             "proof mode must preserve the authored integer existential"
         );
-        assert!(exec.skolem_instance_records.is_empty());
+        assert_eq!(
+            exec.skolem_instance_records.as_slice(),
+            &[] as &[SkolemInstanceRecord]
+        );
 
         exec.skolemize_existentials(&mut finite_expansions);
 
@@ -3404,10 +3408,10 @@ mod tests {
         .expect("valid bounded existential");
         let mut exec = Executor::new();
         exec.set_produce_proofs(true);
-        assert!(exec
-            .execute_all(&commands)
-            .expect("setup commands execute")
-            .is_empty());
+        assert_eq!(
+            exec.execute_all(&commands).expect("setup commands execute"),
+            [] as [String; 0]
+        );
 
         let off = ay_core::MiscCliFlags {
             no_quant_unit_authority: true,

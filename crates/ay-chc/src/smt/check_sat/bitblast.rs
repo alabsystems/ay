@@ -49,30 +49,8 @@ pub(super) fn bitblast_pregate_max_total_bits() -> u64 {
     bitblast_max_total_bits().saturating_mul(PREGATE_OVERCOUNT_FACTOR)
 }
 
-/// Test-only override for the total-bit envelope; zero selects the default.
-#[cfg(test)]
-static TEST_TOTAL_BITS_OVERRIDE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-pub(in crate::smt) fn set_bitblast_max_total_bits_override_for_tests(v: u64) {
-    TEST_TOTAL_BITS_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(in crate::smt) fn clear_bitblast_max_total_bits_override_for_tests() {
-    TEST_TOTAL_BITS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Base total-bit budget shared by the two existing static query gates.
 pub(super) fn bitblast_max_total_bits() -> u64 {
-    #[cfg(test)]
-    {
-        let ov = TEST_TOTAL_BITS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-        if ov != 0 {
-            return ov;
-        }
-    }
     // B25: env override retired; the named constant is the value.
     DEFAULT_BITBLAST_MAX_TOTAL_BITS
 }

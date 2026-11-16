@@ -207,7 +207,7 @@ fn solver_only_false_cannot_authorize_rewrite_without_parsed_retention() {
     let authored = exec.ctx.terms.mk_var("authored-no-ast", Sort::Bool);
     exec.ctx
         .add_assertion_with_parsed(authored, parsed_placeholder());
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(exec.ctx.assertions_parsed(), []);
 
     // The transient term is indistinguishable from an authored term in the
     // raw solver stack; only Context's concrete-authored provenance may grant
@@ -229,7 +229,7 @@ fn exact_authored_false_still_authorizes_without_parsed_retention() {
     let false_term = exec.ctx.terms.false_term();
     exec.ctx
         .add_assertion_with_parsed(false_term, FrontendTerm::Const(FrontendConstant::False));
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(exec.ctx.assertions_parsed(), []);
 
     let mut proof = Proof::new();
     proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
@@ -258,7 +258,7 @@ fn folded_authored_false_cannot_masquerade_as_literal_false_without_parsed_reten
     );
     exec.ctx
         .add_assertion_with_parsed(false_term, folded_source);
-    assert!(exec.ctx.assertions_parsed().is_empty());
+    assert_eq!(exec.ctx.assertions_parsed(), []);
 
     let mut proof = Proof::new();
     proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());

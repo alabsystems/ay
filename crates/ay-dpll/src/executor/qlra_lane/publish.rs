@@ -146,7 +146,7 @@ impl Executor {
 
     /// [`Self::qlra_publish_sat_working`] with the ground solve's category
     /// chosen by the caller (the QSAT route installs `Int` witnesses too).
-    pub(in crate::executor) fn qlra_publish_sat_working_as(
+    fn qlra_publish_sat_working_as(
         &mut self,
         working: Vec<TermId>,
         category: LogicCategory,

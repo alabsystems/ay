@@ -203,7 +203,7 @@ fn bounded_tuples_respects_its_limit_and_leads_with_the_diagonal() {
     assert_eq!(tuples.len(), 3);
     assert_eq!(tuples[0], vec![a, a]);
     assert_eq!(tuples[1], vec![b, b]);
-    assert!(bounded_tuples(&columns, 0).is_empty());
+    assert_eq!(bounded_tuples(&columns, 0), [] as [Vec<TermId>; 0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ const SEQ_CONTAINS_BOTH_SIDES: &str = r#"
 "#;
 
 fn int_hint(exec: &mut Executor, value: i64) -> TermId {
-    exec.ctx.terms.mk_int(num_bigint::BigInt::from(value))
+    exec.ctx.terms.mk_int(BigInt::from(value))
 }
 
 fn has_rule(proof: &Proof, wanted: &AletheRule) -> bool {
@@ -372,12 +372,12 @@ fn the_hint_ledger_lives_exactly_one_public_decision() {
     assert_eq!(exec.cegqi_witness_hints.len(), 1);
     // A nested same-executor scope starts empty and hands the ledger back.
     let saved = exec.take_consequence_replay_state();
-    assert!(exec.cegqi_witness_hints.is_empty());
+    assert_eq!(exec.cegqi_witness_hints, [] as [(Sort, TermId); 0]);
     exec.restore_consequence_replay_state(saved);
     assert_eq!(exec.cegqi_witness_hints.len(), 1);
     // A new public decision starts over.
     exec.begin_public_solve(false);
-    assert!(exec.cegqi_witness_hints.is_empty());
+    assert_eq!(exec.cegqi_witness_hints, [] as [(Sort, TermId); 0]);
 }
 
 fn solved_executor(script: &str) -> (Executor, Vec<String>) {
@@ -450,7 +450,7 @@ fn a_symbolic_needle_certifies_through_the_substitution_free_probe() {
 /// pair — no Skolem step, no witness lane, same verdict, same rigor.
 #[test]
 fn with_alpha_sharing_on_the_seq_contains_pair_certifies_by_one_resolution() {
-    let (mut exec, outputs) = solved_executor(SEQ_CONTAINS_BOTH_SIDES);
+    let (exec, outputs) = solved_executor(SEQ_CONTAINS_BOTH_SIDES);
     assert_eq!(outputs, vec!["unsat".to_string()]);
     let proof = exec
         .last_proof
@@ -497,7 +497,10 @@ fn registry_records_are_rebuilt_after_the_per_solve_records_are_cleared() {
     // choice registry rebuilds it for the exact authored root only.
     let (mut exec, _) = solved_executor(SEQ_CONTAINS_BOTH_SIDES);
     exec.clear_preprocessing_proof_records();
-    assert!(exec.skolem_instance_records.is_empty());
+    assert_eq!(
+        exec.skolem_instance_records,
+        [] as [crate::executor::query_state::SkolemInstanceRecord; 0]
+    );
     let authored = exec.exact_concrete_authored_scope();
     let records = exec.authored_positive_exists_skolem_records(&authored);
     assert_eq!(
@@ -575,8 +578,7 @@ fn a_skolem_step_with_a_mismatched_choice_body_is_refused() {
     let refusal = format!(
         "{:?}",
         exec.check_proof_strict_with_datatypes(&forged)
-            .err()
-            .expect("a witness registered for a different body is not this root's choice")
+            .expect_err("a witness registered for a different body is not this root's choice")
     );
     assert!(
         refusal.contains("registered choice does not match the existential source"),
@@ -664,7 +666,7 @@ fn psi_conjunct_root_translates_to_a_strict_proof() {
 #[test]
 fn psi_conjunct_minimizer_publishes_unsat_end_to_end() {
     let script = format!("{PSI_CONJUNCT_MINIMIZER}    (check-sat)\n");
-    let (mut exec, outputs) = solved_executor(&script);
+    let (exec, outputs) = solved_executor(&script);
     assert_eq!(outputs, vec!["unsat".to_string()]);
     let proof = exec
         .last_proof
@@ -677,7 +679,7 @@ fn psi_conjunct_minimizer_publishes_unsat_end_to_end() {
 
 #[test]
 fn primes_three_binder_psi_conjunct_publishes_unsat_end_to_end() {
-    let (mut exec, outputs) = solved_executor(PRIMES_SHAPE);
+    let (exec, outputs) = solved_executor(PRIMES_SHAPE);
     assert_eq!(outputs, vec!["unsat".to_string()]);
     let proof = exec
         .last_proof

@@ -328,7 +328,7 @@ impl LraSolver {
                 BoundType::Lower => &mut info.lower,
                 BoundType::Upper => &mut info.upper,
             };
-            let old_bound = std::mem::replace(slot, Some(new_bound));
+            let old_bound = slot.replace(new_bound);
             self.trail.push((var, bound_type, old_bound));
             true
         } else {
@@ -510,7 +510,7 @@ impl LraSolver {
                 BoundType::Lower => &mut info.lower,
                 BoundType::Upper => &mut info.upper,
             };
-            let old_bound = std::mem::replace(slot, Some(new_bound));
+            let old_bound = slot.replace(new_bound);
             self.trail.push((var, bound_type, old_bound));
             true
         } else {

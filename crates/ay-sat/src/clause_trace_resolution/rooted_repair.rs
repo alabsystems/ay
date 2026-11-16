@@ -396,7 +396,7 @@ fn finish_combined_rooted_chain(
     let Some(conflict_clause) = prior_clause_by_id(original_clauses, derived, conflict_id) else {
         return Ok(None);
     };
-    debug_assert!(root.cone_stack.is_empty());
+    debug_assert_eq!(root.cone_stack.len(), 0);
     for &literal in conflict_clause {
         meter.charge(1)?;
         let variable = literal.variable().index();

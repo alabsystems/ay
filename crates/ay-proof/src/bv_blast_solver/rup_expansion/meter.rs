@@ -235,7 +235,7 @@ impl RupExpansionMeter {
 }
 
 pub(super) fn reserve_rup_map<K, V>(
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
     entries: usize,
 ) -> Result<(), BvSolvedExportError> {
     // Hash tables need control bytes and spare capacity in addition to their
@@ -251,7 +251,7 @@ pub(super) fn reserve_rup_map<K, V>(
 pub(super) fn try_reserve_rup_map<K, V>(
     map: &mut std::collections::HashMap<K, V>,
     entries: usize,
-    state: &RupExpansionState,
+    state: &RupExpansionState<'_>,
 ) -> Result<(), BvSolvedExportError>
 where
     K: Eq + Hash,
@@ -275,7 +275,7 @@ where
 
 pub(super) fn reserve_rup_vec<T>(
     len: usize,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
     literal_slots: usize,
 ) -> Result<Vec<T>, BvSolvedExportError> {
     if state.meter.is_none() {

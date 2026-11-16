@@ -93,7 +93,7 @@ fn verify_drat_proof_native(
     let steps =
         parse_drat(proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker

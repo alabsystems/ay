@@ -105,7 +105,7 @@ fn elaborate_replay_without_solving(text: &str) {
     for command in &commands {
         context.process_command(command).unwrap();
     }
-    assert!(!context.assertions.is_empty());
+    assert_ne!(context.assertions, [] as [ay_core::TermId; 0]);
 }
 
 #[test]

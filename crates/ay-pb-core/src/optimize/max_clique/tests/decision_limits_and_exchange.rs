@@ -76,7 +76,7 @@ fn decision_search_node_limit_is_fail_closed_without_global_interruption() {
     assert_eq!(stats.nodes_visited, 0);
     assert!(stats.interrupted);
     assert!(!search.interrupted);
-    assert!(search.best_vertices.is_empty());
+    assert_eq!(search.best_vertices.as_slice(), &[] as &[usize]);
     assert!(no_clique_cache.is_empty());
 }
 

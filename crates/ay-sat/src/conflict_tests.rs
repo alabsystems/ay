@@ -103,7 +103,7 @@ fn test_compact_clears_seen_state_regression() {
     analyzer.compact(&mut var_data);
     let mut var_data = vd(&[0; 4]);
 
-    assert!(analyzer.seen_to_clear.is_empty());
+    assert_eq!(analyzer.seen_to_clear.len(), 0);
     #[cfg(debug_assertions)]
     assert_eq!(analyzer.seen_true_count, 0);
 
@@ -128,16 +128,16 @@ fn test_compact_resets_analysis_buffers() {
     analyzer.compact(&mut var_data);
 
     // Seen marks cleared by compact() via sparse-clear
-    assert!(analyzer.seen_to_clear.is_empty());
+    assert_eq!(analyzer.seen_to_clear.len(), 0);
     #[cfg(debug_assertions)]
     assert_eq!(analyzer.seen_true_count, 0);
     assert_eq!(analyzer.learned_count(), 0);
     assert!(analyzer.asserting_lit.is_none());
-    assert!(analyzer.resolution_chain.is_empty());
+    assert_eq!(analyzer.resolution_chain.len(), 0);
     assert_eq!(analyzer.resolution_chain_len(), 0);
-    assert!(analyzer.lbd_seen.is_empty());
-    assert!(analyzer.lbd_to_clear.is_empty());
-    assert!(analyzer.clause_buf.is_empty());
+    assert_eq!(analyzer.lbd_seen.len(), 0);
+    assert_eq!(analyzer.lbd_to_clear.len(), 0);
+    assert_eq!(analyzer.clause_buf.len(), 0);
 }
 
 #[test]

@@ -439,7 +439,7 @@ fn an_arithmetic_term_over_its_own_class_does_not_loop() {
 
     let canonical = v.run(vec![root, clause]);
 
-    assert!(!canonical.assertions.is_empty());
+    assert_ne!(canonical.assertions, [] as [TermId; 0]);
     assert_ne!(canonical.assertions, vec![v.terms.false_term()]);
 }
 

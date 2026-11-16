@@ -164,9 +164,10 @@ fn capture_with_group_sample(
             if let Some(current) =
                 crate::supervisor::process_group::process_identity(owned.child.id())?
             {
+                let left_original_group = current.group != original.pid;
                 if current.birth != original.birth
                     || current.parent != original.parent
-                    || current.group != original.pid
+                    || left_original_group
                 {
                     return Err(io::Error::other("metadata original group identity changed; RSS restriction cannot be proved"));
                 }

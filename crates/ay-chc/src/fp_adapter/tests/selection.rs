@@ -147,8 +147,11 @@ fn whole_selection_keeps_condition_both_words_and_all_original_roots() {
     let mut budget = WorkBudget::new(10_000_000_000, &mut poll);
     let output = lower_fp_clause(&terms, &roots, &inputs, &namespace, &mut budget).unwrap();
     assert_eq!(output.source_roots(), &roots);
-    assert!(std::ptr::eq(output.source_terms(), &terms));
-    assert!(std::ptr::eq(output.source_namespace(), &namespace));
+    assert!(std::ptr::eq(output.source_terms(), &raw const terms));
+    assert!(std::ptr::eq(
+        output.source_namespace(),
+        &raw const namespace
+    ));
     assert_eq!(output.input_bindings().len(), 3);
     let ChcExpr::Op(crate::ChcOp::And, entries) = output.constraint() else {
         panic!()
@@ -383,17 +386,19 @@ fn original_work_and_storage_one_short_poison_without_new_allowance() {
         storage.set(storage.get() + bytes);
         Ok(())
     };
-    let mut funded = WorkBudget::with_admission(10_000_000_000, &mut count);
-    assert!(lower_fp_clause(&terms, &[root], &[], &namespace, &mut funded).is_ok());
-    drop(funded);
+    {
+        let mut funded = WorkBudget::with_admission(10_000_000_000, &mut count);
+        assert!(lower_fp_clause(&terms, &[root], &[], &namespace, &mut funded).is_ok());
+    }
     let mut poll = || ControlFlow::Continue(());
-    let mut short = WorkBudget::new((work.get() - 1) as u64, &mut poll);
-    assert!(matches!(
-        lower_fp_clause(&terms, &[root], &[], &namespace, &mut short),
-        Err(FpAdapterError::Owner(QueryError::Exhausted))
-    ));
-    assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-    drop(short);
+    {
+        let mut short = WorkBudget::new((work.get() - 1) as u64, &mut poll);
+        assert!(matches!(
+            lower_fp_clause(&terms, &[root], &[], &namespace, &mut short),
+            Err(FpAdapterError::Owner(QueryError::Exhausted))
+        ));
+        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+    }
     let mut zero = WorkBudget::new(0, &mut poll);
     assert!(matches!(
         lower_fp_clause(&terms, &[root], &[], &namespace, &mut zero),

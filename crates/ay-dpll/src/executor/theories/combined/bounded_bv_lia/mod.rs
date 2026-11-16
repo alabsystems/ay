@@ -70,8 +70,7 @@ impl Executor {
             &exact_roots,
             self.current_solve_deadline(),
         )
-        .ok()
-        .is_some_and(|evidence| evidence.is_current_for(&self.ctx.terms, &exact_roots));
+        .is_ok_and(|evidence| evidence.is_current_for(&self.ctx.terms, &exact_roots));
 
         if self.should_abort_theory_loop() {
             return Some(SolveResult::Unknown);

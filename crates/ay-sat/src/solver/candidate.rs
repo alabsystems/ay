@@ -65,9 +65,9 @@ pub struct CandidateSolver {
 impl CandidateSolver {
     /// Construct a fixed variable namespace under the retained original owner.
     pub fn try_new(num_vars: usize, owner: CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         let mut solver =
-            Solver::build_with_hint(num_vars, None, None, &super::construction::Counted(&owner))?;
+            Solver::build_with_hint(num_vars, None, None, &construction::Counted(&owner))?;
         owner.admit(num_vars.saturating_add(1), 0)?;
         solver.set_ic3_mode();
         owner.check()?;
@@ -86,10 +86,10 @@ impl CandidateSolver {
             clause.len().saturating_add(1),
             clause
                 .len()
-                .checked_mul(std::mem::size_of::<Literal>())
+                .checked_mul(size_of::<Literal>())
                 .ok_or_else(|| self.owner.refuse(CountedAdmissionError::StorageExhausted))?,
         )?;
-        if clause.len() > super::clause_add::OVERSIZED_CLAUSE_SPLIT_THRESHOLD
+        if clause.len() > clause_add::OVERSIZED_CLAUSE_SPLIT_THRESHOLD
             || clause
                 .iter()
                 .any(|literal| literal.variable().index() >= self.solver.user_num_vars)
@@ -248,9 +248,9 @@ impl IncrementalCompletion<'_> {
                 })();
                 match result {
                     Ok(values) => AssumeResult::Sat(values),
-                    Err(error) => solver.declare_assume_unknown_with_reason(
-                        super::counted_admission::reason(error),
-                    ),
+                    Err(error) => {
+                        solver.declare_assume_unknown_with_reason(counted_admission::reason(error))
+                    }
                 }
             }
         }

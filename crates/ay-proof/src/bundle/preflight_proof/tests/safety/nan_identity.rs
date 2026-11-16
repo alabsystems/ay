@@ -216,12 +216,12 @@ fn nan_preflight_global_snapshot_validation_remains_prior_and_mandatory() {
     let fixture = Fixture::new(8, 24);
     let bundle = fixture.bundle();
     let preflight = |bundle: &SerializableProofBundle| {
-        crate::bundle::preflight::preflight_bundle_with_progress(bundle, &mut |_, _| true)
+        preflight::preflight_bundle_with_progress(bundle, &mut |_, _| true)
     };
     assert!(preflight(&bundle).is_ok());
     // This shape-only proof is deliberately not closed; shape preflight is
     // separate from strict replay and cannot itself create proof authority.
-    assert!(crate::re_check_bundle_strict(&bundle).is_err());
+    assert!(re_check_bundle_strict(&bundle).is_err());
     let mut descendant = bundle.clone();
     descendant.term_entries[2].0 = TermData::App(Symbol::named("fp.neg"), vec![TermId(u32::MAX)]);
     let shallow = Fixture {

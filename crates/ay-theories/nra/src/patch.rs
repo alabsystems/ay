@@ -82,7 +82,7 @@ impl NraSolver<'_> {
     ) -> Option<BigRational> {
         let mut product = BigRational::one();
         for &var in &mon.vars {
-            product *= self.monomial_factor_value_memo(var, memo)?;
+            product *= self.monomial_factor_value(var, memo)?;
         }
         Some(mon.aux_from_product(&product))
     }

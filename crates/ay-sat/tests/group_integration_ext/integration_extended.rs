@@ -977,7 +977,7 @@ p cnf 6 9
     let proof = String::from_utf8(writer.into_vec().expect("proof flush")).expect("Valid UTF-8");
 
     // LRAT proof must not be empty
-    assert!(!proof.is_empty(), "LRAT proof must not be empty for UNSAT");
+    assert_ne!(proof.len(), 0, "LRAT proof must not be empty for UNSAT");
 
     // Every LRAT line must be well-formed: "id literals... 0 hints... 0" or "id d clause_ids... 0"
     for line in proof.lines() {

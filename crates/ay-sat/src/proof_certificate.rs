@@ -430,6 +430,7 @@ impl ProofCertificate {
     /// [`Self::write_drat`] for independently checkable SAT evidence. This
     /// does not affect the input-bound SMT Alethe exporter in `ay-proof`.
     #[deprecated(
+        since = "0.27.0",
         note = "SAT Alethe export is unavailable without original DIMACS clauses; use write_lrat or write_drat"
     )]
     pub fn write_alethe(&self, w: &mut dyn Write) -> io::Result<()> {

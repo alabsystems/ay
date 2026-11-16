@@ -194,7 +194,10 @@ fn addition_charges_copied_terms_and_subtraction_cancels_exactly() {
     assert!(checked_poly_add(&poly, &MultiPoly::zero(), &mut exhausted).is_none());
     let difference = checked_poly_sub(&poly, &poly, &mut SosPolynomialBudget::default())
         .expect("small exact subtraction");
-    assert!(difference.terms.is_empty());
+    assert_eq!(
+        difference.terms.as_slice(),
+        &[] as &[(Vec<TermId>, BigRational)]
+    );
 }
 
 #[test]

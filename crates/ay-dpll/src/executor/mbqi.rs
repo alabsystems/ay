@@ -178,6 +178,7 @@ pub(in crate::executor) struct CheckedExactClosedSentenceSat {
     source_context_stamp: ay_frontend::SourceContextStamp,
     roots: Box<[TermId]>,
     root_entries: Box<[Option<TermEntryStamp>]>,
+    #[cfg(test)]
     evidence: ClosedSentenceEvidence,
 }
 
@@ -201,12 +202,12 @@ pub(in crate::executor) struct CheckedDtSatAuthority {
 /// certificate producer. Accounting reconstruction does not grant SAT or
 /// renew a semantic seal; only the completed interpretation can cross here.
 pub(in crate::executor) struct CheckedDtModelConstruction<'a> {
-    model: &'a mut super::model::Model,
+    model: &'a mut Model,
     roots: &'a [TermId],
 }
 
 impl<'a> CheckedDtModelConstruction<'a> {
-    pub(in crate::executor) fn into_parts(self) -> (&'a mut super::model::Model, &'a [TermId]) {
+    pub(in crate::executor) fn into_parts(self) -> (&'a mut Model, &'a [TermId]) {
         (self.model, self.roots)
     }
 }
@@ -393,7 +394,7 @@ impl CheckedExactClosedSentenceSat {
     fn for_current(
         executor: &Executor,
         roots: &[TermId],
-        evidence: ClosedSentenceEvidence,
+        _evidence: ClosedSentenceEvidence,
     ) -> Self {
         Self {
             query_epoch: executor.query_authority_epoch.clone(),
@@ -403,11 +404,13 @@ impl CheckedExactClosedSentenceSat {
                 .iter()
                 .map(|&root| executor.ctx.terms.entry_stamp(root))
                 .collect(),
-            evidence,
+            #[cfg(test)]
+            evidence: _evidence,
         }
     }
 
     /// The evidence class this grant rests on.
+    #[cfg(test)]
     pub(in crate::executor) fn evidence(&self) -> ClosedSentenceEvidence {
         self.evidence
     }

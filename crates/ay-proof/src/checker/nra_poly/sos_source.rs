@@ -46,6 +46,9 @@ pub(crate) fn extract_sos_clause_sources(
         let TermData::App(Symbol::Named(name), args) = terms.get(atom) else {
             return Err("SOS requires direct arithmetic comparison literals".to_string());
         };
+        if declared_application(terms, atom, meter)? {
+            return Err("SOS comparison is a declared application".to_string());
+        }
         if args.len() != 2 || !matches!(name.as_str(), "=" | "<" | "<=" | ">" | ">=") {
             return Err("SOS rejects Boolean packing and unsupported comparisons".to_string());
         }
@@ -125,6 +128,9 @@ fn preflight_arithmetic(
         }
         if terms.sort(term) != source_sort {
             return Err("SOS arithmetic child sorts do not agree".to_string());
+        }
+        if declared_application(terms, term, meter)? {
+            return Err("SOS source has an opaque declared application".to_string());
         }
         match terms.get(term) {
             TermData::Const(Constant::Rational(value)) if source_sort == &Sort::Real => {

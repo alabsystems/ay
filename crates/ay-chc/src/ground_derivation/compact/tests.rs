@@ -110,7 +110,7 @@ fn evidence(depth: usize) -> (ChcProblem, CompactDerivation) {
 }
 
 fn check(problem: &ChcProblem, derivation: &CompactDerivation) -> Result<()> {
-    validate(problem, derivation, &mut Owner::capture()?)
+    validate(problem, derivation, &mut Owner::<'_>::capture()?)
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn unread_sibling_corruption_breaks_original_relation_equality() {
                 constructor,
                 fields: vec![fields[0], fields[0]],
             },
-            &mut Owner::capture().expect("owner"),
+            &mut Owner::<'_>::capture().expect("owner"),
         )
         .expect("typed but different complete value");
     *derivation.steps[1]
@@ -222,7 +222,7 @@ fn unknown_constructor_arity_and_child_sort_are_rejected() {
         }
         let id = derivation
             .arena
-            .intern(&node, &mut Owner::capture().expect("owner"))
+            .intern(&node, &mut Owner::<'_>::capture().expect("owner"))
             .expect("structural node");
         *derivation.steps[0]
             .env

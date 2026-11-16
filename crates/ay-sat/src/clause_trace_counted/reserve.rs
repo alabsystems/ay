@@ -59,7 +59,7 @@ fn replacement<T>(
     let replacement = try_reserved_exact(owner, target)?;
     let excess = replacement.capacity().saturating_sub(target);
     let bytes = excess
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .ok_or_else(|| exhausted(owner))?;
     owner.admit(excess, bytes)?;
     Ok(Some(replacement))

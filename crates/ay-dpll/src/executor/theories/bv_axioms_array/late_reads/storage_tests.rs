@@ -124,8 +124,8 @@ fn eager_walk_reaches_bv_dependencies_below_boolean_conditions_without_scanning_
     let unrelated = terms.mk_var("unrelated", Sort::bitvec(32));
     let preexisting = terms.mk_var("already-eager", Sort::bitvec(32));
     let mut reads = LateArrayReads::default();
-    reads.materialize_read(&mut terms, value_array, index);
-    reads.materialize_read(&mut terms, bool_array, index);
+    let _ = reads.materialize_read(&mut terms, value_array, index);
+    let _ = reads.materialize_read(&mut terms, bool_array, index);
     let mut eager = HashSet::default();
     eager.insert(preexisting);
     reads.extend_eager_terms(&terms, &mut eager);
@@ -150,8 +150,8 @@ fn folded_arithmetic_is_really_encoded_when_delay_mode_is_enabled() {
     let bool_array = terms.mk_const_array(Sort::bitvec(8), condition);
     let index = terms.mk_var("index", Sort::bitvec(8));
     let mut reads = LateArrayReads::default();
-    reads.materialize_read(&mut terms, array, index);
-    reads.materialize_read(&mut terms, bool_array, index);
+    let _ = reads.materialize_read(&mut terms, array, index);
+    let _ = reads.materialize_read(&mut terms, bool_array, index);
     let mut uncontrolled = BvSolver::new(&terms);
     uncontrolled.set_delay_enabled(true);
     reads.materialize_bits(&mut uncontrolled, &terms);
@@ -168,7 +168,7 @@ fn folded_arithmetic_is_really_encoded_when_delay_mode_is_enabled() {
     assert!(encoded.delayed_ops().is_empty());
     assert_eq!(encoded.get_term_bits(value).unwrap().len(), 16);
     assert!(encoded.bool_to_var().contains_key(&condition));
-    assert!(!encoded.clauses().is_empty());
+    assert_ne!(encoded.clauses(), []);
     let (variables, clauses) = (encoded.num_vars(), encoded.clauses().len());
     reads.materialize_bits(&mut encoded, &terms);
     assert_eq!(encoded.num_vars(), variables);

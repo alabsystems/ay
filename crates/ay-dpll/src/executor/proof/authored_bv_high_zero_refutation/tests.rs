@@ -7,9 +7,11 @@ use crate::executor::theories::solve_harness::ProofProblemAssertionProvenance;
 use ay_frontend::parse;
 
 fn fixture(bound: u32, include_second_edge: bool, expected_zero: u32) -> String {
-    let second_edge = include_second_edge
-        .then_some("(= x3 x2)")
-        .unwrap_or("(= unrelated x2)");
+    let second_edge = if include_second_edge {
+        "(= x3 x2)"
+    } else {
+        "(= unrelated x2)"
+    };
     format!(
         r#"(set-logic ALL)
             (declare-const x1 (_ BitVec 64))
@@ -49,10 +51,12 @@ fn ult_fanout_fixture(fact_count: usize) -> String {
 fn executor_for(source: &str) -> Executor {
     let commands = parse(source).expect("test input parses");
     let mut executor = Executor::new();
-    assert!(executor
-        .execute_all(&commands)
-        .expect("declarations/assertion execute")
-        .is_empty());
+    assert_eq!(
+        executor
+            .execute_all(&commands)
+            .expect("declarations/assertion execute"),
+        [] as [String; 0]
+    );
     executor
 }
 
@@ -199,8 +203,11 @@ fn replacement_declines_when_raw_root_has_no_preexisting_membership() {
     executor.replace_with_exact_authored_bv_high_zero_refutation(&mut proof);
 
     assert_single_trust(&proof);
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
-    assert!(executor.last_proof_rebuild_originals.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
+    assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
 }
 
 #[test]
@@ -214,9 +221,7 @@ fn replacement_declines_misaligned_parsed_and_canonical_indices() {
         assertion_sources: Default::default(),
     });
     assert_eq!(executor.ctx.assertions_parsed().len(), 1);
-    assert!(executor
-        .proof_original_problem_assertions_slice()
-        .is_empty());
+    assert_eq!(executor.proof_original_problem_assertions_slice(), []);
     let mut proof = provisional_trust_proof();
 
     executor.replace_with_exact_authored_bv_high_zero_refutation(&mut proof);
@@ -304,7 +309,7 @@ fn missing_raw_authority_declines_before_publication_walk() {
     executor.replace_with_exact_authored_bv_high_zero_refutation(&mut proof);
 
     assert_eq!(executor.strict_check_invocations.get(), checks_before);
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }
 
 #[test]

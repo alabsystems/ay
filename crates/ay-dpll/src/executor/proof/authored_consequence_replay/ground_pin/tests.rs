@@ -23,10 +23,10 @@ fn provenance_for(
 fn executor_with_instance(script: &str, value: i64) -> Executor {
     let commands = ay_frontend::parse(script).expect("ground-pin fixture parses");
     let mut exec = Executor::new();
-    assert!(exec
-        .execute_all(&commands)
-        .expect("fixture loads")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("fixture loads"),
+        [] as [String; 0]
+    );
     let record = provenance_for(&mut exec, value);
     exec.ematching_proof_records
         .push(crate::executor::EmatchingProofRecord {

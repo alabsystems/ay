@@ -140,14 +140,14 @@ impl BvPlan<'_> {
         let (guard, sticky) = if cut == 0 {
             (false, false)
         } else {
-            super::discarded_bits(
+            discarded_bits(
                 v.fraction,
                 cut,
                 normal.then_some(hidden),
                 v.fraction.trailing(),
             )
         };
-        if super::round_increment(self.rm, v.sign, guard, sticky, q.bit(0)) {
+        if round_increment(self.rm, v.sign, guard, sticky, q.bit(0)) {
             q += BigUint::one();
         }
         let fits = if matches!(self.signedness, Signedness::Unsigned) {

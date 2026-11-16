@@ -89,10 +89,89 @@ static int model_has_only(Z3_context c, Z3_solver s, const char *a,
     return ok;
 }
 
+// Caller-built model declarations must be discoverable, including overloads.
+// This same control runs against the pinned reference with AY_TWIN_USE_Z3.
+static void check_user_model_inventory(Z3_context c) {
+    Z3_sort integer = Z3_mk_int_sort(c);
+    Z3_sort boolean = Z3_mk_bool_sort(c);
+    Z3_symbol name = Z3_mk_string_symbol(c, "inventory_member");
+    Z3_model model = Z3_mk_model(c);
+    Z3_model_inc_ref(c, model);
+    Z3_func_decl ci = Z3_mk_func_decl(c, name, 0, NULL, integer);
+    Z3_func_decl cb = Z3_mk_func_decl(c, name, 0, NULL, boolean);
+    Z3_ast seven = Z3_mk_int(c, 7, integer);
+    Z3_ast eleven = Z3_mk_int(c, 11, integer);
+    Z3_ast yes = Z3_mk_true(c);
+    Z3_add_const_interp(c, model, ci, seven);
+    Z3_add_const_interp(c, model, cb, yes);
+    CHECK(Z3_model_get_num_consts(c, model) == 2,
+          "both overloaded user constants are enumerated");
+    unsigned seen_constants = 0;
+    for (unsigned i = 0; i < Z3_model_get_num_consts(c, model); ++i) {
+        Z3_func_decl d = Z3_model_get_const_decl(c, model, i);
+        CHECK(d != NULL, "user constant declaration is present");
+        if (d == NULL) continue;
+        if (Z3_is_eq_func_decl(c, d, ci)) {
+            CHECK(Z3_is_eq_ast(c, Z3_model_get_const_interp(c, model, d), seven),
+                  "integer user constant value");
+            seen_constants |= 1;
+        } else if (Z3_is_eq_func_decl(c, d, cb)) {
+            CHECK(Z3_is_eq_ast(c, Z3_model_get_const_interp(c, model, d), yes),
+                  "Boolean user constant value");
+            seen_constants |= 2;
+        }
+    }
+    CHECK(seen_constants == 3, "enumeration covers both constant identities");
+    Z3_add_const_interp(c, model, ci, eleven);
+    CHECK(Z3_model_get_num_consts(c, model) == 2,
+          "constant reassignment retains inventory size");
+    CHECK(Z3_is_eq_ast(c, Z3_model_get_const_interp(c, model, ci), eleven),
+          "constant reassignment replaces the value");
+
+    Z3_func_decl fi = Z3_mk_func_decl(c, name, 1, &integer, integer);
+    Z3_func_decl fb = Z3_mk_func_decl(c, name, 1, &boolean, integer);
+    Z3_add_func_interp(c, model, fi, seven);
+    Z3_add_func_interp(c, model, fb, eleven);
+    CHECK(Z3_model_get_num_funcs(c, model) == 2,
+          "both overloaded user functions are enumerated");
+    unsigned seen_functions = 0;
+    for (unsigned i = 0; i < Z3_model_get_num_funcs(c, model); ++i) {
+        Z3_func_decl d = Z3_model_get_func_decl(c, model, i);
+        CHECK(d != NULL, "user function declaration is present");
+        if (d == NULL) continue;
+        Z3_func_interp interpretation = Z3_model_get_func_interp(c, model, d);
+        CHECK(interpretation != NULL, "enumerated user function interpretation");
+        if (interpretation == NULL) continue;
+        Z3_ast otherwise = Z3_func_interp_get_else(c, interpretation);
+        if (Z3_is_eq_func_decl(c, d, fi)) {
+            CHECK(Z3_is_eq_ast(c, otherwise, seven), "integer-domain function value");
+            seen_functions |= 1;
+        } else if (Z3_is_eq_func_decl(c, d, fb)) {
+            CHECK(Z3_is_eq_ast(c, otherwise, eleven), "Boolean-domain function value");
+            seen_functions |= 2;
+        }
+    }
+    CHECK(seen_functions == 3, "enumeration covers both function identities");
+    Z3_add_func_interp(c, model, fi, eleven);
+    CHECK(Z3_model_get_num_funcs(c, model) == 2,
+          "function reassignment retains inventory size");
+    Z3_func_interp replacement = Z3_model_get_func_interp(c, model, fi);
+    CHECK(replacement != NULL &&
+          Z3_is_eq_ast(c, Z3_func_interp_get_else(c, replacement), eleven),
+          "function reassignment replaces the default");
+    Z3_model_dec_ref(c, model);
+}
+
 int main(void) {
     Z3_config cfg = Z3_mk_config();
     Z3_context c = Z3_mk_context(cfg);
     Z3_del_config(cfg);
+    check_user_model_inventory(c);
+#ifdef AY_MODEL_INVENTORY_ONLY
+    Z3_del_context(c);
+    printf("model inventory: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+#endif
     Z3_sort real = Z3_mk_real_sort(c);
     Z3_sort int_s = Z3_mk_int_sort(c);
 

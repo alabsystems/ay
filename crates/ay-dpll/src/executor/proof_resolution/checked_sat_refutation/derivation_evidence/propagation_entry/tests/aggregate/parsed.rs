@@ -9,7 +9,7 @@ use ay_core::ProofStep;
 fn replay_parsed(source: &str, variables: &[&str], query: usize, opaque: Option<usize>) {
     let mut executor = Executor::new();
     let commands = ay_frontend::parse(source).unwrap();
-    assert!(executor.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(executor.execute_all(&commands).unwrap(), [] as [String; 0]);
     let originals = executor.ctx.assertions.clone();
     assert_eq!(query, variables.len());
     assert_eq!(originals.len(), query + 1 + usize::from(opaque.is_some()));

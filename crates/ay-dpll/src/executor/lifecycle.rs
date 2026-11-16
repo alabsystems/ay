@@ -475,18 +475,6 @@ impl Executor {
             .is_some_and(QuantifierManager::demand_active)
     }
 
-    /// Compatibility shim retained for callers that previously toggled model
-    /// checking. Independent SAT validation is now a mandatory publication
-    /// boundary and cannot be disabled.
-    #[deprecated(note = "the independent model gate is mandatory and cannot be disabled")]
-    pub fn set_independent_model_gate(&mut self, _enabled: bool) {}
-
-    /// Whether the independent model-check gate is currently enabled.
-    #[must_use]
-    pub const fn independent_model_gate_enabled(&self) -> bool {
-        true
-    }
-
     /// Create a new executor with a specific verification level (#4444).
     #[must_use]
     pub fn with_verification_level(level: VerificationLevel) -> Self {

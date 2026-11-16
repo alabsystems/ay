@@ -5,11 +5,10 @@
 
 use super::super::QuantifiedChcTraceBinding;
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 
 mod fixtures;
 mod native;
-#[path = "../../render/tests/oracle.rs"]
-mod oracle;
 
 pub(super) fn control(token: &CancellationToken) -> SourceControl<'_> {
     SourceControl::new(Instant::now() + Duration::from_secs(60), token)
@@ -164,8 +163,14 @@ fn stale_pins_refuse_but_coherent_unsatisfying_pins_remain_only_prepared_data() 
     let prepared = prepare(&trace, row.id(), &aggregate, &control(&token)).unwrap();
     // Exact pin reconstruction is not SAT authority. This independent tiny
     // interpreter finds no assignment; native.rs checks actual lift refusal.
-    assert!(oracle::models(&prepared.pinned).is_empty());
-    assert!(oracle::models(trace.replay_obligation()).is_empty());
+    assert_eq!(
+        oracle::models(&prepared.pinned),
+        [] as [std::vec::Vec<u64>; 0]
+    );
+    assert_eq!(
+        oracle::models(trace.replay_obligation()),
+        [] as [std::vec::Vec<u64>; 0]
+    );
     trace.bindings[0].occurrence = 1;
     assert!(prepare(&trace, row.id(), &aggregate, &control(&token)).is_none());
 }

@@ -230,5 +230,5 @@ fn an_exhausted_envelope_rejects_rather_than_accepts() {
     assert!(recognize_euf_polarity_congruence(&terms, &clause));
     let refused = validate_euf_polarity_congruence(&terms, ProofId(0), &clause, &mut |_, _| false);
     assert!(matches!(refused, Err(ProofCheckError::ResourceLimit)));
-    assert!(!GUARD_MUTATION_LEDGER.is_empty());
+    assert_ne!(GUARD_MUTATION_LEDGER, "");
 }

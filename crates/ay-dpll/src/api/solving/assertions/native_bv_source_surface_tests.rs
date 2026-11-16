@@ -111,7 +111,7 @@ fn genuine_retention_off_source_is_other_and_still_certifies() {
     solver.parse_smtlib2("(declare-const unretained_surface_x (_ BitVec 4)) (assert (= unretained_surface_x #x0)) (assert (= unretained_surface_x #x1))")
         .expect("genuine unretained source");
     let ctx = solver.executor.context();
-    assert!(ctx.assertions_parsed().is_empty());
+    assert_eq!(ctx.assertions_parsed(), []);
     assert_eq!(
         ctx.native_assertion_surfaces_for(&ctx.assertions, 64, &mut |_| true),
         Some(NativeAssertionSurfaces::Other)

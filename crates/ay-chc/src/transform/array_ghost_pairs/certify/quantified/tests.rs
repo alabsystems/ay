@@ -130,6 +130,15 @@ pub(super) fn deadline() -> Instant {
 }
 
 #[test]
+fn every_source_clause_requires_one_premise_row() {
+    let source = fixture(true, "i");
+    assert!(source_clause_rows_match(source.source_problem(), &source));
+    let mut extra_clause = source.source_problem().clone();
+    extra_clause.add_clause(source.source_problem().clauses()[0].clone());
+    assert!(!source_clause_rows_match(&extra_clause, &source));
+}
+
+#[test]
 fn symbolic_source_uses_the_same_arbitrary_head_probe_not_low_index_enumeration() {
     let source = fixture(true, "i");
     let token = CancellationToken::new();

@@ -14,7 +14,7 @@
 //! AY returning "unknown" when Z3 is definite is a completeness gap,
 //! not a soundness issue.
 
-use crate::common::{check_z3_or_skip, z3_oracle};
+use crate::common::z3::{check_z3_or_skip, z3_oracle};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use proptest::prelude::*;

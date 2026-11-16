@@ -238,7 +238,7 @@ mod fp_serde {
 
     struct FpOpFieldVisitor;
 
-    impl<'de> Visitor<'de> for FpOpFieldVisitor {
+    impl Visitor<'_> for FpOpFieldVisitor {
         type Value = FpOp;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

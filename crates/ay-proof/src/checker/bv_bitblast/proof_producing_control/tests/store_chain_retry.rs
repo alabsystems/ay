@@ -9,6 +9,7 @@
 use super::super::ordinary::{attempt_ordinary_refutation, counted_exhaustion};
 use super::*;
 use crate::checker::bv_bitblast::array_finite::SmallIndexReads;
+use crate::checker::bv_bitblast::producer_limits::strict_producer_limits;
 
 /// `(= v (select (store ((as const (Array (_ BitVec index) (_ BitVec element)))
 /// 0) off v) off))`, and the same read against an unrelated value `w`.

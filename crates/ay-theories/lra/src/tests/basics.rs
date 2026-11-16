@@ -80,7 +80,7 @@ fn test_linear_expr_cancel() {
     expr.add_term(0, BigRational::from(BigInt::from(-3)));
 
     // Should cancel: 3x - 3x = 0
-    assert!(expr.coeffs.is_empty());
+    assert_eq!(expr.coeffs, []);
 }
 
 #[test]

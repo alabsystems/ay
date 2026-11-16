@@ -259,7 +259,7 @@ fn nan_scope_pop_and_foreign_positive_roots_cannot_authorize_a_proof() {
         ),
         Outcome::Declined
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
     executor
         .execute_all(&ay_frontend::parse(&format!("(push 1) {BOTH}")).unwrap())
         .unwrap();
@@ -276,7 +276,7 @@ fn nan_scope_pop_and_foreign_positive_roots_cannot_authorize_a_proof() {
         ),
         Outcome::Declined
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }
 
 #[test]
@@ -355,7 +355,11 @@ fn nan_census_and_evidence_respect_live_and_recorded_terminal_stops() {
         assert_eq!(attempt(&mut executor, MAX_WORK, 0).0, Outcome::Stopped);
     }
     let mut executor = parsed(&source(8, 24, false, BOTH));
-    executor.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+    executor.set_deadline(Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock can represent one second ago"),
+    ));
     assert_eq!(attempt(&mut executor, MAX_WORK, 0).0, Outcome::Stopped);
 }
 
@@ -417,5 +421,5 @@ fn nan_forged_endpoint_metadata_fails_independent_theory_replay() {
         ),
         Outcome::Declined
     );
-    assert!(untouched.steps.is_empty());
+    assert_eq!(untouched.steps, [] as [ProofStep; 0]);
 }

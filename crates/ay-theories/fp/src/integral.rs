@@ -258,7 +258,7 @@ impl FpSolver<'_> {
             RoundingMode::RTZ => solver.const_false(),
         });
 
-        let one_exp = self.const_bv(u64::from(bias), eb);
+        let one_exp = self.const_bv(bias, eb);
         // `sb - 1` false bits, as `const_bv(0, ..)` builds them (`sb >= 2`).
         let zero_sig = self.const_bv(0, sb.saturating_sub(1));
         let zero_exp = self.const_bv(0, eb);

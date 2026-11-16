@@ -219,7 +219,7 @@ impl Executor {
             if found {
                 // Prepay amortized vector growth; there is no auxiliary unit
                 // hash index whose allocation precedes the caller's meter.
-                if active && !progress(1, 2 * std::mem::size_of::<(usize, TermId)>()) {
+                if active && !progress(1, 2 * size_of::<(usize, TermId)>()) {
                     return None;
                 }
                 candidates.push((index, *term));

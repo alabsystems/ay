@@ -167,9 +167,7 @@ fn caught_callback_panic_cannot_resume_the_operation_or_control() {
     let calls = Cell::new(0);
     let mut progress = |_, _| {
         calls.set(calls.get() + 1);
-        if calls.get() == 2 {
-            panic!("expected resource callback panic");
-        }
+        assert!(calls.get() != 2, "expected resource callback panic");
         true
     };
     let mut control = Control::new(&mut progress);

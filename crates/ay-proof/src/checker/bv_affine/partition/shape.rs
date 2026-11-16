@@ -11,7 +11,7 @@ pub(super) fn binary(terms: &TermStore, term: TermId, name: &str) -> Option<[Ter
     let [a, b] = args.as_slice() else { return None };
     terms.entry_stamp(*a)?;
     terms.entry_stamp(*b)?;
-    (op == name).then_some([*a, *b])
+    (op == name && !terms.is_declared_function(op)).then_some([*a, *b])
 }
 
 pub(super) fn flatten(

@@ -1138,9 +1138,9 @@ mod tests {
         // over the individualized colouring (cell order may differ: it
         // depends on the splitter sequence, which is fixed per procedure).
         let mut individualized = color_a.clone();
-        for u in 0..n {
-            if individualized[u] > color_a[v] || (individualized[u] == color_a[v] && u != v) {
-                individualized[u] += 1;
+        for (u, color) in individualized.iter_mut().enumerate() {
+            if *color > color_a[v] || (*color == color_a[v] && u != v) {
+                *color += 1;
             }
         }
         let mut full = Partition::from_colors(&individualized);
@@ -1235,7 +1235,7 @@ mod tests {
         ];
         let counts = build_formula_counts(&clauses);
         let signed = find_signed_automorphisms(&clauses, &counts, 10_000, 64);
-        assert!(!signed.is_empty(), "signed search must find generators");
+        assert_ne!(signed.len(), 0, "signed search must find generators");
         for g in &signed {
             assert!(crate::symmetry::literal_permutation_preserves_formula(
                 &counts, g

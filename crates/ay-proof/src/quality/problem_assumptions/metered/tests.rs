@@ -50,7 +50,7 @@ impl Fixture {
     }
 
     fn compare(&self) -> Result<(), ProofCheckError> {
-        let old = super::super::validate_problem_assumptions_metered(
+        let old = validate_problem_assumptions_metered(
             &self.proof,
             &self.terms,
             &self.roots,

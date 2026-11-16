@@ -39,6 +39,10 @@ impl std::fmt::Debug for ChcPdrProofRun {
 
 /// Solver-owned evidence state for an atomic proof/budget report.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "checked replay authority stays inline without a fresh unmetered post-verdict allocation"
+)]
 pub(super) enum ChcProofRunEvidence {
     MetadataOnly(ChcPdrProofRun),
     Checked(ChcCheckedReplayRun),
@@ -463,7 +467,6 @@ impl ChcProofRunWithBudgetReport {
     /// obligation, or internal AY panic leaves the original metadata-only run
     /// intact. Replay wall time is added to the authoritative whole-run elapsed
     /// time; the solve's stop classification is unchanged.
-    #[must_use]
     pub fn with_checked_replay(self, replay_budget: std::time::Duration) -> Self {
         self.with_checked_replay_with_progress(replay_budget, &mut || true)
     }
@@ -489,7 +492,6 @@ impl ChcProofRunWithBudgetReport {
     /// deadline or a 100 ms cancellation guarantee. The final poll is the
     /// admission point; replacing the original evidence can then perform
     /// additional opaque destruction before this call returns.
-    #[must_use]
     pub fn with_checked_replay_with_progress(
         self,
         replay_budget: std::time::Duration,
@@ -507,7 +509,6 @@ impl ChcProofRunWithBudgetReport {
     /// [`Self::with_checked_replay_with_progress`]. Opaque export/offline
     /// checking and cleanup remain; this is not a hard latency contract.
     /// As in the progress API, old-evidence disposal follows final admission.
-    #[must_use]
     pub fn with_checked_replay_with_cancellation(
         self,
         replay_budget: std::time::Duration,
@@ -616,7 +617,7 @@ mod replay_progress_tests;
 mod tests {
     use super::*;
     use crate::engine_result::ValidationEvidence;
-    use crate::{ChcEngineResult, ChcParser, ChcVar, ClauseBody};
+    use crate::{ChcEngineResult, ChcParser, ChcVar, ClauseBody, ClauseHead};
 
     fn parse_problem(query: &str) -> ChcProblem {
         ChcParser::parse(&format!(

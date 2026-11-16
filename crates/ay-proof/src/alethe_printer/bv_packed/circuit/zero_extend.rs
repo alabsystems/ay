@@ -35,7 +35,7 @@ impl TemplateKey {
         }
         // This is the original wire-case admission, including its unchanged
         // eight DISTINCT symbolic-bit bound, not a bound on the word width.
-        let arguments = super::super::wire::case_atoms(input.iter())?;
+        let arguments = wire::case_atoms(input.iter())?;
         let pattern = input
             .iter()
             .map(|bit| match bit.as_str() {

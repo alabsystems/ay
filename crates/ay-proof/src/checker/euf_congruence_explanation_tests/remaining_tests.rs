@@ -132,11 +132,20 @@ fn congruence_does_not_reach_under_a_binder() {
     // because p(1) is false, while `(forall x. p c)` is p(0) = TRUE (the body
     // does not mention the bound variable). So the conclusion equality is
     // false and the clause is FALSE.
+    let forall = |values: &[bool]| values.iter().copied().all(std::convert::identity);
+    for (values, expected) in [
+        ([false, false], false),
+        ([false, true], false),
+        ([true, false], false),
+        ([true, true], true),
+    ] {
+        assert_eq!(forall(&values), expected);
+    }
     let p = [true, false];
     let (x_value, c_value) = (0usize, 0usize);
     assert_eq!(x_value, c_value, "the hypothesis x = c holds");
-    let forall_p_x = p[0] && p[1];
-    let forall_p_c = p[c_value] && p[c_value];
+    let forall_p_x = forall(&p);
+    let forall_p_c = p[c_value];
     assert!(!forall_p_x);
     assert!(forall_p_c);
     assert_ne!(forall_p_x, forall_p_c, "the conclusion equality is false");
@@ -174,14 +183,14 @@ fn an_oversize_subterm_graph_is_rejected_rather_than_accepted() {
     // (each `store` contributes three nodes) without depending on it for its
     // size — deleting the bound must not turn this test into a memory bomb.
     const CHAIN: usize = 4200;
-    assert!(
+    const _: () = assert!(
         CHAIN * 3 > MAX_NODES,
         "the fixture must exceed MAX_NODES to exercise the bound"
     );
     let mut chain = terms.mk_var("base", array.clone());
     for step in 0..CHAIN {
-        let index = terms.mk_var(&format!("i{step}"), Sort::Int);
-        let value = terms.mk_var(&format!("v{step}"), Sort::Int);
+        let index = terms.mk_var(format!("i{step}"), Sort::Int);
+        let value = terms.mk_var(format!("v{step}"), Sort::Int);
         chain = mk_fun(
             &mut terms,
             "store",
@@ -494,5 +503,5 @@ const GUARD_MUTATION_LEDGER: &str = "see the doc comment above";
 
 #[test]
 fn guard_mutation_ledger_is_present() {
-    assert!(!GUARD_MUTATION_LEDGER.is_empty());
+    assert_ne!(GUARD_MUTATION_LEDGER, "");
 }

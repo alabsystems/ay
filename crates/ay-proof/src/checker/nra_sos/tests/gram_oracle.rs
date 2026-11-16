@@ -29,7 +29,9 @@ fn exact_two_by_two_psd_matches_all_principal_minors() {
                     // All principal minors are nonnegative iff a real
                     // symmetric 2x2 matrix is PSD. The common positive
                     // denominator does not change their signs.
-                    let expected = a >= 0 && c >= 0 && a * c >= b * b;
+                    let diagonal_product = a * c;
+                    let off_diagonal_square = b * b;
+                    let expected = a >= 0 && c >= 0 && diagonal_product >= off_diagonal_square;
                     let actual = gram::decode_and_check(&matrix, &mut WorkMeter::new()).is_ok();
                     assert_eq!(
                         actual, expected,

@@ -174,7 +174,7 @@ fn internal_projection_rejects_zero_and_variables_above_formula_range() {
             projection: Some(projection),
             ..Default::default()
         });
-        assert!(report.solutions.is_empty());
+        assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
         assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
         assert_eq!(report.stats.input_error, Some(expected));
         assert_eq!(report.stats.sat_calls, 0);
@@ -190,7 +190,7 @@ fn duplicate_projection_variables_are_rejected() {
         ..Default::default()
     });
 
-    assert!(report.solutions.is_empty());
+    assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
     assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
     assert_eq!(
         report.stats.input_error,
@@ -250,7 +250,7 @@ fn signed_clause_boundaries_are_typed_and_legacy_calls_fail_closed() {
     let mut compatibility_solver = AllSatSolver::new();
     compatibility_solver.add_clause(vec![0]);
     let report = compatibility_solver.enumerate_report();
-    assert!(report.solutions.is_empty());
+    assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
     assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
     assert_eq!(
         report.stats.input_error,
@@ -271,7 +271,7 @@ fn sparse_high_internal_identifier_is_rejected_before_dense_allocation() {
 
     solver.add_clause(vec![i32::MAX]);
     let report = solver.enumerate_report();
-    assert!(report.solutions.is_empty());
+    assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
     assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
     assert_eq!(report.stats.sat_calls, 0);
 }
@@ -637,7 +637,7 @@ fn external_projection_rejects_variables_at_or_above_user_count() {
         ..Default::default()
     });
 
-    assert!(report.solutions.is_empty());
+    assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
     assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
     assert_eq!(
         report.stats.input_error,
@@ -661,7 +661,7 @@ fn signed_clause_addition_is_rejected_for_external_backends() {
 
     solver.add_clause(vec![1]);
     let report = solver.enumerate_report();
-    assert!(report.solutions.is_empty());
+    assert_eq!(report.solutions.as_slice(), &[] as &[Solution]);
     assert_eq!(report.stats.outcome, AllSatOutcome::InvalidInput);
     assert_eq!(
         report.stats.input_error,

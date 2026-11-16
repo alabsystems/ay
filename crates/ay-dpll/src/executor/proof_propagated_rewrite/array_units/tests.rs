@@ -3,7 +3,7 @@
 
 use super::*;
 
-mod fixtures;
+pub(super) mod fixtures;
 use fixtures::{authenticate, Fixture};
 
 fn allow(_: usize, _: usize) -> bool {
@@ -149,7 +149,7 @@ fn plan_budget_is_exact_and_failure_does_not_refund_work_or_leave_steps() {
         let result = planner.plan_array_unit_base(&mut cx, f.term);
         assert_eq!(result.is_some(), budget == needed);
         if result.is_none() {
-            assert!(cx.chain.steps.is_empty());
+            assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
             assert!(cx.budget < budget || budget == 0);
         }
     }
@@ -170,7 +170,7 @@ fn fresh_plan_without_array_channel_cannot_reuse_an_old_plan_memo() {
     // The c7 constructor does not install this L1-only evidence channel.
     let mut fresh = PlanCx::new(&set, &f.roots, &records, &entries, &[], true);
     assert!(planner.plan_derive_clause(&mut fresh, f.term).is_none());
-    assert!(fresh.chain.steps.is_empty());
+    assert_eq!(fresh.chain.steps, [] as [ProofStep; 0]);
 }
 
 #[test]

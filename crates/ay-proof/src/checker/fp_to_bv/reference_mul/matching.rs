@@ -96,14 +96,14 @@ impl Reference<'_, '_> {
             .and_then(|n| n.checked_add(3))
             .ok_or(ReferenceError::Resource)?;
         let todo_bytes = tasks
-            .checked_mul(std::mem::size_of::<Pair>())
+            .checked_mul(size_of::<Pair>())
             .ok_or(ReferenceError::Resource)?;
         self.storage(tasks, todo_bytes)?;
         if todo.try_reserve_exact(tasks).is_err() {
             return self.stop(ReferenceError::Allocation);
         }
         let seen_bytes = count
-            .checked_mul(std::mem::size_of::<Option<TermId>>())
+            .checked_mul(size_of::<Option<TermId>>())
             .ok_or(ReferenceError::Resource)?;
         self.storage(count, seen_bytes)?;
         if seen.try_reserve_exact(count).is_err() {

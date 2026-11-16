@@ -124,10 +124,7 @@ fn private_complete_batch_all_entries_and_retries_share_native_original_work() {
     assert!(exec
         .functional_array_snapshots_for_named_values(&[w, w])
         .is_err());
-    assert_eq!(
-        data.work_used.load(Ordering::Acquire),
-        super::super::work_counter::REFUSED
-    );
+    assert_eq!(data.work_used.load(Ordering::Acquire), REFUSED);
 }
 
 #[test]

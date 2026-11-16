@@ -258,7 +258,7 @@ fn test_maxsmt_no_softs() {
     let result = solver.check_sat_max().unwrap();
     assert_eq!(result.status, MaxSmtStatus::Optimal);
     assert_eq!(result.satisfied_weight, 0);
-    assert!(result.violated_softs.is_empty());
+    assert_eq!(result.violated_softs, [] as [usize; 0]);
 }
 
 /// Sort mismatch: assert_soft with non-Bool term.
@@ -679,7 +679,7 @@ fn test_maxsmt_large_and_overflowing_weights_are_honest_unknown() {
         assert!(!result.is_optimal());
         assert_eq!(result.satisfied_weight, 0);
         assert_eq!(result.violated_weight(), 0);
-        assert!(result.violated_softs.is_empty());
+        assert_eq!(result.violated_softs, [] as [usize; 0]);
         assert_eq!(solver.assertions(), assertions_before);
         assert_eq!(solver.num_scopes(), scopes_before);
         assert!(solver.model().is_none());

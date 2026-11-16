@@ -45,7 +45,7 @@ fn application<'a>(terms: &'a TermStore, term: TermId, name: &str) -> Option<&'a
     let TermData::App(Symbol::Named(op), args) = data(terms, term)? else {
         return None;
     };
-    (op == name).then_some(args)
+    (op == name && !terms.is_declared_function(op)).then_some(args)
 }
 
 /// The two arguments of `name` applied to exactly two terms.
@@ -163,6 +163,10 @@ fn parse_guard(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the guarded-mask theorem's root, guard position, equality operands, and width are positional"
+)]
 fn check_guard(
     terms: &TermStore,
     root: TermId,
@@ -181,6 +185,7 @@ fn check_guard(
         mask,
         nodes: 0,
         work: 0,
+        metadata_work: 0,
         scale_constant_products: false,
         accept_elaborated_shifts: false,
     };
@@ -277,6 +282,11 @@ impl Mapper<'_, '_> {
         let TermData::App(Symbol::Named(op), args) = data(terms, term)? else {
             return None;
         };
+        if !matches!(op.as_str(), "bvshl" | "bvlshr" | "bvand" | "bvor" | "bvadd")
+            || terms.is_declared_function(op)
+        {
+            return None;
+        }
         let (left, right) = two_args(args)?;
         let next_depth = depth.checked_add(1)?;
         let a = self.bits(left, next_depth)?;

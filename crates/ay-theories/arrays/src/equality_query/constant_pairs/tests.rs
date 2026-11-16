@@ -55,7 +55,7 @@ fn singleton_index_blocks_do_no_constant_pair_comparisons_as_population_grows() 
         prepare(&mut solver);
         assert_eq!(solver.select_cache.len(), count);
         let before = comparisons();
-        assert!(check_oracle(&solver).is_empty());
+        assert_eq!(check_oracle(&solver).len(), 0);
         assert_eq!(comparisons() - before, 0);
         // The frozen reference still constructs this many global constant
         // comparisons; the assertion measures production loop events, not time.

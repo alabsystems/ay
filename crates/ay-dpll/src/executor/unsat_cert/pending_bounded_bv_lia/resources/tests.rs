@@ -106,7 +106,7 @@ fn stale_snapshot_proof_assumptions_and_unused_bundle_rows_remain_terminal() {
         let proof = executor.last_proof.as_ref().unwrap().clone();
         match mutation {
             0 => {
-                executor.ctx.terms.mk_var("later-unused", Sort::Bool);
+                let _ = executor.ctx.terms.mk_var("later-unused", Sort::Bool);
             }
             1 => {
                 executor.last_proof.as_mut().unwrap().steps.pop();

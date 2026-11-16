@@ -281,5 +281,5 @@ fn empty_goal_is_a_no_op() {
     let mut terms = TermStore::new();
     let mut fs: Vec<TermId> = Vec::new();
     assert!(!apply(&mut terms, &mut fs));
-    assert!(fs.is_empty());
+    assert_eq!(fs, [] as [TermId; 0]);
 }

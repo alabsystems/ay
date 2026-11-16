@@ -336,6 +336,7 @@ impl Solver {
     /// entry point so a dry-run artifact destination configured on the solver
     /// cannot add unmetered serialization or filesystem I/O to its resource
     /// envelope.
+    #[cfg(test)]
     pub(crate) fn solve_interruptible_without_artifact<F>(
         &mut self,
         should_stop: F,
@@ -1275,7 +1276,7 @@ impl Solver {
             // at Kissat's initial limit, whatever preprocessing did
             // (kimits.c:123-124; preprocessing BVE is not a Kissat elimination).
             if self.cold.eliminate_cadence_kissat {
-                let first = super::inprocessing::kissat_eliminate_interval_nlog2n(
+                let first = inprocessing::kissat_eliminate_interval_nlog2n(
                     self.arena.irredundant_count() as u64,
                     1,
                 );
@@ -1449,7 +1450,7 @@ impl Solver {
         } else {
             let head_start_stop =
                 || should_stop() || ay_core::time::Instant::now() >= head_start_until;
-            self.cdcl_loop_pure_with_proof_progress(&head_start_stop, proof_progress)
+            self.cdcl_loop_pure_with_proof_progress(head_start_stop, proof_progress)
         };
         // A verdict, or a stop the CALLER asked for (interrupt, deadline,
         // resource budget), ends the solve exactly as it would have without

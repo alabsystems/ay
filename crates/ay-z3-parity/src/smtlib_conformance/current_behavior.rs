@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(ids.len(), cases.len());
         for case in cases {
             assert_ne!(case.candidate, case.control);
-            assert!(!case.scope.is_empty());
+            assert_ne!(case.scope.as_str(), "");
         }
     }
 }

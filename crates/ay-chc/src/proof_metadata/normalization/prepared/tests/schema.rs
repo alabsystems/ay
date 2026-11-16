@@ -75,7 +75,7 @@ fn successful_prepared_bytes_hash_and_schema_match_the_public_v1_identity() {
             .with_work(|work| {
                 prepare_normalized_chc_input_with_work(&problem, work)?.with_sha256(
                     |source, bytes, digest, _| {
-                        assert!(std::ptr::eq(source, &problem));
+                        assert!(std::ptr::eq(source, &raw const problem));
                         assert_eq!(bytes, expected);
                         assert_eq!(digest, crate::normalized_chc_input_sha256(source));
                         Ok(())

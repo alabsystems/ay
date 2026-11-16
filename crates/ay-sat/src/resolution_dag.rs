@@ -902,7 +902,7 @@ fn map_backward_proof_failure(failure: BackwardProofFailure) -> ResolutionProofE
     }
 }
 
-fn map_proof_writer_error(error: std::io::Error) -> ResolutionProofError {
+fn map_proof_writer_error(error: io::Error) -> ResolutionProofError {
     if crate::proof::is_bounded_emission_cancelled(&error) {
         ResolutionProofError::Cancelled
     } else {
@@ -1412,7 +1412,7 @@ impl<'a, 'p> CodecMeter<'a, 'p> {
             },
         )?;
         if actual_transient > self.limit {
-            *vec = Vec::new();
+            drop(std::mem::take(vec));
             return Err(ResolutionProofError::LimitExceeded {
                 resource: ResolutionProofResource::CodecBytes,
                 limit: self.limit as u128,
@@ -1829,7 +1829,7 @@ mod tests {
         assert_eq!(dag.original_clauses.len(), 4);
         assert_eq!(dag.original_clauses[0].0, 1);
         // Final derived clause is empty, with positive-only hints throughout.
-        assert!(dag.derived.last().expect("steps").clause.is_empty());
+        assert_eq!(dag.derived.last().expect("steps").clause.len(), 0);
         assert_eq!(dag.empty_clause_id, dag.derived.last().unwrap().id);
         for step in &dag.derived {
             assert!(step.id > 4, "derived ids namespaced after originals");
@@ -1988,7 +1988,7 @@ mod tests {
             .expect("baseline");
         let baseline_literals: usize = baseline.derived.iter().map(|s| s.clause.len()).sum();
         let baseline_hints: usize = baseline.derived.iter().map(|s| s.rup_hints.len()).sum();
-        assert!(!baseline.derived.is_empty());
+        assert_ne!(baseline.derived.len(), 0);
         assert!(baseline_literals > 0);
         assert!(baseline_hints > 0);
 

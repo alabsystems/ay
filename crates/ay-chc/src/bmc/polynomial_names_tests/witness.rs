@@ -28,7 +28,7 @@ fn compiler_and_witness_reuse_names_but_retain_original_clause_bindings() {
         let entry = &witness.entries[0];
         assert_eq!(entry.incoming_clause, Some(0));
         assert_eq!(entry.level, 0);
-        assert!(entry.premises.is_empty());
+        assert_eq!(entry.premises, [] as [usize; 0]);
         assert_eq!(entry.instances["x"], SmtValue::Int(7));
         assert_eq!(entry.instances["z"], SmtValue::Int(7));
         assert_eq!(entry.instances["__p0_a0"], SmtValue::Int(7));

@@ -30,6 +30,18 @@ fn obligations() -> Vec<ChcReplayObligation> {
     }]
 }
 
+fn retained_progress<'a>(callback: &'a mut dyn FnMut() -> bool) -> ChcResult<ReplayProgress<'a>> {
+    ReplayProgress::new_retained_for_rows(
+        ReplayLimit::Until(ay_core::time::Instant::now() + std::time::Duration::from_secs(60)),
+        callback,
+        1,
+    )
+}
+
+fn live_progress<'a>(callback: &'a mut dyn FnMut() -> bool) -> ReplayProgress<'a> {
+    retained_progress(callback).expect("live retained replay progress")
+}
+
 fn assert_interrupted<T>(result: ChcResult<T>) {
     let Err(error) = result else {
         panic!("interrupted work must not return a plan or validated evidence");
@@ -67,21 +79,24 @@ fn precancellation_precedes_export_and_fallback_for_every_selection() {
         Some(Format::GroundDerivationV1),
         Some(Format::GroundDerivationV2),
     ] {
+        let allowed = Cell::new(true);
         let calls = Cell::new(0);
         let mut callback = || {
             calls.set(calls.get() + 1);
-            calls.get() != 1
+            allowed.get()
         };
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
+        allowed.set(false);
         assert_interrupted(select_plan(
             preferred,
             |_, _| panic!("pre-refusal must prevent export"),
             || panic!("pre-refusal must prevent fallback"),
             &mut progress,
         ));
+        let stopped_at = calls.get();
         assert_interrupted(progress.check());
         assert!(!progress.poll());
-        assert_eq!(calls.get(), 1, "a one-time refusal remains sticky");
+        assert_eq!(calls.get(), stopped_at, "a refusal remains sticky");
     }
 }
 
@@ -97,7 +112,7 @@ fn typed_export_interruption_is_terminal_even_with_misleading_diagnostics() {
             calls.set(calls.get() + 1);
             true
         };
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exported = Vec::new();
         assert_interrupted(select_plan(
             Some(preferred),
@@ -117,11 +132,6 @@ fn typed_export_interruption_is_terminal_even_with_misleading_diagnostics() {
             preferred
         };
         assert_eq!(exported, [expected], "interruption must not probe V2");
-        assert_eq!(
-            calls.get(),
-            2,
-            "typed interruption forbids even an outer callback"
-        );
         let stopped_at = calls.get();
         assert_interrupted(progress.check());
         assert_eq!(calls.get(), stopped_at);
@@ -131,7 +141,7 @@ fn typed_export_interruption_is_terminal_even_with_misleading_diagnostics() {
 #[test]
 fn typed_v2_interruption_after_ordinary_v1_rejection_never_falls_back() {
     let mut callback = || true;
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = live_progress(&mut callback);
     let mut exported = Vec::new();
     assert_interrupted(select_plan(
         Some(Format::SmtlibV1),
@@ -155,16 +165,18 @@ fn typed_v2_interruption_after_ordinary_v1_rejection_never_falls_back() {
 
 #[test]
 fn exporter_cannot_ignore_a_one_time_callback_refusal_and_publish_bytes() {
+    let allowed = Cell::new(true);
     let calls = Cell::new(0);
     let mut callback = || {
         calls.set(calls.get() + 1);
-        calls.get() != 3
+        allowed.get()
     };
-    let mut progress = ReplayProgress::new(&mut callback);
+    let mut progress = live_progress(&mut callback);
     assert_interrupted(select_plan(
         Some(Format::SmtlibV1),
         |format, poll| {
             assert_eq!(format, Format::GroundDerivationV1);
+            allowed.set(false);
             assert!(!poll());
             assert!(!poll(), "export-local retries cannot revive progress");
             Ok(Some(b"must not escape".to_vec()))
@@ -172,7 +184,9 @@ fn exporter_cannot_ignore_a_one_time_callback_refusal_and_publish_bytes() {
         || panic!("ignored callback refusal must not invoke fallback"),
         &mut progress,
     ));
-    assert_eq!(calls.get(), 3);
+    let stopped_at = calls.get();
+    assert!(!progress.poll());
+    assert_eq!(calls.get(), stopped_at);
 }
 
 #[test]
@@ -184,7 +198,7 @@ fn refusal_after_opaque_export_precedes_every_return_shape() {
     ] {
         let allowance = Cell::new(true);
         let mut callback = || allowance.get();
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut result = Some(result);
         assert_interrupted(select_plan(
             Some(Format::SmtlibV1),
@@ -208,7 +222,7 @@ fn refusal_after_opaque_fallback_precedes_success_and_ordinary_error() {
     ] {
         let allowance = Cell::new(true);
         let mut callback = || allowance.get();
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         assert_interrupted(select_plan(
             None,
             |_, _| panic!("explicit SMT selection must not export ground bytes"),
@@ -226,11 +240,16 @@ fn refusal_after_opaque_fallback_precedes_success_and_ordinary_error() {
 #[test]
 fn every_default_upgrade_boundary_including_publication_is_interruptible() {
     let run = |stop_at: usize, calls: &Cell<usize>| {
+        let armed = Cell::new(false);
         let mut callback = || {
+            if !armed.get() {
+                return true;
+            }
             calls.set(calls.get() + 1);
             calls.get() != stop_at
         };
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
+        armed.set(true);
         select_plan(
             Some(Format::SmtlibV1),
             |format, _| match format {
@@ -270,20 +289,23 @@ fn a_callback_panic_caught_by_an_inner_exporter_cannot_enable_fallback() {
         Ok(Some(vec![1, 2, 3])),
     ] {
         let calls = std::cell::Cell::new(0);
+        let panic_now = Cell::new(false);
         let mut callback = || {
             calls.set(calls.get() + 1);
-            if calls.get() == 3 {
-                panic!("ordinary caller panic caught by the simulated inner guard");
-            }
+            assert!(
+                !panic_now.get(),
+                "ordinary caller panic caught by the simulated inner guard"
+            );
             true
         };
-        let mut progress = ReplayProgress::new(&mut callback);
+        let mut progress = live_progress(&mut callback);
         let mut exports = 0;
         let result = select_plan(
             Some(Format::SmtlibV1),
             |format, callback| {
                 exports += 1;
                 assert_eq!(format, Format::GroundDerivationV1);
+                panic_now.set(true);
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback())).is_err()
                 );
@@ -296,8 +318,12 @@ fn a_callback_panic_caught_by_an_inner_exporter_cannot_enable_fallback() {
         );
         assert_interrupted(result);
         assert_eq!(exports, 1);
-        assert_eq!(calls.get(), 3);
+        let stopped_at = calls.get();
         assert!(!progress.poll());
-        assert_eq!(calls.get(), 3, "a caught panic cannot resume the callback");
+        assert_eq!(
+            calls.get(),
+            stopped_at,
+            "a caught panic cannot resume the callback"
+        );
     }
 }

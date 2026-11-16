@@ -7,7 +7,7 @@ use super::super::term::Sort;
 use super::EmissionProgress;
 use std::cell::Cell;
 
-fn run_projection(p: &mut Proof) -> Option<super::super::chain::ChainResult> {
+fn run_projection(p: &mut Proof<'_>) -> Option<super::super::chain::ChainResult> {
     let x = p.t.var("x", Sort::Bool);
     let chain = Chain {
         bounds: vec![vec![x], vec![x]],
@@ -30,7 +30,7 @@ fn chain_projection_uses_the_original_owner_without_retry() {
     );
     let healthy = run_projection(&mut p).expect("both input states are reachable");
     assert_eq!(healthy.outputs.len(), 1);
-    assert!(healthy.finals.is_empty());
+    assert_eq!(healthy.finals.as_slice(), &[] as &[u32]);
     assert!(calls.get() > 1);
     for stop_at in 1..=calls.get() {
         let seen = Cell::new(0);

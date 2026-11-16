@@ -1320,8 +1320,8 @@ fn test_batch_bump_multi_sift_preserves_heap_property() {
 
         // Seed varied activities (small integers so ties — exercised by the
         // index tie-break in `var_less` — occur frequently) and rebuild.
-        for v in 0..n {
-            vsids.activities[v] = (next() % 6) as f64;
+        for activity in &mut vsids.activities[..n] {
+            *activity = (next() % 6) as f64;
         }
         vsids.rebuild_heap();
         assert_heap_property_holds(&vsids);

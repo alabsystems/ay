@@ -279,7 +279,11 @@ enum Stop {
 impl Stop {
     fn install(self, exec: &mut Executor) {
         match self {
-            Self::Deadline => exec.set_deadline(Some(Instant::now() - Duration::from_secs(1))),
+            Self::Deadline => exec.set_deadline(Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("the monotonic clock can represent one second ago"),
+            )),
             Self::TermMemory => exec.set_term_memory_limit(Some(0)),
         }
     }

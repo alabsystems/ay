@@ -148,11 +148,14 @@ fn icp_algebraic_certificate_refuses_unparsed_atoms() {
         "the parsed subset alone is satisfiable"
     );
 
+    let problem = IcpProblem {
+        constraints,
+        vars,
+        coverage: ParseCoverage::Complete,
+    };
     let result = solver.branch_and_prune(
-        &constraints,
-        &vars,
+        &problem,
         root,
-        ParseCoverage::Complete,
         SearchAuthority::Exhaustive,
         MAX_BOXES,
         &solver.icp_main_box_count,

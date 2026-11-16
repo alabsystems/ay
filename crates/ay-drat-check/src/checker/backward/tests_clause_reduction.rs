@@ -187,5 +187,5 @@ fn test_reduce_clause_empty_positions() {
 fn test_reduce_clause_all_positions() {
     let clause = vec![lit(0, true), lit(1, true)];
     let reduced = reduce_clause(&clause, &[0, 1]);
-    assert!(reduced.is_empty());
+    assert_eq!(reduced.as_slice(), &[] as &[Literal]);
 }

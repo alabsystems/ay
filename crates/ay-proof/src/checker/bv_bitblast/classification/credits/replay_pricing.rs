@@ -74,8 +74,8 @@ fn refine_entry(
     terms: &TermStore,
     entry: &mut Entry<'_>,
     payload: &RetainedStepPayload,
-    proof: &crate::bv_blast_solver::BvExprProofLimits,
-    gates: &crate::bv_blast_export::BvBlastValidateLimits,
+    proof: &BvExprProofLimits,
+    gates: &BvBlastValidateLimits,
     wire: &WireLimits,
     progress: Progress<'_>,
 ) -> Result<(), ProofCheckError> {

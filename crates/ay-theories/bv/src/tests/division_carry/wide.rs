@@ -79,12 +79,12 @@ fn wide_dense_divider_models_match_big_integer_and_frozen_cnf() {
         let a = fresh_word(&mut solver, width);
         let b = fresh_word(&mut solver, width);
         let (q, r) = solver.bitblast_udiv_urem(&a, &b);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         let mut old = BvSolver::new(&store);
         let old_a = fresh_word(&mut old, width);
         let old_b = fresh_word(&mut old, width);
         let (old_q, old_r) = oracle::divide(&mut old, &old_a, &old_b);
-        let old_circuit = Circuit::new(&old);
+        let old_circuit = Circuit::from_clauses(old.num_vars(), old.clauses());
         assert_smaller(width, &solver, &old);
         let max = (BigInt::from(1) << width) - BigInt::from(1);
         let high = BigInt::from(1) << (width - 1);
@@ -128,7 +128,7 @@ fn wide_fused_subtraction_preserves_high_bit_carry() {
         let a = fresh_word(&mut solver, width);
         let b = fresh_word(&mut solver, width);
         let (difference, carry) = solver.bitblast_sub_with_carry(&a, &b);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         let max = (BigInt::from(1) << width) - BigInt::from(1);
         let high = BigInt::from(1) << (width - 1);
         for (av, bv) in [
@@ -166,7 +166,7 @@ fn zero_padded_129_bit_dispatch_preserves_full_width_zero_division() {
     let r = solver.get_bits(remainder);
     let a_bits = solver.get_bits(a);
     let b_bits = solver.get_bits(b);
-    let circuit = Circuit::new(&solver);
+    let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
     let max: BigInt = (BigInt::from(1) << 129_usize) - BigInt::from(1);
     for (av, bv) in [(255_u32, 0_u32), (0, 0), (255, 1), (255, 3), (1, 255)] {
         let av = BigInt::from(av);

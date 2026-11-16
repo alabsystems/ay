@@ -138,6 +138,7 @@ fn canonical_scalar_value(sort: &Sort) -> Option<ModelValue> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn same_value(left: &ModelValue, right: &ModelValue) -> bool {
     let mut budget = SemanticNormalizationBudget::new();
     match (
@@ -432,17 +433,14 @@ enum AggregateRoot<'a> {
 /// precedes the debit; all later recursive building, equality and hashing see
 /// only a depth-bounded tree.
 fn aggregate_work(root: AggregateRoot<'_>) -> Option<usize> {
-    if !super::super::recovery_admission::pay_current(
-        0,
-        std::mem::size_of::<(AggregateRoot<'_>, usize)>(),
-    ) {
+    if !super::super::recovery_admission::pay_current(0, size_of::<(AggregateRoot<'_>, usize)>()) {
         return None;
     }
     let mut stack = vec![(root, 0usize)];
     let mut nodes = 0usize;
     let mut bytes = 0usize;
     while let Some((root, depth)) = stack.pop() {
-        if !super::super::recovery_admission::pay_current(1, std::mem::size_of::<ModelValue>()) {
+        if !super::super::recovery_admission::pay_current(1, size_of::<ModelValue>()) {
             return None;
         }
         nodes = nodes.checked_add(1)?;
@@ -461,7 +459,7 @@ fn aggregate_work(root: AggregateRoot<'_>) -> Option<usize> {
                 }
                 if !super::super::recovery_admission::pay_current(
                     children,
-                    children.checked_mul(std::mem::size_of::<(AggregateRoot<'_>, usize)>())?,
+                    children.checked_mul(size_of::<(AggregateRoot<'_>, usize)>())?,
                 ) {
                     return None;
                 }
@@ -479,7 +477,7 @@ fn aggregate_work(root: AggregateRoot<'_>) -> Option<usize> {
                 if !super::super::recovery_admission::pay_current(
                     args.len(),
                     args.len()
-                        .checked_mul(std::mem::size_of::<(AggregateRoot<'_>, usize)>())?,
+                        .checked_mul(size_of::<(AggregateRoot<'_>, usize)>())?,
                 ) {
                     return None;
                 }

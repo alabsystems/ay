@@ -312,7 +312,7 @@ fn test_diagnostic_trace_emits_header_on_enable() {
     // Diagnostic file must exist and contain at least the header line
     let contents = std::fs::read_to_string(&diag_path).expect("read diag file");
     let lines: Vec<&str> = contents.lines().collect();
-    assert!(!lines.is_empty(), "diagnostic file must not be empty");
+    assert_ne!(lines.len(), 0, "diagnostic file must not be empty");
 
     let header: serde_json::Value = serde_json::from_str(lines[0]).expect("parse header JSON");
     assert_eq!(header["type"], "header");

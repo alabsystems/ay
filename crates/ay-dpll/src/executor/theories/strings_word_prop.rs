@@ -725,10 +725,10 @@ mod tests {
     fn load_without_check(input: &str) -> Executor {
         let commands = parse(input).expect("valid SMT-LIB");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load assertions")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("load assertions"),
+            [] as [String; 0]
+        );
         executor
     }
 
@@ -1054,10 +1054,10 @@ mod tests {
     fn large_chain_direct_pass_distinguishes_sat_and_unsat() {
         let commands = parse(&large_chain("b", false, false)).expect("valid SMT-LIB");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load UNSAT chain")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("load UNSAT chain"),
+            [] as [String; 0]
+        );
         assert!(executor
             .try_word_eq_constant_propagation()
             .expect("word propagation")
@@ -1065,10 +1065,10 @@ mod tests {
 
         let commands = parse(&large_chain("a", false, false)).expect("valid SMT-LIB");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load SAT chain")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("load SAT chain"),
+            [] as [String; 0]
+        );
         assert!(executor
             .try_word_eq_constant_propagation()
             .expect("word propagation")
@@ -1104,10 +1104,12 @@ mod tests {
         strict_only.push_str("(set-option :check-proofs-strict true)\n");
         let commands = parse(&strict_only).expect("valid strict-only SMT-LIB");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load strict-only chain")
-            .is_empty());
+        assert_eq!(
+            executor
+                .execute_all(&commands)
+                .expect("load strict-only chain"),
+            [] as [String; 0]
+        );
         assert!(executor
             .try_word_eq_constant_propagation()
             .expect("strict-only bypass")
@@ -1115,10 +1117,10 @@ mod tests {
 
         let commands = parse(&large_chain("b", false, true)).expect("valid SMT-LIB");
         let mut executor = Executor::new();
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load strict chain")
-            .is_empty());
+        assert_eq!(
+            executor.execute_all(&commands).expect("load strict chain"),
+            [] as [String; 0]
+        );
         assert!(executor
             .try_word_eq_constant_propagation()
             .expect("proof-mode bypass")
@@ -1127,10 +1129,12 @@ mod tests {
         let commands = parse(&large_chain("b", false, false)).expect("valid SMT-LIB");
         let mut executor = Executor::new();
         executor.set_self_check(true);
-        assert!(executor
-            .execute_all(&commands)
-            .expect("load self-check chain")
-            .is_empty());
+        assert_eq!(
+            executor
+                .execute_all(&commands)
+                .expect("load self-check chain"),
+            [] as [String; 0]
+        );
         assert!(executor
             .try_word_eq_constant_propagation()
             .expect("self-check bypass")

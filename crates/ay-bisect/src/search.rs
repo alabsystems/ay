@@ -266,7 +266,7 @@ mod tests {
         let runner = MockRunner::new(vec![]);
         let trials = AtomicUsize::new(0);
         let min = minimize(&runner, &[], Expected::Sat, &trials).expect("minimize");
-        assert!(min.is_empty());
+        assert_eq!(min, Vec::<&str>::new());
         assert_eq!(trials.load(Ordering::Relaxed), 0);
     }
 }

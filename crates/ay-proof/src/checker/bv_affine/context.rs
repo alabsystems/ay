@@ -52,7 +52,12 @@ pub(crate) fn context_identity(
     let TermData::App(Symbol::Named(op), args) = terms.get(*root) else {
         return Ok(None);
     };
-    if op != "and" || args.len() != 2 || terms.sort(*negated) != &Sort::Bool {
+    if op != "and"
+        || terms.is_declared_function(op)
+        || args.len() != 2
+        || terms.sort(*negated) != &Sort::Bool
+        || terms.sort(*root) != &Sort::Bool
+    {
         return Ok(None);
     }
     if !progress(MAX_WORK, MAX_ALLOCATION) {
@@ -70,7 +75,9 @@ pub(crate) fn context_identity(
             }
             terms.entry_stamp(term)?;
             match terms.get(term) {
-                TermData::App(Symbol::Named(op), args) if op == "and" && args.len() == 2 => {
+                TermData::App(Symbol::Named(op), args)
+                    if op == "and" && !terms.is_declared_function(op) && args.len() == 2 =>
+                {
                     facts.insert(term);
                     stack.extend(args.iter().map(|&arg| (arg, depth + 1)));
                 }
@@ -119,6 +126,9 @@ impl Reducer<'_> {
 
     fn boolean(&mut self, term: TermId, depth: usize) -> Option<bool> {
         self.visit(term, depth)?;
+        if self.terms.sort(term) != &Sort::Bool {
+            return None;
+        }
         if self.facts.contains(&term) {
             return Some(true);
         }
@@ -126,6 +136,23 @@ impl Reducer<'_> {
             TermData::Const(Constant::Bool(value)) => Some(*value),
             TermData::Not(inner) => Some(!self.boolean(*inner, depth + 1)?),
             TermData::App(Symbol::Named(op), args) => {
+                if !matches!(
+                    op.as_str(),
+                    "and"
+                        | "or"
+                        | "="
+                        | "bvule"
+                        | "bvuge"
+                        | "bvsle"
+                        | "bvsge"
+                        | "bvult"
+                        | "bvugt"
+                        | "bvslt"
+                        | "bvsgt"
+                ) || self.terms.is_declared_function(op)
+                {
+                    return None;
+                }
                 let [a, b] = args.as_slice() else {
                     return None;
                 };
@@ -168,7 +195,9 @@ impl Reducer<'_> {
             TermData::Const(Constant::BitVec { value, .. }) => {
                 Some(Word::Literal(value.to_u128()?))
             }
-            TermData::App(Symbol::Named(op), args) if op == "bvadd" => {
+            TermData::App(Symbol::Named(op), args)
+                if op == "bvadd" && !self.terms.is_declared_function(op) =>
+            {
                 let [a, b] = args.as_slice() else {
                     return None;
                 };
@@ -194,16 +223,26 @@ pub(crate) fn context_conditional(
     terms: &TermStore,
     term: TermId,
 ) -> Option<(TermId, TermId, TermId)> {
-    match terms.get(term) {
+    terms.entry_stamp(term)?;
+    let (condition, yes, no) = match terms.get(term) {
         TermData::Ite(c, y, n) => Some((*c, *y, *n)),
-        TermData::App(Symbol::Named(op), args) if op == "ite" => {
+        TermData::App(Symbol::Named(op), args)
+            if op == "ite" && !terms.is_declared_function(op) =>
+        {
             let [c, y, n] = args.as_slice() else {
                 return None;
             };
             Some((*c, *y, *n))
         }
         _ => None,
+    }?;
+    for child in [condition, yes, no] {
+        terms.entry_stamp(child)?;
     }
+    (terms.sort(condition) == &Sort::Bool
+        && terms.sort(yes) == terms.sort(term)
+        && terms.sort(no) == terms.sort(term))
+    .then_some((condition, yes, no))
 }
 
 #[cfg(test)]

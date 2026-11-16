@@ -579,28 +579,13 @@ impl<W: Write> LratWriter<W> {
     /// Emit a caller-prevalidated positive-RUP addition without repeating
     /// whole-hint scans. The bounded ResolutionDag producer has already
     /// enforced nonzero/unique/known hints under its deadline and count caps.
+    #[cfg(test)]
     pub(crate) fn add_bounded_prevalidated_rup(
         &mut self,
         clause: &[Literal],
         hints: &[u64],
     ) -> io::Result<u64> {
         self.add_bounded_prevalidated_rup_with_cancellation(clause, hints, &|| true)
-    }
-
-    /// Emit a pre-assigned caller-prevalidated positive-RUP addition without
-    /// generic RAT/duplicate preflight allocation or scans.
-    pub(crate) fn add_with_id_bounded_prevalidated_rup(
-        &mut self,
-        clause_id: u64,
-        clause: &[Literal],
-        hints: &[i64],
-    ) -> io::Result<()> {
-        self.add_with_id_bounded_prevalidated_rup_with_cancellation(
-            clause_id,
-            clause,
-            hints,
-            &|| true,
-        )
     }
 
     /// Write addition in text format: "id lit1 lit2 ... 0 hint1 hint2 ... 0"

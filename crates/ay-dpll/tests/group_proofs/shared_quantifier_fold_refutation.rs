@@ -198,7 +198,7 @@ fn a_conjunct_behind_a_unit_and_is_declined_not_committed() {
     // Without the artifact demand the verdict is published, and the document
     // is the bare hole this pass could not improve on — never an `and_pos`
     // step over a unit conjunction.
-    let commands = ay_frontend::parse(UNIT_AND).expect("fixture must parse");
+    let commands = parse(UNIT_AND).expect("fixture must parse");
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).expect("fixture must run");
     assert_eq!(

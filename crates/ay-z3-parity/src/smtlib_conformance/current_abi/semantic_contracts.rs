@@ -315,14 +315,13 @@ fn render_reference_source(source: &str, check: &str) -> String {
     format!(
         "static const char *ay_abi_check_target = \"\";\n\
          #define AY_CONTRACT_NEGATIVE_CHECK ay_abi_check_target\n\
-         #define main ay_abi_fixture_main\n{}\n\
+         #define main ay_abi_fixture_main\n{source}\n\
          #undef main\n\
          int main(int argc, char **argv) {{\n\
          if (argc == 1) ay_abi_check_target = \"\";\n\
          else if (argc == 2 && strcmp(argv[1], \"{NEGATIVE_MODE}\") == 0) ay_abi_check_target = \"{check}\";\n\
          else {{ fputs(\"ABI_CONTRACT_MODE_REFUSED\\n\", stderr); return 64; }}\n\
-         return ay_abi_fixture_main();\n}}\n",
-        source
+         return ay_abi_fixture_main();\n}}\n"
     )
 }
 
@@ -1096,7 +1095,7 @@ mod tests {
             "Z3_optimize_from_file",
         ] {
             let contract = function_contract(function, &passed);
-            assert!(contract.obligations.is_empty());
+            assert_eq!(contract.obligations.as_slice(), &[] as &[Obligation]);
             assert!(!contract.registered_obligations_passed);
             assert_eq!(contract.unregistered_aspects, ASPECTS);
         }

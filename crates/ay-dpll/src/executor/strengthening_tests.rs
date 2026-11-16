@@ -59,9 +59,9 @@ pub(in crate::executor) fn congruence_clash(
     prefix: &str,
 ) -> (ay_core::TermId, ay_core::TermId) {
     let sort = ay_core::Sort::Uninterpreted(format!("{prefix}_U"));
-    let a = exec.ctx.terms.mk_var(&format!("{prefix}_a"), sort.clone());
-    let b = exec.ctx.terms.mk_var(&format!("{prefix}_b"), sort.clone());
-    let f = ay_core::term::Symbol::named(&format!("{prefix}_f"));
+    let a = exec.ctx.terms.mk_var(format!("{prefix}_a"), sort.clone());
+    let b = exec.ctx.terms.mk_var(format!("{prefix}_b"), sort.clone());
+    let f = ay_core::term::Symbol::named(format!("{prefix}_f"));
     let fa = exec.ctx.terms.mk_app(f.clone(), [a], sort.clone());
     let fb = exec.ctx.terms.mk_app(f, [b], sort);
     let a_eq_b = exec.ctx.terms.mk_eq(a, b);

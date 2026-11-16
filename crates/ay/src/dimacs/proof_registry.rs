@@ -139,6 +139,7 @@ std::thread_local! {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     static INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
     static INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -176,7 +177,7 @@ fn inject_dimacs_proof_cleanup_replacement_once() {
     INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.set(true));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn inject_optional_dimacs_writer_failure_once() {
     INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.set(true));
 }
@@ -218,7 +219,7 @@ fn take_injected_dimacs_proof_cleanup_replacement() -> bool {
     INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.replace(false))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn take_injected_optional_dimacs_writer_failure() -> bool {
     INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.replace(false))
 }
@@ -513,8 +514,8 @@ mod abandoned_staging_sweep_tests {
         let path = dir.path().join("abandoned.drat");
         let path_text = path.to_str().expect("UTF-8 path");
         let mut proof = reserve_named_stage(path_text);
-        std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
-        std::io::Write::flush(&mut proof).expect("flush proof");
+        Write::write_all(&mut proof, b"0\n").expect("write proof");
+        Write::flush(&mut proof).expect("flush proof");
         assert_eq!(
             staging_entries(dir.path()).len(),
             1,
@@ -535,7 +536,7 @@ mod abandoned_staging_sweep_tests {
         let path = dir.path().join("sealed.drat");
         let path_text = path.to_str().expect("UTF-8 path");
         let mut proof = reserve_named_stage(path_text);
-        std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+        Write::write_all(&mut proof, b"0\n").expect("write proof");
         drop(proof);
         let sealed = seal_owned_dimacs_proof(path_text).expect("seal proof");
 

@@ -429,7 +429,7 @@ fn test_fp_fma_zero_factor_neg_zero_times_nan_is_nan() {
 
 /// Z3 #8185 reproducer core pattern: `fma(+0, finite, 0.5) = 0.5` exactly.
 /// This is the simplification Z3 failed to apply in time, producing an invalid
-/// model. The rewrite in `fma.rs::try_make_fma_zero_factor` catches this.
+/// model. The rewrite in `fma.rs::try_make_fma_zero_factor_with_control` catches this.
 ///
 /// Note: the full #8185 benchmark uses an integer→real→fp chain; this test
 /// exercises only the fma-zero rewrite, which is the specific Z3 fix target.

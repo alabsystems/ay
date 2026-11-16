@@ -32,7 +32,7 @@ impl<'a> Sort<'a> {
         }
     }
 
-    pub(super) fn matches(self, other: Self, owner: &mut Owner) -> Result<bool> {
+    pub(super) fn matches(self, other: Self, owner: &mut Owner<'_>) -> Result<bool> {
         for sort in [self, other] {
             if let Self::Product(name) = sort {
                 owner.admit(name.len(), 0)?;
@@ -49,7 +49,11 @@ pub(super) struct Variables<'a> {
 }
 
 impl<'a> Variables<'a> {
-    pub(super) fn new(problem: &'a ChcProblem, path: &[usize], owner: &mut Owner) -> Result<Self> {
+    pub(super) fn new(
+        problem: &'a ChcProblem,
+        path: &[usize],
+        owner: &mut Owner<'_>,
+    ) -> Result<Self> {
         let mut result = Self {
             declarations: Vec::new(),
             frames: Vec::new(),
@@ -84,7 +88,7 @@ impl<'a> Variables<'a> {
         root: &'a ChcExpr,
         frame: &mut DetHashMap<&'a str, usize>,
         seen: &mut DetHashSet<*const ChcExpr>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<()> {
         let mut pending = Vec::new();
         reserve(&mut pending, 1, owner)?;
@@ -111,7 +115,7 @@ impl<'a> Variables<'a> {
         &mut self,
         var: &'a ChcVar,
         frame: &mut DetHashMap<&'a str, usize>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<()> {
         owner.admit(var.name.len().saturating_add(1), 64)?;
         let sort = Sort::read(&var.sort)?;
@@ -133,7 +137,7 @@ impl<'a> Variables<'a> {
         Ok(())
     }
 
-    pub(super) fn root(&self, mut index: usize, owner: &mut Owner) -> Result<usize> {
+    pub(super) fn root(&self, mut index: usize, owner: &mut Owner<'_>) -> Result<usize> {
         loop {
             owner.admit(1, 0)?;
             let parent = *self.parents.get(index).ok_or(Error::InvalidSource)?;
@@ -144,7 +148,12 @@ impl<'a> Variables<'a> {
         }
     }
 
-    pub(super) fn lookup(&self, frame: usize, var: &ChcVar, owner: &mut Owner) -> Result<usize> {
+    pub(super) fn lookup(
+        &self,
+        frame: usize,
+        var: &ChcVar,
+        owner: &mut Owner<'_>,
+    ) -> Result<usize> {
         owner.admit(var.name.len().saturating_add(1), 0)?;
         let index = *self
             .frames
@@ -161,7 +170,7 @@ impl<'a> Variables<'a> {
         &mut self,
         problem: &ChcProblem,
         path: &[usize],
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<()> {
         for step in 1..path.len() {
             let previous = &problem.clauses()[path[step - 1]];

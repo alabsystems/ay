@@ -59,7 +59,7 @@ fn the_elimination_is_charged_against_the_search_budget() {
     ));
     assert!(work <= MAX_WORK, "work {work}");
     let chain = find_chain(&within).expect("refuted by elimination alone");
-    assert!(chain.cuts.is_empty());
+    assert_eq!(chain.cuts.as_slice(), &[]);
 
     let over = chained_equalities(48, 633);
     let mut work = 0;

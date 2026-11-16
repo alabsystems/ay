@@ -185,7 +185,7 @@ fn authored_tautology_duplicates_empty_row_and_source_ids_remain_distinct() {
             (5, vec![p(1)], true, vec![]),
         ]
     );
-    assert!(loaded.solver.trail.is_empty());
+    assert_eq!(loaded.solver.trail.len(), 0);
 }
 
 #[test]

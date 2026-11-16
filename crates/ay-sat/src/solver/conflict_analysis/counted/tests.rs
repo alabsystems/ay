@@ -114,25 +114,25 @@ fn ordinary(s: &mut Solver, conflict: ClauseRef) -> Option<Learned> {
 
 fn clean(s: &Solver) {
     assert!(s.var_data.iter().all(|data| !data.is_seen()));
-    assert!(s.conflict.analyzed_vars().is_empty());
+    assert_eq!(s.conflict.analyzed_vars().len(), 0);
     assert_eq!(s.conflict.learned_count(), 0);
-    assert!(s.min.level_seen_to_clear.is_empty());
+    assert_eq!(s.min.level_seen_to_clear.len(), 0);
     assert!(s
         .min
         .level_seen
         .iter()
         .all(|level| *level == minimization_state::LevelSeen::EMPTY));
-    assert!(s.min.minimize_to_clear.is_empty());
+    assert_eq!(s.min.minimize_to_clear.len(), 0);
     assert!(s.min.minimize_flags.iter().all(|flags| *flags == 0));
-    assert!(s.min.minimize_levels_to_clear.is_empty());
+    assert_eq!(s.min.minimize_levels_to_clear.len(), 0);
     assert!(s
         .min
         .minimize_level_seen
         .iter()
         .all(|level| *level == minimization_state::LevelSeen::EMPTY));
-    assert!(s.ws_shrink_entries.is_empty());
-    assert!(s.ws_shrink_result.is_empty());
-    assert!(s.ws_shrink_block_lits.is_empty());
+    assert_eq!(s.ws_shrink_entries.len(), 0);
+    assert_eq!(s.ws_shrink_result.len(), 0);
+    assert_eq!(s.ws_shrink_block_lits.len(), 0);
 }
 
 fn clauses(s: &Solver) -> Vec<Vec<Literal>> {

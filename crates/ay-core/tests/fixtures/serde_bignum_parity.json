@@ -427,8 +427,7 @@
       "json": "{\"Int\":[2,[1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10",
-        "message_trimmed": "invalid value: integer `2`, expected a sign of -1, 0, or 1"
+        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10"
       }
     },
     {
@@ -438,8 +437,7 @@
       "json": "{\"Int\":[1,[4294967296]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `4294967296`, expected u32 at line 1 column 21",
-        "message_trimmed": "invalid value: integer `4294967296`, expected u32"
+        "message": "invalid value: integer `4294967296`, expected u32 at line 1 column 21"
       }
     },
     {
@@ -449,8 +447,7 @@
       "json": "{\"Int\":[1,[-1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `-1`, expected u32 at line 1 column 13",
-        "message_trimmed": "invalid value: integer `-1`, expected u32"
+        "message": "invalid value: integer `-1`, expected u32 at line 1 column 13"
       }
     },
     {
@@ -471,8 +468,7 @@
       "json": "{\"Rational\":[[1,[1]],[0,[]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator"
       }
     },
     {
@@ -482,8 +478,7 @@
       "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8,\"extra\":1}}",
       "outcome": {
         "kind": "reject",
-        "message": "unknown field `extra`, expected `value` or `width` at line 1 column 43",
-        "message_trimmed": "unknown field `extra`, expected `value` or `width`"
+        "message": "unknown field `extra`, expected `value` or `width` at line 1 column 43"
       }
     },
     {
@@ -493,8 +488,7 @@
       "json": "{\"Int\":[2,[-1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10",
-        "message_trimmed": "invalid value: integer `2`, expected a sign of -1, 0, or 1"
+        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10"
       }
     },
     {
@@ -504,8 +498,7 @@
       "json": "{\"Int\":[3,[4294967296]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `3`, expected a sign of -1, 0, or 1 at line 1 column 10",
-        "message_trimmed": "invalid value: integer `3`, expected a sign of -1, 0, or 1"
+        "message": "invalid value: integer `3`, expected a sign of -1, 0, or 1 at line 1 column 10"
       }
     },
     {
@@ -515,8 +508,7 @@
       "json": "{\"Rational\":[[7,[1]],[0,[]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16",
-        "message_trimmed": "invalid value: integer `7`, expected a sign of -1, 0, or 1"
+        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16"
       }
     },
     {
@@ -526,8 +518,7 @@
       "json": "{\"Rational\":[[7,[1]],[9,[1]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16",
-        "message_trimmed": "invalid value: integer `7`, expected a sign of -1, 0, or 1"
+        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16"
       }
     },
     {
@@ -537,8 +528,7 @@
       "json": "{\"BitVec\":{\"value\":[0,[]]}}",
       "outcome": {
         "kind": "reject",
-        "message": "missing field `width` at line 1 column 26",
-        "message_trimmed": "missing field `width`"
+        "message": "missing field `width` at line 1 column 26"
       }
     },
     {
@@ -548,8 +538,7 @@
       "json": "{\"BitVec\":{\"width\":8}}",
       "outcome": {
         "kind": "reject",
-        "message": "missing field `value` at line 1 column 21",
-        "message_trimmed": "missing field `value`"
+        "message": "missing field `value` at line 1 column 21"
       }
     },
     {
@@ -559,8 +548,7 @@
       "json": "{\"BitVec\":{}}",
       "outcome": {
         "kind": "reject",
-        "message": "missing field `value` at line 1 column 12",
-        "message_trimmed": "missing field `value`"
+        "message": "missing field `value` at line 1 column 12"
       }
     },
     {
@@ -570,8 +558,7 @@
       "json": "{\"BitVec\":{\"value\":null,\"width\":8}}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: null, expected a tuple of size 2 at line 1 column 23",
-        "message_trimmed": "invalid type: null, expected a tuple of size 2"
+        "message": "invalid type: null, expected a tuple of size 2 at line 1 column 23"
       }
     },
     {
@@ -592,8 +579,7 @@
       "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8,\"width\":9}}",
       "outcome": {
         "kind": "reject",
-        "message": "duplicate field `width` at line 1 column 43",
-        "message_trimmed": "duplicate field `width`"
+        "message": "duplicate field `width` at line 1 column 43"
       }
     },
     {
@@ -603,8 +589,7 @@
       "json": "{\"Int\":[1]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 10",
-        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 10"
       }
     },
     {
@@ -614,8 +599,7 @@
       "json": "{\"Int\":[]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid length 0, expected a tuple of size 2 at line 1 column 9",
-        "message_trimmed": "invalid length 0, expected a tuple of size 2"
+        "message": "invalid length 0, expected a tuple of size 2 at line 1 column 9"
       }
     },
     {
@@ -625,8 +609,7 @@
       "json": "{\"Int\":[1,[1],9]}",
       "outcome": {
         "kind": "reject",
-        "message": "trailing characters at line 1 column 15",
-        "message_trimmed": "trailing characters"
+        "message": "trailing characters at line 1 column 15"
       }
     },
     {
@@ -636,8 +619,7 @@
       "json": "{\"Rational\":[[1,[1]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 21",
-        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 21"
       }
     },
     {
@@ -647,8 +629,7 @@
       "json": "{\"Int\":[1,\"x\"]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: string \"x\", expected a sequence of unsigned 32-bit numbers at line 1 column 13",
-        "message_trimmed": "invalid type: string \"x\", expected a sequence of unsigned 32-bit numbers"
+        "message": "invalid type: string \"x\", expected a sequence of unsigned 32-bit numbers at line 1 column 13"
       }
     },
     {
@@ -658,8 +639,7 @@
       "json": "{\"Int\":[1,{}]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: map, expected a sequence of unsigned 32-bit numbers at line 1 column 10",
-        "message_trimmed": "invalid type: map, expected a sequence of unsigned 32-bit numbers"
+        "message": "invalid type: map, expected a sequence of unsigned 32-bit numbers at line 1 column 10"
       }
     },
     {
@@ -669,8 +649,7 @@
       "json": "{\"Int\":[\"1\",[1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: string \"1\", expected i8 at line 1 column 11",
-        "message_trimmed": "invalid type: string \"1\", expected i8"
+        "message": "invalid type: string \"1\", expected i8 at line 1 column 11"
       }
     },
     {
@@ -680,8 +659,7 @@
       "json": "{\"Int\":[1.5,[1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: floating point `1.5`, expected i8 at line 1 column 11",
-        "message_trimmed": "invalid type: floating point `1.5`, expected i8"
+        "message": "invalid type: floating point `1.5`, expected i8 at line 1 column 11"
       }
     },
     {
@@ -691,8 +669,7 @@
       "json": "{\"Int\":[1,[1.5]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: floating point `1.5`, expected u32 at line 1 column 14",
-        "message_trimmed": "invalid type: floating point `1.5`, expected u32"
+        "message": "invalid type: floating point `1.5`, expected u32 at line 1 column 14"
       }
     },
     {
@@ -702,8 +679,7 @@
       "json": "{\"Int\":5}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: integer `5`, expected a tuple of size 2 at line 1 column 8",
-        "message_trimmed": "invalid type: integer `5`, expected a tuple of size 2"
+        "message": "invalid type: integer `5`, expected a tuple of size 2 at line 1 column 8"
       }
     },
     {
@@ -713,8 +689,7 @@
       "json": "{\"Rational\":[[1,[1]],[-1,[]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator"
       }
     },
     {
@@ -724,8 +699,7 @@
       "json": "{\"Rational\":[[1,[1]],[1,[0]]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator"
       }
     },
     {
@@ -746,8 +720,7 @@
       "json": "{\"Nope\":1}",
       "outcome": {
         "kind": "reject",
-        "message": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`, `FiniteField` at line 1 column 7",
-        "message_trimmed": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`, `FiniteField`"
+        "message": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`, `FiniteField` at line 1 column 7"
       }
     },
     {
@@ -757,8 +730,7 @@
       "json": "{}",
       "outcome": {
         "kind": "reject",
-        "message": "expected value at line 1 column 2",
-        "message_trimmed": "expected value"
+        "message": "expected value at line 1 column 2"
       }
     },
     {
@@ -768,8 +740,7 @@
       "json": "{\"Int\":[0,[]],\"Bool\":true}",
       "outcome": {
         "kind": "reject",
-        "message": "expected value at line 1 column 13",
-        "message_trimmed": "expected value"
+        "message": "expected value at line 1 column 13"
       }
     },
     {
@@ -812,8 +783,7 @@
       "json": "{\"coefficients\":[[1,0]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23"
       }
     },
     {
@@ -823,8 +793,7 @@
       "json": "{\"coefficients\":[[1,1]],\"extra\":2}",
       "outcome": {
         "kind": "reject",
-        "message": "unknown field `extra`, expected `coefficients` at line 1 column 31",
-        "message_trimmed": "unknown field `extra`, expected `coefficients`"
+        "message": "unknown field `extra`, expected `coefficients` at line 1 column 31"
       }
     },
     {
@@ -834,8 +803,7 @@
       "json": "{\"coefficients\":[[9223372036854775808,1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37",
-        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37"
       }
     },
     {
@@ -845,8 +813,7 @@
       "json": "{}",
       "outcome": {
         "kind": "reject",
-        "message": "missing field `coefficients` at line 1 column 2",
-        "message_trimmed": "missing field `coefficients`"
+        "message": "missing field `coefficients` at line 1 column 2"
       }
     },
     {
@@ -856,8 +823,7 @@
       "json": "{\"coefficients\":null}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: null, expected a sequence at line 1 column 20",
-        "message_trimmed": "invalid type: null, expected a sequence"
+        "message": "invalid type: null, expected a sequence at line 1 column 20"
       }
     },
     {
@@ -878,8 +844,7 @@
       "json": "{\"coefficients\":[[1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 20",
-        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 20"
       }
     },
     {
@@ -889,8 +854,7 @@
       "json": "{\"coefficients\":[[1,2,3]]}",
       "outcome": {
         "kind": "reject",
-        "message": "trailing characters at line 1 column 23",
-        "message_trimmed": "trailing characters"
+        "message": "trailing characters at line 1 column 23"
       }
     },
     {
@@ -900,8 +864,7 @@
       "json": "{\"coefficients\":[1]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: integer `1`, expected a tuple of size 2 at line 1 column 18",
-        "message_trimmed": "invalid type: integer `1`, expected a tuple of size 2"
+        "message": "invalid type: integer `1`, expected a tuple of size 2 at line 1 column 18"
       }
     },
     {
@@ -911,8 +874,7 @@
       "json": "{\"coefficients\":[[1.5,2]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid type: floating point `1.5`, expected i64 at line 1 column 21",
-        "message_trimmed": "invalid type: floating point `1.5`, expected i64"
+        "message": "invalid type: floating point `1.5`, expected i64 at line 1 column 21"
       }
     },
     {
@@ -922,8 +884,7 @@
       "json": "{\"coefficients\":[[1,9223372036854775808]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 39",
-        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 39"
       }
     },
     {
@@ -933,8 +894,7 @@
       "json": "{\"coefficients\":[[9223372036854775808,0]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37",
-        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37"
       }
     },
     {
@@ -944,8 +904,7 @@
       "json": "{\"coefficients\":[[1,2],[3,0]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 29",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 29"
       }
     },
     {
@@ -955,8 +914,7 @@
       "json": "{\"coefficients\":[[1,0],[9223372036854775808,1]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23"
       }
     },
     {
@@ -977,8 +935,7 @@
       "json": "{\"coefficients\":[[0,0]]}",
       "outcome": {
         "kind": "reject",
-        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
-        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23"
       }
     }
   ]

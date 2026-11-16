@@ -111,7 +111,7 @@ fn interrupted_consecution_cannot_install_a_frame_lemma() {
     let mut limit = 1;
     assert!(!solver.trivial_block(&cube(), 1, &mut limit));
     assert!(!solver.is_inductive_relative(&cube(), 1));
-    assert_eq!(solver.is_inductive_relative_capture(&cube(), 1).0, false);
+    assert!(!solver.is_inductive_relative_capture(&cube(), 1).0);
     assert!(!solver.propagate());
     assert_eq!(solver.stats.cubes_blocked, 0);
     assert!(solver
@@ -139,7 +139,10 @@ fn propagation_restores_all_unprocessed_clauses_at_first_refusal() {
     assert!(!solver.propagate());
     assert_eq!(solver.stats.sat_calls, 1);
     assert_eq!(solver.frames[1].blocked_clauses, original);
-    assert!(solver.frames[2].blocked_clauses.is_empty());
+    assert_eq!(
+        solver.frames[2].blocked_clauses,
+        [] as [std::vec::Vec<ay_sat::Literal>; 0]
+    );
     assert_eq!(solver.stats.clauses_propagated, 0);
     assert!(matches!(solver.solve(), Ic3Result::Unknown));
     assert_eq!(solver.frames.len(), 3);

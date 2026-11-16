@@ -29,22 +29,27 @@ impl Decoder<'_> {
                 self.registered_sort(carrier)
             }
             Sort::Datatype(datatype) => {
+                // Names are raw symbol text, so the empty name of `||` is
+                // admitted: the only name-based refusal here is a duplicate
+                // constructor or field name. A datatype sort is also refused
+                // for an empty constructor set, a refused field sort or an
+                // exhausted charge or copy budget.
                 self.charge(datatype.name.len())?;
-                if datatype.name.is_empty() || datatype.constructors.is_empty() {
+                if datatype.constructors.is_empty() {
                     return None;
                 }
                 let mut names = BTreeSet::new();
                 for constructor in &datatype.constructors {
                     self.charge(constructor.name.len().checked_add(1)?)?;
                     self.copy(512)?;
-                    if constructor.name.is_empty() || !names.insert(constructor.name.as_str()) {
+                    if !names.insert(constructor.name.as_str()) {
                         return None;
                     }
                     let mut fields = BTreeSet::new();
                     for field in &constructor.fields {
                         self.charge(field.name.len().checked_add(1)?)?;
                         self.copy(512)?;
-                        if field.name.is_empty() || !fields.insert(field.name.as_str()) {
+                        if !fields.insert(field.name.as_str()) {
                             return None;
                         }
                         self.sort(&field.sort, depth + 1)?;

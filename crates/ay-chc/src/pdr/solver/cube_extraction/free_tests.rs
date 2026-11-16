@@ -15,8 +15,11 @@ use crate::ChcParser;
 
 fn solver(smt2: &str) -> PdrSolver {
     let problem = ChcParser::parse(smt2).expect("parse");
-    let mut config = PdrConfig::default();
-    config.spacer = SpacerLane::rung(2);
+    let base = PdrConfig::default();
+    let config = PdrConfig {
+        spacer: SpacerLane::rung(2),
+        ..base
+    };
     PdrSolver::new(problem, config)
 }
 
@@ -157,7 +160,7 @@ fn repeated_arguments_become_a_canonical_equality() {
     );
     let child = s.child_cube_from_model(q, &body, &t, &post_on_head, &m, None, &[]);
     let cube = child.cube.expect("cube");
-    assert!(child.source != CubeSource::PointFallbackMismatch);
+    assert_ne!(child.source, CubeSource::PointFallbackMismatch);
     let at = |a, b| holds(cube.expr(), &canon_point(&s, q, &[a, b]));
     assert_eq!(at(5, 5), Some(true), "the model's state: {}", cube.expr());
     assert_eq!(at(9, 9), Some(true), "not a point cube: {}", cube.expr());

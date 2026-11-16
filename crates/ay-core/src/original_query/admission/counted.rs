@@ -27,41 +27,6 @@ impl std::fmt::Debug for CountedAdmission {
     }
 }
 
-#[cfg(test)]
-mod identity_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn ledger_identity_distinguishes_equal_grants_without_polling_or_renewal() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&calls);
-        let owner = CountedAdmission::new(
-            FiniteAdmissionGrant::new(10, 20),
-            None,
-            Arc::new(move || {
-                observed.fetch_add(1, Ordering::SeqCst);
-                false
-            }),
-        )
-        .unwrap();
-        let clone = owner.clone();
-        let other =
-            CountedAdmission::new(FiniteAdmissionGrant::new(10, 20), None, Arc::new(|| false))
-                .unwrap();
-        let receipt = owner.usage().unwrap();
-        assert!(owner.shares_ledger_with(&clone));
-        assert!(!owner.shares_ledger_with(&other));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(owner.usage().unwrap(), receipt);
-        owner.refuse(CountedAdmissionError::WorkExhausted);
-        let refused = owner.usage().unwrap();
-        assert!(clone.shares_ledger_with(&owner));
-        assert_eq!(clone.usage().unwrap(), refused);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-}
-
 impl CountedAdmission {
     /// Move the caller's grants into an owner and capture ambient controls
     /// before invoking any observer. `None` does not invent a wall-clock end.
@@ -137,5 +102,40 @@ impl CountedAdmission {
                 .unwrap_or(CountedAdmissionError::Original(fallback)),
             Err(error) => error,
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn ledger_identity_distinguishes_equal_grants_without_polling_or_renewal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let owner = CountedAdmission::new(
+            FiniteAdmissionGrant::new(10, 20),
+            None,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        )
+        .unwrap();
+        let clone = owner.clone();
+        let other =
+            CountedAdmission::new(FiniteAdmissionGrant::new(10, 20), None, Arc::new(|| false))
+                .unwrap();
+        let receipt = owner.usage().unwrap();
+        assert!(owner.shares_ledger_with(&clone));
+        assert!(!owner.shares_ledger_with(&other));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.usage().unwrap(), receipt);
+        owner.refuse(CountedAdmissionError::WorkExhausted);
+        let refused = owner.usage().unwrap();
+        assert!(clone.shares_ledger_with(&owner));
+        assert_eq!(clone.usage().unwrap(), refused);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

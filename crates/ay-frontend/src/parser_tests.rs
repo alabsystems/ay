@@ -255,13 +255,13 @@ fn test_parse_comments() {
 #[test]
 fn test_parse_empty_input() {
     let commands = parse("").unwrap();
-    assert!(commands.is_empty());
+    assert_eq!(commands.len(), 0);
 }
 
 #[test]
 fn test_parse_whitespace_only() {
     let commands = parse("   \n\t\n   ").unwrap();
-    assert!(commands.is_empty());
+    assert_eq!(commands.len(), 0);
 }
 
 #[test]

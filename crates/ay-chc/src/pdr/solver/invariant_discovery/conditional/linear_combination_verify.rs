@@ -108,10 +108,7 @@ impl PdrSolver {
         }
 
         // If zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 
     /// Extract the "other" variable from a guard pattern: NOT (other <= var) meaning var < other
@@ -325,9 +322,6 @@ impl PdrSolver {
         }
 
         // If zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 }

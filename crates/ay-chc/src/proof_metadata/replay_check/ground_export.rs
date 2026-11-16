@@ -16,33 +16,13 @@ use crate::{
     ChcValidatedGroundDerivation,
 };
 
-#[cfg(test)]
-pub(super) fn within_budget(start: &super::Instant, budget: super::Duration) -> bool {
-    budget
-        .checked_sub(start.elapsed())
-        .is_some_and(|remaining| !remaining.is_zero())
-}
-
 pub(super) struct ReplayProgress<'a> {
-    allowance: ReplayAllowance<'a>,
+    allowance: RetainedReplayProgress<'a>,
     stopped: bool,
     compact_owner: Option<crate::ground_derivation::compact::Owner<'static>>,
 }
 
-enum ReplayAllowance<'a> {
-    Callback(&'a mut dyn FnMut() -> bool),
-    Retained(RetainedReplayProgress<'a>),
-}
-
 impl<'a> ReplayProgress<'a> {
-    pub(super) fn new(progress: &'a mut dyn FnMut() -> bool) -> Self {
-        Self {
-            allowance: ReplayAllowance::Callback(progress),
-            stopped: false,
-            compact_owner: None,
-        }
-    }
-
     pub(super) fn new_retained_for_rows(
         limit: ReplayLimit<'a>,
         callback: &'a mut dyn FnMut() -> bool,
@@ -55,7 +35,7 @@ impl<'a> ReplayProgress<'a> {
             ))
             })?;
         Ok(Self {
-            allowance: ReplayAllowance::Retained(allowance),
+            allowance,
             stopped: false,
             compact_owner: None,
         })
@@ -75,10 +55,7 @@ impl<'a> ReplayProgress<'a> {
         {
             return false;
         }
-        let allowed = match &mut self.allowance {
-            ReplayAllowance::Callback(progress) => progress(),
-            ReplayAllowance::Retained(progress) => progress.charge(0, 0),
-        };
+        let allowed = self.allowance.charge(0, 0);
         if allowed {
             self.stopped = false;
             true
@@ -99,10 +76,7 @@ impl<'a> ReplayProgress<'a> {
         {
             return false;
         }
-        let allowed = match &mut self.allowance {
-            ReplayAllowance::Callback(progress) => progress(),
-            ReplayAllowance::Retained(progress) => progress.charge(work, bytes),
-        };
+        let allowed = self.allowance.charge(work, bytes);
         self.stopped = !allowed;
         allowed
     }
@@ -123,12 +97,7 @@ impl<'a> ReplayProgress<'a> {
 
     pub(super) fn retained_mut(&mut self) -> ChcResult<&mut RetainedReplayProgress<'a>> {
         self.check()?;
-        match &mut self.allowance {
-            ReplayAllowance::Retained(progress) => Ok(progress),
-            ReplayAllowance::Callback(_) => Err(verification_error(
-                "checked replay has no request-wide retained resource owner",
-            )),
-        }
+        Ok(&mut self.allowance)
     }
 
     pub(super) fn check(&mut self) -> ChcResult<()> {

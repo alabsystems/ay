@@ -77,7 +77,7 @@ fn nested_sat_true_sequence_equality_gets_one_model_class_without_bv() {
     let nested = exec.ctx.terms.mk_or(vec![equal, guard]);
     let distinct = exec.ctx.terms.mk_distinct(vec![x, z]);
     exec.self_check_authored_assertions = Some(vec![nested, distinct]);
-    assert!(exec.ctx.assertions.is_empty());
+    assert_eq!(exec.ctx.assertions, [] as [ay_core::TermId; 0]);
 
     let mut model = Model::empty();
     model.sat_model = vec![true];
@@ -111,7 +111,7 @@ fn default_completion_ignores_independent_gate_only_authored_roots() {
     exec.independent_gate_authored_assertions = Some(vec![nested, distinct]);
     assert!(!exec.self_check(), "the regression exercises default mode");
     assert!(exec.self_check_authored_assertions.is_none());
-    assert!(exec.ctx.assertions.is_empty());
+    assert_eq!(exec.ctx.assertions, [] as [ay_core::TermId; 0]);
 
     let mut model = Model::empty();
     model.sat_model = vec![true];

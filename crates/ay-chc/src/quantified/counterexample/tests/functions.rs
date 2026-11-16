@@ -5,6 +5,7 @@
 
 use super::super::{render, SourceControl};
 use super::*;
+use std::fmt::Write as _;
 
 mod fixtures;
 mod oracle;
@@ -86,11 +87,15 @@ fn premise_only_function_keeps_both_universal_axes_and_its_declaration() {
     let replay = output(&source, &[0, 1, 2]);
     assert_eq!(replay.matches("(declare-fun uf_range ").count(), 1);
     assert_eq!(replay.matches("(uf_range ").count(), 1);
-    let binders = premise
-        .binders()
-        .map(|binder| format!("({} (_ BitVec 64))", ay_core::quote_symbol(&binder.name)))
-        .collect::<Vec<_>>()
-        .join("");
+    let mut binders = String::new();
+    for binder in premise.binders() {
+        write!(
+            &mut binders,
+            "({} (_ BitVec 64))",
+            ay_core::quote_symbol(&binder.name)
+        )
+        .unwrap();
+    }
     assert!(replay.contains(&format!("(forall ({binders})")));
     assert!(replay.contains("(_ bv34 64)"));
     assert!(replay.contains("(_ bv2 64)"));

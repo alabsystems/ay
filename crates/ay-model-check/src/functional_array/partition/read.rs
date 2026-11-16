@@ -53,7 +53,6 @@ pub(super) fn value<'a>(
                     destination
                 }
             }
-            _ => return Err(FunctionalArrayError::Value),
         };
         // Topology already validated this; keep the local backwards check so
         // traversal cannot cycle even if the borrowed representation changes.

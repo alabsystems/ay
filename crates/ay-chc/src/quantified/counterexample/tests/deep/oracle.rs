@@ -126,7 +126,7 @@ pub(super) fn check() {
                 Cells::CorruptLast => vec![9],
             }
         );
-        let mut reachable = vec![false; 16];
+        let mut reachable = [false; 16];
         reachable[0] = failed.is_empty();
         let mut query_states = Vec::new();
         for position in 0..16 {

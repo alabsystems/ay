@@ -72,19 +72,6 @@ impl RustFrontend {
         args
     }
 
-    /// Respell a whole argv whose program is `cargo`; any other argv is
-    /// returned unchanged.
-    pub(crate) fn argv<S: AsRef<str>>(self, argv: &[S]) -> Vec<String> {
-        match argv.split_first() {
-            Some((program, rest)) if program.as_ref() == "cargo" => {
-                let mut spelled = vec![self.program().to_string()];
-                spelled.extend(self.args(rest));
-                spelled
-            }
-            _ => argv.iter().map(|a| a.as_ref().to_string()).collect(),
-        }
-    }
-
     /// Respell a human-readable `cargo ...` command line for this frontend.
     /// Text that does not start with `cargo ` is returned unchanged.
     pub(crate) fn render(self, cargo_command: &str) -> String {
@@ -204,22 +191,6 @@ mod tests {
             ["clippy", "--workspace"]
         );
         assert_eq!(RustFrontend::Cargo.args(&["build"]), ["build"]);
-    }
-
-    #[test]
-    fn argv_respells_only_a_cargo_program() {
-        assert_eq!(
-            RustFrontend::Targo.argv(&["cargo", "test", "-p", "ay"]),
-            ["targo", "--unverified", "test", "-p", "ay"]
-        );
-        assert_eq!(
-            RustFrontend::Cargo.argv(&["cargo", "test"]),
-            ["cargo", "test"]
-        );
-        assert_eq!(
-            RustFrontend::Targo.argv(&["python3", "x.py"]),
-            ["python3", "x.py"]
-        );
     }
 
     #[test]

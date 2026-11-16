@@ -42,8 +42,8 @@ fn export_cancellation_latch_survives_refusal_and_caught_panic() {
         },
     );
     assert_eq!(calls, 1);
-    cancellation::run(&mut || panic!("callback panic"), |poll| {
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll())).is_err());
+    cancellation::run(&mut || panic!("callback panic"), |mut poll| {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut poll)).is_err());
         assert!(!poll());
     });
 }

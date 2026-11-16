@@ -150,7 +150,10 @@ fn binary128_ground_arithmetic_exports_an_original_bound_native_strict_bundle() 
     let bundle = solver
         .export_last_unsat_bundle()
         .expect("native binary128 proof bundle");
-    assert!(!bundle.obligation_assertions.is_empty());
+    assert_ne!(
+        bundle.obligation_assertions.as_slice(),
+        &[] as &[ay_dpll::api::TermId]
+    );
     assert!(bundle
         .obligation_assertions
         .iter()

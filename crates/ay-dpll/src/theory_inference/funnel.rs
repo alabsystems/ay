@@ -229,7 +229,7 @@ fn infer_theory_lemma_kind_in_caller_order(
         // Ordered here and at the terminal `Generic` below — never ahead of a
         // rational arm. See `funnel_integer.rs` for the priority argument and
         // for which second-chance passes run ahead of which integer arm.
-        if let Some(kind) = integer::integer_lattice_kind(terms, clause) {
+        if let Some(kind) = integer_lattice_kind(terms, clause) {
             return kind;
         }
         return TheoryLemmaKind::LiaGeneric;
@@ -239,7 +239,7 @@ fn infer_theory_lemma_kind_in_caller_order(
     }
     // Placed LAST so every established classification keeps its priority and
     // only the `Generic` residual reaches the payload-free integer arms.
-    if let Some(kind) = integer::integer_lattice_kind(terms, clause) {
+    if let Some(kind) = integer_lattice_kind(terms, clause) {
         return kind;
     }
     TheoryLemmaKind::Generic

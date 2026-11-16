@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 
 mod fixtures;
 mod native;
-#[path = "../../render/tests/oracle.rs"]
-mod oracle;
 mod refusal;
 mod values;
 
@@ -50,7 +49,10 @@ fn changed_assignment_with_recomputed_hash_is_data_not_a_replay_permit() {
     // This is intentionally coherent attacker-controlled DATA, including a
     // recomputed pin digest. Preparation must not itself mint sealed evidence.
     let prepared = rebuild::prepare(&source, &wire, &control(&token)).unwrap();
-    assert!(oracle::models(prepared.test_pins()).is_empty());
+    assert_eq!(
+        oracle::models(prepared.test_pins()),
+        [] as [std::vec::Vec<u64>; 0]
+    );
     assert_eq!(prepared.test_pins(), trace.replay_obligation());
 }
 

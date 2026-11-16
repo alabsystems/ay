@@ -70,7 +70,9 @@ mod tests {
     #[test]
     fn expired_ambient_clock_is_not_replaced_by_absent_or_later_request() {
         let now = Instant::now();
-        let expired = now - Duration::from_secs(1);
+        let expired = now
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset");
         for timeout in [None, Some(Duration::from_secs(30))] {
             let config = PdrConfig {
                 solve_timeout: timeout,

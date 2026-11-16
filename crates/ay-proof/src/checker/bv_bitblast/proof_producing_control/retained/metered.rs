@@ -97,6 +97,10 @@ pub(crate) fn capture_clause(
 
 /// Decode and independently replay THIS live clause. Empty, corrupt,
 /// missing or source-mismatched wire never selects SAT search or a memo.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "live source, wire, three independent limit owners, allowance, and poll stay explicit"
+)]
 pub(crate) fn replay_clause(
     terms: &TermStore,
     clause: &[TermId],

@@ -177,7 +177,7 @@ impl SchemaSourceBudget {
 
 /// Exact bounded node/payload work for aggregate callers.
 pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
-    if !super::recovery_admission::pay_current(0, std::mem::size_of::<(&ModelValue, usize)>()) {
+    if !super::recovery_admission::pay_current(0, size_of::<(&ModelValue, usize)>()) {
         return None;
     }
     let mut stack = vec![(value, 0usize)];
@@ -185,7 +185,7 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
     let mut bytes = 0usize;
     while let Some((value, depth)) = stack.pop() {
         if depth > MAX_RENDERED_DT_DEPTH
-            || !super::recovery_admission::pay_current(1, std::mem::size_of::<ModelValue>())
+            || !super::recovery_admission::pay_current(1, size_of::<ModelValue>())
         {
             return None;
         }
@@ -225,8 +225,7 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 }
                 if !super::recovery_admission::pay_current(
                     args.len(),
-                    args.len()
-                        .checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                    args.len().checked_mul(size_of::<(&ModelValue, usize)>())?,
                 ) {
                     return None;
                 }
@@ -234,14 +233,11 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 ctor.len().saturating_add(2)
             }
             ModelValue::Array(array) => {
-                let Some(extra) = array
+                let extra = array
                     .store
                     .len()
                     .checked_mul(2)
-                    .and_then(|entries| entries.checked_add(1))
-                else {
-                    return None;
-                };
+                    .and_then(|entries| entries.checked_add(1))?;
                 if stack
                     .len()
                     .checked_add(extra)
@@ -251,7 +247,7 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 }
                 if !super::recovery_admission::pay_current(
                     extra,
-                    extra.checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                    extra.checked_mul(size_of::<(&ModelValue, usize)>())?,
                 ) {
                     return None;
                 }
@@ -274,7 +270,7 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                     elements.len(),
                     elements
                         .len()
-                        .checked_mul(std::mem::size_of::<(&ModelValue, usize)>())?,
+                        .checked_mul(size_of::<(&ModelValue, usize)>())?,
                 ) {
                     return None;
                 }

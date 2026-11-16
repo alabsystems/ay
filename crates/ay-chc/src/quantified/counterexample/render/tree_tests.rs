@@ -4,14 +4,12 @@
 //! Independent emitted-text semantics for occurrence-tree edges and scopes.
 
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 use crate::quantified::QuantifiedHornClause;
 use crate::{CancellationToken, ChcOp, ChcProblem, ChcSort, ClauseBody};
 use ay_core::time::Instant;
 use std::sync::Arc;
 use std::time::Duration;
-
-#[path = "tests/oracle.rs"]
-mod oracle;
 
 fn op(operator: ChcOp, arguments: Vec<ChcExpr>) -> ChcExpr {
     ChcExpr::Op(operator, arguments.into_iter().map(Arc::new).collect())
@@ -109,7 +107,7 @@ fn false_premises_on_either_facts_or_query_remain_in_the_tree_obligation() {
         source(enabled(), ChcExpr::Bool(false)),
     ] {
         let script = output(&problem, &[0, 0, 1], &[vec![], vec![], vec![0, 1]]).unwrap();
-        assert!(oracle::models(&script).is_empty());
+        assert_eq!(oracle::models(&script), [] as [std::vec::Vec<u64>; 0]);
         assert_eq!(script.matches("(forall ").count(), 3);
     }
 }

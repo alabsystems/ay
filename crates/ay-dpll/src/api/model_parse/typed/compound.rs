@@ -23,7 +23,7 @@ impl Decoder<'_> {
             count = count.checked_add(1)?;
             cursor = base;
         }
-        self.copy(count.checked_mul(std::mem::size_of::<(ModelValue, ModelValue)>())?)?;
+        self.copy(count.checked_mul(size_of::<(ModelValue, ModelValue)>())?)?;
         let mut stores = Vec::new();
         stores.try_reserve_exact(count).ok()?;
         cursor = value;
@@ -118,11 +118,8 @@ impl Decoder<'_> {
             return None;
         }
         self.copy(
-            name.len().checked_add(
-                arguments
-                    .len()
-                    .checked_mul(std::mem::size_of::<ModelValue>())?,
-            )?,
+            name.len()
+                .checked_add(arguments.len().checked_mul(size_of::<ModelValue>())?)?,
         )?;
         let mut args = Vec::new();
         args.try_reserve_exact(arguments.len()).ok()?;
@@ -141,7 +138,7 @@ impl Decoder<'_> {
         sort: &Sort,
         depth: usize,
     ) -> Option<ModelValue> {
-        self.copy(std::mem::size_of::<&SExpr>())?;
+        self.copy(size_of::<&SExpr>())?;
         let mut pending = vec![value];
         let mut values = Vec::new();
         while let Some(value) = pending.pop() {
@@ -162,13 +159,13 @@ impl Decoder<'_> {
                     self.ascribed(element, sort, depth + 1)?;
                 }
                 [head, element] if head.is_symbol("seq.unit") => {
-                    self.copy(std::mem::size_of::<ModelValue>().checked_mul(2)?)?;
+                    self.copy(size_of::<ModelValue>().checked_mul(2)?)?;
                     values.try_reserve(1).ok()?;
                     values.push(self.value(element, sort, depth + 1)?);
                 }
                 [head, parts @ ..] if head.is_symbol("seq.++") && parts.len() >= 2 => {
                     self.charge(parts.len())?;
-                    self.copy(parts.len().checked_mul(std::mem::size_of::<&SExpr>())?)?;
+                    self.copy(parts.len().checked_mul(size_of::<&SExpr>())?)?;
                     pending.try_reserve_exact(parts.len()).ok()?;
                     pending.extend(parts.iter().rev());
                 }

@@ -16,10 +16,15 @@ use ay_sat::ResolutionProofLimits;
 /// and source-to-term journal. In particular a named RoundingMode carrier does
 /// not itself authenticate the reserved five-value SMT theory.
 pub struct NativeFpProofContext<'a> {
+    /// The immutable term store that owns every proof and assertion term.
     pub terms: &'a TermStore,
+    /// Authenticated datatype declarations from the original source snapshot.
     pub datatype_declarations: Option<&'a [(String, Vec<String>)]>,
+    /// Authenticated datatype constructor-selector declarations.
     pub constructor_selectors: Option<&'a [(String, Vec<String>)]>,
+    /// Authenticated datatype member signatures for strict proof replay.
     pub datatype_member_signatures: &'a [DatatypeMemberSignature],
+    /// The complete original problem assertion inventory.
     pub problem_assertions: &'a [TermId],
 }
 
@@ -95,7 +100,7 @@ fn check_inner(
     limits: &ResolutionProofLimits,
     work: &mut WorkBudget<'_>,
 ) -> Result<ProofQuality, ProofCheckError> {
-    let accepted = ValidatedSteps::prepare(proof, context.terms, &limits, work)?;
+    let accepted = ValidatedSteps::prepare(proof, context.terms, limits, work)?;
     let result = (|| {
         let mut progress =
             |units, bytes| clock(limits, work).is_ok() && work.admit(units, bytes).is_ok();
@@ -107,8 +112,8 @@ fn check_inner(
             Some(&accepted),
             &mut progress,
         )?;
-        debug_assert!(deferred.is_empty());
-        debug_assert!(retained_output.is_empty());
+        debug_assert_eq!(deferred, []);
+        debug_assert_eq!(retained_output, []);
         ensure_terminal_empty_clause(&clauses)?;
         // Temporary derived clauses/registries drop before the outer observation.
         Ok(quality)

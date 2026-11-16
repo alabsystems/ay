@@ -35,6 +35,7 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// The private quarantine directories left in `dir`.
+#[cfg(target_os = "linux")]
 fn quarantines(dir: &Path) -> Vec<PathBuf> {
     names(dir)
         .into_iter()

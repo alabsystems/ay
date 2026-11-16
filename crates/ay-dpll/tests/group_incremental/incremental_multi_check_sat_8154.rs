@@ -34,7 +34,7 @@ fn test_core_evolution_basic_overlap() {
 fn test_core_evolution_independent() {
     let evo =
         IncrementalCoreEvolution::new(vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]);
-    assert!(evo.persisted().is_empty());
+    assert_eq!(evo.persisted(), &[] as &[String]);
     assert_eq!(evo.entered(), &["c", "d"]);
     assert_eq!(evo.exited(), &["a", "b"]);
     assert!(evo.is_independent());
@@ -46,8 +46,8 @@ fn test_core_evolution_unchanged() {
     let evo =
         IncrementalCoreEvolution::new(vec!["x".into(), "y".into()], vec!["y".into(), "x".into()]);
     assert_eq!(evo.persisted().len(), 2);
-    assert!(evo.entered().is_empty());
-    assert!(evo.exited().is_empty());
+    assert_eq!(evo.entered(), &[] as &[String]);
+    assert_eq!(evo.exited(), &[] as &[String]);
     assert!(evo.is_unchanged());
     assert!((evo.persistence_ratio() - 1.0).abs() < f64::EPSILON);
 }

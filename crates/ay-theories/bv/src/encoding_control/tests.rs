@@ -40,7 +40,10 @@ fn offset_census_retains_the_original_owner_after_tls_removal() {
     assert!(owner.was_stopped());
     armed.store(false, Ordering::Relaxed);
     assert!(!solver.encoding_complete());
-    assert!(solver.bitblast_all(&[equality]).is_empty());
+    assert_eq!(
+        solver.bitblast_all(&[equality]).as_slice(),
+        &[] as &[CnfClause]
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
@@ -57,8 +60,8 @@ fn original_raw_stop_refuses_one_128_bit_predicate_and_flag_reset() {
     assert!(solver.bitblast_predicate(predicate).is_none());
     flag.store(false, Ordering::Relaxed);
     assert!(!solver.encoding_complete());
-    assert!(solver.clauses().is_empty());
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.clauses(), &[] as &[CnfClause]);
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
     assert!(solver.get_term_bits(product).is_none());
     assert!(matches!(solver.check(), TheoryResult::Unknown));
 }
@@ -95,14 +98,14 @@ fn multiply_mid_encoding_stop_never_exports_a_partial_word_or_cnf() {
     let before = solver.num_vars();
     armed.store(true, Ordering::Relaxed);
     let result = solver.bitblast_mul(&a, &b);
-    assert!(result.is_empty());
+    assert_eq!(result.as_slice(), &[] as &[CnfLit]);
     assert!(
         solver.num_vars() > before,
         "stop must occur after circuit work begins"
     );
     assert_eq!(count.load(Ordering::Relaxed), 40);
     assert!(!solver.encoding_complete());
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
 }
 
 #[test]
@@ -120,7 +123,7 @@ fn unsigned_division_mid_rows_never_populates_the_division_cache() {
     assert!(q.is_empty() && r.is_empty());
     assert!(solver.div_caches().0.is_empty());
     assert!(!solver.encoding_complete());
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
 }
 
 #[test]
@@ -152,10 +155,13 @@ fn delayed_refusal_does_not_mark_circuit_built_or_export_state() {
     assert_eq!(solver.ensure_term_bits(product).unwrap().len(), 128);
     assert_eq!(solver.delayed_ops().len(), 1);
     flag.store(true, Ordering::Relaxed);
-    assert!(solver.build_delayed_circuit(0).is_empty());
+    assert_eq!(
+        solver.build_delayed_circuit(0).as_slice(),
+        &[] as &[CnfClause]
+    );
     assert!(!solver.delayed_ops()[0].circuit_built);
     assert!(solver.take_delayed_state().is_none());
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
 }
 
 #[test]
@@ -165,11 +171,17 @@ fn stopped_comparison_and_mux_do_not_assert_unwind_widths() {
     let mut solver = BvSolver::new(&store);
     solver.set_interrupt(flag);
     assert_eq!(solver.bitblast_eq(&vec![1], &Vec::new()), 0);
-    assert!(solver.bitwise_mux(&vec![1], &Vec::new(), 1).is_empty());
-    assert!(solver
-        .bitblast_udiv_urem(&vec![1], &Vec::new())
-        .0
-        .is_empty());
+    assert_eq!(
+        solver.bitwise_mux(&vec![1], &Vec::new(), 1).as_slice(),
+        &[] as &[CnfLit]
+    );
+    assert_eq!(
+        solver
+            .bitblast_udiv_urem(&vec![1], &Vec::new())
+            .0
+            .as_slice(),
+        &[] as &[CnfLit]
+    );
     assert!(!solver.encoding_complete());
 }
 
@@ -273,7 +285,7 @@ fn recursive_materialization_does_not_memoize_a_stopped_root() {
     assert!(solver.ensure_term_bits(product).is_none());
     assert!(!solver.term_to_bits().contains_key(&product));
     assert!(!solver.encoding_complete());
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
 }
 
 #[test]
@@ -352,7 +364,7 @@ fn delayed_first_raw_refusal_survives_replacement_reset_and_preexisting_guard() 
     solver.reset();
     assert!(!solver.encoding_complete());
     assert!(matches!(solver.check(), TheoryResult::Unknown));
-    assert!(solver.take_clauses().is_empty());
+    assert_eq!(solver.take_clauses().as_slice(), &[] as &[CnfClause]);
 }
 
 #[test]

@@ -180,7 +180,7 @@ fn bv_reconstruct_ten_retained_raw_sources_have_one_strict_native_and_exact_wire
     }
     let mut unit = proof.add_rule_step(AletheRule::AndNeg, clause.clone(), vec![], vec![]);
     for (&source, premise) in sources.iter().zip(units) {
-        clause.remove(1);
+        let _ = clause.remove(1);
         unit = proof.add_resolution(clause.clone(), source, unit, premise);
     }
     proof.add_resolution(vec![], conjunction, a, unit);

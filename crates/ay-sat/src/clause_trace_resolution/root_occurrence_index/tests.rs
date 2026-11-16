@@ -193,7 +193,7 @@ fn representation_refusal_is_distinct_from_accounting_overflow() {
     let mut root = empty_root(0);
     build(&mut root, &[], usize::MAX, 0, &mut meter).unwrap();
     assert!(root.index_heads.is_none());
-    assert!(root.index_items.is_empty());
+    assert_eq!(root.index_items.len(), 0);
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn stop_and_work_refusal_never_publish_a_partial_index() {
             "a transient stop must not become a fallback"
         );
         assert!(root.index_heads.is_none());
-        assert!(root.index_items.is_empty());
+        assert_eq!(root.index_items.len(), 0);
     }
     let (result, _, root) = run(usize::MAX, work - 1);
     assert!(matches!(
@@ -239,7 +239,7 @@ fn stop_and_work_refusal_never_publish_a_partial_index() {
         })
     ));
     assert!(root.index_heads.is_none());
-    assert!(root.index_items.is_empty());
+    assert_eq!(root.index_items.len(), 0);
 }
 
 #[test]
@@ -298,16 +298,19 @@ fn retained_index_coexists_with_full_and_terminal_repair() {
         clause: vec![pos(2)],
         rup_hints: vec![3, 4],
     }];
-    assert!(!synthesize_terminal_empty_hints(
-        &originals,
-        &derived,
-        &[pos(4)],
-        5,
-        planned_synthesis_scratch_bytes(5, 6).unwrap(),
-        &mut meter
-    )
-    .unwrap()
-    .is_empty());
+    assert_ne!(
+        synthesize_terminal_empty_hints(
+            &originals,
+            &derived,
+            &[pos(4)],
+            5,
+            planned_synthesis_scratch_bytes(5, 6).unwrap(),
+            &mut meter
+        )
+        .unwrap()
+        .len(),
+        0
+    );
     assert_eq!(root.index_items, retained_items);
     assert!(root.index_heads.is_some());
     drop(owner);
@@ -329,5 +332,5 @@ fn retained_index_coexists_with_full_and_terminal_repair() {
     .unwrap();
     assert_eq!(checked.dag().derived.len(), 3);
     assert_eq!(checked.dag().derived[0].rup_hints, vec![1, 2]);
-    assert!(checked.dag().derived.last().unwrap().clause.is_empty());
+    assert_eq!(checked.dag().derived.last().unwrap().clause.len(), 0);
 }

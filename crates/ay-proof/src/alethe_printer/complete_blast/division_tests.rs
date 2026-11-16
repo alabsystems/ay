@@ -58,10 +58,9 @@ fn little_endian(bits: &[bool]) -> u32 {
 
 /// SMT-LIB's `bvudiv` and `bvurem`, zero divisor included.
 fn reference(x: u32, y: u32, width: u32) -> (u32, u32) {
-    if y == 0 {
-        ((1 << width) - 1, x)
-    } else {
-        (x / y, x % y)
+    match x.checked_div(y) {
+        Some(quotient) => (quotient, x % y),
+        None => ((1 << width) - 1, x),
     }
 }
 

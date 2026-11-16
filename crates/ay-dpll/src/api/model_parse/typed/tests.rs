@@ -239,6 +239,46 @@ fn nullary_and_quoted_constructor_names_remain_sort_authenticated() {
     assert_eq!(decode("(as wrong |Choice space|)", &sort), None);
 }
 
+/// Datatype `||` with the nullary constructor `||` and the constructor `mk`
+/// whose one field is `||`.
+fn empty_names() -> DatatypeSort {
+    DatatypeSort::new(
+        "",
+        vec![
+            DatatypeConstructor::unit(""),
+            DatatypeConstructor::new("mk", vec![DatatypeField::new("", Sort::Int)]),
+        ],
+    )
+}
+
+#[test]
+fn empty_datatype_constructor_and_field_names_decode_as_ordinary_names() {
+    let sort = Sort::Datatype(empty_names());
+    for text in ["||", "(as || ||)"] {
+        assert_eq!(decode(text, &sort), Some(record("", vec![])), "{text}");
+    }
+    assert_eq!(
+        decode("(mk 7)", &sort),
+        Some(record("mk", vec![ModelValue::Int(BigInt::from(7))]))
+    );
+    assert_eq!(decode("(as || Wrong)", &sort), None);
+    let mut duplicate = empty_names();
+    duplicate.constructors.push(DatatypeConstructor::unit(""));
+    let mut duplicate_field = empty_names();
+    duplicate_field.constructors[1]
+        .fields
+        .push(DatatypeField::new("", Sort::Bool));
+    let mut no_constructors = empty_names();
+    no_constructors.constructors.clear();
+    for sort in [duplicate, duplicate_field, no_constructors] {
+        assert_eq!(
+            decode("(mk 7)", &Sort::Datatype(sort.clone())),
+            None,
+            "{sort:?}"
+        );
+    }
+}
+
 #[test]
 fn overwritten_nested_defaults_and_fields_are_still_validated() {
     let sort = Sort::array(Sort::bitvec(64), inner_sort());

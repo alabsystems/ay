@@ -263,7 +263,7 @@ fn bve_density_threshold_is_named_when_it_does_change_admission() {
     for i in 0..filler {
         let a = 2 + (i % (vars - 1));
         let b = 2 + ((i + 1) % (vars - 1));
-        cnf.push_str(&format!("{} -{} 0\n", a, b));
+        cnf.push_str(&format!("{a} -{b} 0\n"));
     }
     std::fs::write(&input, cnf).expect("write CNF");
     let output = ay_command()

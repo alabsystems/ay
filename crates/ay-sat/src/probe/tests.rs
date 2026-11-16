@@ -31,7 +31,7 @@ fn make_var_data(trail_pos: &[usize], level: &[u32], reason: &[Option<ClauseRef>
 fn test_prober_new() {
     let prober = Prober::new(10);
     assert_eq!(prober.num_vars, 10);
-    assert!(prober.probes.is_empty());
+    assert_eq!(prober.probes.len(), 0);
     assert_eq!(prober.stats.rounds, 0);
 }
 
@@ -102,7 +102,7 @@ fn test_generate_probes_root_detection() {
     //     → probe neg_x0 (to falsify x0 and exercise x0→!x1 chain)
     //   x2 appears in binary clauses (pos_occs=1), !x2 does not (neg_occs=0)
     //     → probe neg_x2 (to falsify x2 and exercise x2→!x1 chain)
-    assert!(!prober.probes.is_empty());
+    assert_ne!(prober.probes.len(), 0);
 
     // x1 (positive) should be a probe: deciding x1=TRUE falsifies !x1,
     // triggering propagation from {x0, !x1} and {x2, !x1}.

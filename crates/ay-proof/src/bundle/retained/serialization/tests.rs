@@ -147,7 +147,7 @@ fn unbounded_display_refuses_without_calling_display() {
         Err(TransportError::InvalidShape("unbounded collect_str"))
     );
     assert_eq!(calls.get(), 0);
-    assert!(output.is_empty());
+    assert_eq!(output.as_slice(), &[] as &[u8]);
 }
 
 struct CatchElementError;

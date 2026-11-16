@@ -43,10 +43,10 @@ fn prepay_chain(proof: &Proof, progress: &dyn Fn(usize, usize) -> bool) -> Optio
             ProofStep::Anchor { .. } => 1,
             _ => 0,
         };
-        let bytes = std::mem::size_of::<ProofStep>()
+        let bytes = size_of::<ProofStep>()
             .checked_mul(2)?
-            .checked_add(4 * std::mem::size_of::<ProofId>())?
-            .checked_add(premises.checked_mul(std::mem::size_of::<ProofId>())?)?;
+            .checked_add(4 * size_of::<ProofId>())?
+            .checked_add(premises.checked_mul(size_of::<ProofId>())?)?;
         if !progress(premises.checked_add(1)?, bytes) {
             return None;
         }

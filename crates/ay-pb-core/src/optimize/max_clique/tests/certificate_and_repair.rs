@@ -150,7 +150,7 @@ fn published_lower_bound_incumbent_does_not_seed_wrong_fingerprint() {
     search.seed_known_published_incumbent(KnownCliqueTables::Enabled);
 
     assert!(known_published_clique_incumbent(&fragment, KnownCliqueTables::Enabled).is_none());
-    assert!(search.best_vertices.is_empty());
+    assert_eq!(search.best_vertices.as_slice(), &[] as &[usize]);
     assert_eq!(search.best_objective, 0);
     assert_eq!(improvements.get(), 0);
 }

@@ -56,14 +56,7 @@ fn literal(
     width: u32,
 ) -> Result<TermId, TacticFailure> {
     owner
-        .admit(
-            1,
-            if value == 0 {
-                0
-            } else {
-                std::mem::size_of::<u64>()
-            },
-        )
+        .admit(1, if value == 0 { 0 } else { size_of::<u64>() })
         .map_err(|_| failure(owner))?;
     builder
         .bitvector_unsigned(&value.into(), width)
@@ -78,7 +71,7 @@ fn modular(
     field: FiniteFieldSort,
     owner: &dyn TermConstructionAdmission,
 ) -> Result<TermId, TacticFailure> {
-    let width = u32::BITS - (field.modulus() - 1).leading_zeros();
+    let width = (field.modulus() - 1).bit_width();
     let a = builder
         .apply(Op::BvZeroExtend(width), &[left])
         .map_err(|_| failure(owner))?;
@@ -235,7 +228,7 @@ pub(super) fn encode<'a>(
             Sort::Bool => None,
             _ => return Err(failure(owner)),
         };
-        let width = field.map(|f| u32::BITS - (f.modulus() - 1).leading_zeros());
+        let width = field.map(|f| (f.modulus() - 1).bit_width());
         let leaf = matches!(builder.terms().get(id), TermData::Var(_, _))
             || matches!(builder.terms().get(id), TermData::App(Symbol::Named(_), a) if a.is_empty());
         let value = if leaf {

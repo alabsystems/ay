@@ -149,9 +149,7 @@ fn copy_probe(
         pay(
             owner,
             boxed,
-            boxed
-                .checked_mul(std::mem::size_of::<Probe>())
-                .ok_or_else(stopped)?,
+            boxed.checked_mul(size_of::<Probe>()).ok_or_else(stopped)?,
         )?;
         let copied = match probe {
             Probe::Not(_) => Probe::Not(Box::new(arena.probes.pop().ok_or_else(stopped)?)),
@@ -328,9 +326,7 @@ impl Tactic {
                 pay(
                     owner,
                     boxes,
-                    boxes
-                        .checked_mul(std::mem::size_of::<Tactic>())
-                        .ok_or_else(stopped)?,
+                    boxes.checked_mul(size_of::<Tactic>()).ok_or_else(stopped)?,
                 )?;
                 let start = arena.values.len().checked_sub(count).ok_or_else(stopped)?;
                 let mut values = arena.values.drain(start..);
@@ -357,9 +353,7 @@ impl Tactic {
             pay(
                 owner,
                 boxes,
-                boxes
-                    .checked_mul(std::mem::size_of::<Tactic>())
-                    .ok_or_else(stopped)?,
+                boxes.checked_mul(size_of::<Tactic>()).ok_or_else(stopped)?,
             )?;
             let tactic = match node {
                 A::Repeat(_, bound) => {

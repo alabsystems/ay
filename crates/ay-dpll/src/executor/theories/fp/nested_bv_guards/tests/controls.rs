@@ -42,7 +42,7 @@ fn malformed_shadowed_and_indexed_predicates_are_not_seeded() {
     )
     .unwrap();
     assert_eq!(tseitin.num_vars(), 0);
-    assert!(tseitin.take_new_clauses().is_empty());
+    assert_eq!(tseitin.take_new_clauses(), [] as [ay_core::CnfClause; 0]);
 }
 
 #[test]

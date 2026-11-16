@@ -51,7 +51,7 @@ fn assert_unsat_with_drat_proof(path: &str, label: &str, timeout_secs: u64) {
             // Verify the DRAT proof is non-empty and ends with the empty clause.
             let writer = solver.take_proof_writer().expect("proof writer");
             let proof_bytes = writer.into_vec().expect("proof flush");
-            assert!(!proof_bytes.is_empty(), "{label}: DRAT proof is empty");
+            assert_ne!(proof_bytes.len(), 0, "{label}: DRAT proof is empty");
             let proof_text = String::from_utf8_lossy(&proof_bytes);
             assert!(
                 proof_text.ends_with("0\n"),

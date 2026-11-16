@@ -133,7 +133,10 @@ fn wrong_eighty_store_read_value_does_not_acquire_a_refutation() {
         }
     ));
     assert!(executor.last_proof.is_none());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
 }
 
 #[test]

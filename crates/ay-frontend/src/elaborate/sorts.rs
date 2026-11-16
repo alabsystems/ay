@@ -697,11 +697,12 @@ impl Context {
                         return Err(ElaborateError::LogicNonlinearArithmetic);
                     }
                 }
-                "/" | "div" | "mod" | "rem" => {
-                    if args.iter().skip(1).any(|&d| !self.is_numeral_term(d)) {
-                        return Err(ElaborateError::LogicNonlinearArithmetic);
-                    }
+                "/" | "div" | "mod" | "rem"
+                    if args.iter().skip(1).any(|&d| !self.is_numeral_term(d)) =>
+                {
+                    return Err(ElaborateError::LogicNonlinearArithmetic);
                 }
+                "/" | "div" | "mod" | "rem" => {}
                 _ => {}
             }
         }
@@ -943,7 +944,7 @@ impl Context {
                     // a `(declare-fun x () Float32)` would fall through to the
                     // Uninterpreted fallback below, and `x` would never route through
                     // the eager FP-to-BV bit-blaster (the structural-`=` branch in
-                    // bitblast_fp_predicate is gated on Sort::FloatingPoint). That
+                    // bitblast_fp_predicate_controlled is gated on Sort::FloatingPoint). That
                     // gap caused symbolic-variable QF_FP conflicts such as
                     // `x = 1.0 AND x = 2.0` to be reported SAT (false-SAT).
                     "Float16" => {

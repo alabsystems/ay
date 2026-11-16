@@ -50,7 +50,7 @@ fn parsed_quantifier_metadata_is_validated_and_retained() {
     let quantifier = context.assertions[0];
     let body = match context.terms.get(quantifier) {
         TermData::Forall(_, body, triggers) => {
-            assert!(triggers.is_empty());
+            assert_eq!(triggers.len(), 0);
             *body
         }
         other => panic!("expected retained forall, got {other:?}"),
@@ -436,7 +436,7 @@ fn polymorphic_recursive_definition_forms_are_supported() {
                 .expect("recursive polymorphic definition elaborates");
         }
         assert!(context.polymorphic_instantiation_complete());
-        assert!(!context.assertions.is_empty());
+        assert_ne!(context.assertions.len(), 0);
     }
 }
 
@@ -1086,9 +1086,9 @@ fn multi_pop_underflow_is_atomic() {
     assert!(ctx.sort_defs.contains_key("Outer"));
     assert!(!ctx.sort_defs.contains_key("Scoped"));
     assert!(!ctx.symbols.contains_key("local"));
-    assert!(ctx.assertions.is_empty());
-    assert!(ctx.soft_constraints.is_empty());
-    assert!(ctx.objectives.is_empty());
+    assert_eq!(ctx.assertions.len(), 0);
+    assert_eq!(ctx.soft_constraints.len(), 0);
+    assert_eq!(ctx.objectives.len(), 0);
 }
 
 #[test]
@@ -2786,7 +2786,7 @@ fn definitional_forall_adoption_rolls_back_on_later_assert_failure() {
         .expect_err("injected error");
     assert!(matches!(error, ElaborateError::Unsupported(_)));
     assert!(ctx.adopted_macro_interp("f").is_none());
-    assert!(ctx.assertions.is_empty());
+    assert_eq!(ctx.assertions.len(), 0);
 
     // A second attempt can adopt the same definition. This proves both the
     // model interpretation and the expansion entry were removed on rollback.
@@ -3064,8 +3064,8 @@ fn reset_assertions_clears_named_formula_provenance() {
             .expect("reset-assertions fixture elaborates");
     }
 
-    assert!(ctx.assertions.is_empty());
-    assert!(ctx.assertions_parsed().is_empty());
+    assert_eq!(ctx.assertions.len(), 0);
+    assert_eq!(ctx.assertions_parsed().len(), 0);
     assert_eq!(ctx.scope_depth(), 0);
     assert!(
         ctx.named_terms_iter().next().is_none(),
@@ -3123,15 +3123,15 @@ fn internal_query_window_isolates_and_exactly_restores_query_local_state() {
         ctx.assertion_finite_set_metadata,
         vec![PublicAssertionMetadata::default()]
     );
-    assert!(ctx.assertions_parsed.is_empty());
+    assert_eq!(ctx.assertions_parsed.len(), 0);
     assert!(!ctx.retains_parsed_assertions());
-    assert!(ctx.objectives.is_empty());
-    assert!(ctx.objective_finite_set_metadata.is_empty());
-    assert!(ctx.soft_constraints.is_empty());
-    assert!(ctx.soft_finite_set_metadata.is_empty());
-    assert!(ctx.named_terms.is_empty());
-    assert!(ctx.polymorphic_assertions.is_empty());
-    assert!(ctx.authored_assertions.is_empty());
+    assert_eq!(ctx.objectives.len(), 0);
+    assert_eq!(ctx.objective_finite_set_metadata.len(), 0);
+    assert_eq!(ctx.soft_constraints.len(), 0);
+    assert_eq!(ctx.soft_finite_set_metadata.len(), 0);
+    assert_eq!(ctx.named_terms.len(), 0);
+    assert_eq!(ctx.polymorphic_assertions.len(), 0);
+    assert_eq!(ctx.authored_assertions.len(), 0);
     assert_eq!(ctx.materialized_polymorphic_assertions, 0);
     assert!(ctx.polymorphic_instantiation_complete);
     assert_eq!(ctx.scope_depth(), scope_depth_before);

@@ -502,10 +502,6 @@ impl PortfolioSolver {
 
     /// Memory shares for one parallel lane (WP-F, `engine_memory.rs`).
     fn lane_memory_limits(&self) -> Option<super::engine_memory::LaneMemoryLimits> {
-        #[cfg(test)]
-        if let Some(limits) = self.engine_memory_limits_override {
-            return Some(limits);
-        }
         super::engine_memory::LaneMemoryLimits::from_process_limit()
     }
 
@@ -1902,10 +1898,7 @@ impl PortfolioSolver {
             return vec![Duration::ZERO; num_active];
         }
 
-        let divisor = match u32::try_from(num_active) {
-            Ok(divisor) => divisor,
-            Err(_) => u32::MAX,
-        };
+        let divisor = u32::try_from(num_active).unwrap_or(u32::MAX);
         let equal_share = total_timeout / divisor;
         let mut unallocated = total_timeout;
 

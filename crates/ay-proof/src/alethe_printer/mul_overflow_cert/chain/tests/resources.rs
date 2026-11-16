@@ -33,7 +33,7 @@ fn dense_twelve_bit_membership_removes_the_quadratic_observations() {
     }
     assert_eq!(calls.get(), N * (N + 1) / 2);
     assert_eq!(p.budget, budget);
-    assert!(p.out.is_empty());
+    assert_eq!(p.out, "");
 }
 
 fn assert_sticky_refusal(reach: &HashSet<Vec<bool>>, chosen: &[Vec<(usize, bool)>], s: &[bool]) {
@@ -70,7 +70,7 @@ fn assert_sticky_refusal(reach: &HashSet<Vec<bool>>, chosen: &[Vec<(usize, bool)
             "one-shot refusal cannot be polled away"
         );
         assert_eq!(p.budget, budget);
-        assert!(p.out.is_empty());
+        assert_eq!(p.out, "");
     }
 }
 
@@ -113,11 +113,8 @@ fn membership_supports_the_existing_maximum_bounded_state() {
     let reach = HashSet::from_iter([last.clone()]);
     assert_eq!(covered_state(&p, &reach, &[], &last), Some(true));
     assert_eq!(
-        covered_state(&p, &reach, &[], &vec![false; MAX_STATE]),
+        covered_state(&p, &reach, &[], &[false; MAX_STATE]),
         Some(false)
     );
-    assert_eq!(
-        covered_state(&p, &reach, &[], &vec![true; MAX_STATE + 1]),
-        None
-    );
+    assert_eq!(covered_state(&p, &reach, &[], &[true; MAX_STATE + 1]), None);
 }

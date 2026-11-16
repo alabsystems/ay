@@ -279,6 +279,7 @@ struct EnumProgram {
     /// Dense variable id -> original variable index.
     orig_of: Vec<u32>,
     kinds: Vec<u8>,
+    xor_count: usize,
     starts: Vec<u32>,
     lits: Vec<u32>,
     /// Support variables as dense ids (support members that occur in no
@@ -435,6 +436,7 @@ impl Solver {
         let EnumProgram {
             orig_of,
             kinds,
+            xor_count: _,
             starts,
             lits,
             support: dense_support,
@@ -673,7 +675,7 @@ impl Solver {
         tracing::info!(
             support = size,
             constraints = program.kinds.len(),
-            xors = program.kinds.iter().filter(|&&k| k == KIND_XOR).count(),
+            xors = program.xor_count,
             blocks,
             "indep enum: admitted",
         );
@@ -754,10 +756,11 @@ impl Solver {
             })
             .collect();
         let and_gates = ay_core::sat_ab_switches().indep_enum_and == Some(true);
-        let (kinds, starts, lits) = collapse_constraints(&raw, and_gates);
+        let (kinds, starts, lits, xor_count) = collapse_constraints(&raw, and_gates);
         Some(EnumProgram {
             orig_of,
             kinds,
+            xor_count,
             starts,
             lits,
             support: dense_support,
@@ -829,11 +832,7 @@ impl Solver {
 ///
 /// Emitted order follows the first clause each constraint came from, so the
 /// circuit's evaluation order survives the collapse.
-fn collapse_xors(raw: &[Vec<u32>]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
-    collapse_constraints(raw, false)
-}
-
-/// `collapse_xors`, then (`and_gates`, `--sat-indep-enum-and`) two-input AND
+/// After XOR collapsing, (`and_gates`, `--sat-indep-enum-and`) two-input AND
 /// gates among the clauses left: a ternary `(o ∨ ¬a ∨ ¬b)` whose binaries
 /// `(¬o ∨ a)` and `(¬o ∨ b)` are also still unconsumed becomes one `KIND_AND`
 /// constraint `[o, a, b]`. The constraint is exactly the conjunction of the
@@ -842,7 +841,7 @@ fn collapse_xors(raw: &[Vec<u32>]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
 /// literal slots in the queue (on xorshift_r14_110, 882 of 4,133 constraints
 /// carrying 6,174 of 10,635 literal slots; multiplier miters are mostly AND
 /// partial products and adders).
-fn collapse_constraints(raw: &[Vec<u32>], and_gates: bool) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
+fn collapse_constraints(raw: &[Vec<u32>], and_gates: bool) -> (Vec<u8>, Vec<u32>, Vec<u32>, usize) {
     let mut groups: HashMap<Vec<u32>, Vec<(usize, u32)>> = HashMap::new();
     for (i, c) in raw.iter().enumerate() {
         if c.len() < 2 || c.len() > INDEP_ENUM_XOR_MAX_ARITY {
@@ -943,13 +942,15 @@ fn collapse_constraints(raw: &[Vec<u32>], and_gates: bool) -> (Vec<u8>, Vec<u32>
     let mut kinds = Vec::with_capacity(out.len());
     let mut starts = Vec::with_capacity(out.len() + 1);
     let mut lits: Vec<u32> = Vec::new();
+    let mut xor_count = 0;
     starts.push(0);
     for (_, kind, cl) in out {
+        xor_count += usize::from(kind == KIND_XOR);
         kinds.push(kind);
         lits.extend_from_slice(&cl);
         starts.push(lits.len() as u32);
     }
-    (kinds, starts, lits)
+    (kinds, starts, lits, xor_count)
 }
 
 #[cfg(test)]

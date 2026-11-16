@@ -898,8 +898,11 @@ mod tests {
         );
 
         assert_eq!(first, second);
-        assert!(first.fallbacks.is_empty());
-        assert!(first.rejections.is_empty());
+        assert_eq!(first.fallbacks.as_slice(), &[] as &[LearnedClauseFallback]);
+        assert_eq!(
+            first.rejections.as_slice(),
+            &[] as &[LearnedClauseRejection]
+        );
         let ids: Vec<u64> = first.descriptors.iter().map(|d| d.clause_id).collect();
         assert_eq!(ids, vec![20, 10, 30]);
 
@@ -950,7 +953,10 @@ mod tests {
                 reason: LearnedClauseFallbackReason::BudgetExhausted,
             }]
         );
-        assert!(extracted.rejections.is_empty());
+        assert_eq!(
+            extracted.rejections.as_slice(),
+            &[] as &[LearnedClauseRejection]
+        );
     }
 
     #[test]
@@ -1010,7 +1016,10 @@ mod tests {
                 reason: LearnedClauseFallbackReason::ProofUnavailable,
             }]
         );
-        assert!(extracted.rejections.is_empty());
+        assert_eq!(
+            extracted.rejections.as_slice(),
+            &[] as &[LearnedClauseRejection]
+        );
     }
 
     #[test]
@@ -1042,8 +1051,14 @@ mod tests {
             budget,
         );
 
-        assert!(extracted.descriptors.is_empty());
-        assert!(extracted.fallbacks.is_empty());
+        assert_eq!(
+            extracted.descriptors.as_slice(),
+            &[] as &[LearnedClauseDescriptor]
+        );
+        assert_eq!(
+            extracted.fallbacks.as_slice(),
+            &[] as &[LearnedClauseFallback]
+        );
         assert_eq!(
             extracted.rejections,
             vec![

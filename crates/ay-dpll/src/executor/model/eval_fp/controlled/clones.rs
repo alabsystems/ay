@@ -39,7 +39,7 @@ impl Executor {
         };
         usize::try_from(occupied.div_ceil(64))
             .ok()?
-            .checked_mul(4 * std::mem::size_of::<u64>())?
+            .checked_mul(4 * size_of::<u64>())?
             .checked_add(4096)
     }
 

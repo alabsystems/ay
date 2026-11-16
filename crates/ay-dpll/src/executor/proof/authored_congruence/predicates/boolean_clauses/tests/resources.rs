@@ -85,7 +85,7 @@ fn conditional_stops_remain_terminal_after_collection_and_live_flag_recovery() {
         ),
         Outcome::Stopped
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
     for origin in [
         UnknownOrigin::SolveDeadline,
         UnknownOrigin::MemoryBudget,
@@ -106,7 +106,11 @@ fn conditional_stops_remain_terminal_after_collection_and_live_flag_recovery() {
     }
     let mut executor = parsed(&both_branches());
     let (roots, equalities) = scope(&executor);
-    executor.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+    executor.set_deadline(Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock can represent one second ago"),
+    ));
     assert_eq!(
         executor.try_authored_predicate_with_attempt(
             &mut proof,
@@ -116,5 +120,5 @@ fn conditional_stops_remain_terminal_after_collection_and_live_flag_recovery() {
         ),
         Outcome::Stopped
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }

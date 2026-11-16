@@ -440,7 +440,7 @@ impl AlethePrinter<'_> {
         {
             return false;
         }
-        let Some(step) = super::aci_simp_step::ac_identity_step(id, surface, canonical.text) else {
+        let Some(step) = aci_simp_step::ac_identity_step(id, surface, canonical.text) else {
             return false;
         };
         derivation.steps.push(step);

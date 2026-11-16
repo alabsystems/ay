@@ -508,13 +508,24 @@ pub struct LiaSolver<'a> {
     /// Maximum HNF cut iterations
     pub(crate) max_hnf_iterations: usize,
     /// Skip memo for HNF cut generation (#hnf-dimension-gate): the
-    /// assertion-view epoch + matrix dims of an attempt that produced ZERO
-    /// cuts. Rebuilding the same matrix (Bareiss determinant overflow on
-    /// large u64-range guards) is pure waste — observed 41 identical
-    /// 824x1259 rebuilds at ~0.7s each = a 30s test timeout. Sound to skip:
-    /// HNF cuts are an optimization; Gomory cuts and branch-and-bound
-    /// still run.
-    pub(crate) hnf_barren_fingerprint: Option<(u64, usize, usize)>,
+    /// positive-equality epoch, variable-index epoch and matrix dims of an
+    /// attempt that produced ZERO cuts. Rebuilding the same matrix (Bareiss
+    /// determinant overflow on large u64-range guards) is pure waste —
+    /// observed 41 identical 824x1259 rebuilds at ~0.7s each = a 30s test
+    /// timeout. The stamp keys on exactly what the cutter consumes — the
+    /// parsed `positive_equalities` (`pos_eq_epoch`) and the
+    /// `build_var_index` bijection (`var_index_epoch`) — not the
+    /// all-literals view epoch, which every asserted inequality advances:
+    /// keyed there, the memo never hit on Certora QF_UFDTNIA (1,102 barren
+    /// attempts, 0 fired, ~83% of the sampled wall in `generate_cuts`).
+    /// Sound to skip: HNF cuts are an optimization; Gomory cuts and
+    /// branch-and-bound still run.
+    pub(crate) hnf_barren_fingerprint: Option<(u64, u64, usize, usize)>,
+    /// Positive-equality epoch of the last `gcd_test` scan that found no
+    /// divisibility conflict. The verdict is a pure function of
+    /// `positive_equalities` (each atom's cached linear form is
+    /// assignment-independent), so an equal epoch re-scan must agree.
+    pub(crate) gcd_barren_pos_eq_epoch: Option<u64>,
     /// Deduplicate HNF cuts across the solve (cuts are globally valid).
     pub(crate) seen_hnf_cuts: HashSet<HnfCutKey>,
     /// #C7: Insertion trail backing the per-scope undo of `seen_hnf_cuts`.

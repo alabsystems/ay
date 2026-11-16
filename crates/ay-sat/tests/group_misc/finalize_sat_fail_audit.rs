@@ -235,7 +235,7 @@ fn no_finalize_sat_fail_on_small_corpus() {
         &root.join("benchmarks/sat/unsat"),
     ));
 
-    assert!(!benchmarks.is_empty(), "no benchmarks found");
+    assert_ne!(benchmarks.len(), 0, "no benchmarks found");
 
     let mut audit = AuditResult::new();
     for (label, dimacs, known_unsat) in &benchmarks {

@@ -35,7 +35,7 @@ impl Blaster {
         b
     }
 
-    fn respelled(&mut self, p: &mut Proof, e: T) -> Option<(Vec<T>, Vec<S>)> {
+    fn respelled(&mut self, p: &mut Proof<'_>, e: T) -> Option<(Vec<T>, Vec<S>)> {
         let mut words = Vec::new();
         let mut prem = Vec::new();
         for &a in p.t.args(e).to_vec().iter() {
@@ -46,7 +46,7 @@ impl Blaster {
         Some((words, prem))
     }
 
-    fn finish(p: &mut Proof, e: T, re: T, bits: &[T], rule: &str, prem: &[S]) -> S {
+    fn finish(p: &mut Proof<'_>, e: T, re: T, bits: &[T], rule: &str, prem: &[S]) -> S {
         let w = p.t.bb(bits);
         let s2 = eq_step(p, re, w, rule, &[]);
         if prem.is_empty() {
@@ -56,7 +56,7 @@ impl Blaster {
         eq_step(p, e, w, "trans", &[s1, s2])
     }
 
-    pub(crate) fn blast(&mut self, p: &mut Proof, e: T) -> Option<(Vec<T>, Option<S>)> {
+    pub(crate) fn blast(&mut self, p: &mut Proof<'_>, e: T) -> Option<(Vec<T>, Option<S>)> {
         if let Some(r) = self.memo.get(&e) {
             return Some(r.clone());
         }
@@ -65,7 +65,7 @@ impl Blaster {
         Some(r)
     }
 
-    fn blast_node(&mut self, p: &mut Proof, e: T) -> Option<(Vec<T>, Option<S>)> {
+    fn blast_node(&mut self, p: &mut Proof<'_>, e: T) -> Option<(Vec<T>, Option<S>)> {
         if self.opaque.contains(&e) || p.opaque.contains(&e) {
             return Some(Self::var(p, e));
         }
@@ -141,7 +141,7 @@ impl Blaster {
         }
     }
 
-    fn var(p: &mut Proof, e: T) -> (Vec<T>, Option<S>) {
+    fn var(p: &mut Proof<'_>, e: T) -> (Vec<T>, Option<S>) {
         let bits = p.t.bits(e);
         let w = p.t.bb(&bits);
         (bits, Some(eq_step(p, e, w, "bitblast_var", &[])))
@@ -154,7 +154,7 @@ pub(crate) enum Kind {
 }
 
 /// `(= a circuit)` for a word atom `a` = `(= E1 E2)` or `(bvult E1 E2)`.
-pub(crate) fn atom_bits(p: &mut Proof, b: &mut Blaster, a: T) -> Option<(S, T, Kind)> {
+pub(crate) fn atom_bits(p: &mut Proof<'_>, b: &mut Blaster, a: T) -> Option<(S, T, Kind)> {
     let (e1, e2) = (p.t.args(a)[0], p.t.args(a)[1]);
     let (b1, s1) = b.blast(p, e1)?;
     let (b2, s2) = b.blast(p, e2)?;
@@ -212,7 +212,7 @@ struct Setup {
     params: Vec<(T, S)>,
 }
 
-fn add_hyps(p: &mut Proof, b: &mut Blaster, hyps: &[S], o: &LinOpts) -> Option<Setup> {
+fn add_hyps(p: &mut Proof<'_>, b: &mut Blaster, hyps: &[S], o: &LinOpts) -> Option<Setup> {
     let mut st = Setup {
         hyp_pos: HashMap::default(),
         hyp_at: Vec::new(),
@@ -254,7 +254,12 @@ fn add_hyps(p: &mut Proof, b: &mut Blaster, hyps: &[S], o: &LinOpts) -> Option<S
 }
 
 /// Prove each target literal (a word relation or its negation) from `hyps`.
-pub(crate) fn lin_prove(p: &mut Proof, hyps: &[S], targets: &[T], o: &LinOpts) -> Option<Vec<S>> {
+pub(crate) fn lin_prove(
+    p: &mut Proof<'_>,
+    hyps: &[S],
+    targets: &[T],
+    o: &LinOpts,
+) -> Option<Vec<S>> {
     let mut b = Blaster::new(&o.opaque, &o.known);
     let st = add_hyps(p, &mut b, hyps, o)?;
     let mut infos = Vec::new();
@@ -277,8 +282,10 @@ pub(crate) fn lin_prove(p: &mut Proof, hyps: &[S], targets: &[T], o: &LinOpts) -
         .chain(std::iter::once(n))
         .max()
         .unwrap_or(n);
-    let mut chain = Chain::default();
-    chain.bounds = vec![Vec::new(); len + 1];
+    let mut chain = Chain {
+        bounds: vec![Vec::new(); len + 1],
+        ..Chain::default()
+    };
     for ch in b.chains.iter().chain(&o.extra_chains) {
         for i in 0..=len {
             chain.bounds[i].push(if i < ch.len() {
@@ -344,7 +351,7 @@ pub(crate) fn lin_prove(p: &mut Proof, hyps: &[S], targets: &[T], o: &LinOpts) -
 /// Each target from the chain's outputs or finals, transferred back from its
 /// bit-level circuit to the atom.
 fn conclude(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     infos: Vec<(S, T, Kind, bool)>,
     plan: Vec<Plan>,
     res: &ChainResult,
@@ -373,12 +380,12 @@ fn conclude(
     Some(out)
 }
 
-pub(crate) fn lin1(p: &mut Proof, hyps: &[S], target: T, o: &LinOpts) -> Option<S> {
+pub(crate) fn lin1(p: &mut Proof<'_>, hyps: &[S], target: T, o: &LinOpts) -> Option<S> {
     lin_prove(p, hyps, &[target], o)?.pop()
 }
 
 /// Carry every leaf atom used at several bit positions through the boundaries between its uses.
-fn add_carried(p: &Proof, chain: &mut Chain, cut: &HashSet<T>, leafcut: &HashSet<T>) {
+fn add_carried(p: &Proof<'_>, chain: &mut Chain, cut: &HashSet<T>, leafcut: &HashSet<T>) {
     let len = chain.bounds.len() - 1;
     let mut stop = HashSet::default();
     for b in &chain.bounds {
@@ -412,14 +419,14 @@ fn add_carried(p: &Proof, chain: &mut Chain, cut: &HashSet<T>, leafcut: &HashSet
         }
     }
     for (a, (lo, hi)) in uses {
-        for j in lo + 1..=hi {
-            chain.bounds[j].push(a);
+        for bound in &mut chain.bounds[lo + 1..=hi] {
+            bound.push(a);
         }
     }
 }
 
 /// From `(not (bvult x y))` and `(not (bvult y x))` over `@bbterm` words, `(= x y)`.
-pub(crate) fn tri_eq(p: &mut Proof, xw: T, yw: T, nlt: S, ngt: S) -> Option<S> {
+pub(crate) fn tri_eq(p: &mut Proof<'_>, xw: T, yw: T, nlt: S, ngt: S) -> Option<S> {
     let (xb, yb) = (p.t.bits(xw), p.t.bits(yw));
     let n = xb.len();
     let ch1 = ult_bits(&mut p.t, &xb, &yb);
@@ -452,7 +459,7 @@ pub(crate) fn tri_eq(p: &mut Proof, xw: T, yw: T, nlt: S, ngt: S) -> Option<S> {
     word_eq(p, xw, yw, &bits)
 }
 
-fn level_gates(p: &mut Proof, g: T, lower: &[Option<T>; 2], prem: &mut Vec<Prem>) {
+fn level_gates(p: &mut Proof<'_>, g: T, lower: &[Option<T>; 2], prem: &mut Vec<Prem>) {
     let mut stack = vec![g];
     let mut seen = HashSet::default();
     while let Some(u) = stack.pop() {

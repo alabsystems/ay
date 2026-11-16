@@ -92,7 +92,7 @@ fn test_proof_certificate_write_lrat_produces_output() {
     cert.write_lrat(&mut buf)
         .expect("write_lrat should succeed");
     let output = String::from_utf8(buf).expect("should be valid UTF-8");
-    assert!(!output.is_empty(), "LRAT output should not be empty");
+    assert_ne!(output.len(), 0, "LRAT output should not be empty");
     // Each line ends with "0\n" (the hint terminator)
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.len(), 3, "should have 3 proof steps");
@@ -118,7 +118,7 @@ fn test_proof_certificate_write_drat_produces_output() {
     cert.write_drat(&mut buf)
         .expect("write_drat should succeed");
     let output = String::from_utf8(buf).expect("should be valid UTF-8");
-    assert!(!output.is_empty(), "DRAT output should not be empty");
+    assert_ne!(output.len(), 0, "DRAT output should not be empty");
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines.len(), 3, "should have 3 proof steps");
     // DRAT has no clause IDs or hints -- just literals terminated by 0
@@ -151,7 +151,7 @@ fn test_proof_certificate_from_lrat_text_is_unverified() {
     assert_eq!(steps[0].dimacs_literals(), vec![1]);
     assert_eq!(steps[0].hints, vec![1]);
     assert_eq!(steps[1].clause_id, 4);
-    assert!(steps[1].literals.is_empty());
+    assert_eq!(steps[1].literals.len(), 0);
     assert_eq!(steps[1].hints, vec![3, -2]);
     assert_eq!(cert.completeness(), ProofCompleteness::NotEstablished);
     assert!(!cert.is_complete());
@@ -247,7 +247,7 @@ fn test_tracked_original_clause_ids_extracts_retained_hints() {
 fn test_tracked_original_clause_ids_empty_proof() {
     let cert = ProofCertificate::empty();
     let support = cert.tracked_original_clause_ids();
-    assert!(support.is_empty(), "empty proof should yield no support");
+    assert_eq!(support.len(), 0, "empty proof should yield no support");
 }
 
 #[test]

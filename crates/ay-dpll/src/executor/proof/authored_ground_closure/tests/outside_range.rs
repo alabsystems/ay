@@ -110,7 +110,7 @@ fn checked_control(input: &str, name: &str) {
     let directory =
         std::env::temp_dir().join(format!("ay-outside-range-controls-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::write(directory.join(format!("{name}.smt2")), &input).unwrap();
+    std::fs::write(directory.join(format!("{name}.smt2")), input).unwrap();
     std::fs::write(directory.join(format!("{name}.alethe")), &text).unwrap();
     println!(
         "OUTSIDE_RANGE_CONTROL {name} steps={} bytes={} capture={}",

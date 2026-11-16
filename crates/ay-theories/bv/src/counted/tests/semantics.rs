@@ -25,13 +25,7 @@ fn expected(name: &str, width: u32, a: u64, b: u64) -> u64 {
         "bvnand" => !(a & b),
         "bvnor" => !(a | b),
         "bvxnor" => !(a ^ b),
-        "bvudiv" => {
-            if b == 0 {
-                mask
-            } else {
-                a / b
-            }
-        }
+        "bvudiv" => a.checked_div(b).unwrap_or(mask),
         "bvurem" => {
             if b == 0 {
                 a
@@ -294,19 +288,22 @@ fn comparisons_and_bvcomp_have_unique_outputs_at_width_one_and_three() {
 
 #[test]
 fn indexed_extract_extension_repeat_rotate_and_concat_preserve_exact_bit_positions() {
+    type IndexedCase = (&'static str, &'static [u32], u32, fn(u64, u64) -> u64);
+
     let mut terms = TermStore::new();
     let a = terms.mk_var("a", Sort::bitvec(3));
     let b = terms.mk_var("b", Sort::bitvec(3));
-    let cases: [(&str, &[u32], u32, fn(u64, u64) -> u64); 10] = [
+    let cases: [IndexedCase; 10] = [
         ("extract", &[1, 1], 1, |a, _| (a >> 1) & 1),
         ("extract", &[2, 0], 3, |a, _| a),
         ("zero_extend", &[2], 5, |a, _| a),
-        (
-            "sign_extend",
-            &[2],
-            5,
-            |a, _| if a & 4 != 0 { a | 24 } else { a },
-        ),
+        ("sign_extend", &[2], 5, |a, _| {
+            if a & 4 != 0 {
+                a | 0b1_1000
+            } else {
+                a
+            }
+        }),
         ("rotate_left", &[0], 3, |a, _| a),
         ("rotate_left", &[1], 3, |a, _| ((a << 1) | (a >> 2)) & 7),
         ("rotate_left", &[8], 3, |a, _| ((a << 2) | (a >> 1)) & 7),

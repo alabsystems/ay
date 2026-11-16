@@ -86,7 +86,7 @@ impl Context {
                 self.expect_all_args_sort(arg_ids, &sort)?;
                 Ok(Some(self.terms.mk_app(
                     Symbol::Named("^".into()),
-                    arg_ids.to_vec(),
+                    &arg_ids,
                     Sort::Real,
                 )))
             }

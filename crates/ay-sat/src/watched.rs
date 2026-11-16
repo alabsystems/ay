@@ -617,7 +617,7 @@ impl WatchedLists {
         owner: &ay_core::original_query::CountedAdmission,
     ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
         use ay_core::original_query::{CountedAdmissionError, QueryError};
-        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        owner.admit(size_of::<Self>(), 0)?;
         let num_lits = crate::counted_storage::checked_double(owner, num_vars)?;
         if num_lits > ENTRY_BINARY_FLAG as usize {
             return Err(owner.refuse(CountedAdmissionError::Original(
@@ -797,6 +797,7 @@ impl WatchedLists {
 
     /// Get the packed entries for a literal as an immutable slice.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn entry_slice(&self, lit: Literal) -> &[u64] {
         let m = &self.meta[lit.index()];
         let start = m.offset as usize;
@@ -1303,6 +1304,7 @@ impl WatchedLists {
     /// full region, an unsized literal) takes `push_entry` as before. The
     /// resulting lists are identical; the out-of-line `push_entry` call was
     /// 2.1 percent of search time on the multiplier miters.
+    #[cfg(feature = "raw-pointer-bcp")]
     #[inline(always)]
     pub(crate) fn add_long_watch(&mut self, lit: Literal, watcher: Watcher) {
         let li = lit.index();

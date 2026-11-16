@@ -29,6 +29,7 @@ use super::{
     workspace_root, CarcaraSurface, Executor, Logic, Solver, StrictProofVerdict,
 };
 use ntest::timeout;
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// The three measured QF_LIA files and, for each, the rewrite that gives every
@@ -59,11 +60,10 @@ fn benchmark(relative: &str) -> String {
 /// The problem-scoped document and the surface verdict read with it.
 fn certificate(label: &str, problem: &str) -> (String, CarcaraSurface) {
     // The checker reads the file as written; the session must not `(exit)`.
-    let session: String = problem
-        .lines()
-        .filter(|line| line.trim() != "(exit)")
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let mut session = String::new();
+    for line in problem.lines().filter(|line| line.trim() != "(exit)") {
+        writeln!(&mut session, "{line}").expect("write to String");
+    }
     let script = format!("(set-option :produce-proofs true)\n{session}");
     let commands = parse(&script).unwrap_or_else(|e| panic!("{label}: {e}"));
     let mut exec = Executor::new();
@@ -223,15 +223,14 @@ fn the_unsat_artifact_carries_both_disclosures() {
         let mut solver = Solver::try_new(logic).expect("solver");
         solver.set_produce_proofs(true);
         // The solver owns the logic and the query.
-        let declarations: String = problem
-            .lines()
-            .filter(|line| {
-                !["(set-logic", "(check-sat", "(exit"]
-                    .iter()
-                    .any(|command| line.starts_with(command))
-            })
-            .map(|line| format!("{line}\n"))
-            .collect();
+        let mut declarations = String::new();
+        for line in problem.lines().filter(|line| {
+            !["(set-logic", "(check-sat", "(exit"]
+                .iter()
+                .any(|command| line.starts_with(command))
+        }) {
+            writeln!(&mut declarations, "{line}").expect("write to String");
+        }
         solver
             .parse_smtlib2(&declarations)
             .expect("parse the fixture");

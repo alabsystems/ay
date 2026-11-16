@@ -122,7 +122,7 @@ fn fp_to_real_exact_sparse_precision_normalizes_before_dense_allocation() {
             x,
             value: exact(negative, 127, fraction, 8, sb),
             used: Cell::new(0),
-            limit: crate::MODEL_DATA_WORK_LIMIT,
+            limit: MODEL_DATA_WORK_LIMIT,
         };
         let want = BigRational::new(int(if negative { -3 } else { 3 }), int(2));
         assert!(

@@ -51,7 +51,7 @@ impl Model {
             if terms.entry_stamp(term) == Some(pin.entry_stamp)
                 && !dt_model::term_depends_on_scoped_binding(terms, term)
             {
-                super::evaluation_copies::copy(&pin.value)
+                evaluation_copies::copy(&pin.value)
             } else {
                 EvalValue::Unknown
             },

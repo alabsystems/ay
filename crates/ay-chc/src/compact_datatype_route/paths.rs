@@ -4,7 +4,10 @@
 use super::{candidate, reserve, CompactDerivation, Error, Owner, Result, MAX_DEPTH};
 use crate::{ChcProblem, ClauseHead};
 
-pub(super) fn search(problem: &ChcProblem, owner: &mut Owner) -> Result<Option<CompactDerivation>> {
+pub(super) fn search(
+    problem: &ChcProblem,
+    owner: &mut Owner<'_>,
+) -> Result<Option<CompactDerivation>> {
     let mut reverse = Vec::new();
     for (index, clause) in problem.clauses().iter().enumerate() {
         owner.admit(1, 0)?;
@@ -21,7 +24,7 @@ fn visit(
     problem: &ChcProblem,
     index: usize,
     reverse: &mut Vec<usize>,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<CompactDerivation>> {
     owner.admit(1, 0)?;
     if reverse.len() >= MAX_DEPTH {
@@ -61,7 +64,7 @@ fn predecessors(
     problem: &ChcProblem,
     required: crate::PredicateId,
     reverse: &mut Vec<usize>,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<CompactDerivation>> {
     for (index, clause) in problem.clauses().iter().enumerate() {
         owner.admit(1, 0)?;

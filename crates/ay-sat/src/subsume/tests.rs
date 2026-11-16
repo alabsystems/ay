@@ -242,8 +242,8 @@ fn test_incremental_dirty_bits() {
         KeptThresholds::all_inclusive(),
     );
 
-    assert!(result.subsumed.is_empty());
-    assert!(result.strengthened.is_empty());
+    assert_eq!(result.subsumed.len(), 0);
+    assert_eq!(result.strengthened.len(), 0);
 }
 
 #[test]
@@ -360,7 +360,7 @@ fn test_fixed_literal_skipped() {
         KeptThresholds::all_inclusive(),
     );
 
-    assert!(result.subsumed.is_empty());
+    assert_eq!(result.subsumed.len(), 0);
 }
 
 /// Verify KeptThresholds filtering: learned clauses with LBD above tier2
@@ -475,8 +475,9 @@ fn test_irredundant_only_skips_learned_non_binary_clauses() {
     );
     let result =
         subsumer.run_forward_subsumption(&mut clauses, &freeze_counts, &all_dirty, &vals, kissat);
-    assert!(
-        result.subsumed.is_empty(),
+    assert_eq!(
+        result.subsumed.len(),
+        0,
         "learned ternary subsumer: {:?}",
         result.subsumed
     );

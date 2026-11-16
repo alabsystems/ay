@@ -104,7 +104,7 @@ fn bitvector_width_replay_work(width: u32) -> Result<usize, GroundSourceSurfaceE
     if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
         return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
     }
-    usize::try_from((u64::from(width) + 7) / 8)
+    usize::try_from(u64::from(width).div_ceil(8))
         .map_err(|_| GroundSourceSurfaceError::SourceWorkLimitExceeded)
 }
 
@@ -1091,6 +1091,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             .ok_or(GroundSourceSurfaceError::InvalidVariableSurface)
     }
 
+    #[cfg(test)]
     pub(crate) fn charge_step_reuse(
         &mut self,
         clause_index: usize,
@@ -2282,7 +2283,7 @@ fn validate_ground_derivation_with_control(
                         argument,
                     });
                 }
-                let equal = smt_values_equal(&use_value, &def_value);
+                let equal = smt_values_equal(&use_value, def_value);
                 control.poll()?;
                 if !equal {
                     if ground_backtranslation_debug() {

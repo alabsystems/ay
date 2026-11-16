@@ -107,10 +107,10 @@ impl DtBuilder<'_> {
         root: usize,
         ctor: &str,
     ) -> bool {
-        if !self
+        if self
             .diseq
             .get(&root)
-            .is_some_and(|neighbors| !neighbors.is_empty())
+            .is_none_or(|neighbors| neighbors.is_empty())
         {
             return false;
         }
@@ -194,7 +194,7 @@ fn finite_function_variant_count(sort: &ay_core::ArraySort) -> Option<usize> {
         return Some(constants);
     }
     let indices = scalar_domain_count(&sort.index_sort, MAX_FREE_ARRAY_VARIANTS)?;
-    let points = (indices >= 2).then_some(indices).unwrap_or(0);
+    let points = if indices >= 2 { indices } else { 0 };
     constants
         .checked_add(points)
         .map(|count| count.min(MAX_FREE_ARRAY_VARIANTS))

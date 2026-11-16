@@ -20,7 +20,7 @@ use crate::ematching::contains_quantifier;
 use crate::executor_types::{
     ExecutorError, Result, SolveResult, Statistics, UnknownOrigin, UnknownReason,
 };
-use crate::logic_detection::{LogicCategory, TheoryKind, FAIL_CLOSED_COMBINED};
+use crate::logic_detection::{LogicCategory, TheoryKind};
 
 #[path = "check_sat_assuming/publication.rs"]
 mod publication;
@@ -1597,9 +1597,9 @@ impl Executor {
     /// `(not g1)` (D10(b), `--z3-mode` wrong UNSAT). The window hands those
     /// lanes a fresh state and restores the outer one afterwards, so the
     /// assumptions live exactly as long as this query. It isolates in every
-    /// mode: `solve_without_persistent_encoding` isolates only in incremental
-    /// mode, and the D10(b) witness (two `check-sat-assuming`, no `push`) is
-    /// not incremental.
+    /// mode: the predecessor's conditional isolation missed non-incremental
+    /// sessions, while `solve_scoped_window` always forks this state. The
+    /// D10(b) witness (two `check-sat-assuming`, no `push`) is not incremental.
     fn solve_quantified_assumptions(
         &mut self,
         base_assertions: &[TermId],

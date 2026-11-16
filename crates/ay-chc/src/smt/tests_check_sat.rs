@@ -12,8 +12,7 @@ use super::bv_cache::{
 };
 use super::check_sat::{
     bv_bitblast_count_for_tests, bv_new_clause_count_for_tests, cached_bv_clause_count_for_tests,
-    clear_bitblast_max_total_bits_override_for_tests, max_bv_width, reset_reuse_counters_for_tests,
-    set_bitblast_max_total_bits_override_for_tests, total_bv_bits,
+    max_bv_width, reset_reuse_counters_for_tests, total_bv_bits,
 };
 use super::context::{SmtContext, MAX_PERSISTENT_CACHE_ENTRIES};
 use super::types::SmtResult;
@@ -835,9 +834,6 @@ fn test_check_sat_many_moderate_bv_accumulation_gated_bitblast_total() {
     const N: usize = 2000; // 2000 distinct 256-bit comparisons over 2000 distinct vars
     const W: u32 = 256; // the WIDEST real BV width — no single term trips the width guard
 
-    // Defensive: clear any override a prior (panicking) serial test may have left.
-    clear_bitblast_max_total_bits_override_for_tests();
-
     let conjuncts: Vec<ChcExpr> = (0..N)
         .map(|i| {
             let x = ChcVar::new(format!("x{i}"), ChcSort::BitVec(W));
@@ -876,8 +872,6 @@ fn test_check_sat_many_moderate_bv_accumulation_gated_bitblast_total() {
 #[test]
 #[serial]
 fn test_check_sat_moderate_bv_total_under_budget_still_decides_bitblast_total() {
-    clear_bitblast_max_total_bits_override_for_tests();
-
     const N: usize = 100; // 100 * (256 + 256) = 51_200 bits << 400_000 budget
     const W: u32 = 256;
     let conjuncts: Vec<ChcExpr> = (0..N)
@@ -927,7 +921,6 @@ fn test_check_sat_moderate_bv_total_under_budget_still_decides_bitblast_total() 
 #[test]
 #[serial]
 fn test_check_sat_single_wide_bv_refused_by_width_guard_bitblast_total() {
-    clear_bitblast_max_total_bits_override_for_tests();
     const WIDE: u32 = 200_000; // 200k >> 16_384 per-term width budget
 
     reset_reuse_counters_for_tests();
@@ -968,7 +961,6 @@ fn test_check_sat_single_wide_bv_refused_by_width_guard_bitblast_total() {
 #[test]
 #[serial]
 fn test_check_sat_widest_real_bv_still_bitblasts_bitblast_total() {
-    clear_bitblast_max_total_bits_override_for_tests();
     reset_reuse_counters_for_tests();
     reset_bv_cache_peak_for_tests();
 

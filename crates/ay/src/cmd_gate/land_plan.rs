@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-const CLI_FEATURES: &str = "cli,bench";
+pub(super) const CLI_FEATURES: &str = "cli,bench";
 
 #[path = "land_batch.rs"]
 mod batch;
@@ -31,7 +31,9 @@ pub(super) struct Resolution {
 pub(super) struct ResolvedPackage {
     pub id: String,
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub dependencies: Option<Vec<String>>,
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +96,17 @@ pub(super) fn select(
         .filter(|p| metadata.workspace_members.contains(&p.id))
         .collect();
     let local = local_paths::Graph::read(root, metadata)?;
+    if version_only(root, metadata, &local, &paths, old_lock, scope)? {
+        // `pub bump` moved versions only: no source, compilation setting or
+        // external dependency changed. Resolve the workspace with its lockfile
+        // and build the CLI. Workspace tests, broad compilation and the
+        // quiet-host benchmark controls belong to changes that can alter them.
+        return Ok(Plan {
+            changed_paths: paths,
+            broad_compile: false,
+            steps: vec![Step::metadata(), cli_build()],
+        });
+    }
     let mut selected: BTreeMap<String, Selection> = BTreeMap::new();
     let mut broad = false;
     let mut cli = false;
@@ -123,7 +136,7 @@ pub(super) fn select(
             .iter()
             .filter(|package| !metadata.workspace_members.contains(&package.id))
         {
-            cli = true;
+            cli |= local.cli_depends_on(&package.id);
             let consumers = local.consumers(&package.id);
             broad |= consumers.is_empty();
             for consumer in consumers {
@@ -216,7 +229,7 @@ pub(super) fn select(
             if relative.is_some_and(|p| p.starts_with("tests")) {
                 select_test(&mut selected, package, &absolute, scope);
             } else {
-                cli = true;
+                cli |= local.cli_depends_on(&package.id);
                 if package.name == "ay" {
                     let entry = selected.entry(package.name.clone()).or_default();
                     match relative {
@@ -284,16 +297,7 @@ pub(super) fn select(
     }
     let ffi = selected.contains_key("ay-ffi");
     if cli {
-        let mut args = strings(&["build", "--profile", "test", "--locked"]);
-        args.extend(strings(&[
-            "-p",
-            "ay",
-            "--features",
-            CLI_FEATURES,
-            "--bin",
-            "ay",
-        ]));
-        steps.push(Step::compiler(args));
+        steps.push(cli_build());
     }
     // CLI features affect shared dependencies. Keep them out of the native
     // library/consumer graph rather than rebuilding that graph on test entry.
@@ -428,6 +432,191 @@ pub(super) fn select(
         broad_compile: broad,
         steps,
     })
+}
+
+/// The CLI build that checks the binary and its workspace provenance.
+fn cli_build() -> Step {
+    Step::compiler(strings(&[
+        "build",
+        "--profile",
+        "test",
+        "--locked",
+        "-p",
+        "ay",
+        "--features",
+        CLI_FEATURES,
+        "--bin",
+        "ay",
+    ]))
+}
+
+/// A version-only change, as `pub bump` writes it. The root manifest and
+/// lockfile are the only changed paths; every manifest difference is the
+/// `[workspace.package]` version or the version requirement of a path
+/// dependency into this workspace; and every lockfile difference is a
+/// sourceless local package moving from the base workspace version to the new
+/// one with the rest of its entry unchanged. Values are compared as Cargo reads
+/// them, so comments and layout are not differences. A declared provenance
+/// input, or a manifest or lockfile this cannot parse, plans as before; one
+/// this cannot read ends the plan with an error, as the Cargo.lock arm does.
+fn version_only(
+    root: &Path,
+    metadata: &Metadata,
+    local: &local_paths::Graph<'_>,
+    paths: &[PathBuf],
+    old_lock: Option<&str>,
+    scope: &RustScope,
+) -> Result<bool> {
+    let (manifest, lock) = (Path::new("Cargo.toml"), Path::new("Cargo.lock"));
+    if !paths.iter().any(|path| path == manifest)
+        || paths.iter().any(|path| path != manifest && path != lock)
+        || paths.iter().any(|path| {
+            local
+                .packages
+                .iter()
+                .any(|package| provenance_inputs(package).contains(&root.join(path)))
+        })
+    {
+        return Ok(false);
+    }
+    let Some(base) = scope.base_workspace_manifest.as_deref() else {
+        return Ok(false);
+    };
+    let members: BTreeSet<PathBuf> = metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .filter_map(|package| package.manifest_path.parent().map(normalize))
+        .collect();
+    let current = std::fs::read_to_string(root.join(manifest)).context("read Cargo.toml")?;
+    let Some((before, after)) = moved_workspace_version(root, &members, base, &current) else {
+        return Ok(false);
+    };
+    if !paths.iter().any(|path| path == lock) {
+        return Ok(true);
+    }
+    let current = std::fs::read_to_string(root.join(lock)).context("read Cargo.lock")?;
+    let names: BTreeSet<_> = local
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+    Ok(lock_moves_only(
+        old_lock.context("missing base lockfile")?,
+        &current,
+        &names,
+        &before,
+        &after,
+    ))
+}
+
+/// The workspace version before and after, when the manifests are otherwise
+/// equal apart from the version requirements of path dependencies into this
+/// workspace (which must stay declared on both sides).
+fn moved_workspace_version(
+    root: &Path,
+    members: &BTreeSet<PathBuf>,
+    before: &str,
+    after: &str,
+) -> Option<(String, String)> {
+    // Remove what a bump moves; everything left must be equal.
+    let strip = |text: &str| -> Option<(toml::Value, String, BTreeSet<String>)> {
+        let mut manifest: toml::Value = toml::from_str(text).ok()?;
+        let workspace = manifest.get_mut("workspace")?.as_table_mut()?;
+        let version = workspace
+            .get_mut("package")?
+            .as_table_mut()?
+            .remove("version")?
+            .as_str()?
+            .to_owned();
+        let mut requirements = BTreeSet::new();
+        if let Some(dependencies) = workspace.get_mut("dependencies") {
+            for (name, dependency) in dependencies.as_table_mut()? {
+                let Some(dependency) = dependency.as_table_mut() else {
+                    continue;
+                };
+                let internal = dependency
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|path| members.contains(&normalize(&root.join(path))));
+                if !internal {
+                    continue;
+                }
+                if let Some(requirement) = dependency.remove("version") {
+                    if !requirement.is_str() {
+                        return None;
+                    }
+                    requirements.insert(name.clone());
+                }
+            }
+        }
+        Some((manifest, version, requirements))
+    };
+    let (before, old, old_requirements) = strip(before)?;
+    let (after, new, new_requirements) = strip(after)?;
+    (before == after && old_requirements == new_requirements).then_some((old, new))
+}
+
+/// Every lockfile difference is a sourceless local package moving from the
+/// base version to the new one, with the rest of its entry and the lockfile
+/// header unchanged.
+fn lock_moves_only(
+    old: &str,
+    new: &str,
+    local: &BTreeSet<&str>,
+    before: &str,
+    after: &str,
+) -> bool {
+    fn entries(text: &str) -> Option<(toml::Value, BTreeMap<String, toml::Value>)> {
+        let mut lock: toml::Value = toml::from_str(text).ok()?;
+        let packages = lock.as_table_mut()?.remove("package")?;
+        let mut entries = BTreeMap::new();
+        for package in packages.as_array()? {
+            let field = |key: &str| package.get(key).and_then(toml::Value::as_str);
+            let key = format!(
+                "{}\n{}\n{}",
+                field("name")?,
+                field("version")?,
+                field("source").unwrap_or("")
+            );
+            if entries.insert(key, package.clone()).is_some() {
+                return None;
+            }
+        }
+        Some((lock, entries))
+    }
+    let (Some((old_header, mut old)), Some((new_header, new))) = (entries(old), entries(new))
+    else {
+        return false;
+    };
+    if old_header != new_header {
+        return false;
+    }
+    for (key, entry) in new {
+        match old.remove(&key) {
+            Some(previous) if previous == entry => continue,
+            Some(_) => return false,
+            None => {}
+        }
+        let Some(name) = entry.get("name").and_then(toml::Value::as_str) else {
+            return false;
+        };
+        if entry.get("source").is_some()
+            || !local.contains(name)
+            || entry.get("version").and_then(toml::Value::as_str) != Some(after)
+        {
+            return false;
+        }
+        let mut previous = entry.clone();
+        let Some(table) = previous.as_table_mut() else {
+            return false;
+        };
+        table.insert("version".into(), toml::Value::String(before.into()));
+        if old.remove(&format!("{name}\n{before}\n")) != Some(previous) {
+            return false;
+        }
+    }
+    old.is_empty()
 }
 
 fn select_runtime(selected: &mut BTreeMap<String, Selection>, name: &str) {

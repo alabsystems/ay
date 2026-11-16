@@ -95,7 +95,7 @@ fn test_array_minimize_empty_stores_noop() {
     };
     minimize_array_interpretation(&mut interp, false);
     assert_eq!(interp.default.as_deref(), Some("#x00"));
-    assert!(interp.stores.is_empty());
+    assert_eq!(interp.stores, [] as [(String, String); 0]);
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_array_minimize_removes_all_default_duplicate_entries() {
         element_sort: None,
     };
     minimize_array_interpretation(&mut interp, false);
-    assert!(interp.stores.is_empty());
+    assert_eq!(interp.stores, [] as [(String, String); 0]);
 }
 
 #[test]

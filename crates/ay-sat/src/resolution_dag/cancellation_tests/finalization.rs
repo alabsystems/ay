@@ -36,22 +36,21 @@ fn only_the_typed_writer_marker_maps_to_cancellation() {
     let output = ProofOutput::lrat_binary(Vec::new(), 0);
     let error = output
         .into_inner_with_cancellation(&|| false)
-        .err()
-        .expect("caller refusal");
+        .expect_err("caller refusal");
     let text = error.to_string();
-    assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert_ne!(error.kind(), io::ErrorKind::Interrupted);
     assert_eq!(
         map_proof_writer_error(error),
         ResolutionProofError::Cancelled
     );
     for kind in [
-        std::io::ErrorKind::Other,
-        std::io::ErrorKind::Interrupted,
-        std::io::ErrorKind::TimedOut,
-        std::io::ErrorKind::BrokenPipe,
+        io::ErrorKind::Other,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::BrokenPipe,
     ] {
         assert_eq!(
-            map_proof_writer_error(std::io::Error::new(kind, text.clone())),
+            map_proof_writer_error(io::Error::new(kind, text.clone())),
             ResolutionProofError::ProofWriterUnavailable
         );
     }

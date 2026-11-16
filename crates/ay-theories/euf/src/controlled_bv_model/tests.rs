@@ -105,7 +105,6 @@ fn measured(
     };
     let mut work = WorkBudget::with_admission(units, &mut sink);
     let result = source.try_extract_prepared_bv_model_from_roots_with_budget(roots, &mut work);
-    drop(work);
     (result, used.get(), copied.get(), polls.get())
 }
 

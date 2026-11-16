@@ -152,7 +152,7 @@ fn the_scope_guard_is_neither_send_nor_sync() {
         impl<T: ?Sized> AmbiguousIfSend<()> for T {}
         struct IsSend;
         impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
-        let _ = <crate::ProofInprocessingKeptAfterExhaustion as AmbiguousIfSend<_>>::check;
+        let _ = <ProofInprocessingKeptAfterExhaustion as AmbiguousIfSend<_>>::check;
     }
     {
         trait AmbiguousIfSync<Marker> {
@@ -161,6 +161,6 @@ fn the_scope_guard_is_neither_send_nor_sync() {
         impl<T: ?Sized> AmbiguousIfSync<()> for T {}
         struct IsSync;
         impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
-        let _ = <crate::ProofInprocessingKeptAfterExhaustion as AmbiguousIfSync<_>>::check;
+        let _ = <ProofInprocessingKeptAfterExhaustion as AmbiguousIfSync<_>>::check;
     }
 }

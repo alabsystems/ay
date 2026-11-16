@@ -23,7 +23,7 @@ pub(super) fn build<'a>(
     variables: &Variables<'a>,
     projection: &Projection<'a>,
     model: &DetHashMap<String, SmtValue>,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<CompactDerivation> {
     let mut builder = Builder {
         problem,
@@ -92,7 +92,7 @@ pub(super) fn build<'a>(
 }
 
 impl<'a> Builder<'a> {
-    fn default(&mut self, sort: Sort<'a>, depth: usize, owner: &mut Owner) -> Result<ValueId> {
+    fn default(&mut self, sort: Sort<'a>, depth: usize, owner: &mut Owner<'_>) -> Result<ValueId> {
         owner.admit(1, 0)?;
         if depth >= MAX_DEPTH {
             return owner.refuse(Error::Resource);
@@ -139,7 +139,12 @@ impl<'a> Builder<'a> {
         Ok(value)
     }
 
-    fn scalar(&mut self, value: &SmtValue, sort: Sort<'_>, owner: &mut Owner) -> Result<ValueId> {
+    fn scalar(
+        &mut self,
+        value: &SmtValue,
+        sort: Sort<'_>,
+        owner: &mut Owner<'_>,
+    ) -> Result<ValueId> {
         let node = match (sort, value) {
             (Sort::Bool, SmtValue::Bool(value)) => ValueNode::Bool(*value),
             (Sort::BitVec(width), SmtValue::BitVec(value, actual)) if width == *actual => {
@@ -157,7 +162,7 @@ impl<'a> Builder<'a> {
                     return Err(Error::InvalidValue);
                 }
                 let bytes =
-                    usize::try_from((u64::from(width) + 7) / 8).map_err(|_| Error::Resource)?;
+                    usize::try_from(u64::from(width).div_ceil(8)).map_err(|_| Error::Resource)?;
                 owner.admit(bytes, bytes)?;
                 ValueNode::BitVec {
                     value: value.as_ref().clone(),
@@ -175,7 +180,7 @@ impl<'a> Builder<'a> {
         path: &[usize],
         leaf: ValueId,
         depth: usize,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<ValueId> {
         owner.admit(1, 0)?;
         if depth >= MAX_DEPTH {

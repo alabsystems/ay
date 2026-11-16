@@ -77,6 +77,5 @@ fn costs(source: &ArrayModel) -> (usize, usize, usize) {
     let result = source.try_clone_with_budget(&mut work).unwrap();
     assert_eq!(result.array_values, source.array_values);
     drop(result);
-    drop(work);
     totals.get()
 }

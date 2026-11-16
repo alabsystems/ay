@@ -1904,13 +1904,14 @@ fn push_extension_checker_rows(
             ),
             extension.extension_var_one_based,
         )?;
-        for offset in 0..3 {
+        for (offset, &extension_clause_id) in extension.extension_clause_ids[..3].iter().enumerate()
+        {
             require_planned_row_equal(
                 DenseCliquePhpCheckerVisibleRowKind::ExtensionForward,
                 row_index,
                 "extension_clause_id",
                 ledger.extension_clause_id_start + row_index * 3 + offset,
-                extension.extension_clause_ids[offset],
+                extension_clause_id,
             )?;
         }
         require_planned_row_equal(
@@ -3484,7 +3485,7 @@ mod tests {
         assert_eq!(source.clauses[0].source_id, 1);
         assert_eq!(source.clauses[0].raw_dimacs, vec![1, -2, 3]);
         assert_eq!(source.clauses[1].source_id, 2);
-        assert!(source.clauses[1].raw_dimacs.is_empty());
+        assert_eq!(source.clauses[1].raw_dimacs.len(), 0);
         assert_eq!(source.clauses[2].source_id, 3);
         assert_eq!(source.clauses[2].raw_dimacs, vec![-4, -5]);
         assert_eq!(source.clauses[2].literals, clauses[2]);
@@ -3819,7 +3820,7 @@ mod tests {
         let audit =
             materialize_dense_clique_php_checker_audit(Default::default(), &packet).unwrap();
 
-        assert!(audit.rows.is_empty());
+        assert_eq!(audit.rows.len(), 0);
         assert!(audit.authority_is_absent());
         assert!(!audit.stats.enabled);
         assert_eq!(audit.stats.source_rows_audited, 18);
@@ -3948,7 +3949,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(materialization.drat.is_empty());
+        assert_eq!(materialization.drat.len(), 0);
         assert!(materialization.authority_is_absent());
         assert!(!materialization.stats.enabled);
         assert_eq!(materialization.stats.source_rows_audited, 18);
@@ -4054,7 +4055,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(materialization.lrat.is_empty());
+        assert_eq!(materialization.lrat.len(), 0);
         assert!(materialization.authority_is_absent());
         assert!(!materialization.stats.enabled);
         assert_eq!(materialization.stats.source_rows_audited, 18);

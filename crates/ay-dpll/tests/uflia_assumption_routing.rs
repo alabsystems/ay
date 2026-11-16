@@ -98,7 +98,7 @@ fn check_recursive_query_stage(input: &'static str, sat: bool, stage: StageExpec
                 solver.try_get_model_str().expect("validated SAT model");
             } else if matches!(route, AssertionRoute::Named) {
                 let core = solver.try_get_unsat_core().expect("named core");
-                assert!(!core.is_empty());
+                assert_ne!(core, [] as [String; 0]);
                 assert!(core.iter().all(|name| name.starts_with("qh")));
             }
         }
@@ -426,7 +426,7 @@ fn uflia_mixed_base_named_core_rechecks_only_its_own_premises() {
         }
         assert!(solver.check_sat().is_unsat());
         let core = solver.try_get_unsat_core().expect("core");
-        assert!(!core.is_empty());
+        assert_ne!(core, [] as [String; 0]);
 
         let mut checker = self::solver();
         let fresh_roots = checker.parse_smtlib2(CORE_INPUT).expect("checker parses");

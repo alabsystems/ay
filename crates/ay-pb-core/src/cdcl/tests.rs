@@ -2169,7 +2169,7 @@ fn test_new_unpreprocessed_interruptible_honors_immediate_stop() {
     let result = solver.solve_interruptible(|| false);
 
     assert!(solver.interrupted);
-    assert!(solver.constraints.is_empty());
+    assert_eq!(solver.constraints.as_slice(), &[] as &[PbConstraint]);
     assert_eq!(result, PbCdclResult::Unknown);
 }
 
@@ -2198,7 +2198,7 @@ fn test_new_unpreprocessed_interruptible_stops_during_constraint_load() {
         "constructor should poll while loading constraints"
     );
     assert!(solver.interrupted);
-    assert!(solver.constraints.is_empty());
+    assert_eq!(solver.constraints.as_slice(), &[] as &[PbConstraint]);
     assert_eq!(result, PbCdclResult::Unknown);
 }
 
@@ -2227,7 +2227,7 @@ fn test_new_unpreprocessed_interruptible_stops_during_wide_constraint_import() {
         "constructor should poll while scanning one wide imported row"
     );
     assert!(solver.interrupted);
-    assert!(solver.constraints.is_empty());
+    assert_eq!(solver.constraints.as_slice(), &[] as &[PbConstraint]);
     assert_eq!(result, PbCdclResult::Unknown);
 }
 
@@ -4860,7 +4860,7 @@ fn test_root_probe_success_undo_preserves_root_trail_without_repropagation() {
 
     assert_eq!(outcome, RootProbeOutcome::Ok);
     assert_eq!(solver.decision_level, 0);
-    assert!(solver.trail_lim.is_empty());
+    assert_eq!(solver.trail_lim.as_slice(), &[] as &[usize]);
     assert_eq!(solver.propagator.value(-1), LitValue::True);
     assert_eq!(solver.propagator.value(3), LitValue::True);
     assert_eq!(solver.propagator.value(4), LitValue::Unassigned);
@@ -4947,7 +4947,7 @@ fn implied_literals_at_root_returns_implications_and_restores_state() {
         learned_before,
         "probe must not learn"
     );
-    assert!(solver.trail_lim.is_empty());
+    assert_eq!(solver.trail_lim.as_slice(), &[] as &[usize]);
     // Repeated probing is idempotent and re-solving still succeeds.
     let _ = solver.implied_literals_at_root(lit(4));
     assert!(matches!(
@@ -5066,7 +5066,7 @@ fn test_root_probe_interrupt_undo_preserves_root_trail() {
 
     assert_eq!(outcome, RootProbeOutcome::Interrupted);
     assert_eq!(solver.decision_level, 0);
-    assert!(solver.trail_lim.is_empty());
+    assert_eq!(solver.trail_lim.as_slice(), &[] as &[usize]);
     assert_eq!(solver.propagator.value(-1), LitValue::True);
     assert_eq!(solver.propagator.value(3), LitValue::True);
     assert_eq!(solver.propagator.value(4), LitValue::Unassigned);

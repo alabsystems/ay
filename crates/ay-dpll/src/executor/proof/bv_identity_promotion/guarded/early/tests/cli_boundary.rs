@@ -63,7 +63,11 @@ fn authored_memory_queries_honor_entry_stops() {
         let mut executor = loaded(CELL32);
         match control {
             0 => executor.set_interrupt(Arc::new(AtomicBool::new(true))),
-            1 => executor.set_deadline(Some(Instant::now() - Duration::from_secs(1))),
+            1 => executor.set_deadline(Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("the monotonic clock can represent one second ago"),
+            )),
             _ => executor.set_memory_limit(Some(1)),
         }
         assert_eq!(
@@ -75,6 +79,9 @@ fn authored_memory_queries_honor_entry_stops() {
         );
         assert!(executor.last_proof().is_none());
         assert!(executor.last_unsat_certificate.is_none());
-        assert!(executor.last_proof_raw_original_assertions.is_empty());
+        assert_eq!(
+            executor.last_proof_raw_original_assertions,
+            [] as [TermId; 0]
+        );
     }
 }

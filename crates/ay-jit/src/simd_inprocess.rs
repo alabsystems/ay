@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(result, vec![1]);
 
         let result = scanner.find_clauses_containing_scalar(encode_lit(99, 0));
-        assert!(result.is_empty());
+        assert_eq!(result.as_slice(), &[] as &[u32]);
     }
 
     #[test]
@@ -676,9 +676,12 @@ mod tests {
         assert_eq!(scanner.find_clauses_containing(encode_lit(0, 0)), vec![0]);
         assert_eq!(scanner.find_clauses_containing(encode_lit(10, 0)), vec![0]);
         assert_eq!(scanner.find_clauses_containing(encode_lit(19, 0)), vec![0]);
-        assert!(scanner
-            .find_clauses_containing(encode_lit(20, 0))
-            .is_empty());
+        assert_eq!(
+            scanner
+                .find_clauses_containing(encode_lit(20, 0))
+                .as_slice(),
+            &[] as &[u32]
+        );
     }
 
     #[test]
@@ -688,7 +691,10 @@ mod tests {
         scanner.push(&[encode_lit(0, 0), encode_lit(1, 0), encode_lit(2, 0)]);
 
         // Searching for SENTINEL should not find the clause.
-        assert!(scanner.find_clauses_containing(SENTINEL).is_empty());
+        assert_eq!(
+            scanner.find_clauses_containing(SENTINEL).as_slice(),
+            &[] as &[u32]
+        );
     }
 
     // ------------------------------------------------------------------

@@ -314,7 +314,7 @@ mod tests {
         assert!(!output.status.success());
         assert!(!output.timed_out);
         assert!(output.output_limit_reached);
-        assert!(!output.stdout.text.is_empty());
+        assert_ne!(output.stdout.text, "");
         assert!(output.stdout.text.len() <= 256);
         assert!(output.stdout.incomplete);
     }

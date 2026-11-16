@@ -112,7 +112,6 @@ pub(super) fn derive(
                     push(&mut cuts, preimage(*cut, lo, source_lo), meter)?;
                 }
             }
-            _ => return Err(FunctionalArrayError::Value),
         }
         canonical(&mut cuts, meter)?;
         meter.pay(64)?;

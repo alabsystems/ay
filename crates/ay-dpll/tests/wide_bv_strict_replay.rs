@@ -45,7 +45,7 @@ fn wide_bitvector_queries_emit_serialized_zero_trust_refutations() {
                 .unwrap_or_else(|error| panic!("width {width}: {error:?}"));
             assert_eq!(checked.quality.trust_count, 0);
             assert!(checked.quality.is_complete());
-            assert!(!checked.assume_terms.is_empty());
+            assert_ne!(checked.assume_terms, [] as [ay_dpll::api::TermId; 0]);
             checked_queries += 1;
         }
     }

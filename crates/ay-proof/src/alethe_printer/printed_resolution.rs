@@ -71,11 +71,11 @@
 //! Anything the bridge cannot reach is an export DECLINE. That turns a false
 //! green into an honest `no`, which is the campaign's stated floor.
 
+#[cfg(test)]
 use super::printed_command::{printed_commands, PrintedCommandRead};
-use super::{
-    parse_printed_bitvec_literal, split_application, split_smt_terms, AlethePrintError,
-    AlethePrinter,
-};
+#[cfg(test)]
+use super::split_application;
+use super::{parse_printed_bitvec_literal, split_smt_terms, AlethePrintError, AlethePrinter};
 use ay_core::kani_compat::{
     det_hash_map_with_capacity, DetHashMap, DetHashMap as HashMap, DetHashSet,
 };
@@ -143,7 +143,7 @@ const ATOM_SLOT_BITS: u32 = 18;
 const ATOM_SLOT_MASK: u32 = (1 << ATOM_SLOT_BITS) - 1;
 const MAX_ATOM_GENERATION: u16 = (u32::MAX >> ATOM_SLOT_BITS) as u16;
 const NO_FREE_ATOM: u32 = u32::MAX;
-const RC_TEXT_HEADER: usize = 2 * std::mem::size_of::<usize>();
+const RC_TEXT_HEADER: usize = 2 * size_of::<usize>();
 
 #[derive(Debug)]
 pub(super) struct PrintedAtomSlot {
@@ -156,7 +156,7 @@ pub(super) struct PrintedAtomSlot {
 fn rc_text_bytes(text: &str) -> usize {
     // Include the allocation header and its maximum trailing alignment padding.
     text.len()
-        .saturating_add(RC_TEXT_HEADER + std::mem::align_of::<usize>() - 1)
+        .saturating_add(RC_TEXT_HEADER + align_of::<usize>() - 1)
 }
 
 fn atom_id(slot: usize, generation: u16) -> PrintedAtomId {
@@ -271,6 +271,7 @@ pub(super) fn normalise_printed_spelling(text: &str, depth: usize, nodes: &mut u
 /// p))` decodes as `("p", 2)` and is therefore the complement of `(not p)`,
 /// which matches carcara's own `not` handling (probe `p6a`: it resolves
 /// `(not a)` against `(not (not a))` to `(cl)` and answers `valid`).
+#[cfg(test)]
 fn decode_printed_literal(printed: &str) -> Option<(String, usize)> {
     let mut current = printed.trim().to_string();
     let mut depth = 0usize;
@@ -284,25 +285,6 @@ fn decode_printed_literal(printed: &str) -> Option<(String, usize)> {
         depth = depth.checked_add(1)?;
         current = inner.trim().to_string();
     }
-}
-
-/// Reverse unit propagation over printed clauses.
-///
-/// `premises` and `conclusion` are decoded printed literals. Returns `true`
-/// when asserting the negation of `conclusion` and unit-propagating `premises`
-/// reaches a conflict — i.e. when the printed step is a resolution consequence
-/// of its printed premises.
-#[cfg(test)]
-fn printed_clauses_rup_entail(
-    premises: &[Vec<PrintedLiteral>],
-    conclusion: &[PrintedLiteral],
-) -> bool {
-    printed_clauses_rup_entail_with_budget(
-        premises,
-        conclusion,
-        &TextBudget::new(super::printed_command::MAX_STEP_BYTES),
-    )
-    .unwrap_or(false)
 }
 
 fn printed_clauses_rup_entail_with_budget(
@@ -353,23 +335,20 @@ fn printed_clauses_rup_entail_with_budget(
         .checked_add(
             clauses
                 .capacity()
-                .checked_mul(std::mem::size_of::<Vec<(usize, bool)>>())?,
+                .checked_mul(size_of::<Vec<(usize, bool)>>())?,
         )?
         .checked_add(clauses.iter().try_fold(0usize, |n, row| {
-            n.checked_add(
-                row.capacity()
-                    .checked_mul(std::mem::size_of::<(usize, bool)>())?,
-            )
+            n.checked_add(row.capacity().checked_mul(size_of::<(usize, bool)>())?)
         })?)?
         .checked_add(
             negated_conclusion
                 .capacity()
-                .checked_mul(std::mem::size_of::<(usize, bool)>())?,
+                .checked_mul(size_of::<(usize, bool)>())?,
         )?
         .checked_add(
             assignment
                 .capacity()
-                .checked_mul(std::mem::size_of::<Option<bool>>())?,
+                .checked_mul(size_of::<Option<bool>>())?,
         )?;
     metadata.resize(actual, budget.limit)?;
     for (atom, polarity) in &negated_conclusion {
@@ -421,11 +400,6 @@ fn printed_clauses_rup_entail_with_budget(
     }
 }
 
-/// Split a printed `(cl ...)` clause into its literal strings.
-pub(super) fn split_printed_clause(printed: &str) -> Option<Vec<String>> {
-    split_application(printed, "cl")
-}
-
 /// Extract the clause an external checker will bind to `id` from the text this
 /// printer just emitted for it.
 ///
@@ -437,6 +411,7 @@ pub(super) fn split_printed_clause(printed: &str) -> Option<Vec<String>> {
 /// Read through the command reader, never line by line: a command spanning
 /// lines (a quoted symbol `|g\nh|`, a multi-line string literal) is one
 /// command to the checker and must be one command here.
+#[cfg(test)]
 pub(super) fn printed_conclusion_of(id: ProofId, rendered: &str) -> Option<Vec<String>> {
     let commands = printed_commands(rendered).ok()?;
     let name = id.to_string();
@@ -512,7 +487,7 @@ fn read_wire_conclusion(
                         1 => command_name = Some(field),
                         2 => conclusion = Some(field),
                         _ => (),
-                    };
+                    }
                     count += 1;
                 }
                 Ok(None) => break,
@@ -724,16 +699,12 @@ impl AlethePrinter<'_> {
         let mut bytes = demand
             .allocation_size()
             .saturating_add(zero_scopes.allocation_size())
-            .saturating_add(
-                scope_stack
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<ProofId>()),
-            )
+            .saturating_add(scope_stack.capacity().saturating_mul(size_of::<ProofId>()))
             .saturating_add(clauses.allocation_size())
             .saturating_add(
                 retirement
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<(ProofId, ProofId)>()),
+                    .saturating_mul(size_of::<(ProofId, ProofId)>()),
             );
         if surviving.saturating_add(bytes) > MAX_RECORDED_PRINTED_BYTES {
             demand = HashMap::default();
@@ -865,8 +836,7 @@ impl AlethePrinter<'_> {
         let slot_growth = grown_slots
             .as_ref()
             .map_or(0, |new: &Vec<PrintedAtomSlot>| {
-                (new.capacity() - slots.capacity())
-                    .saturating_mul(std::mem::size_of::<PrintedAtomSlot>())
+                (new.capacity() - slots.capacity()).saturating_mul(size_of::<PrintedAtomSlot>())
             });
         let index_growth =
             grown_index
@@ -888,21 +858,20 @@ impl AlethePrinter<'_> {
             .checked_add(
                 recorded
                     .capacity()
-                    .checked_mul(std::mem::size_of::<PrintedAtomId>())?,
+                    .checked_mul(size_of::<PrintedAtomId>())?,
             )?;
         let _growth_scratch = scratch.reserve(
             grown_slots
                 .as_ref()
                 .map_or(0, |v| {
-                    v.capacity()
-                        .saturating_mul(std::mem::size_of::<PrintedAtomSlot>())
+                    v.capacity().saturating_mul(size_of::<PrintedAtomSlot>())
                 })
                 .saturating_add(grown_index.as_ref().map_or(0, HashMap::allocation_size))
                 .saturating_add(grown_bodies.as_ref().map_or(0, HashMap::allocation_size))
                 .saturating_add(
                     recorded
                         .capacity()
-                        .saturating_mul(std::mem::size_of::<PrintedAtomId>()),
+                        .saturating_mul(size_of::<PrintedAtomId>()),
                 ),
         )?;
         let total = self
@@ -981,9 +950,7 @@ impl AlethePrinter<'_> {
     }
 
     fn release_printed_atoms(&self, ids: Vec<PrintedAtomId>) {
-        let released = ids
-            .capacity()
-            .saturating_mul(std::mem::size_of::<PrintedAtomId>());
+        let released = ids.capacity().saturating_mul(size_of::<PrintedAtomId>());
         let mut index = self.printed_clause_atom_index.borrow_mut();
         let mut slots = self.printed_clause_atom_texts.borrow_mut();
         let mut bodies = self.printed_clause_bodies.borrow_mut();
@@ -1041,8 +1008,7 @@ impl AlethePrinter<'_> {
             &self.printed_clause_bytes,
         );
         let budget = self.printed_replay_budget();
-        let mut lease =
-            budget.reserve(ids.len().checked_mul(std::mem::size_of::<WireLiteral>())?)?;
+        let mut lease = budget.reserve(ids.len().checked_mul(size_of::<WireLiteral>())?)?;
         let slots = self.printed_clause_atom_texts.borrow();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -1053,8 +1019,7 @@ impl AlethePrinter<'_> {
             out.push(slot.text.clone()?);
         }
         lease.resize(
-            out.capacity()
-                .checked_mul(std::mem::size_of::<WireLiteral>())?,
+            out.capacity().checked_mul(size_of::<WireLiteral>())?,
             budget.limit,
         )?;
         Some(Tracked::reserved(out, lease))
@@ -1067,8 +1032,7 @@ impl AlethePrinter<'_> {
             &self.printed_clause_bytes,
         );
         let scratch = self.printed_replay_budget();
-        let mut lease =
-            scratch.reserve(wires.len().checked_mul(std::mem::size_of::<OwnedText>())?)?;
+        let mut lease = scratch.reserve(wires.len().checked_mul(size_of::<OwnedText>())?)?;
         let retained = TextBudget::retained(
             Rc::clone(&self.printed_clause_bytes),
             MAX_RECORDED_PRINTED_BYTES,
@@ -1078,8 +1042,7 @@ impl AlethePrinter<'_> {
             out.push(wire.materialize(&retained)?);
         }
         lease.resize(
-            out.capacity()
-                .checked_mul(std::mem::size_of::<OwnedText>())?,
+            out.capacity().checked_mul(size_of::<OwnedText>())?,
             scratch.limit,
         )?;
         Some(Tracked::reserved(out, lease))
@@ -1264,6 +1227,7 @@ impl AlethePrinter<'_> {
         Some(identity)
     }
 
+    #[cfg(test)]
     fn decode_all<C: AsRef<[OwnedText]>>(
         &self,
         printed: &[C],
@@ -1279,8 +1243,8 @@ impl AlethePrinter<'_> {
             .try_fold(0usize, |n, row| n.checked_add(row.as_ref().len()))?;
         let bytes = printed
             .len()
-            .checked_mul(std::mem::size_of::<Vec<PrintedLiteral>>())?
-            .checked_add(count.checked_mul(std::mem::size_of::<PrintedLiteral>())?)?;
+            .checked_mul(size_of::<Vec<PrintedLiteral>>())?
+            .checked_add(count.checked_mul(size_of::<PrintedLiteral>())?)?;
         let mut lease = budget.reserve(bytes)?;
         let mut result = Vec::with_capacity(printed.len());
         for row in printed {
@@ -1309,8 +1273,8 @@ impl AlethePrinter<'_> {
             .try_fold(0usize, |n, row| n.checked_add(row.as_ref().len()))?;
         let bytes = printed
             .len()
-            .checked_mul(std::mem::size_of::<Vec<PrintedLiteral>>())?
-            .checked_add(count.checked_mul(std::mem::size_of::<PrintedLiteral>())?)?;
+            .checked_mul(size_of::<Vec<PrintedLiteral>>())?
+            .checked_add(count.checked_mul(size_of::<PrintedLiteral>())?)?;
         let mut lease = budget.reserve(bytes)?;
         let mut result = Vec::with_capacity(printed.len());
         for row in printed {

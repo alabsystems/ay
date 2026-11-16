@@ -23,7 +23,7 @@
 //! The obvious shape — `Cell<u64>` fields on `Executor`, published into
 //! `last_statistics` — cannot see this regression at all. The CHC portfolio
 //! constructs a **fresh `Executor` per sub-query** (`executor_adapter`'s
-//! `execute_commands_via_executor`), and the two nested corroboration solves
+//! `execute_commands_via_executor_with_limits`), and the two nested corroboration solves
 //! inside a mint each construct another one. Per-executor counters would
 //! therefore report `1` decision and `0` nested solves on ~1000 separate
 //! objects, none of which any caller ever inspects. The quantity being

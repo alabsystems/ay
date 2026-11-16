@@ -39,7 +39,7 @@ impl<'a> ContextMeter<'a> {
         // alloc's btree/node.rs has B=6, at most 11 keys and 12 edges per
         // node. Internal branching is >=2, so bit_length(entries)+1 bounds
         // the visited levels. Also retain the full-key-scan upper bound.
-        let levels = add((usize::BITS - entries.leading_zeros()) as usize, 1)?;
+        let levels = add(entries.bit_width() as usize, 1)?;
         let comparisons = add(entries, 1)?.min(mul(levels, 12)?);
         self.charge(add(mul(comparisons, add(name.len(), 1)?)?, levels)?, 0)
     }
@@ -59,7 +59,7 @@ impl<'a> ContextMeter<'a> {
         // a new root. alloc's B=6 node stores 11 (K,V) slots, 12 edges and a
         // parent/length header. 32 slots conservatively cover that layout,
         // padding and key/edge movement without charging the entire tree.
-        let nodes = add((usize::BITS - entries.leading_zeros()) as usize, 2)?;
+        let nodes = add(entries.bit_width() as usize, 2)?;
         let slot = add(size_of::<(K, V)>(), size_of::<usize>())?;
         self.charge(mul(nodes, 32)?, mul(mul(nodes, 32)?, slot)?)
     }

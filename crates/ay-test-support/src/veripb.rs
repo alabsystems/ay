@@ -1317,7 +1317,7 @@ pub mod pin {
                 64,
                 "patch sha256 must be 64 hex chars"
             );
-            assert!(!version().is_empty());
+            assert_ne!(version(), "");
         }
 
         // The patch-file hash check lives in tests/veripb_patch_pin.rs: the

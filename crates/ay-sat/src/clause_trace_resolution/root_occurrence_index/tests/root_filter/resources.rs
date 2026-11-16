@@ -40,7 +40,7 @@ fn filtered_build_keeps_conservative_admission_and_terminal_stop_boundaries() {
         assert_eq!(result, Err(ResolutionValidationError::Cancelled));
         assert_eq!(calls, stop_at);
         assert!(root.index_heads.is_none());
-        assert!(root.index_items.is_empty());
+        assert_eq!(root.index_items.len(), 0);
     }
     for (budget, bytes, resource) in [
         (work - 1, admitted, ResolutionValidationResource::Work),
@@ -51,7 +51,7 @@ fn filtered_build_keeps_conservative_admission_and_terminal_stop_boundaries() {
             matches!(result, Err(ResolutionValidationError::LimitExceeded { resource: actual, .. }) if actual == resource)
         );
         assert!(root.index_heads.is_none());
-        assert!(root.index_items.is_empty());
+        assert_eq!(root.index_items.len(), 0);
     }
 }
 
@@ -77,7 +77,7 @@ fn filtered_build_rejects_invalid_indices_even_behind_a_true_root_literal() {
             ))
         ));
         assert!(root.index_heads.is_none());
-        assert!(root.index_items.is_empty());
+        assert_eq!(root.index_items.len(), 0);
     }
 }
 
@@ -92,7 +92,7 @@ fn filtered_empty_index_and_expired_deadline_never_invent_occurrences() {
     let admitted = planned_bytes(2, 2, 4).unwrap();
     build(&mut root, &originals, 2, admitted, &mut meter).unwrap();
     assert_eq!(root.index_heads, Some(vec![0; 5]));
-    assert!(root.index_items.is_empty());
+    assert_eq!(root.index_items.len(), 0);
 
     let mut expired = ResolutionValidationLimits::unbounded();
     expired.deadline = Some(Instant::now());
@@ -104,5 +104,5 @@ fn filtered_empty_index_and_expired_deadline_never_invent_occurrences() {
     })();
     assert_eq!(result, Err(ResolutionValidationError::DeadlineExceeded));
     assert!(root.index_heads.is_none());
-    assert!(root.index_items.is_empty());
+    assert_eq!(root.index_items.len(), 0);
 }

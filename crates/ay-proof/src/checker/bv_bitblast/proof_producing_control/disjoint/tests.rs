@@ -162,7 +162,7 @@ fn source_queries_truth_and_split_limits_reach_one_continuation_in_order() {
 fn optional_search_caps_and_original_deadlines_are_not_replaced() {
     let fixture = fixture(Route::Combined, Value::Valid);
     let deadline = deadline();
-    let replay_deadline = deadline - Duration::from_secs(1);
+    let replay_deadline = deadline.checked_sub(Duration::from_secs(1)).unwrap();
     let mut limits = limits(deadline);
     limits.resolution.validation.deadline = Some(replay_deadline);
     limits.resolution.max_conflicts = None;

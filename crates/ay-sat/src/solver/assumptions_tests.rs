@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn compose_scope_assumptions_empty_when_no_scope_or_assumptions() {
     let solver: Solver = Solver::new(2);
-    assert!(solver.compose_scope_assumptions(&[]).is_empty());
+    assert_eq!(solver.compose_scope_assumptions(&[]).len(), 0);
 }
 
 #[test]
@@ -756,7 +756,7 @@ fn test_assume_unsat_carries_proof_certificate_when_lrat_enabled() {
     let core = result
         .unsat_core()
         .expect("UNSAT result should have a core");
-    assert!(core.is_empty(), "Base UNSAT needs no assumptions");
+    assert_eq!(core.len(), 0, "Base UNSAT needs no assumptions");
 
     // Genuine base UNSAT preserves the historical LRAT certificate assertion.
     match result.result() {

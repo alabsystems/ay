@@ -325,7 +325,7 @@ fn accepts_the_boolean_proxy_definition_the_corpus_carries() {
                     .with_int("y", y)
                     .with_bool("g", g_value)
                     .with_bool("boolarg_7", witness);
-                assert!(ev.holds(authored) == (0 <= x));
+                assert_eq!(ev.holds(authored), 0 <= x);
                 assert!(
                     ev.holds(atom),
                     "`p := body` must satisfy the definition at ({x}, {y}, {g_value})"

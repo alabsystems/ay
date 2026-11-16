@@ -151,7 +151,7 @@ fn array_cell_metadata_copy_limits_charge_before_clone_and_fresh_retry() {
     assert!(exact.sort_copy(sort).is_ok());
     assert_eq!((exact.bytes, exact.work), (MAX_COPY_BYTES, MAX_WORK));
     for (bytes, work) in [(MAX_COPY_BYTES - bytes + 1, 0), (0, MAX_WORK - work + 1)] {
-        assert!(Budget { bytes, work }.sort_copy(sort).is_err());
+        assert!(Budget { work, bytes }.sort_copy(sort).is_err());
     }
     let mut fresh = Budget::default();
     assert!(fresh.sort_copy(sort).is_ok());

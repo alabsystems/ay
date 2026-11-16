@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::ClauseHead;
 use ay_core::resource::{enter_check_stop, ChildSpec, Guard, NodeLabel};
 
 use super::*;

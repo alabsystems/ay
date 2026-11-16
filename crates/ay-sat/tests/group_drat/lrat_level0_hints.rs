@@ -106,5 +106,5 @@ fn test_lrat_contradictory_units() {
     let proof = String::from_utf8(writer.into_vec().expect("flush")).expect("UTF-8");
 
     // The proof must not be empty — at minimum the empty clause must be derived.
-    assert!(!proof.is_empty(), "LRAT proof must not be empty");
+    assert_ne!(proof.len(), 0, "LRAT proof must not be empty");
 }

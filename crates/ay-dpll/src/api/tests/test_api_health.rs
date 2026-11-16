@@ -294,7 +294,10 @@ mod solver_capability_descriptor_surface {
         );
         assert!(symbolic_manifest_health.accepted_for_consumer);
         assert!(symbolic_manifest_health.all_contracts_fail_closed);
-        assert!(symbolic_manifest_health.issues.is_empty());
+        assert_eq!(
+            symbolic_manifest_health.issues,
+            [] as [crate::SymbolicExecutionContractManifestHealthIssue; 0]
+        );
         assert_eq!(
             crate::api::validate_symbolic_execution_contract_manifest(&symbolic_manifest),
             symbolic_manifest_health

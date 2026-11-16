@@ -566,6 +566,7 @@ impl AdaptivePortfolio {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn run_preprocessed_acyclic_bmc_probe(
         &self,
         summary: PreprocessSummary,
@@ -1654,7 +1655,6 @@ impl AdaptivePortfolio {
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(route_cancellation.clone()),
-                    ..ChcEngineConfig::default()
                 },
                 max_depth: depth,
                 acyclic_safe: true,
@@ -1732,7 +1732,6 @@ impl AdaptivePortfolio {
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
                     cancellation_token: Some(route_cancellation.clone()),
-                    ..ChcEngineConfig::default()
                 },
                 max_depth: depth,
                 acyclic_safe: false,

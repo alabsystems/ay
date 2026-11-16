@@ -64,7 +64,7 @@ impl Circuit<'_, '_, '_> {
             return None;
         }
         let input = self.bit_text(&arg.bits)?;
-        if super::super::wire::admits_wire_cases(&input) {
+        if wire::admits_wire_cases(&input) {
             let source = Value {
                 bits: input,
                 equality: arg.equality,

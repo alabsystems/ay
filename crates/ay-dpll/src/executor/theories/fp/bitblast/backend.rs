@@ -93,6 +93,7 @@ impl Encoder for FpConstruction<'_, '_> {
     }
 }
 
+#[cfg(test)]
 pub(in crate::executor::theories::fp) fn infallible<T>(result: Result<T, Infallible>) -> T {
     match result {
         Ok(value) => value,

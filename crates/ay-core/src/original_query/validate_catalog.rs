@@ -189,7 +189,11 @@ pub(super) fn group_shape(
     entries: &[DeclId],
     work: &mut WorkBudget<'_>,
 ) -> Result<(), QueryError> {
-    use DeclarationSyntax::*;
+    use DeclarationSyntax::{
+        DeclareConst, DeclareDatatype, DeclareDatatypes, DeclareFun, DeclareRel, DeclareSort,
+        DeclareSortParameter, DeclareVar, DefineFun, DefineFunRec, DefineFunsRec, DefineSort,
+        SynthFun, SynthInv,
+    };
     work.charge(1)?;
     let required = match syntax {
         DefineFunRec | DefineFunsRec => DeclarationGroupKind::RecursiveFunctions,

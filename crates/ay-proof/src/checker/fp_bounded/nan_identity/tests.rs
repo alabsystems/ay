@@ -222,7 +222,7 @@ fn nan_identity_offline_proof_rejects_changed_premises_and_forged_derived_assume
     let fixture = Fixture::new(8, 24, false);
     for removed in 0..3 {
         let mut bundle = fixture.bundle();
-        bundle.obligation_assertions.remove(removed);
+        let _removed_obligation = bundle.obligation_assertions.remove(removed);
         assert!(re_check_bundle_strict(&bundle).is_err());
         let mut bundle = fixture.bundle();
         bundle.steps[removed] = ProofStep::Assume(fixture.terms.true_term());

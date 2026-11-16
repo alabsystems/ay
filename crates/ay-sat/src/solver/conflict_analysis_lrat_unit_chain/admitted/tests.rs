@@ -65,7 +65,7 @@ fn fast_and_stale_position_paths_keep_exact_reverse_order_and_filtering() {
                 actual.stats.lrat_unit_chain_root_trail_entries,
                 if stale { 8 } else { 0 }
             );
-            assert!(actual.min.lrat_to_clear.is_empty());
+            assert_eq!(actual.min.lrat_to_clear.len(), 0);
             assert!(actual.min.minimize_flags.iter().all(|&value| value == 0));
             assert!(owner.usage().unwrap().work_admitted > 0);
         }
@@ -113,7 +113,7 @@ fn actual_bfs_missing_unit_fallback_keeps_ordinary_chain_without_minting_ids() {
         expected.lrat_materialization_stats()
     );
     assert_eq!(actual.unit_proof_id, expected.unit_proof_id);
-    assert!(actual.min.lrat_to_clear.is_empty());
+    assert_eq!(actual.min.lrat_to_clear.len(), 0);
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn invalid_root_and_counter_overflow_refuse_before_dirty_registration() {
         assert!(s
             .append_lrat_unit_chain_admitted(&roots, &det_hash_set_new(), &root::Counted(&owner))
             .is_err());
-        assert!(s.min.lrat_to_clear.is_empty());
+        assert_eq!(s.min.lrat_to_clear.len(), 0);
         assert!(s.min.minimize_flags.iter().all(|&v| v == 0));
         assert_eq!(s.conflict.resolution_chain_len(), 0);
         assert!(owner.check().is_err());

@@ -243,7 +243,7 @@ pub const CHECKABLE_ALETHE_RULES: [&str; 182] = [
 /// [`wire_rule_name`] into any document; a name the pinned checker does not
 /// implement turns the whole document `invalid` there (the reverted
 /// `dt_distinct` -> `dt_clash` alias). The names here never pass through
-/// [`wire_rule_name`]: [`wire_rule_name`]`("dt_project")` stays
+/// [`wire_rule_name`]: calling it with `"dt_project"` stays
 /// [`UNPROVED_STEP_RULE`], and only a dedicated printer lowering, run in the
 /// Clean dialect, writes them.
 ///
@@ -806,7 +806,7 @@ pub enum AletheRule {
     /// multi-binder quantifier into one binder over the rest, which is what
     /// lets the single-binder `sko_forall`/`sko_ex` Skolemize a multi-binder
     /// existential one binder at a time, each witness with its own registered
-    /// choice. See `ay_proof::checker::quantifier::validate_qnt_join` for the
+    /// choice. See `ay_proof::checker::quantifier::validate_qnt_join_with_progress` for the
     /// strict re-derivation and its soundness argument. `qnt_join` is a
     /// pinned wire rule (`CHECKABLE_ALETHE_RULES`).
     ///

@@ -152,7 +152,7 @@ fn metered_bundle_does_not_reset_an_envelope_between_copies() {
 fn metered_bundle_prices_unused_payload_even_after_zero_ledger_reconstruction() {
     let (mut terms, proof, assertions) = fixture();
     let (_, small_bytes, _) = usage(&terms, &proof, &assertions);
-    terms.mk_string("unused-certificate-payload".repeat(4096));
+    let _unused_certificate_payload = terms.mk_string("unused-certificate-payload".repeat(4096));
     let restored = TermStore::from_entries(
         terms.entries_snapshot(),
         Some(terms.true_term()),

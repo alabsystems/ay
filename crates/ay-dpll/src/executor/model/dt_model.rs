@@ -128,7 +128,7 @@ impl OverrideGuard {
         let admitted = super::evaluation_copies::pay(
             map.len(),
             map.len()
-                .saturating_mul(4 * std::mem::size_of::<(TermId, EvalValue)>()),
+                .saturating_mul(4 * size_of::<(TermId, EvalValue)>()),
         );
         let map = if admitted {
             map.into_iter()
@@ -157,8 +157,7 @@ struct ScopedBindingGuard {
 
 impl ScopedBindingGuard {
     fn install(term: TermId, value: EvalValue) -> Self {
-        let admitted =
-            super::evaluation_copies::pay(1, 4 * std::mem::size_of::<(TermId, EvalValue)>());
+        let admitted = super::evaluation_copies::pay(1, 4 * size_of::<(TermId, EvalValue)>());
         if !admitted {
             return Self {
                 restore_len: SCOPED_TERM_BINDINGS.with(|slot| slot.borrow().len()),
@@ -1567,10 +1566,7 @@ impl Executor {
         // already excluded genuinely-equal arrays via `cx == cy` above, including
         // transitively-equated ones). Fixes over-refutation of `(distinct v3 v5)`
         // over unconstrained datatype-element arrays (#dt-array-distinct-freeslot).
-        if self.census_index_domain_has_free_slot(x, &keys_x) {
-            return true;
-        }
-        false
+        self.census_index_domain_has_free_slot(x, &keys_x)
     }
 
     /// Whether array `arr`'s index domain has a value NOT among the `observed`

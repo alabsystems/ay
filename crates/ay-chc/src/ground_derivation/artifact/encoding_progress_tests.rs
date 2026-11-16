@@ -26,7 +26,6 @@ fn every_refusal<T>(
         total += 1;
         true
     })
-    .ok()
     .expect("valid encoding");
     assert!(total > 1);
     for ordinal in 1..=total {

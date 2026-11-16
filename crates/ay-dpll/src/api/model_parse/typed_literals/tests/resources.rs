@@ -11,9 +11,7 @@ fn exact_single_literal_allowance_and_one_short_refusal_use_one_shared_ledger() 
     let (parse_work, parse_bytes) = storage::allowance("true").unwrap();
     // Result Vec, borrowed-sort preflight, then existing Decoder input/sort/value.
     let work = 1 + parse_work + 1 + 3;
-    let bytes = 2 * std::mem::size_of::<ModelValue>()
-        + parse_bytes
-        + std::mem::size_of::<&ay_frontend::SExpr>();
+    let bytes = 2 * size_of::<ModelValue>() + parse_bytes + size_of::<&ay_frontend::SExpr>();
     let mut exact = Decoder::new();
     exact
         .reserve_literal_resources(WORK - work, COPY - bytes)
@@ -135,7 +133,7 @@ fn parser_storage_counts_quoted_payloads_and_error_line_tables_before_allocation
     assert_eq!(quoted_work - small_work, 27);
     assert_eq!(quoted_bytes - small_bytes, 18);
     let (_, newline) = storage::allowance("\"\n\"").unwrap();
-    assert_eq!(newline - small_bytes, 2 * std::mem::size_of::<usize>());
+    assert_eq!(newline - small_bytes, 2 * size_of::<usize>());
     // Literal/comment parentheses do not create hypothetical AST nodes.
     assert_eq!(storage::allowance("|(|"), storage::allowance("|x|"));
     assert_eq!(

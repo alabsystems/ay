@@ -19,6 +19,9 @@ mod exploration;
 #[cfg(test)]
 mod paths;
 mod render;
+#[cfg(test)]
+#[path = "render/tests/oracle.rs"]
+mod render_oracle;
 mod replay;
 mod search_trees;
 mod trace;

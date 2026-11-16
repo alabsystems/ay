@@ -57,7 +57,10 @@ fn forced_git_download_verifies_staging_before_replacing_destination() {
         "last-good\n"
     );
     assert!(!destination.join(".git").exists());
-    assert!(corpus_work_directories(directory.path()).is_empty());
+    assert_eq!(
+        corpus_work_directories(directory.path()).as_slice(),
+        &[] as &[PathBuf]
+    );
 }
 
 #[test]

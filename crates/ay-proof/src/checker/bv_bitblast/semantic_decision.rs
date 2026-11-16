@@ -99,6 +99,7 @@ pub(super) fn validate_bv_bitblast_semantics_speculative(
 /// The private fallback seam lets cancellation controls prove no fallback was
 /// entered without running a solver. Production always supplies the unchanged
 /// proof-producing validator with the same caller control and hang guard.
+#[cfg(test)]
 pub(super) fn validate_bv_bitblast_semantics_with_fallback(
     terms: &TermStore,
     step_id: ProofId,

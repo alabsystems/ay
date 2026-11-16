@@ -39,7 +39,8 @@ impl Fixture {
         let default = terms.mk_var("else", Sort::Int);
         let constant = terms.mk_const_array(Sort::Int, default);
         // Raw registration keeps the const-array tracked without folding or a value pin.
-        terms.mk_app(Symbol::named("select"), [constant, indices[0]], Sort::Int);
+        let _constant_read =
+            terms.mk_app(Symbol::named("select"), [constant, indices[0]], Sort::Int);
         let inner = terms.mk_app(
             Symbol::named("store"),
             [base, indices[0], written[1]],
@@ -52,7 +53,7 @@ impl Fixture {
         );
         let selects = [indices[0], indices[2], indices[3]]
             .map(|index| terms.mk_app(Symbol::named("select"), [base, index], Sort::Int));
-        terms.mk_array_default(base);
+        let _base_default = terms.mk_array_default(base);
         Self {
             terms,
             base,
@@ -108,7 +109,6 @@ fn costs(solver: &ArraySolver<'_>, values: &HashMap<TermId, String>) -> (usize, 
         .try_extract_prepared_model_with_budget(values, &mut work)
         .unwrap();
     drop(output);
-    drop(work);
     totals.get()
 }
 

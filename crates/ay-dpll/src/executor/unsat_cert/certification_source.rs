@@ -7,6 +7,10 @@
 use super::*;
 
 /// Fully authenticated theorem selected by the common UNSAT mint.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing would add an unmetered allocation after authentication and alter affine carrier custody"
+)]
 pub(super) enum CertificationSource {
     StrictProof,
     StrictNativeBvLiaBundle(PreparedStrictNativeBvLiaBundle),
@@ -28,7 +32,7 @@ pub(super) enum CertificationSource {
         evidence: AuthenticatedBvLiaUnsatQuery,
         exact_roots: Box<[TermId]>,
     },
-    DischargedTrust(crate::executor::UnsatCorroboration),
+    DischargedTrust(UnsatCorroboration),
 }
 
 pub(super) enum StrictProofPresentationFailure {

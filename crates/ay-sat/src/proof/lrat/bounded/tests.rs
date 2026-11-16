@@ -203,7 +203,7 @@ fn invalid_id_and_overflow_keep_errors_and_poison_without_acceptance() {
         assert!(!is_bounded_emission_cancelled(&error));
         assert_eq!(writer.added_count(), 0);
         assert!(writer.has_io_error());
-        assert!(!writer.get_ref().is_empty());
+        assert_ne!(writer.get_ref().len(), 0);
         assert!(writer.into_inner().is_err());
     }
 }

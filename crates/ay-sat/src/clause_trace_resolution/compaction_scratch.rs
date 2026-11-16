@@ -93,7 +93,7 @@ impl CompactionScratch {
         target_clause: &[Literal],
         meter: &mut ConversionMeter<'_>,
     ) -> Result<bool, ResolutionValidationError> {
-        debug_assert!(self.touched.is_empty());
+        debug_assert_eq!(self.touched.len(), 0);
         for (literal, value) in fixed_unit_premises
             .iter()
             .map(|lit| (*lit, lit.is_positive()))

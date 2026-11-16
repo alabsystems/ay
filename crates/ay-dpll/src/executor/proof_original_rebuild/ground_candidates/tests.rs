@@ -96,7 +96,7 @@ fn memoized_candidates_follow_the_authored_set() {
         }
     }
     assert_eq!(exec.authored_ground_candidates(v, &[pin_two]), vec![two]);
-    assert!(exec.authored_ground_candidates(v, &[]).is_empty());
+    assert_eq!(exec.authored_ground_candidates(v, &[]), [] as [TermId; 0]);
 }
 
 #[test]

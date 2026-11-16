@@ -186,10 +186,9 @@ fn operation_value(operation: ChcOp, args: &[Value]) -> Value {
             };
             match operation {
                 ChcOp::BvUDiv => Value::Bv(
-                    if right == 0 {
-                        mask(width)
-                    } else {
-                        left / right
+                    match left.checked_div(right) {
+                        Some(quotient) => quotient,
+                        None => mask(width),
                     },
                     width,
                 ),
@@ -199,5 +198,19 @@ fn operation_value(operation: ChcOp, args: &[Value]) -> Value {
             }
         }
         _ => panic!("unsupported fixture operation"),
+    }
+}
+
+#[test]
+fn bvudiv_oracle_matches_smt_zero_and_nonzero_semantics() {
+    let expected = [[3, 0, 0, 0], [3, 1, 0, 0], [3, 2, 1, 0], [3, 3, 1, 1]];
+    for left in 0..4 {
+        for right in 0..4 {
+            assert_eq!(
+                operation_value(ChcOp::BvUDiv, &[Value::Bv(left, 2), Value::Bv(right, 2)]),
+                Value::Bv(expected[left as usize][right as usize], 2),
+                "left={left} right={right}"
+            );
+        }
     }
 }

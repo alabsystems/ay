@@ -47,6 +47,9 @@ impl Reducer<'_> {
                 (2, Sort::bitvec(self.width), Sort::Bool)
             }
             "=" => {
+                if self.terms.is_declared_function(op) {
+                    return None;
+                }
                 let [left, right] = args else {
                     return None;
                 };
@@ -60,6 +63,9 @@ impl Reducer<'_> {
             "bvneg" | "bvnot" => (1, Sort::bitvec(self.width), Sort::bitvec(self.width)),
             _ => return None,
         };
+        if self.terms.is_declared_function(op) {
+            return (sort == &Sort::bitvec(self.width)).then_some(());
+        }
         if args.len() != arity || sort != &output {
             return None;
         }

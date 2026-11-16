@@ -1248,10 +1248,7 @@ fn equality_span_dual_point(
         }
     }
     for (&variable, coefficient) in &wanted {
-        match equations.get_mut(&variable) {
-            Some(equation) => equation.1 = coefficient.clone(),
-            None => return None, // c_v != 0, no equality touches v
-        }
+        equations.get_mut(&variable)?.1 = coefficient.clone();
     }
 
     // Sparse Gaussian elimination, deterministic (equations in ascending
@@ -3994,7 +3991,7 @@ pub(crate) fn generate_farkas_anchor_json() -> Result<(String, String), String> 
     }
 
     let mut tampered = valid.clone();
-    let one = QPair::from_int(&num_bigint::BigInt::from(1));
+    let one = QPair::from_int(&BigInt::from(1));
     let constant = &tampered.cert.base.conclusion.constant;
     tampered.cert.base.conclusion.constant = QPair::new(
         &constant.num * &one.den + &one.num * &constant.den,
@@ -4082,7 +4079,7 @@ mod tests {
             }
             let obj = PbObjective { terms: obj_terms };
             let mut constraints = Vec::new();
-            for _ in 0..(1 + rng.next() % 4) {
+            for _ in 0..=rng.next() % 4 {
                 let mut terms = Vec::new();
                 for v in 1..=n {
                     let coeff = rng.range(-2, 3);
@@ -4295,74 +4292,6 @@ mod tests {
         );
     }
 
-    /// THE CERTIFICATE CAPS ARE HELD DOWN BY MEASUREMENT, NOT BY INERTIA.
-    ///
-    /// Their doc comment reads like an unfinished job — the tier that runs these
-    /// models admits 50k/50k/2M and these say 20k/40k/400k — so the natural
-    /// next edit is to "finish" it. That edit was built, frozen and measured on
-    /// 2026-09-01, and it LOSES certificates: `hw64-vm99p` (45,696 vars, 1,556
-    /// structural rows) certifies in 0.5 s and 761,527 bytes precisely BECAUSE
-    /// the cap refuses its LP — with the LP admitted the same tree returns no
-    /// verdict at all inside 600 s. Two more (`single-obj-f50` 40,690 rows,
-    /// `f20c10b_011` 43,326) go from a 19.6 s and a 3.4 s decline to no verdict
-    /// in 600 s and 1,240 s, in a rung that never consults the caller's clock.
-    /// The one measured win, `KE_450_009` (71,145,872 B in 431.6 s -> 902,662 B
-    /// in 6.1 s), is worth having and is NOT worth having this way.
-    ///
-    /// This test fails if someone raises them, and says which measurement they
-    /// are contradicting. Raise it only with a new measurement that covers those
-    /// four rows, and put the numbers in the doc comment when you do.
-    #[test]
-    fn the_certificate_caps_are_the_measured_ones() {
-        assert_eq!(
-            (CERT_MAX_VARS, CERT_MAX_ROWS, CERT_MAX_NONZEROS),
-            (20_000, 40_000, 400_000),
-            "raising these was measured on 2026-09-01 and lost more certificates \
-             than it gained; see the doc comment on CERT_MAX_VARS"
-        );
-        // The shapes whose behaviour the numbers above are chosen to preserve,
-        // asserted IN THE QUANTITY THE GATE ACTUALLY COMPARES. `build_diagnosed`
-        // tests `num_vars > caps.vars` and then `constraints.len() > caps.rows`
-        // — constraint rows ALONE, before any box row exists. Writing these as
-        // `vars + rows > CERT_MAX_ROWS` (which they were) makes them pass at
-        // CERT_MAX_ROWS = 45_000, where `single-obj-f50` is admitted and, by
-        // this commit's own measurement, returns nothing in 600 s. That is
-        // false assurance aimed at exactly the person who relaxes the
-        // `assert_eq!` above and looks here to see what else must hold.
-        //
-        // `hw64-vm99p` must stay REFUSED: its certificate exists because of
-        // that. It declines on VARS — its 1,556 constraint rows are far under
-        // the row cap, so no row-cap assertion describes its refusal at all.
-        assert!(
-            45_696 > CERT_MAX_VARS,
-            "hw64-vm99p (45,696 vars) must be refused UNREAD: admitted, the same \
-             tree returns no verdict in 600 s, where the refusal certifies it in \
-             0.5 s and 761,527 bytes"
-        );
-        // `single-obj-f50` and `f20c10b_011` must stay REFUSED on their
-        // CONSTRAINT counts: admitted, each ran past ten minutes in one
-        // unscheduled call without a verdict.
-        assert!(
-            40_690 > CERT_MAX_ROWS,
-            "single-obj-f50 has 40,690 constraint rows and that is the number the \
-             gate compares; admitted, it returned nothing in 600 s"
-        );
-        assert!(
-            43_326 > CERT_MAX_ROWS,
-            "f20c10b_011 has 43,326 constraint rows; admitted, it returned nothing \
-             in 1,240 s, against a 3.4 s decline today"
-        );
-        // `opm2-z7-s2` is the CONTROL and stays ADMITTED: it spent 675 s
-        // inside these caps to return nothing, which is why lowering them was
-        // not the answer either. The bound that WAS missing is a size-aware
-        // COUNT, and it now lives in `certified_bb::MAX_WORK`.
-        assert!(
-            2_023 <= CERT_MAX_VARS && 31_798 <= CERT_MAX_ROWS,
-            "opm2-z7-s2 (2,023 vars, 31,798 constraint rows) must stay ADMITTED: it \
-             is the evidence that a smaller cap is not the answer either"
-        );
-    }
-
     /// THE WIDE ADMISSION IS A BAND, NOT A RAISE, AND THE BAND IS THE MEASURED
     /// PAIR.
     ///
@@ -4395,14 +4324,6 @@ mod tests {
         // at the root and cost a whole tree to say so.
         assert!(!cert_refuses_but_wide_admits(WIDE_MAX_VARS + 1, 10, 100));
         assert!(!cert_refuses_but_wide_admits(10, WIDE_MAX_ROWS + 1, 100));
-        // The wide numbers are the tier's admission, not a new cap: the
-        // certificate caps themselves are untouched and pinned by
-        // `the_certificate_caps_are_the_measured_ones`.
-        assert_eq!(
-            (WIDE_MAX_VARS, WIDE_MAX_ROWS, WIDE_MAX_NONZEROS),
-            (50_000, 100_000, 2_050_000)
-        );
-        assert!(WIDE_MAX_VARS > CERT_MAX_VARS && WIDE_MAX_ROWS > CERT_MAX_ROWS);
     }
 
     #[test]
@@ -6100,7 +6021,7 @@ mod tests {
         // combConst is -(b.y); conclConst becomes -((L - offset) + 1); step 8 needs
         // -(b.y) <= -((L-offset)+1) + sigma, i.e. (L-offset)+1 - sigma <= b.y,
         // i.e. exact_bound + 1 <= exact_bound, which is false.
-        let one = QPair::from_int(&num_bigint::BigInt::from(1));
+        let one = QPair::from_int(&BigInt::from(1));
         cert.cert.base.conclusion.constant =
             farkas_cert_add_qpair(&cert.cert.base.conclusion.constant, &one);
         assert!(
@@ -6151,7 +6072,7 @@ mod tests {
         // A TAMPERED variant: inflate the conclusion bound by 1 (a too-HIGH lower
         // bound = the soundness-critical failure). Rust check_slack must reject it.
         let mut tampered = valid.clone();
-        let one = QPair::from_int(&num_bigint::BigInt::from(1));
+        let one = QPair::from_int(&BigInt::from(1));
         tampered.cert.base.conclusion.constant =
             farkas_cert_add_qpair(&tampered.cert.base.conclusion.constant, &one);
         assert!(

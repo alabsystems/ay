@@ -41,6 +41,7 @@ impl<'a> SosProgress<'a> {
         self.charge(0, 0)
     }
 
+    #[cfg(test)]
     pub(crate) fn refused(&self) -> bool {
         self.refused
     }

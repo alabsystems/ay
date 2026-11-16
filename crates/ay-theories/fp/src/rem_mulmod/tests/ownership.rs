@@ -88,7 +88,7 @@ fn fresh_complete_native_rem_owner_remains_healthy_after_a_separate_refusal() {
     assert_eq!(result.precision, x.precision);
     let built = attempt.finish().unwrap();
     assert!(!built.has_encoding_gap);
-    assert!(!built.clauses.is_empty());
+    assert_ne!(built.clauses.len(), 0);
     assert_eq!(final_polls.get(), 2);
     drop((built, result, x, y));
     assert!(Instant::now() < end);

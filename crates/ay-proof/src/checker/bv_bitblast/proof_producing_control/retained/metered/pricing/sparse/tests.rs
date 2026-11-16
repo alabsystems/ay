@@ -124,7 +124,7 @@ fn sparse_unknown_address_mux_and_generated_name_bound_cover_actual_native_outpu
             SmallIndexReads::CompleteDomain,
         );
         let (nodes, names) = footprint(&lowered.unwrap().disjunction);
-        assert!(nodes + 1 <= 30); // each width>1 read has14 nodes, equality29
+        assert!(nodes < 30); // each width>1 read has14 nodes, equality29
         assert!(16 * names <= cost.name_work);
     }
 }
@@ -238,7 +238,7 @@ fn scalar_n_recurrence_covers_unrolled_occurrences_and_raw_repeated_pushes() {
     );
     let repeated = bounds::node(Operation::Balanced, &[TermId(0); 128], &nodes).unwrap();
     assert_eq!(repeated.nodes, 255);
-    assert!(repeated.nodes >= 1 + 128); // source node plus raw children
+    assert!(repeated.nodes > 128); // source node plus raw children
     let empty = bounds::node(Operation::Balanced, &[], &nodes).unwrap();
     assert_eq!(empty.nodes, 1);
     let singleton = bounds::node(Operation::Balanced, &[TermId(0)], &nodes).unwrap();

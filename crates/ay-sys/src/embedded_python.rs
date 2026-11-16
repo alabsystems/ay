@@ -84,7 +84,7 @@ mod tests {
                 .all(|piece| !piece.is_empty() && piece.len() <= max));
             assert_eq!(pieces.concat(), text);
         }
-        assert!(split_at_char_boundaries("", 4).is_empty());
+        assert_eq!(split_at_char_boundaries("", 4), Vec::<&str>::new());
     }
 
     /// A program twice the kernel's per-string bound, which `python3 -c`

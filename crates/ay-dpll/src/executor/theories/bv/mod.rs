@@ -2583,7 +2583,7 @@ impl Executor {
                 if consuming_trace {
                     let trace = solver.into_consuming_clause_trace(&mut || !encoding.open());
                     let Some(caller) = &trace_caller else {
-                        self.record_evaluation_stop(crate::UnknownOrigin::IncompleteSolverLane);
+                        self.record_evaluation_stop(UnknownOrigin::IncompleteSolverLane);
                         if let Some((_, original)) = var_subst {
                             self.ctx.assertions = original;
                         }
@@ -2884,10 +2884,13 @@ impl Executor {
                 self.query_authority_epoch.diagnostic_address(),
                 self.last_clause_trace
                     .as_ref()
-                    .map_or(std::ptr::null(), |trace| trace as *const ClauseTrace),
+                    .map_or(std::ptr::null(), std::ptr::from_ref::<ClauseTrace>),
                 self.last_var_to_term
                     .as_ref()
-                    .map_or(std::ptr::null(), |map| map as *const HashMap<u32, TermId>),
+                    .map_or(
+                        std::ptr::null(),
+                        std::ptr::from_ref::<HashMap<u32, TermId>>,
+                    ),
                 self.last_clause_trace
                     .as_ref()
                     .and_then(ClauseTrace::solver_num_vars),

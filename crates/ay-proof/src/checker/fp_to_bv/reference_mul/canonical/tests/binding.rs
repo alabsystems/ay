@@ -65,7 +65,7 @@ fn missing_added_changed_reordered_clause_inventory_never_replays() {
     let not_a = app(&mut terms, "not", &[a], Sort::Bool);
     let mut live = || ControlFlow::Continue(());
     let mut work = WorkBudget::new(50_000_000, &mut live);
-    let mut proof =
+    let proof =
         capture(&terms, &[a, not_a], &limits(), &mut work).expect("full original contradiction");
     let mut changed = proof.dag.clone();
     changed.original_clauses.pop();
@@ -124,7 +124,7 @@ fn changed_refutation_hints_empty_clause_and_variable_namespace_refuse() {
     let not_a = app(&mut terms, "not", &[a], Sort::Bool);
     let mut live = || ControlFlow::Continue(());
     let mut work = WorkBudget::new(50_000_000, &mut live);
-    let mut proof = capture(&terms, &[a, not_a], &limits(), &mut work).expect("source refutation");
+    let proof = capture(&terms, &[a, not_a], &limits(), &mut work).expect("source refutation");
     let mut changed = proof.dag.clone();
     changed.num_vars += 1;
     assert!(matches!(

@@ -22,26 +22,46 @@ impl BvExpr {
     /// verify_output) construct these shapes at many call sites — the boxed
     /// variant spelling is an implementation detail, not the API.
     #[must_use]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "this downstream constructor API uses the SMT operator name and has no receiver"
+    )]
     pub fn add(lhs: BvExpr, rhs: BvExpr) -> Self {
         Self::Add(Box::new(lhs), Box::new(rhs))
     }
     /// Convenience: `bvsub(lhs, rhs)`.
     #[must_use]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "this downstream constructor API uses the SMT operator name and has no receiver"
+    )]
     pub fn sub(lhs: BvExpr, rhs: BvExpr) -> Self {
         Self::Sub(Box::new(lhs), Box::new(rhs))
     }
     /// Convenience: `bvmul(lhs, rhs)`.
     #[must_use]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "this downstream constructor API uses the SMT operator name and has no receiver"
+    )]
     pub fn mul(lhs: BvExpr, rhs: BvExpr) -> Self {
         Self::Mul(Box::new(lhs), Box::new(rhs))
     }
     /// Convenience: `bvshl(value, amount)`.
     #[must_use]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "this downstream constructor API uses the SMT operator name and has no receiver"
+    )]
     pub fn shl(value: BvExpr, amount: BvExpr) -> Self {
         Self::Shl(Box::new(value), Box::new(amount))
     }
     /// Convenience: `bvnot(inner)`.
     #[must_use]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "this downstream constructor API uses the SMT operator name and has no receiver"
+    )]
     pub fn not(inner: BvExpr) -> Self {
         Self::Not(Box::new(inner))
     }

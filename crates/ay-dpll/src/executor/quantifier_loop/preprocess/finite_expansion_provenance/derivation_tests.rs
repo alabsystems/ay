@@ -40,10 +40,11 @@ fn expanded(script: &str) -> Executor {
     let commands = parse(script).expect("fixture parses");
     let mut exec = Executor::new();
     exec.set_produce_proofs(true);
-    assert!(exec
-        .execute_all(&commands)
-        .expect("fixture declarations and assertions run")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands)
+            .expect("fixture declarations and assertions run"),
+        [] as [String; 0]
+    );
     exec.proof_tracker.enable();
     let _ = exec.process_quantifiers();
     assert!(

@@ -204,7 +204,7 @@ fn reader_and_writer_refusals_are_latched_nonretryable_and_preallocation() {
         writer.write(b"null").unwrap_err().kind(),
         io::ErrorKind::Other
     );
-    assert!(writer.bytes.is_empty());
+    assert_eq!(writer.bytes, [] as [u8; 0]);
     assert_eq!(writer.bytes.capacity(), 0);
     assert!(writer.write(b"0").is_err());
     assert!(writer.flush().is_err());

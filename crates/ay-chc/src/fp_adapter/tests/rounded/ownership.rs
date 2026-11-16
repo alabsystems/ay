@@ -17,16 +17,18 @@ fn rounded_work_and_storage_one_short_stay_terminal_before_native_entry() {
                 ControlFlow::Continue(())
             }
         };
-        let mut original = WorkBudget::new(10_000_000_000, &mut poll);
-        let plan = source::plan(&terms, &[root], &[], &mut original).unwrap();
-        drop(original);
-        let mut short = WorkBudget::new((plan.gates * 1024 - 1) as u64, &mut poll);
-        assert!(matches!(
-            plan.prepay(&mut short),
-            Err(FpAdapterError::Owner(QueryError::Exhausted))
-        ));
-        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-        drop(short);
+        let plan = {
+            let mut original = WorkBudget::new(10_000_000_000, &mut poll);
+            source::plan(&terms, &[root], &[], &mut original).unwrap()
+        };
+        {
+            let mut short = WorkBudget::new((plan.gates * 1024 - 1) as u64, &mut poll);
+            assert!(matches!(
+                plan.prepay(&mut short),
+                Err(FpAdapterError::Owner(QueryError::Exhausted))
+            ));
+            assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+        }
         let (permit, left) = (Cell::new(false), Cell::new(plan.gates * 4096 - 1));
         let mut storage = |_, bytes| {
             if Instant::now() >= end {
@@ -78,7 +80,9 @@ fn rounded_original_raw_callback_and_expired_deadline_cannot_be_reset() {
             budget.charge(0),
             Err(QueryError::Interrupted(StopReason::Cancelled))
         );
-        let end = Instant::now() - Duration::from_secs(1);
+        let end = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset");
         let mut stop = || {
             if Instant::now() >= end {
                 ControlFlow::Break(StopReason::Deadline)
@@ -186,10 +190,11 @@ fn adapter_final(terms: &TermStore, root: TermId, end: Instant) {
             ControlFlow::Continue(())
         }
     };
-    let mut calibration = WorkBudget::new(10_000_000_000, &mut count);
-    assert!(lower_fp_clause(terms, &[root], &[], &namespace, &mut calibration).is_ok());
-    let last = calls.get();
-    drop(calibration);
+    let last = {
+        let mut calibration = WorkBudget::new(10_000_000_000, &mut count);
+        assert!(lower_fp_clause(terms, &[root], &[], &namespace, &mut calibration).is_ok());
+        calls.get()
+    };
     let (calls, released) = (Cell::new(0), Cell::new(false));
     let mut owner = || {
         calls.set(calls.get() + 1);
@@ -228,33 +233,35 @@ fn rounded_final_drop_and_complete_adapter_fence_never_return_data_after_refusal
                 ControlFlow::Continue(())
             }
         };
-        let mut budget = WorkBudget::new(10_000_000_000, &mut owner);
-        let plan = source::plan(&terms, &[root], &[], &mut budget).unwrap();
-        plan.prepay(&mut budget).unwrap();
-        let mut poll = |p: ay_fp::FpBuildProgress| {
-            if p.stage == ay_fp::FpBuildStage::Finalize {
-                finals.set(finals.get() + 1);
-                if finals.get() == 2 {
-                    stopped.set(true);
-                }
+        {
+            let mut budget = WorkBudget::new(10_000_000_000, &mut owner);
+            let plan = source::plan(&terms, &[root], &[], &mut budget).unwrap();
+            plan.prepay(&mut budget).unwrap();
+            {
+                let mut poll = |p: ay_fp::FpBuildProgress| {
+                    if p.stage == ay_fp::FpBuildStage::Finalize {
+                        finals.set(finals.get() + 1);
+                        if finals.get() == 2 {
+                            stopped.set(true);
+                        }
+                    }
+                    budget.charge(0).is_err()
+                };
+                let mut attempt =
+                    ay_fp::FpConstruction::new(ay_fp::FpSolver::new(&terms), &mut poll).unwrap();
+                assert!(attempt.try_encode_bool_condition(root).is_ok());
+                assert!(matches!(
+                    attempt.finish(),
+                    Err(ay_fp::FpBuildError::Interrupted)
+                ));
+                assert_eq!(finals.get(), 2);
+                stopped.set(false);
             }
-            budget.charge(0).is_err()
-        };
-        let mut attempt =
-            ay_fp::FpConstruction::new(ay_fp::FpSolver::new(&terms), &mut poll).unwrap();
-        assert!(attempt.try_encode_bool_condition(root).is_ok());
-        assert!(matches!(
-            attempt.finish(),
-            Err(ay_fp::FpBuildError::Interrupted)
-        ));
-        assert_eq!(finals.get(), 2);
-        stopped.set(false);
-        drop(poll);
-        assert_eq!(
-            budget.charge(0),
-            Err(QueryError::Interrupted(StopReason::Cancelled))
-        );
-        drop(budget);
+            assert_eq!(
+                budget.charge(0),
+                Err(QueryError::Interrupted(StopReason::Cancelled))
+            );
+        }
         adapter_final(&terms, root, end);
     }
 }

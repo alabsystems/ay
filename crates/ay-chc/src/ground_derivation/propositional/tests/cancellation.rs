@@ -96,20 +96,21 @@ fn missing_candidate_and_clause_cap_remain_distinct_from_interruption() {
 fn search_control_stays_stopped_after_the_progress_source_recovers() {
     let problem = fanout_problem();
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        calls != 5
-    };
-    let mut control = GroundValidationControl::new(&mut callback);
-    assert!(matches!(
-        search(&problem, &mut control),
-        Err(GroundDerivationError::Interrupted)
-    ));
-    assert!(control.is_stopped());
-    assert!(matches!(
-        search(&problem, &mut control),
-        Err(GroundDerivationError::Interrupted)
-    ));
-    drop(control);
+    {
+        let mut callback = || {
+            calls += 1;
+            calls != 5
+        };
+        let mut control = GroundValidationControl::new(&mut callback);
+        assert!(matches!(
+            search(&problem, &mut control),
+            Err(GroundDerivationError::Interrupted)
+        ));
+        assert!(control.is_stopped());
+        assert!(matches!(
+            search(&problem, &mut control),
+            Err(GroundDerivationError::Interrupted)
+        ));
+    }
     assert_eq!(calls, 5);
 }

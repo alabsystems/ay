@@ -76,10 +76,10 @@ fn greedy_cover_is_deterministic_and_covers_every_factor_tail() {
 fn candidate_covers_are_unique_nonempty_and_valid() {
     let monomials = vec![monomial(&[1, 10]), monomial(&[2, 10])];
     let covers = grounding_covers(&monomials);
-    assert!(!covers.is_empty());
+    assert_ne!(covers.as_slice(), &[] as &[Vec<TermId>]);
     let mut remaining = covers.as_slice();
     while let Some((cover, later)) = remaining.split_first() {
-        assert!(!cover.is_empty());
+        assert_ne!(cover.as_slice(), &[] as &[TermId]);
         assert!(monomials
             .iter()
             .all(|item| free_factor_count(item, cover) <= 1));
@@ -107,7 +107,7 @@ fn pin_substitution_linearizes_and_combines_exactly() {
     let pins = [pin(1, 2)];
     let (constant, linear) = substitute_pins(&cancelling, &pin_map(&pins)).expect("linear");
     assert!(constant.is_zero());
-    assert!(linear.is_empty());
+    assert_eq!(linear.as_slice(), &[] as &[(TermId, BigRational)]);
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn pin_substitution_handles_fully_pinned_and_zero_annihilated_terms() {
     let pins = [pin(1, 2), pin(2, 3)];
     let (constant, linear) = substitute_pins(&fully_pinned, &pin_map(&pins)).expect("fully pinned");
     assert_eq!(constant, BigRational::from_integer(8.into()));
-    assert!(linear.is_empty());
+    assert_eq!(linear.as_slice(), &[] as &[(TermId, BigRational)]);
 
     // x*y + y with x=0 drops the annihilated product and leaves y.
     let annihilated = MultiPoly {

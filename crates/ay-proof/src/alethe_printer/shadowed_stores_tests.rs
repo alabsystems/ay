@@ -44,6 +44,29 @@ impl Fixture {
     }
 }
 
+#[test]
+fn an_unchecked_rule_is_refused_before_the_derivation_spends_or_advances() {
+    let terms = TermStore::new();
+    let printer = AlethePrinter::new(&terms);
+    let mut derivation = Derivation {
+        printer: &printer,
+        prefix: "s".into(),
+        next: 0,
+        output: String::new(),
+        witness: String::new(),
+        selected: String::new(),
+        ext: String::new(),
+        not_false: String::new(),
+    };
+    let before_work = printer.work_used();
+
+    assert_eq!(derivation.step("p", "invented_rule", &[]), None);
+    assert_eq!(derivation.output, "");
+    assert_eq!(printer.work_used(), before_work);
+    assert_eq!(derivation.step("p", "refl", &[]).as_deref(), Some("s.0"));
+    assert_eq!(derivation.output, "(step s.0 (cl p) :rule refl)\n");
+}
+
 fn publish(terms: &mut TermStore, equality: TermId, declarations: &str, name: &str) {
     let root = terms.mk_not_raw(equality);
     let mut proof = Proof::new();

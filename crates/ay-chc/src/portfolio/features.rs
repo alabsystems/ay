@@ -1259,7 +1259,7 @@ fn mul_chain(node: &ChcExpr, memo: &mut FxHashMap<*const ChcExpr, usize>) -> usi
     let ChcExpr::Op(ChcOp::Mul, args) = node else {
         return 0;
     };
-    let key = node as *const ChcExpr;
+    let key = std::ptr::from_ref::<ChcExpr>(node);
     if let Some(&known) = memo.get(&key) {
         return known;
     }

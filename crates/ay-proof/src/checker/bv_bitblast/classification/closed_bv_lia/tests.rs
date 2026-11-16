@@ -1,6 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+use super::super::credits::BvCreditError;
 use super::*;
 use ay_core::time::Instant;
 use std::time::Duration;

@@ -11,6 +11,7 @@
 use ay_nra::NraSolver;
 
 use super::super::Executor;
+use super::solve_harness::TheoryModels;
 use crate::executor_types::Result;
 use crate::executor_types::SolveResult;
 

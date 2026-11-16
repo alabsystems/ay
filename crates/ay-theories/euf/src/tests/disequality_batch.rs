@@ -101,7 +101,7 @@ fn the_limit_bounds_the_number_of_conflicts() {
     assert!(matches!(euf.check(), TheoryResult::Unsat(_)));
 
     assert_eq!(euf.collect_disequality_conflicts(2).len(), 2);
-    assert!(euf.collect_disequality_conflicts(0).is_empty());
+    assert_eq!(euf.collect_disequality_conflicts(0).len(), 0);
 }
 
 #[test]
@@ -114,5 +114,5 @@ fn a_consistent_assignment_names_no_conflict() {
     }
     assert!(matches!(euf.check(), TheoryResult::Sat));
 
-    assert!(euf.collect_disequality_conflicts(16).is_empty());
+    assert_eq!(euf.collect_disequality_conflicts(16).len(), 0);
 }

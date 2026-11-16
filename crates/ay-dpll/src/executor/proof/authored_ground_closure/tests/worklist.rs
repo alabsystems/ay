@@ -82,7 +82,7 @@ fn parent_revisit_needs_argument_equality_and_declines_exhausted_work() {
     assert!(exec
         .close_ground_congruence(&mut search.closure, &mut SharedGroundWork::new(0))
         .is_none());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof.is_none());
 }
 
@@ -163,6 +163,6 @@ fn a_large_refutation_proposal_declines_without_premise_authority() {
     assert!(exec
         .early_ground_closure_memory_candidate(negative)
         .is_none());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof.is_none());
 }

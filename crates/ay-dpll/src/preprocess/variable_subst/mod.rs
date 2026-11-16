@@ -21,11 +21,14 @@
 //! - `reference/bitwuzla/src/preprocess/pass/variable_substitution.cpp`
 //! - the development design notes
 
+use super::guarded_eq_mining::GuardedEqMining;
 use super::PreprocessingPass;
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore};
+use num_rational::BigRational;
+use num_traits::{One, Zero};
 
 /// Red zone size for `stacker::maybe_grow` in variable substitution helper recursion (#8414).
 const VAR_SUBST_HELPER_STACK_RED_ZONE: usize = 32 * 1024;
@@ -42,6 +45,11 @@ pub(crate) const VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT: usize = 32;
 
 /// Bound the total borrowed nominal-identity bytes compared in one equality.
 const VAR_SUBST_NOMINAL_IDENTITY_BYTE_LIMIT: usize = 20_000;
+
+/// Maximum leaves in a linear row solved for a variable (mirrors the
+/// EqDiffVar row cap); wider rows keep their equality for the arithmetic
+/// solver instead of growing a wide solved-form replacement.
+const VAR_SUBST_LINEAR_ROW_LEAF_LIMIT: usize = 64;
 
 /// Variable substitution preprocessing pass.
 ///
@@ -77,6 +85,22 @@ pub(crate) struct VariableSubstitution {
     /// Used by the UFNIA lane, whose nonlinear solver is weaker than
     /// z3's nlsat on expanded forms.
     preserve_nonlinear_vars: bool,
+    /// Keep variables that occur inside a non-builtin application or
+    /// a select/store named. The AUFLIA array fixpoint can
+    /// reintroduce pre-substitution applications from the term
+    /// store, and their arguments still need defining equalities in
+    /// EUF; variables used only in builtin arithmetic/Boolean
+    /// contexts carry no such hazard. Used by the AUFLIA lane in
+    /// place of its blanket arrays+UF substitution skip.
+    preserve_app_argument_vars: bool,
+    /// Also solve top-level LINEAR Int/Real equalities that isolate no
+    /// variable syntactically (z3 solve-eqs / arith-fixed-eqs behaviour
+    /// on post-normalization rows): a row `sum c_i*leaf_i = rhs` yields
+    /// `var -> (rhs - sum_{i != var} ...)/c_var` for a variable leaf
+    /// with a unit coefficient over Int, or any nonzero coefficient
+    /// over Real. Opt-in per lane; every existing gate (occurs/cycle
+    /// checks, protected variables, node budget) still applies.
+    solve_linear_equalities: bool,
 }
 
 impl VariableSubstitution {
@@ -90,6 +114,8 @@ impl VariableSubstitution {
             scalar_replacement_node_limit: None,
             constants_only: false,
             preserve_nonlinear_vars: false,
+            preserve_app_argument_vars: false,
+            solve_linear_equalities: false,
         }
     }
 
@@ -105,6 +131,8 @@ impl VariableSubstitution {
             scalar_replacement_node_limit: None,
             constants_only: true,
             preserve_nonlinear_vars: false,
+            preserve_app_argument_vars: false,
+            solve_linear_equalities: false,
         }
     }
 
@@ -121,6 +149,8 @@ impl VariableSubstitution {
             scalar_replacement_node_limit: None,
             constants_only: false,
             preserve_nonlinear_vars: false,
+            preserve_app_argument_vars: false,
+            solve_linear_equalities: false,
         }
     }
 
@@ -139,6 +169,8 @@ impl VariableSubstitution {
             scalar_replacement_node_limit: None,
             constants_only: false,
             preserve_nonlinear_vars: false,
+            preserve_app_argument_vars: false,
+            solve_linear_equalities: false,
         }
     }
 
@@ -150,6 +182,20 @@ impl VariableSubstitution {
     /// field doc); used by the UFNIA preprocessing route.
     pub(crate) fn set_preserve_nonlinear_vars(&mut self, preserve: bool) {
         self.preserve_nonlinear_vars = preserve;
+    }
+
+    /// Keep variables occurring inside non-builtin applications or
+    /// select/store named (see the field doc); used by the AUFLIA
+    /// preprocessing route under arrays+UF.
+    pub(crate) fn set_preserve_app_argument_vars(&mut self, preserve: bool) {
+        self.preserve_app_argument_vars = preserve;
+    }
+
+    /// Solve top-level linear Int/Real equalities for a variable (see
+    /// the field doc); used by the AUFLIA and UFNIA preprocessing
+    /// routes, whose post-normalization rows isolate no variable.
+    pub(crate) fn set_solve_linear_equalities(&mut self, solve: bool) {
+        self.solve_linear_equalities = solve;
     }
 
     /// Get the substitution map (from -> to).
@@ -171,11 +217,18 @@ impl VariableSubstitution {
         matches!(terms.get(term), TermData::Var(_, _))
     }
 
-    /// Variables occurring inside a nonlinear product (a `*` node with at
-    /// least two non-constant factors) anywhere in `assertions`. A
-    /// same-named declared function is treated as a product too: that
-    /// only over-protects, never mis-substitutes.
-    fn nonlinear_protected_vars(terms: &TermStore, assertions: &[TermId]) -> HashSet<TermId> {
+    /// Variables occurring inside a protected context anywhere in
+    /// `assertions`: a nonlinear product (a `*` node with at least
+    /// two non-constant factors) when `preserve_nonlinear`, or a
+    /// non-builtin application / select / store when
+    /// `preserve_app_args`. A same-named declared function counts as
+    /// a product too: that only over-protects, never mis-substitutes.
+    fn protected_vars(
+        terms: &TermStore,
+        assertions: &[TermId],
+        preserve_nonlinear: bool,
+        preserve_app_args: bool,
+    ) -> HashSet<TermId> {
         let mut protected = HashSet::default();
         let mut seen: HashSet<(TermId, bool)> = HashSet::default();
         let mut stack: Vec<(TermId, bool)> = assertions.iter().map(|&root| (root, false)).collect();
@@ -191,13 +244,18 @@ impl VariableSubstitution {
                 }
                 TermData::Const(_) => {}
                 TermData::App(sym, args) => {
-                    let nonlinear = sym.name() == "*"
+                    let nonlinear = preserve_nonlinear
+                        && sym.name() == "*"
                         && args
                             .iter()
                             .filter(|arg| !matches!(terms.get(**arg), TermData::Const(_)))
                             .count()
                             >= 2;
-                    let child_inside = inside || nonlinear;
+                    let protected_app = preserve_app_args
+                        && (sym.name() == "select"
+                            || sym.name() == "store"
+                            || !crate::features::is_builtin_symbol_name(sym.name()));
+                    let child_inside = inside || nonlinear || protected_app;
                     stack.extend(args.iter().map(|&arg| (arg, child_inside)));
                 }
                 TermData::Not(inner) => stack.push((*inner, inside)),
@@ -213,9 +271,7 @@ impl VariableSubstitution {
                     stack.extend(triggers.iter().flatten().map(|&trigger| (trigger, inside)));
                 }
                 // All current TermData variants are handled above.
-                other => unreachable!(
-                    "unhandled TermData variant in nonlinear_protected_vars(): {other:?}"
-                ),
+                other => unreachable!("unhandled TermData variant in protected_vars(): {other:?}"),
             }
         }
         protected
@@ -556,6 +612,7 @@ impl VariableSubstitution {
         skip_array_sort: bool,
         scalar_replacement_node_limit: Option<usize>,
         constants_only: bool,
+        solve_linear_equalities: bool,
     ) -> Option<(TermId, TermId)> {
         match terms.get(assertion) {
             TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
@@ -684,6 +741,20 @@ impl VariableSubstitution {
                     return Some((rhs, lhs));
                 }
 
+                // No side is an isolated variable. With linear solving
+                // enabled, a numeric row can still be solved for one of
+                // its variable leaves (post-normalization rows such as
+                // `(= (+ x y) 10)`); never in constants-only mode.
+                if solve_linear_equalities && !constants_only {
+                    return Self::find_linear_solved_substitution(
+                        terms,
+                        assertion,
+                        existing_substs,
+                        pending_vars,
+                        scalar_replacement_node_limit,
+                    );
+                }
+
                 None
             }
             // Bool equality is encoded as ite(a, b, not(b)) by mk_eq (#3421).
@@ -764,6 +835,126 @@ impl VariableSubstitution {
             }
             _ => None,
         }
+    }
+
+    /// Build a numeric constant term for `value` in the row's sort.
+    fn linear_numeric_constant(terms: &mut TermStore, value: &BigRational, is_int: bool) -> TermId {
+        if is_int {
+            terms.mk_int(value.to_integer())
+        } else {
+            terms.mk_rational(value.clone())
+        }
+    }
+
+    /// Build `coeff * leaf`, eliding unit coefficients.
+    fn linear_scaled_leaf(
+        terms: &mut TermStore,
+        coeff: &BigRational,
+        leaf: TermId,
+        is_int: bool,
+    ) -> TermId {
+        if coeff.is_one() {
+            leaf
+        } else if (-coeff.clone()).is_one() {
+            terms.mk_neg(leaf)
+        } else {
+            let k = Self::linear_numeric_constant(terms, coeff, is_int);
+            terms.mk_mul(vec![k, leaf])
+        }
+    }
+
+    /// Solve a top-level linear numeric equality for one variable leaf.
+    ///
+    /// `GuardedEqMining::parse_eq_atom` normalizes the assertion to a row
+    /// `sum c_i*leaf_i = rhs` over opaque numeric leaves (exact rational
+    /// arithmetic; nonlinear subterms stay whole leaves). For a variable
+    /// leaf `v` the row rearranges exactly to
+    /// `v = (rhs - sum_{i: leaf_i != v} c_i*leaf_i) / c_v`. Over Int this
+    /// is an integer term only when `c_v` is +/-1 and every coefficient
+    /// and the rhs are integral; over Real any nonzero `c_v` works with
+    /// rational coefficients. The candidate still passes the ordinary
+    /// occurs/cycle/budget gates, so a leaf mentioning `v` (e.g. an
+    /// `x*y` monomial) rejects the solve for `v`.
+    fn find_linear_solved_substitution(
+        terms: &mut TermStore,
+        assertion: TermId,
+        existing_substs: &HashMap<TermId, TermId>,
+        pending_vars: &HashSet<TermId>,
+        scalar_replacement_node_limit: Option<usize>,
+    ) -> Option<(TermId, TermId)> {
+        let row = GuardedEqMining::parse_eq_atom(terms, assertion)?;
+        if row.coeffs.len() < 2 || row.coeffs.len() > VAR_SUBST_LINEAR_ROW_LEAF_LIMIT {
+            return None;
+        }
+        let TermData::App(_, args) = terms.get(assertion) else {
+            return None;
+        };
+        let (lhs, rhs) = (args[0], args[1]);
+        let sort = terms.sort(lhs).clone();
+        if !matches!(sort, Sort::Int | Sort::Real) || terms.sort(rhs) != &sort {
+            return None;
+        }
+        // The solved form must typecheck in the row sort: every leaf
+        // (variables and opaque monomials alike) lives in that sort.
+        if row
+            .coeffs
+            .iter()
+            .any(|(leaf, _)| terms.sort(*leaf) != &sort)
+        {
+            return None;
+        }
+        let is_int = sort == Sort::Int;
+        if is_int && (!row.rhs.is_integer() || row.coeffs.iter().any(|(_, c)| !c.is_integer())) {
+            return None;
+        }
+
+        for (leaf, coeff) in &row.coeffs {
+            let var = *leaf;
+            if !Self::is_variable(terms, var)
+                || existing_substs.contains_key(&var)
+                || pending_vars.contains(&var)
+            {
+                continue;
+            }
+            if is_int {
+                if !coeff.is_one() && !(-coeff.clone()).is_one() {
+                    continue;
+                }
+            } else if coeff.is_zero() {
+                continue;
+            }
+            let mut parts: Vec<TermId> = Vec::with_capacity(row.coeffs.len());
+            for (other, c) in &row.coeffs {
+                if *other == var {
+                    continue;
+                }
+                let scaled = -c.clone() / coeff.clone();
+                parts.push(Self::linear_scaled_leaf(terms, &scaled, *other, is_int));
+            }
+            let konst = row.rhs.clone() / coeff.clone();
+            if !konst.is_zero() {
+                parts.push(Self::linear_numeric_constant(terms, &konst, is_int));
+            }
+            let replacement = match parts.len() {
+                0 => Self::linear_numeric_constant(terms, &BigRational::zero(), is_int),
+                1 => parts[0],
+                _ => terms.mk_add(parts),
+            };
+            if terms.sort(replacement) != &sort {
+                continue;
+            }
+            if Self::is_allowed_substitution(
+                terms,
+                var,
+                replacement,
+                existing_substs,
+                pending_vars,
+                scalar_replacement_node_limit,
+            ) {
+                return Some((var, replacement));
+            }
+        }
+        None
     }
 
     /// Recognize ITE-expanded equality and recover the substitution.
@@ -963,8 +1154,13 @@ impl PreprocessingPass for VariableSubstitution {
         // graph-based cycle checks that are less restrictive than TermId ordering (#2830).
         let mut combined_substs = self.substitutions.clone();
 
-        let nonlinear_protected = if self.preserve_nonlinear_vars {
-            Self::nonlinear_protected_vars(terms, assertions)
+        let protected = if self.preserve_nonlinear_vars || self.preserve_app_argument_vars {
+            Self::protected_vars(
+                terms,
+                assertions,
+                self.preserve_nonlinear_vars,
+                self.preserve_app_argument_vars,
+            )
         } else {
             HashSet::default()
         };
@@ -978,10 +1174,11 @@ impl PreprocessingPass for VariableSubstitution {
                 self.skip_array_sort,
                 self.scalar_replacement_node_limit,
                 self.constants_only,
+                self.solve_linear_equalities,
             ) {
-                if nonlinear_protected.contains(&var) {
+                if protected.contains(&var) {
                     if debug {
-                        safe_eprintln!("[var_subst] Skip: {var:?} occurs in a nonlinear product");
+                        safe_eprintln!("[var_subst] Skip: {var:?} occurs in a protected context");
                     }
                     continue;
                 }

@@ -6,17 +6,13 @@ use ay_dpll::api::{
     MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA, MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF,
     MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
-use std::{mem::size_of, time::Duration};
+use std::mem::size_of;
 
 use diagnostic::Refusal;
 
 // The existing counted_limits_until codec ceiling (ay-proof producer_limits),
 // separately downward-intersected with remaining aggregate request allowance.
 const DOCUMENT_BYTES: usize = 192 * 1024 * 1024;
-// The existing producer hang guard, derived ONCE for a retained-only legacy
-// request. Neither a new row nor encoding/replay renews this absolute wall.
-const LEGACY_REQUEST_SECONDS: u64 = 300;
-
 pub(crate) struct RetainedReplayProgress<'a> {
     limit: ReplayLimit<'a>,
     memory: ReplayMemory,
@@ -62,15 +58,8 @@ impl<'a> RetainedReplayProgress<'a> {
         limit
             .check_diagnostic()
             .map_err(|reason| Refusal::from(reason).message().to_string())?;
-        let deadline = match limit.deadline() {
-            Some(deadline) => deadline,
-            None => Instant::now()
-                .checked_add(Duration::from_secs(LEGACY_REQUEST_SECONDS))
-                .ok_or_else(|| "retained request deadline overflow".to_string())?,
-        };
-        let limit = match limit {
-            ReplayLimit::Legacy => ReplayLimit::Until(deadline),
-            bounded => bounded,
+        let deadline = match limit {
+            ReplayLimit::Until(deadline) | ReplayLimit::Cancellable { deadline, .. } => deadline,
         };
         let memory = ReplayMemory::capture(None);
         // Published whole-proof count times published per-lemma admission

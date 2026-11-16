@@ -37,7 +37,7 @@ pub(super) fn fixture() -> Fixture {
         (declare-datatype Outer ((outer (rows (Array (_ BitVec 64) Row)))))",
     )
     .unwrap();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     let info = exec.ctx.exact_datatype_member_info("row").unwrap();
     let row_sort = info.sort.clone();
     let row_ctor = exec.ctx.symbol_identity_name("row", info).to_string();

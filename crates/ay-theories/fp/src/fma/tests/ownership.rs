@@ -234,5 +234,5 @@ fn fma_refusal_requires_explicit_fresh_attempt_and_does_not_cancel_healthy_new_o
     fresh.try_get_fp(fma).unwrap();
     let built = fresh.finish().unwrap();
     assert!(!built.has_encoding_gap);
-    assert!(!built.clauses.is_empty());
+    assert_ne!(built.clauses.len(), 0);
 }

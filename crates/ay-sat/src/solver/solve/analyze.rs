@@ -296,7 +296,7 @@ impl Solver {
             return;
         };
 
-        debug_assert!(!result.learned_clause.is_empty());
+        debug_assert_ne!(result.learned_clause.len(), 0);
         debug_assert!(result.backtrack_level < self.decision_level);
 
         // IC3 learned clause verification (#8661): in debug builds, verify

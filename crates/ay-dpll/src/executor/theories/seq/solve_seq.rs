@@ -7,6 +7,7 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 
 use super::super::super::Executor;
 use crate::combined_solvers::UfSeqSolver;
+use crate::executor::theories::solve_harness::TheoryModels;
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 
 impl Executor {

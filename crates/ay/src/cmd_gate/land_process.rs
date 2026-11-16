@@ -17,6 +17,8 @@ mod transport;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) enum StepKind {
     Command,
+    /// Workspace resolution with the checked-in lockfile and no network.
+    Metadata,
     RustTests,
     FfiArtifactBuild,
     FfiArtifactTests,
@@ -36,6 +38,20 @@ impl Step {
             program: program.into(),
             args: args.iter().map(|s| (*s).into()).collect(),
             kind: StepKind::Command,
+        }
+    }
+
+    /// `targo metadata` with the checked-in lockfile: the resolution check of a
+    /// version-only landing, and the planner's conservative read when the
+    /// feature-resolved one fails. It compiles nothing, so it takes no
+    /// build-slot admission, and Targo refuses `--unverified` on it.
+    pub(super) fn metadata() -> Self {
+        Self {
+            kind: StepKind::Metadata,
+            ..Self::new(
+                "targo",
+                &["metadata", "--locked", "--offline", "--format-version", "1"],
+            )
         }
     }
 
@@ -173,6 +189,16 @@ impl Runner {
             }
             return Ok(());
         }
+        if step.kind == StepKind::Metadata {
+            // Decode the resolved workspace rather than print it.
+            let metadata = self.resolve(step)?;
+            println!(
+                "{}",
+                serde_json::json!({"event":"native_validation", "owner":"targo metadata",
+                    "workspace_members":metadata.workspace_members.len(), "success":true})
+            );
+            return Ok(());
+        }
         if step.kind == StepKind::FfiArtifactBuild {
             self.ffi_artifact = None;
             let log = tempfile::NamedTempFile::new()?;
@@ -182,7 +208,16 @@ impl Runner {
                 .status()?;
             self.result(step, status)?;
             if !status.success() {
-                bail!("FFI artifact preparation failed: {status}");
+                // Compiler diagnostics share stdout with artifact JSON. Keep
+                // that exact stream on failure instead of deleting the only
+                // detailed explanation when this temporary file drops.
+                let (_messages, path) = log.keep().with_context(|| {
+                    format!("retain diagnostics after FFI artifact preparation failed: {status}")
+                })?;
+                bail!(
+                    "FFI artifact preparation failed: {status}; compiler messages retained at {}",
+                    path.display()
+                );
             }
             self.ffi_artifact = Some(ffi_artifact::Library::from_messages(
                 &self.root,
@@ -350,10 +385,43 @@ impl Runner {
     }
 
     pub(super) fn metadata(&mut self) -> Result<super::plan::Metadata> {
+        let features = super::plan::CLI_FEATURES
+            .split(',')
+            .map(|feature| format!("ay/{feature}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let output = self.capture(&Step::new(
             "targo",
-            &["metadata", "--locked", "--offline", "--format-version", "1"],
-        ))?;
+            &[
+                "metadata",
+                "--locked",
+                "--offline",
+                "--features",
+                &features,
+                "--format-version",
+                "1",
+            ],
+        ));
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                // Optional feature sources may be absent in an offline cache.
+                // Preserve the original broad CLI integration check rather
+                // than inferring a negative dependency from a partial graph.
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"cli_dependency_scope", "complete":false, "conservative_cli":true, "reason":error.to_string()})
+                );
+                return self
+                    .resolve(&Step::metadata())
+                    .context("conservative Targo workspace metadata");
+            }
+        };
+        serde_json::from_slice(&output).context("decode Targo workspace metadata")
+    }
+
+    fn resolve(&mut self, step: &Step) -> Result<super::plan::Metadata> {
+        let output = self.capture(step)?;
         serde_json::from_slice(&output).context("decode Targo workspace metadata")
     }
 }

@@ -33,13 +33,13 @@ pub(crate) struct DivStage {
 }
 
 /// `(concat 0 w)` at twice the width.
-pub(crate) fn z(p: &mut Proof, n: u32, w: T) -> T {
+pub(crate) fn z(p: &mut Proof<'_>, n: u32, w: T) -> T {
     let zn = p.t.lit(bits::zero(n));
     p.t.concat(&[zn, w])
 }
 
 /// `(and (= (+ (* zQ zY) zR) zX) (bvult R Y) (not (bvult X R)) (not (bvult C Q)))`.
-pub(crate) fn inv(p: &mut Proof, n: u32, q: &[T], r: &[T], x: &[T], y: &[T], c: T) -> T {
+pub(crate) fn inv(p: &mut Proof<'_>, n: u32, q: &[T], r: &[T], x: &[T], y: &[T], c: T) -> T {
     let (qw, rw, xw, yw) = (p.t.bb(q), p.t.bb(r), p.t.bb(x), p.t.bb(y));
     let (zq, zy, zr, zx) = (z(p, n, qw), z(p, n, yw), z(p, n, rw), z(p, n, xw));
     let m = p.t.mul(zq, zy);
@@ -53,14 +53,14 @@ pub(crate) fn inv(p: &mut Proof, n: u32, q: &[T], r: &[T], x: &[T], y: &[T], c: 
     p.t.and(&[e, u, na, nb])
 }
 
-pub(crate) fn shifted_x(p: &Proof, x: &[T]) -> Vec<T> {
+pub(crate) fn shifted_x(p: &Proof<'_>, x: &[T]) -> Vec<T> {
     let mut v = x[1..].to_vec();
     v.push(p.t.ff);
     v
 }
 
 /// Defining clauses of every gate below `t` (to `depth` levels).
-pub(crate) fn gates_rec(p: &mut Proof, t: T, depth: usize) -> Vec<Prem> {
+pub(crate) fn gates_rec(p: &mut Proof<'_>, t: T, depth: usize) -> Vec<Prem> {
     let mut out = Vec::new();
     let mut stack = vec![(t, 0usize)];
     let mut seen = HashSet::default();
@@ -83,8 +83,8 @@ pub(crate) fn gates_rec(p: &mut Proof, t: T, depth: usize) -> Vec<Prem> {
 }
 
 impl DivStage {
-    pub(crate) fn new(p: &mut Proof, n: u32, prefix: &str) -> Option<Self> {
-        let mk = |p: &mut Proof, tag: &str| -> Vec<T> {
+    pub(crate) fn new(p: &mut Proof<'_>, n: u32, prefix: &str) -> Option<Self> {
+        let mk = |p: &mut Proof<'_>, tag: &str| -> Vec<T> {
             (0..n)
                 .map(|i| p.t.var(&format!("{prefix}{tag}{i}"), Sort::Bool))
                 .collect()
@@ -157,7 +157,7 @@ impl DivStage {
         }
     }
 
-    fn words(&self, p: &mut Proof) -> (T, T, T, T, T, T, T) {
+    fn words(&self, p: &mut Proof<'_>) -> (T, T, T, T, T, T, T) {
         let xs = shifted_x(p, &self.x);
         (
             p.t.bb(&self.q2),
@@ -170,7 +170,7 @@ impl DivStage {
         )
     }
 
-    fn prove(&self, p: &mut Proof) -> Option<S> {
+    fn prove(&self, p: &mut Proof<'_>) -> Option<S> {
         let sp = p.anchor(&[]);
         let nyz = p.t.not(self.yz);
         let a1 = p.assume(nyz);
@@ -188,7 +188,7 @@ impl DivStage {
         body_from_clause(p, self.body, spc)
     }
 
-    fn common(&self, p: &mut Proof, a3: S, ak: S) -> Option<Common> {
+    fn common(&self, p: &mut Proof<'_>, a3: S, ak: S) -> Option<Common> {
         let n = self.n;
         let (ep, ultp, nultp, qbp) = (
             project(p, a3, 0)?,
@@ -270,7 +270,7 @@ impl DivStage {
         Some(c)
     }
 
-    fn bitfact(p: &mut Proof, target: T, gates: &[T], asm: &[S]) -> Option<S> {
+    fn bitfact(p: &mut Proof<'_>, target: T, gates: &[T], asm: &[S]) -> Option<S> {
         let mut prem = Vec::new();
         for &g in gates {
             prem.extend(p.gate(g));
@@ -279,7 +279,7 @@ impl DivStage {
         p.derive(&[target], &prem, &[])
     }
 
-    fn case_xlt(&self, p: &mut Proof, c: &Common) -> Option<S> {
+    fn case_xlt(&self, p: &mut Proof<'_>, c: &Common) -> Option<S> {
         let n = self.n;
         let (ff, nn) = (p.t.ff, 2 * n);
         let (_, _, yw, _, qw, rw, xw) = self.words(p);
@@ -339,7 +339,7 @@ impl DivStage {
 
 impl DivStage {
     /// The case `x >= y`: the quotient doubles and takes `co1` as its new low bit.
-    fn case_ge(&self, p: &mut Proof, c: &Common, co1: bool) -> Option<S> {
+    fn case_ge(&self, p: &mut Proof<'_>, c: &Common, co1: bool) -> Option<S> {
         let n = self.n;
         let nn = 2 * n;
         let (_, _, yw, _, qw, rw, xw) = self.words(p);
@@ -425,7 +425,14 @@ impl DivStage {
 
     /// The quotient half of [`Self::case_ge`]: `Q = 2 Q' + co1` (at `n` bits
     /// and zero-extended to `2n`) and the bound `Q <= C`.
-    fn quotient_ge(&self, p: &mut Proof, c: &Common, co1: bool, an: S, ac: S) -> Option<(S, S)> {
+    fn quotient_ge(
+        &self,
+        p: &mut Proof<'_>,
+        c: &Common,
+        co1: bool,
+        an: S,
+        ac: S,
+    ) -> Option<(S, S)> {
         let n = self.n;
         let nn = 2 * n;
         let (ff, tt) = (p.t.ff, p.t.tt);

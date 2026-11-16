@@ -29,6 +29,10 @@ fn polynomial_answers_match_exhaustive_small_domains() {
         let expanded = app(&mut terms, "bvadd", expanded, yy, width);
         let x3y = app(&mut terms, "bvmul", three, xy, width);
         let y3x = app(&mut terms, "bvmul", yx, three, width);
+        #[expect(
+            clippy::type_complexity,
+            reason = "the test table keeps both terms and its independent arithmetic oracle explicit"
+        )]
         let cases: Vec<(TermId, TermId, &dyn Fn(u128, u128) -> (u128, u128))> = vec![
             (xy, yx, &|a, b| (a * b, b * a)),
             (square, expanded, &|a, b| {

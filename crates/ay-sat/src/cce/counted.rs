@@ -8,7 +8,7 @@ use ay_core::original_query::CountedAdmission;
 impl Cce {
     /// Construct the normal initial state under the invocation's original owner.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         Ok(Self {
             // Sized on demand, not here. `OccList::new(n)` commits
             // `vec![Vec::new(); 2n]` plus a per-literal `PosMap` — 128 resident

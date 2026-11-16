@@ -248,7 +248,7 @@ mod tests {
             .expect("the unmentioned A gets a value");
         let a_value = arrays.array_values.get(&a).expect("A is completed");
         assert_eq!(a_value.default.as_deref(), Some("0"));
-        assert!(a_value.stores.is_empty());
+        assert_eq!(a_value.stores, [] as [(String, String); 0]);
         assert!(
             !arrays.array_values.contains_key(&b),
             "a default of U would add an element to the printed universe"

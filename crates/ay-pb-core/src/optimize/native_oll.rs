@@ -1497,9 +1497,7 @@ fn normalize_weighted_softs(objective: &PbObjective) -> Option<(Vec<WeightedSoft
         if term.lits.len() != 1 {
             return None;
         }
-        let Some(&lit) = term.lits.first() else {
-            return None;
-        };
+        let &lit = term.lits.first()?;
         let (cost_lit, weight) = if term.coeff > 0 {
             (lit, term.coeff)
         } else {

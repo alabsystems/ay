@@ -62,6 +62,10 @@ impl PdrSolver {
     /// `smt_model` by the model, `s_i` := head values. Returns the rebuilt
     /// chain (same `state`s, levels, clauses, kinds) or the first failure with
     /// the ORIGINAL chain (no model is replaced unless every step succeeded).
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal returns the original obligation chain without allocating after concretization failed"
+    )]
     pub(in crate::pdr::solver) fn concretize_cex_chain(
         &mut self,
         leaf: ProofObligation,

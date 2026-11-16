@@ -22,7 +22,7 @@ pub(super) fn reserve_append<T>(
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     let target = required.max(capacity).max(4);
     let bytes = target
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     let work = target
         .checked_add(values.len())
@@ -42,7 +42,7 @@ pub(super) fn append_literals(
 ) -> Result<()> {
     reserve_append(target, source.len(), owner)?;
     for literal in source {
-        owner.admit(1, std::mem::size_of::<Literal>())?;
+        owner.admit(1, size_of::<Literal>())?;
         target.push(*literal);
     }
     Ok(())

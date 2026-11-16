@@ -131,7 +131,7 @@ struct UnitAccess<'raw, 'scope, 'progress> {
     control: &'scope mut Control<'progress>,
 }
 
-impl<'de, 'raw, 'scope, 'progress> de::EnumAccess<'de> for UnitAccess<'raw, 'scope, 'progress> {
+impl<'de> de::EnumAccess<'de> for UnitAccess<'_, '_, '_> {
     type Error = Error;
     type Variant = Self;
 

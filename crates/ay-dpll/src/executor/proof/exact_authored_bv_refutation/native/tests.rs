@@ -20,7 +20,7 @@ fn fixture() -> (Executor, Vec<TermId>) {
     executor.ctx.assertions = vec![a, b];
     executor.begin_public_solve(false);
     executor.bind_unsat_query_assumptions(&[]);
-    assert!(executor.ctx.assertions_parsed().is_empty());
+    assert_eq!(executor.ctx.assertions_parsed(), []);
     (executor, vec![a, b])
 }
 
@@ -112,8 +112,11 @@ fn native_roots_commit_a_complete_exact_scope_proof_once() {
         .is_ok_and(|quality| quality.is_complete()));
     assert!(ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &roots).is_ok());
     assert!(ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &roots[..1]).is_err());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
-    assert!(executor.last_proof_rebuild_originals.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
+    assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
     assert!(native_offer_recorded(&executor));
     // The late shared producer cannot replenish this attempt's expensive lane.
     assert!(executor
@@ -149,7 +152,7 @@ fn native_epoch_source_provenance_and_entry_changes_refuse() {
     let (mut stale, _) = fixture();
     stale
         .ctx
-        .process_command(&ay_frontend::Command::Push(1))
+        .process_command(&Command::Push(1))
         .expect("push changes source");
     unchanged_refusal(&mut stale);
     let (mut forged, roots) = fixture();
@@ -431,7 +434,7 @@ fn retained_native_sentinels_use_authenticated_roots_and_share_the_retry_key() {
     }
     executor.begin_public_solve(false);
     executor.bind_unsat_query_assumptions(&[]);
-    assert!(!executor.ctx.assertions_parsed().is_empty());
+    assert_ne!(executor.ctx.assertions_parsed(), []);
     assert_eq!(
         executor.native_bv_source_kind(&|| false),
         Some(NativeAssertionSurfaces::Native)
@@ -445,7 +448,10 @@ fn retained_native_sentinels_use_authenticated_roots_and_share_the_retry_key() {
     assert!(executor
         .exact_authored_bv_refutation(|_, _| panic!("no late native retry"))
         .is_none());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
 }
 
 fn restored_named_native_fixture() -> (Executor, Vec<TermId>) {
@@ -460,7 +466,7 @@ fn restored_named_native_fixture() -> (Executor, Vec<TermId>) {
         );
     }
     executor
-        .execute(&ay_frontend::Command::SetOption(
+        .execute(&Command::SetOption(
             ":produce-unsat-cores".to_string(),
             ay_frontend::sexp::SExpr::True,
         ))

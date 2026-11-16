@@ -74,14 +74,14 @@ fn prepare(
     owner: &CountedAdmission,
     scratch: &mut Scratch,
 ) -> Result<Prepared> {
-    owner.admit(std::mem::size_of::<CountedInitialSolver>(), 0)?;
+    owner.admit(size_of::<CountedInitialSolver>(), 0)?;
     preflight(input, owner)?;
     let assumptions = traced::copy_assumptions(input.num_vars(), premises.unwrap_or(&[]), owner)?;
     scratch.0 = Some(Solver::build_with_hint(
         input.num_vars(),
         None,
         Some(input.len()),
-        &super::super::construction::Counted(owner),
+        &construction::Counted(owner),
     )?);
     let solver = scratch
         .0

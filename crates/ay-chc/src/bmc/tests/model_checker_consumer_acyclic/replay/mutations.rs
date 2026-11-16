@@ -52,9 +52,10 @@ pub(super) fn check_transport(
         Reason::ProblemHashMismatch,
     );
     // Identity rejection is not claimed as semantic replay of the new source.
-    version
+    let checked = version
         .replay(problem, bytes)
         .expect("negative attempts cannot mutate original evidence");
+    assert_original_values(&checked, expected);
 }
 
 fn reject_native_binding(problem: &ChcProblem, cex: &Counterexample, name: &str, value: SmtValue) {

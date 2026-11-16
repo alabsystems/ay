@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn nothing_recorded_adds_no_entry() {
-        assert!(StderrDiagnostics::default().statistics_entries().is_empty());
+        assert_eq!(
+            StderrDiagnostics::default().statistics_entries(),
+            [] as [(String, String); 0]
+        );
     }
 
     #[test]

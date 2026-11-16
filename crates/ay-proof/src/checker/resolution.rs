@@ -424,25 +424,25 @@ fn validate_pivot_directed_resolution_rule(
     };
 
     let mut accumulator =
-        exact::clause_as_unique_set(terms, premise_clauses[0]).ok_or_else(&invalid)?;
-    for (next, annotation) in premise_clauses[1..].iter().zip(args.chunks_exact(2)) {
+        exact::clause_as_unique_set(terms, premise_clauses[0]).ok_or_else(invalid)?;
+    for (next, annotation) in premise_clauses[1..].iter().zip(args.as_chunks::<2>().0) {
         let polarity = match terms.get(annotation[1]) {
             TermData::Const(Constant::Bool(value)) => *value,
             _ => return Err(malformed()),
         };
         let pivot = exact::decode_literal(terms, annotation[0]);
-        let negated_pivot = pivot.with_outer_not().ok_or_else(&invalid)?;
+        let negated_pivot = pivot.with_outer_not().ok_or_else(invalid)?;
         let (current_pivot, next_pivot) = if polarity {
             (pivot, negated_pivot)
         } else {
             (negated_pivot, pivot)
         };
-        let next = exact::clause_as_unique_set(terms, next).ok_or_else(&invalid)?;
+        let next = exact::clause_as_unique_set(terms, next).ok_or_else(invalid)?;
         accumulator = exact::resolve_clause(&accumulator, &next, current_pivot, next_pivot)
-            .ok_or_else(&invalid)?;
+            .ok_or_else(invalid)?;
     }
 
-    let conclusion = exact::clause_as_unique_set(terms, clause).ok_or_else(&invalid)?;
+    let conclusion = exact::clause_as_unique_set(terms, clause).ok_or_else(invalid)?;
     if accumulator == conclusion {
         Ok(())
     } else {

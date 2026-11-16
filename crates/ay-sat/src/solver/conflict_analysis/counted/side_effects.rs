@@ -45,17 +45,18 @@ fn validate_streaming(
 ) -> AdmissionResult<()> {
     owner.admit(3, 0)?;
     let id = s.clause_id(reference);
-    if id > 0 && id <= s.cold.streaming_core_num_originals && s.is_original_clause_id(id) {
-        if s.cold
+    if id > 0
+        && id <= s.cold.streaming_core_num_originals
+        && s.is_original_clause_id(id)
+        && s.cold
             .streaming_core
             .as_ref()
             .is_some_and(|bits| id as usize > bits.len())
-        {
-            return Err(invalid(
-                owner,
-                "counted original streaming marker is outside its bitmap",
-            ));
-        }
+    {
+        return Err(invalid(
+            owner,
+            "counted original streaming marker is outside its bitmap",
+        ));
     }
     Ok(())
 }

@@ -53,7 +53,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Constant, ProofId, Sort, Symbol, TermData, TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, Signed, ToPrimitive, Zero};
+#[cfg(test)]
+use num_traits::One;
+use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::ProofCheckError;
 
@@ -369,7 +371,7 @@ impl Fp {
         }
         if self.is_zero() {
             let zero = meter.integer(0)?;
-            return meter.from_integer(zero);
+            return meter.rational_from_integer(zero);
         }
         let bias = (1u64 << (self.eb - 1)) - 1;
         let stored = self.sb - 1;
@@ -393,7 +395,7 @@ impl Fp {
         } else {
             i64::try_from(self.exponent).ok()? - i64::try_from(bias).ok()? - i64::from(stored)
         };
-        let significand = meter.from_integer(significand)?;
+        let significand = meter.rational_from_integer(significand)?;
         let magnitude = scale_by_pow2_owned(&significand, shift, meter)?;
         Some(if self.sign { -magnitude } else { magnitude })
     }
@@ -510,7 +512,7 @@ fn scale_by_pow2_owned(
     }
     let one = meter.integer(1)?;
     let power = meter.shift(&one, i64::try_from(shift.unsigned_abs()).ok()?)?;
-    let power = meter.from_integer(power)?;
+    let power = meter.rational_from_integer(power)?;
     if shift >= 0 {
         meter.rational_binary(value, &power, Arithmetic::Multiply)
     } else {
@@ -534,7 +536,7 @@ fn floor_log2_owned(a: &BigRational, meter: &mut Meter<'_>) -> Option<i64> {
     let mut exponent = numer_bits.checked_sub(denom_bits)?;
     for _ in 0..4 {
         let one = meter.integer(1)?;
-        let one = meter.from_integer(one)?;
+        let one = meter.rational_from_integer(one)?;
         let lower = scale_by_pow2_owned(&one, exponent, meter)?;
         if meter.rational_compare(&lower, a)? == std::cmp::Ordering::Greater {
             exponent = exponent.checked_sub(1)?;
@@ -605,7 +607,7 @@ fn round_magnitude_owned(
     meter.numeric(Meter::rational_bits(&floor_rational)?)?;
     let floor = floor_rational.to_integer();
     let floor_copy = meter.integer_copy(&floor)?;
-    let floor_value = meter.from_integer(floor_copy)?;
+    let floor_value = meter.rational_from_integer(floor_copy)?;
     let fraction = meter.rational_binary(scaled, &floor_value, Arithmetic::Subtract)?;
     if fraction.is_zero() {
         return Some(floor);
@@ -962,7 +964,7 @@ fn fp_sqrt_owned(rm: Rm, x: &Fp, meter: &mut Meter<'_>) -> Option<Fp> {
     let mut settled = false;
     for _ in 0..4 {
         let one = meter.integer(1)?;
-        let one = meter.from_integer(one)?;
+        let one = meter.rational_from_integer(one)?;
         let lower = scale_by_pow2_owned(&one, exponent.checked_mul(2)?, meter)?;
         if meter.rational_compare(&lower, &magnitude)? == std::cmp::Ordering::Greater {
             exponent = exponent.checked_sub(1)?;
@@ -993,7 +995,7 @@ fn fp_sqrt_owned(rm: Rm, x: &Fp, meter: &mut Meter<'_>) -> Option<Fp> {
     let root = isqrt_owned(&product, meter)?;
     let floor_root = meter.integer_binary(&root, &denominator, Arithmetic::Divide)?;
     let squared = meter.integer_binary(&floor_root, &floor_root, Arithmetic::Multiply)?;
-    let floor_squared = meter.from_integer(squared)?;
+    let floor_squared = meter.rational_from_integer(squared)?;
 
     let integral = if meter.rational_compare(&floor_squared, &inner)? == std::cmp::Ordering::Equal {
         // The square root is exact at this scale.
@@ -1569,7 +1571,7 @@ impl Val {
         match self {
             Self::Int(value) => {
                 let integer = meter.integer_copy(value)?;
-                meter.from_integer(integer)
+                meter.rational_from_integer(integer)
             }
             Self::Real(value) => meter.rational_copy(value),
             _ => None,
@@ -2155,7 +2157,7 @@ impl<'a, 'm, 'p> Evaluator<'a, 'm, 'p> {
                     .eval(args[0], assignment, local, next)?
                     .as_rational(self.meter)?;
                 Some(if matches!(self.terms.sort(args[0]), Sort::Int) {
-                    Val::Int(-self.meter.to_integer(&value)?)
+                    Val::Int(-self.meter.rational_to_integer(&value)?)
                 } else {
                     Val::Real(-value)
                 })
@@ -2230,7 +2232,7 @@ impl<'a, 'm, 'p> Evaluator<'a, 'm, 'p> {
             }
         }
         Some(if integral && accumulator.is_integer() {
-            Val::Int(self.meter.to_integer(&accumulator)?)
+            Val::Int(self.meter.rational_to_integer(&accumulator)?)
         } else {
             Val::Real(accumulator)
         })
@@ -2299,14 +2301,14 @@ impl<'a, 'm, 'p> Evaluator<'a, 'm, 'p> {
                         } else {
                             self.meter.integer_copy(bits)?
                         };
-                        self.meter.from_integer(integer)?
+                        self.meter.rational_from_integer(integer)?
                     }
                     Val::Int(integer) => {
                         if !signed {
                             return None;
                         }
                         let value = self.meter.integer_copy(integer)?;
-                        self.meter.from_integer(value)?
+                        self.meter.rational_from_integer(value)?
                     }
                     Val::Real(real) => {
                         if !signed {
@@ -2366,7 +2368,7 @@ fn values_equal(left: &Val, right: &Val, meter: &mut Meter<'_>) -> Option<bool> 
         (Val::Real(a), Val::Real(b)) => meter.rational_compare(a, b)? == std::cmp::Ordering::Equal,
         (Val::Int(a), Val::Real(b)) | (Val::Real(b), Val::Int(a)) => {
             let integer = meter.integer_copy(a)?;
-            let rational = meter.from_integer(integer)?;
+            let rational = meter.rational_from_integer(integer)?;
             meter.rational_compare(&rational, b)? == std::cmp::Ordering::Equal
         }
         // Mixed sorts are ill-sorted input; fail closed rather than guess.

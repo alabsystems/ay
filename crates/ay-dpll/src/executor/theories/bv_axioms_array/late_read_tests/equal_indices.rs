@@ -78,7 +78,7 @@ fn scalar(element: Sort, kind: Indices) {
             assert_eq!(cnf.axioms[0].0, vec![(bv.num_vars() + 1) as i32]);
         }
         Indices::Distinct => {
-            assert!(cnf.axioms.is_empty());
+            assert_eq!(cnf.axioms, [] as [ay_core::CnfClause; 0]);
             assert_eq!(cnf.num_vars, bv.num_vars());
         }
         Indices::Symbolic => {
@@ -206,7 +206,7 @@ fn missing_or_incompatible_index_bits_still_refuse_to_emit_fc_constraints() {
             Bits::WrongWidth => assert_eq!(bv.ensure_term_bits(j).unwrap().len(), 1),
         }
         let cnf = Circuit::new(&executor, &bv, &roots, None, &roots, &BTreeMap::new());
-        assert!(cnf.axioms.is_empty());
+        assert_eq!(cnf.axioms, [] as [ay_core::CnfClause; 0]);
         assert_eq!(cnf.num_vars, bv.num_vars());
         cnf.check_relation(|_| true);
     }

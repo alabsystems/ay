@@ -454,8 +454,8 @@ pub(super) enum Item {
 /// Parses an OPB term list (`+1 x3 +1 ~x7 ...`) into variable form.
 pub(super) fn parse_terms(tokens: &[&str]) -> Option<CpRow> {
     let mut row = CpRow::default();
-    let mut chunks = tokens.chunks_exact(2);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = tokens.as_chunks::<2>();
+    for chunk in chunks {
         let coeff: i128 = chunk[0].parse().ok()?;
         let (var, negated) = parse_lit(chunk[1])?;
         if negated {
@@ -465,7 +465,7 @@ pub(super) fn parse_terms(tokens: &[&str]) -> Option<CpRow> {
             row.add_coeff(var, coeff)?;
         }
     }
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         return None;
     }
     Some(row)
@@ -1069,6 +1069,7 @@ mod tests {
         assert!(empty.is_contradiction());
         // Anything that is not `<terms> >= <degree>` is refused, not guessed.
         assert!(parse_rup_constraint("1 x3 >= 1 extra").is_none());
+        assert!(parse_rup_constraint("1 x3 2 >= 1").is_none());
         assert!(parse_rup_constraint("1 x3 <= 1").is_none());
         assert!(parse_rup_constraint("1 x3").is_none());
     }

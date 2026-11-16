@@ -10,7 +10,9 @@
 use ay_core::{CnfClause, CnfLit};
 use num_bigint::BigInt;
 
-use crate::construction::control::{uninterrupted, BuildControl};
+#[cfg(test)]
+use crate::construction::control::uninterrupted;
+use crate::construction::control::BuildControl;
 use crate::construction::FpBuildStage;
 
 use super::gates::neg_lit;
@@ -110,11 +112,11 @@ impl FpSolver<'_> {
 
     /// The number of bits an unsigned `value` needs (at least 1).
     pub(crate) const fn bits_to_hold(value: u64) -> usize {
-        let bits = (u64::BITS - value.leading_zeros()) as usize;
+        let bits = value.bit_width();
         if bits == 0 {
             1
         } else {
-            bits
+            bits as usize
         }
     }
 
@@ -217,6 +219,7 @@ impl FpSolver<'_> {
     }
 
     /// Multiplication of two bitvectors. Result has same width as inputs.
+    #[cfg(test)]
     pub(crate) fn bv_mul(&mut self, a: &[CnfLit], b: &[CnfLit]) -> Vec<CnfLit> {
         uninterrupted(|control| self.bv_mul_with_control(a, b, control))
     }
@@ -334,18 +337,6 @@ impl FpSolver<'_> {
         self.make_any_nonzero(bits)
     }
 
-    /// Unsigned bitvector division and remainder (restoring division algorithm).
-    ///
-    /// Returns (quotient, remainder), both n-bit wide.
-    /// Division by zero returns (all-ones, a) following SMT-LIB semantics.
-    pub(crate) fn bv_udiv_urem(
-        &mut self,
-        a: &[CnfLit],
-        b: &[CnfLit],
-    ) -> (Vec<CnfLit>, Vec<CnfLit>) {
-        uninterrupted(|control| self.bv_udiv_urem_with_control(a, b, control))
-    }
-
     /// The shared restoring divider, with refusal before allocating each row.
     pub(crate) fn bv_udiv_urem_with_control<C: BuildControl>(
         &mut self,
@@ -434,7 +425,6 @@ impl FpSolver<'_> {
     /// Signed less-than comparison (two's complement).
     pub(crate) fn bv_slt(&mut self, a: &[CnfLit], b: &[CnfLit]) -> CnfLit {
         debug_assert_eq!(a.len(), b.len());
-        debug_assert!(!a.is_empty());
         // a < b signed iff:
         // (a_msb=1, b_msb=0) => true (a is negative, b positive)
         // (a_msb=0, b_msb=1) => false

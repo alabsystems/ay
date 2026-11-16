@@ -101,6 +101,7 @@ fn checked_substitutions<'a>(
 }
 
 /// Compatibility wrapper for callers without a resource callback.
+#[cfg(test)]
 pub(crate) fn validate_forall_inst(
     terms: &TermStore,
     step: ProofId,

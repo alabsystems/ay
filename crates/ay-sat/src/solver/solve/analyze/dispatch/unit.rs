@@ -101,7 +101,7 @@ fn prepare_pin(
     let pinned = &mut s.cold.lrat_level0_unit_materialize_pinned;
     // Both this search and the unchanged installer's partition_point, including
     // empty-list termination; reserve only when its exact insertion is needed.
-    let depth = (usize::BITS - pinned.len().leading_zeros()) as usize + 1;
+    let depth = pinned.len().bit_width() as usize + 1;
     owner.admit(depth * 2, 0)?;
     let index = pinned.partition_point(|&entry| entry < slot);
     if pinned.get(index) != Some(&slot) {

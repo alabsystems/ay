@@ -200,7 +200,7 @@ pub(super) fn printed_clause_is_certainly_valid(literals: &[String]) -> bool {
         .collect();
     let present = |term: &str| {
         let key = canonical(term, MAX_DEPTH);
-        keys.iter().any(|seen| *seen == key)
+        keys.contains(&key)
     };
 
     for unit in &units {

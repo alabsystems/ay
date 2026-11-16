@@ -13,22 +13,6 @@ fn times() -> (Instant, Instant) {
 }
 
 #[test]
-fn legacy_phase_preserves_results_without_reading_clock() {
-    for proposed in [None, Some(7)] {
-        let called = Cell::new(0);
-        let result = ReplayLimit::Legacy.phase_with_clock(
-            || panic!("legacy compatibility must not sample an absolute wall"),
-            || {
-                called.set(called.get() + 1);
-                proposed
-            },
-        );
-        assert_eq!(result, proposed);
-        assert_eq!(called.get(), 1);
-    }
-}
-
-#[test]
 fn live_phase_preserves_result_and_samples_both_boundaries() {
     let (before, deadline) = times();
     let samples = Cell::new(0);
@@ -163,20 +147,6 @@ fn composed_phases_share_one_origin_and_stop_at_refusal() {
 }
 
 #[test]
-fn optional_presentation_absence_is_not_phase_refusal() {
-    let (before, deadline) = times();
-    let limit = ReplayLimit::Until(deadline);
-    assert_eq!(
-        limit.phase_with_clock(|| before, || Some(None::<String>)),
-        Some(None)
-    );
-    assert_eq!(
-        limit.phase_with_clock(|| deadline, || Some(None::<String>)),
-        None
-    );
-}
-
-#[test]
 fn precancel_refuses_before_clock_or_phase_work() {
     let token = crate::CancellationToken::new();
     let cancellation = super::ReplayCancellation::new(&token);
@@ -282,7 +252,10 @@ fn deadline_expiry_does_not_cancel_caller_or_parent() {
     assert!(!token.is_cancelled());
     assert!(!parent.is_cancelled());
     assert_eq!(limit.deadline(), Some(deadline));
-    assert!(std::ptr::eq(limit.cancellation().unwrap(), &cancellation));
+    assert!(std::ptr::eq(
+        limit.cancellation().unwrap(),
+        &raw const cancellation
+    ));
 }
 
 #[test]

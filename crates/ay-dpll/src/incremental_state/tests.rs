@@ -273,7 +273,7 @@ fn incremental_theory_state_pop_clears_all_lemmas_when_all_scoped() {
     ));
 
     assert!(st.pop());
-    assert!(st.theory_lemmas.is_empty());
+    assert_eq!(st.theory_lemmas, [] as [(TheoryLemma, usize); 0]);
     assert!(st.theory_lemma_keys.is_empty());
 }
 

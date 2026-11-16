@@ -111,7 +111,7 @@ impl Executor {
     pub(super) fn checked_mock_incremental(
         &mut self,
         counts: &Arc<Counts>,
-        mut extract: impl FnMut() -> std::result::Result<TheoryModels, QueryError>,
+        mut extract: impl FnMut() -> Result<TheoryModels, QueryError>,
     ) -> ExecResult<SolveResult> {
         solve_incremental_theory_pipeline!(self,
             tag: "CheckedExtract",
@@ -128,7 +128,7 @@ impl Executor {
     pub(super) fn checked_mock_persistent(
         &mut self,
         counts: &Arc<Counts>,
-        mut extract: impl FnMut() -> std::result::Result<TheoryModels, QueryError>,
+        mut extract: impl FnMut() -> Result<TheoryModels, QueryError>,
     ) -> ExecResult<SolveResult> {
         solve_incremental_theory_pipeline!(self,
             tag: "CheckedExtractPersistent",

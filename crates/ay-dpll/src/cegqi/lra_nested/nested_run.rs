@@ -12,6 +12,7 @@ use super::caps::{MAX_INSTANCES_PER_NODE, MAX_QLRA_ROUNDS, MAX_TOTAL_INSTANCES};
 use super::QlraOutcome;
 
 /// One observable step of the search (tests assert exact traces).
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TraceStep {
     /// The main query `⌊roots⌋Γ` and its answer.
@@ -55,6 +56,7 @@ pub(crate) struct NestedRun {
     /// (no top node's instances changed during the round that built it).
     pub(crate) main: Vec<TermId>,
     pub(crate) stats: NestedStats,
+    #[cfg(test)]
     pub(crate) trace: Vec<TraceStep>,
     /// The final instance log Γ, per node, indexed like the tree's nodes:
     /// the UNSAT expansion certificate is built from it and the SAT route

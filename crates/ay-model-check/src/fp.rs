@@ -216,13 +216,11 @@ pub(crate) fn data_format_supported(eb: u32, sb: u32) -> bool {
 pub(crate) fn data_fields_fit(eb: u32, sb: u32, exponent: u64, significand: u128) -> bool {
     data_format_supported(eb, sb)
         && (eb == 64 || exponent < (1u64 << eb))
-        && u128::BITS - significand.leading_zeros() <= sb - 1
+        && significand.bit_width() < sb
 }
 
 pub(crate) fn fields_fit(eb: u32, sb: u32, exponent: u64, significand: u128) -> bool {
-    format_supported(eb, sb)
-        && exponent <= all_ones(eb)
-        && u128::BITS - significand.leading_zeros() <= sb - 1
+    format_supported(eb, sb) && exponent <= all_ones(eb) && significand.bit_width() < sb
 }
 
 fn check_format(eb: u32, sb: u32) -> Result<(), String> {

@@ -54,18 +54,16 @@ pub(super) fn write(
 ) -> Result<Vec<u8>, TransportError> {
     let view = prepare(entries, wire, control)?;
     let maximum = lexical::inventory_cap(wire, control)?;
-    let length = {
+    let (result, length) = {
         let mut writer = Counter {
             length: 0,
             maximum,
             control,
         };
         let result = serde_json::to_writer(&mut writer, &view);
-        let length = writer.length;
-        drop(writer);
-        map_serde(result, control)?;
-        length
+        (result, writer.length)
     };
+    map_serde(result, control)?;
     let mut output = control.vector::<u8>(length)?;
     let result = {
         let mut writer = Output {

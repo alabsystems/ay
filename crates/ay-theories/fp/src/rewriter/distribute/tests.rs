@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::rewriter::tests::{app, mode, random_leaf, real, to_fp, value_of, Stream};
-use crate::rewriter::{fp_numeral, FpRewriter};
+use crate::rewriter::FpRewriter;
 use crate::tests_support::solve_fp_clauses;
 use crate::{exact, FpSolver, RoundingMode};
 use ay_core::term::TermData;

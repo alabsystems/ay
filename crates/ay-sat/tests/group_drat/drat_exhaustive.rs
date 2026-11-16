@@ -75,7 +75,7 @@ fn solve_and_verify_native(dimacs_text: &str, label: &str) {
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker
@@ -145,7 +145,7 @@ fn solve_and_verify_native_with_timeout(dimacs_text: &str, label: &str, timeout_
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker

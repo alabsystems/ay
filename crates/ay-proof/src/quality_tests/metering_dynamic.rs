@@ -442,7 +442,7 @@ fn test_datatype_free_payload_metering_ignores_unreachable_terms() {
     proof.add_assume(premise, None);
     let before = meter(&terms, &proof, &[]);
     for index in 0..5_000 {
-        terms.mk_var(format!("unrelated_{index}"), Sort::Int);
+        let _unrelated_term = terms.mk_var(format!("unrelated_{index}"), Sort::Int);
     }
     assert_eq!(meter(&terms, &proof, &[]), before);
 

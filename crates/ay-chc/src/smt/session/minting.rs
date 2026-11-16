@@ -2,17 +2,17 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `MintState` / `Minter` — two-tier minting for every `TheoryResult` request
-//! (design §2.5, §4; owner WP-2 / B).
+//! `MintState` / `Minter` — two-tier minting for the supported persistent-LRA
+//! `TheoryResult` requests (design §2.5, §4; owner WP-2 / B).
 //!
 //! Tier 1 (inline, continue the same solve via `ExtCheckResult::AddClauses`):
 //! T-tautological splits — `NeedDisequalitySplit`, `NeedExpressionSplit(s)`,
-//! `NeedLemmas` (cuts), model-equality HINTS (triangle axioms); `NeedSplit`
-//! (B&B) and bound refinements are Rung 2. Dedup is by ATOM only (an atom that
-//! already has a SAT variable is reused through `tseitin.term_to_var`, F10);
-//! the clause is ALWAYS re-added (the deletable tier may have dropped it, and
-//! an all-false re-added clause is a pending conflict that moves the search,
-//! F6).
+//! `NeedLemmas` (cuts), and model-equality HINTS (triangle axioms). Integer
+//! `NeedSplit` requests are refused by the LRA-only session. Dedup is by ATOM
+//! only (an atom that already has a SAT variable is reused through
+//! `tseitin.term_to_var`, F10); the clause is ALWAYS re-added (the deletable
+//! tier may have dropped it, and an all-false re-added clause is a pending
+//! conflict that moves the search, F6).
 //!
 //! Tier 2 (originals via the re-entry protocol, §4.2): clauses the theory
 //! cannot re-derive and that must not live in ay-sat's deletable learned tier
@@ -39,7 +39,7 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use ay_core::term::TermData;
 use ay_core::{
     is_theory_atom, DisequalitySplitRequest, ExpressionSplitRequest, ModelEqualityRequest, Sort,
-    SplitRequest, Symbol, TermId, TheoryLemma, TheoryLit, Tseitin, TseitinState,
+    Symbol, TermId, TheoryLemma, TheoryLit, Tseitin, TseitinState,
 };
 use ay_sat::{Literal, SolverContext};
 
@@ -299,7 +299,7 @@ impl<'a> Minter<'a> {
     }
 
     fn push_inline(&mut self, clause: Vec<Literal>) {
-        debug_assert!(!clause.is_empty());
+        debug_assert_ne!(clause, [] as [ay_sat::Literal; 0]);
         self.mint.count += 1;
         self.inline.push(clause);
     }
@@ -560,26 +560,6 @@ impl<'a> Minter<'a> {
             }
         }
         Ok(self.finish())
-    }
-
-    /// `NeedSplit(SplitRequest { variable, floor, ceil, .. })` — Rung 2 (LIA
-    /// branch-and-bound): `le = mk_le(variable, mk_int(floor))`, `ge =
-    /// mk_ge(variable, mk_int(ceil))`, `Partition::Split`, clause `[+le, +ge]`.
-    /// The LRA arm never raises it from `check()`; the bridge answers
-    /// `Unsupported(Shape)` without calling this.
-    #[allow(dead_code)]
-    pub(crate) fn integer_split(self, _req: SplitRequest) -> Result<MintOutcome, BridgeExit> {
-        todo!("Rung 2 (LIA): MintState::integer_split — inline B&B split, Partition::Split")
-    }
-
-    /// `take_bound_refinements` (Rung 2, flag-gated): atom + implication
-    /// `[¬reason.., +atom]` inline (re-derivable).
-    #[allow(dead_code)]
-    pub(crate) fn bound_refinements(
-        self,
-        _reqs: Vec<ay_core::BoundRefinementRequest>,
-    ) -> Result<MintOutcome, BridgeExit> {
-        todo!("Rung 2 (LIA): MintState::bound_refinements — flag-gated inline refinements")
     }
 }
 

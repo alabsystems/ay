@@ -873,7 +873,7 @@ fn clause_trace_level0_multiliteral_conflict_is_positive_rup() {
     assert!(solver.solve().into_inner().is_unsat());
     let trace = solver.take_clause_trace().expect("clause trace enabled");
     let empty = trace.entries().last().expect("terminal empty-clause entry");
-    assert!(empty.clause.is_empty());
+    assert_eq!(empty.clause.len(), 0);
     assert_eq!(
         empty.resolution_hints.last(),
         Some(&4),
@@ -1350,7 +1350,7 @@ fn level0_hints_without_falsified_seed_refuse_base_certificate() {
     assert!(solver.declare_unsat().is_unknown());
     assert_eq!(
         solver.last_unknown_reason(),
-        Some(crate::SatUnknownReason::ProofFinalizationFailure),
+        Some(SatUnknownReason::ProofFinalizationFailure),
     );
     let output = solver.take_proof_writer().expect("proof writer");
     let proof = String::from_utf8(output.into_vec().expect("flush")).expect("UTF-8");
@@ -2516,7 +2516,7 @@ fn test_incremental_unsat_pop_push_unsat_lrat_no_panic() {
         .take_proof_writer()
         .expect("proof writer should exist");
     let bytes = output.into_vec().expect("proof bytes");
-    assert!(!bytes.is_empty(), "proof output should contain proof steps");
+    assert_ne!(bytes.len(), 0, "proof output should contain proof steps");
 }
 
 /// A permanent base-level contradiction can survive a push/pop while the pop's
@@ -2698,7 +2698,7 @@ fn streaming_support_excludes_derived_id_below_late_original() {
                 "level-0 derivation with originals must produce streaming support"
             );
             let support = cert.tracked_original_clause_ids();
-            assert!(!support.is_empty(), "streaming support must be non-empty");
+            assert_ne!(support.len(), 0, "streaming support must be non-empty");
             assert!(
                 !support.contains(&derived_id),
                 "derived clause ID {derived_id} classified as original support: {support:?}"
@@ -2737,7 +2737,7 @@ fn test_add_clause_reusing_buffer() {
         let actual = reusable.add_clause_reusing_buffer(&mut buffer);
 
         assert_eq!(actual, expected, "reusable add must match add_clause");
-        assert!(buffer.is_empty(), "reusable buffer must be cleared");
+        assert_eq!(buffer.len(), 0, "reusable buffer must be cleared");
         assert!(
             buffer.capacity() >= capacity,
             "reusable buffer must retain its allocation"
@@ -2863,12 +2863,12 @@ fn test_add_clause_reusing_buffer_incremental_scoped_after_solve() {
     let mut buffer = Vec::with_capacity(4);
     buffer.extend_from_slice(&[a, b]);
     assert!(solver.add_clause_reusing_buffer(&mut buffer));
-    assert!(buffer.is_empty());
+    assert_eq!(buffer.len(), 0);
 
     solver.push();
     buffer.extend_from_slice(&[not_a]);
     assert!(solver.add_clause_reusing_buffer(&mut buffer));
-    assert!(buffer.is_empty());
+    assert_eq!(buffer.len(), 0);
 
     let first = solver.solve();
     assert!(first.is_sat(), "scoped formula should start SAT: {first}");
@@ -2876,7 +2876,7 @@ fn test_add_clause_reusing_buffer_incremental_scoped_after_solve() {
     let boundary_before_deferred_add = solver.cold.incremental_original_boundary;
     buffer.extend_from_slice(&[not_b]);
     assert!(solver.add_clause_reusing_buffer(&mut buffer));
-    assert!(buffer.is_empty());
+    assert_eq!(buffer.len(), 0);
     assert!(
         solver.cold.ic3_new_clauses_pending,
         "add-after-solve must mark the incremental attach path pending"

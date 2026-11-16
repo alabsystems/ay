@@ -25,6 +25,10 @@ pub(crate) struct QuantifiedSourceCertificate {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "authenticated source evidence stays inline without a fresh unmetered certificate allocation"
+)]
 enum SourceCertificate {
     Ghost(GhostSourceCertificate),
     Observations(observations::ObservationCertificate),
@@ -95,7 +99,7 @@ fn try_source_inner(
     let source = search.source_problem();
     if source.uses_datatype_features()
         || source.has_stripped_body_forall()
-        || source.clauses().len() != problem.premises().len()
+        || !source_clause_rows_match(source, problem)
         || problem.source_smtlib().len() > MAX_REPLAY_BYTES
     {
         return None;
@@ -143,6 +147,10 @@ fn try_source_inner(
     }
     control.poll()?;
     Some(certificate)
+}
+
+fn source_clause_rows_match(source: &ChcProblem, problem: &QuantifiedChcProblem) -> bool {
+    source.clauses().len() == problem.premises().len()
 }
 
 fn rewrite_source(

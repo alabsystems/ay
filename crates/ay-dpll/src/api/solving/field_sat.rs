@@ -518,7 +518,7 @@ fn check_refutation(
     let mut bytes = proof
         .steps
         .len()
-        .checked_mul(std::mem::size_of::<Option<Vec<TermId>>>())
+        .checked_mul(size_of::<Option<Vec<TermId>>>())
         .ok_or_else(failed)?;
     for step in &proof.steps {
         pay(owner, 1)?;
@@ -532,7 +532,7 @@ fn check_refutation(
         bytes = bytes
             .checked_add(
                 count
-                    .checked_mul(2 * std::mem::size_of::<TermId>())
+                    .checked_mul(2 * size_of::<TermId>())
                     .ok_or_else(failed)?,
             )
             .ok_or_else(failed)?;

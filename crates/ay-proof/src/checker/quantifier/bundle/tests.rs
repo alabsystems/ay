@@ -64,7 +64,7 @@ impl Fixture {
                 Some(next),
             );
         }
-        add_binding(
+        let _dependent_source = add_binding(
             &mut self.terms,
             &mut self.proof,
             "whole_y",

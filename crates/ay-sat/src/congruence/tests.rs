@@ -997,7 +997,7 @@ fn test_forward_subsume_reused_matchable_buffer_is_cleared_between_calls() {
     // Exercise the LRAT collection variant too; it reuses the same buffers.
     let empty = ClauseArena::new();
     let collected = cc.forward_subsume_collect_indices(&empty, &edges_ab);
-    assert!(collected.is_empty());
+    assert_eq!(collected.len(), 0);
 
     let mut clauses = ClauseArena::new();
     let _subsumer = clauses.add(&[lit(0, true), lit(4, true), lit(5, true)], false);

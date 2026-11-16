@@ -114,7 +114,6 @@ fn costs(
         .try_extract_registered_model_with_budget(values, &mut work)
         .unwrap();
     drop(output);
-    drop(work);
     totals.get()
 }
 

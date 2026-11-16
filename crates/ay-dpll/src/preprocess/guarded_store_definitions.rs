@@ -40,7 +40,9 @@ pub(crate) struct GuardedStoreRequest {
 /// itself, it must be reauthenticated after replacing its source or term store.
 #[derive(Debug)]
 pub(crate) struct GuardedStoreDefinition {
+    #[cfg(test)]
     variable: TermId,
+    #[cfg(test)]
     replacement: TermId,
     definition: TermId,
     proof: Proof,
@@ -48,18 +50,22 @@ pub(crate) struct GuardedStoreDefinition {
 }
 
 impl GuardedStoreDefinition {
+    #[cfg(test)]
     pub(crate) fn variable(&self) -> TermId {
         self.variable
     }
 
+    #[cfg(test)]
     pub(crate) fn replacement(&self) -> TermId {
         self.replacement
     }
 
+    #[cfg(test)]
     pub(crate) fn definition(&self) -> TermId {
         self.definition
     }
 
+    #[cfg(test)]
     pub(crate) fn proof(&self) -> (&Proof, ProofId) {
         (&self.proof, self.conclusion)
     }
@@ -120,7 +126,9 @@ pub(crate) fn derive(
         return None;
     }
     Some(GuardedStoreDefinition {
+        #[cfg(test)]
         variable: request.variable,
+        #[cfg(test)]
         replacement,
         definition,
         proof,

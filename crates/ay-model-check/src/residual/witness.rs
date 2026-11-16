@@ -266,9 +266,8 @@ impl ModelView for CompletedModel<'_> {
         }
         self.base
             .admit_evaluation_work(work, bytes)
-            .map_err(|reason| {
-                self.refuse_evaluation_work(&reason);
-                reason
+            .inspect_err(|reason| {
+                self.refuse_evaluation_work(reason);
             })
     }
 
@@ -280,10 +279,11 @@ impl ModelView for CompletedModel<'_> {
         if self.admission_refused.get() {
             return Err("completed-model exact FP admission previously refused".to_owned());
         }
-        self.base.charge_exact_fp_work(amount).map_err(|reason| {
-            self.refuse_evaluation_work(&reason);
-            reason
-        })
+        self.base
+            .charge_exact_fp_work(amount)
+            .inspect_err(|reason| {
+                self.refuse_evaluation_work(reason);
+            })
     }
 
     fn admit_exact_fp_work(&self, work: usize, bytes: usize) -> Result<(), String> {
@@ -292,9 +292,8 @@ impl ModelView for CompletedModel<'_> {
         }
         self.base
             .admit_exact_fp_work(work, bytes)
-            .map_err(|reason| {
-                self.refuse_evaluation_work(&reason);
-                reason
+            .inspect_err(|reason| {
+                self.refuse_evaluation_work(reason);
             })
     }
 
@@ -369,10 +368,7 @@ pub(super) fn materialize_and_replay<'a>(
         value_work: entry_value_work,
     };
 
-    let Some(mut class_arrays) = build_class_arrays(terms, resolve, &member_roots, &mut budget)
-    else {
-        return None;
-    };
+    let mut class_arrays = build_class_arrays(terms, resolve, &member_roots, &mut budget)?;
     if !populate_class_arrays(
         terms,
         resolve,
@@ -1005,16 +1001,16 @@ mod evaluation_admission_tests {
             left: Cell::new(4096),
             refused: Cell::new(false),
         };
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let root = terms.mk_var(
             "overlay_exact",
-            ay_core::Sort::array(ay_core::Sort::Int, ay_core::Sort::FloatingPoint(8, 200)),
+            Sort::array(Sort::Int, Sort::FloatingPoint(8, 200)),
         );
-        let zero = terms.mk_int(num_bigint::BigInt::from(0));
+        let zero = terms.mk_int(BigInt::from(0));
         let selected = terms.mk_app(
             ay_core::Symbol::named("select"),
             &[root, zero],
-            ay_core::Sort::FloatingPoint(8, 200),
+            Sort::FloatingPoint(8, 200),
         );
         let value = ModelValue::floating_point_exact(
             false,
@@ -1030,7 +1026,7 @@ mod evaluation_admission_tests {
             member_roots: [(root, root)].into_iter().collect(),
             arrays: [(
                 root,
-                ModelValue::Array(Box::new(crate::ArrayValue {
+                ModelValue::Array(Box::new(ArrayValue {
                     default: value,
                     store: Vec::new(),
                 })),
@@ -1051,7 +1047,7 @@ mod evaluation_admission_tests {
             4096,
             "retained aggregate DATA consumes no FP field work"
         );
-        let evaluator = crate::Evaluator::new(&terms, &view);
+        let evaluator = Evaluator::new(&terms, &view);
         assert!(matches!(
             evaluator.evaluate(root),
             crate::EvalOutcome::Value(_)
@@ -1070,7 +1066,7 @@ mod evaluation_admission_tests {
             evaluator.evaluate(selected),
             crate::EvalOutcome::Unevaluable(_)
         ));
-        let fresh = crate::Evaluator::new(&terms, &view);
+        let fresh = Evaluator::new(&terms, &view);
         assert!(matches!(fresh.evaluate(root), crate::EvalOutcome::Value(_)));
         assert!(matches!(
             fresh.evaluate(selected),

@@ -1436,20 +1436,29 @@ mod tests {
     fn inequalities_are_ignored() {
         // Only `>=` rows: no equality identity to reduce, so no cuts.
         let constraints = vec![ge(vec![t(1, 1), t(1, 2)], 1), ge(vec![t(1, 1), t(1, 3)], 1)];
-        assert!(gf2_parity_cuts(&constraints, 3).is_empty());
+        assert_eq!(
+            gf2_parity_cuts(&constraints, 3).as_slice(),
+            &[] as &[PbConstraint]
+        );
     }
 
     #[test]
     fn single_equality_row_emits_no_cut() {
         let constraints = vec![eq(vec![t(1, 1), t(1, 2)], 1)];
-        assert!(gf2_parity_cuts(&constraints, 2).is_empty());
+        assert_eq!(
+            gf2_parity_cuts(&constraints, 2).as_slice(),
+            &[] as &[PbConstraint]
+        );
     }
 
     #[test]
     fn even_coeffs_contribute_nothing() {
         // 2x1 + 2x2 = 2 : every column parity is 0, RHS parity 0. No cut.
         let constraints = vec![eq(vec![t(2, 1), t(2, 2)], 2), eq(vec![t(2, 1), t(2, 3)], 2)];
-        assert!(gf2_parity_cuts(&constraints, 3).is_empty());
+        assert_eq!(
+            gf2_parity_cuts(&constraints, 3).as_slice(),
+            &[] as &[PbConstraint]
+        );
     }
 
     // ---- Randomized brute-force entailment property test (soundness anchor) ---- //

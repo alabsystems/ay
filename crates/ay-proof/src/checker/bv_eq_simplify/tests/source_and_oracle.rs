@@ -145,9 +145,8 @@ fn exhaustive_offset_truth_agrees_with_the_independent_z3_reference() {
         .filter(|line| !line.is_empty())
         .collect();
     assert_eq!(answers, expected, "oracle={}\n{output}", oracle.identity());
-    assert!(
-        std::fs::read(directory.join("exhaustive-small-offsets.stderr"))
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        std::fs::read(directory.join("exhaustive-small-offsets.stderr")).unwrap(),
+        Vec::<u8>::new()
     );
 }

@@ -26,7 +26,7 @@ mod prover_audit;
 #[path = "string_theory_verification/routing.rs"]
 mod routing;
 
-use crate::common::{check_z3_or_skip as z3_available, solve_with_z3};
+use crate::common::z3::{check_z3_or_skip as z3_available, solve_with_z3};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;

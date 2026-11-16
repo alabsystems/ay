@@ -77,7 +77,7 @@ fn memory_probe_requires_its_own_diagnostic_coverage() {
     assert_eq!(owner.usage().unwrap().work_admitted, 1);
     assert_eq!(
         owner.usage().unwrap().storage_admitted,
-        std::mem::size_of::<InprocessingEngines>()
+        size_of::<InprocessingEngines>()
     );
     assert_eq!(owner.check(), Err(error));
 }

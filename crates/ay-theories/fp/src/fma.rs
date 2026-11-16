@@ -42,7 +42,7 @@ impl FpSolver<'_> {
     /// Returns `None` for everything else (including symbolic terms and
     /// non-zero constants such as `+oo`, `NaN`, `0.5`).
     ///
-    /// Used by [`FpSolver::try_make_fma_zero_factor`] to detect the
+    /// Used by [`FpSolver::try_make_fma_zero_factor_with_control`] to detect the
     /// Z3 issue #8185 rewrite pattern at decompose time, avoiding the
     /// expensive full FMA bit-blast circuit.
     pub(crate) fn classify_fp_zero_const(&self, term: TermId) -> Option<FpConstClass> {
@@ -104,18 +104,6 @@ impl FpSolver<'_> {
     ///
     /// Returns `Some(result)` if the rewrite applies; otherwise `None` so
     /// the caller falls back to the full [`FpSolver::make_fma`] bit-blast.
-    pub(crate) fn try_make_fma_zero_factor(
-        &mut self,
-        x_term: TermId,
-        y_term: TermId,
-        z: &FpDecomposed,
-        rm: RmOperand,
-    ) -> Option<FpDecomposed> {
-        uninterrupted(|control| {
-            self.try_make_fma_zero_factor_with_control(x_term, y_term, z, rm, control)
-        })
-    }
-
     pub(crate) fn try_make_fma_zero_factor_with_control<C: BuildControl>(
         &mut self,
         x_term: TermId,

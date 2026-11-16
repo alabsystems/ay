@@ -79,7 +79,7 @@ fn simulated_candidate_requires_original_validation_before_publication() {
             Some(until),
             &mut |input, budget, config| {
                 searched += 1;
-                assert!(std::ptr::eq(input, &original));
+                assert!(std::ptr::eq(input, &raw const original));
                 assert!(budget >= Duration::from_millis(250));
                 assert!(budget <= Duration::from_secs(4));
                 assert!(config.strict_proofs && config.preserve_original_clauses);
@@ -115,7 +115,7 @@ fn absent_clock_or_unconfirmed_search_preserves_ordinary_fallback() {
             &configured(),
             clock,
             &mut |input, _, _| {
-                assert!(std::ptr::eq(input, &original));
+                assert!(std::ptr::eq(input, &raw const original));
                 searched += 1;
                 None
             },

@@ -198,11 +198,7 @@ impl AtomicLogHistogram {
     }
 
     pub(crate) fn record(&self, v: u64) {
-        let bucket = if v == 0 {
-            0
-        } else {
-            (u64::BITS - v.leading_zeros()) as usize
-        };
+        let bucket = v.bit_width() as usize;
         self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum.fetch_add(v, Ordering::Relaxed);
@@ -213,6 +209,7 @@ impl AtomicLogHistogram {
         self.count.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn sum(&self) -> u64 {
         self.sum.load(Ordering::Relaxed)
     }
@@ -382,9 +379,10 @@ pub(crate) fn note_construction_in_verification(where_: &'static str) {
         false,
         "HornSmt session used under verification mode / off the Search lane at {where_}"
     );
-    if strict_level() >= 1 {
-        panic!("chc-session-strict: HornSmt session used under verification mode at {where_}");
-    }
+    assert!(
+        strict_level() < 1,
+        "chc-session-strict: HornSmt session used under verification mode at {where_}"
+    );
     tracing::error!("HornSmt session used under verification mode at {where_}");
 }
 

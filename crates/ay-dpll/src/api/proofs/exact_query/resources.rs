@@ -60,7 +60,7 @@ fn resolve_roots(
     let bytes = binding
         .assertions
         .len()
-        .checked_mul(std::mem::size_of::<TermId>())
+        .checked_mul(size_of::<TermId>())
         .ok_or(ProofCheckError::ResourceLimit)?;
     control.charge(binding.assertions.len(), bytes)?;
     let mut roots = Vec::new();

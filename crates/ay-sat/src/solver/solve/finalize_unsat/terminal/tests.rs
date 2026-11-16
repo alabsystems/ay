@@ -87,9 +87,9 @@ fn core(result: SatResult) -> Vec<u64> {
     certificate.tracked_original_clause_ids()
 }
 fn clean(s: &Solver) {
-    assert!(s.min.lrat_to_clear.is_empty());
+    assert_eq!(s.min.lrat_to_clear.len(), 0);
     assert!(s.min.minimize_flags.iter().all(|f| f & LRAT_A == 0));
-    assert!(s.cold.lrat_materialize_hints_buf.is_empty());
+    assert_eq!(s.cold.lrat_materialize_hints_buf.len(), 0);
 }
 fn pending_writer(s: &mut Solver, path: &std::path::Path) {
     s.enable_decision_trace(path.to_str().unwrap()).unwrap();
@@ -97,7 +97,7 @@ fn pending_writer(s: &mut Solver, path: &std::path::Path) {
         .decision_trace
         .as_mut()
         .unwrap()
-        .write_event(&crate::decision_trace::TraceEvent::Decide { lit_dimacs: 1 })
+        .write_event(&TraceEvent::Decide { lit_dimacs: 1 })
         .unwrap();
     assert_eq!(std::fs::metadata(path).unwrap().len(), 9);
 }
@@ -116,7 +116,7 @@ fn actual_root_unsat_matches_ordinary_trace_ids_support_and_strict_original_cnf_
     ordinary.record_level0_conflict_chain(conflict);
     let expected = core(ordinary.declare_unsat());
     assert_eq!(core(run(&mut counted, actual, &owner).unwrap()), expected);
-    assert!(!expected.is_empty());
+    assert_ne!(expected.len(), 0);
     assert_eq!(rows(&counted), rows(&ordinary));
     assert_eq!(
         replay::serialized(&rows(&counted), None),
@@ -162,7 +162,10 @@ fn omitting_a_real_root_antecedent_fails_strict_replay() {
     let (mut s, conflict, cnf) = fixture();
     let owner = test_owner(1_000_000, 1_000_000);
     s.attach_counted_admission(owner.clone()).unwrap();
-    run(&mut s, conflict, &owner).unwrap();
+    assert!(matches!(
+        run(&mut s, conflict, &owner).unwrap(),
+        SatResult::Unsat(_)
+    ));
     let all = rows(&s);
     let last = all.last().unwrap();
     assert!(last.1.is_empty() && last.3.len() >= 3);

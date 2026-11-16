@@ -20,8 +20,10 @@ pub(crate) use bundle::{
     authenticate_bundle_skolems_with_progress, validate_sko_forall_uniqueness,
     validate_sko_forall_uniqueness_with_progress,
 };
-pub(crate) use forall_inst::{validate_forall_inst, validate_forall_inst_with_progress};
-pub(crate) use join::{validate_qnt_join, validate_qnt_join_with_progress};
+#[cfg(test)]
+pub(crate) use forall_inst::validate_forall_inst;
+pub(crate) use forall_inst::validate_forall_inst_with_progress;
+pub(crate) use join::validate_qnt_join_with_progress;
 pub(crate) use neg_exists::validate_qnt_neg_exists;
 use progress::QuantifierMeter;
 use substitution::matches_single_substitution;
@@ -121,15 +123,6 @@ enum SkolemWitnessAuthority {
     ProofBundle,
 }
 
-fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
-    match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
-            Some((args[0], args[1]))
-        }
-        _ => None,
-    }
-}
-
 const SKOLEM_TERM_WORK_LIMIT: usize = 100_000;
 
 /// Validate the internal flat representation of Alethe `sko_forall`.
@@ -140,27 +133,6 @@ const SKOLEM_TERM_WORK_LIMIT: usize = 100_000;
 /// from the quantified source, and the right side must be the exact structural
 /// substitution of `sk` for `x`. The printer expands this one flat step into
 /// Carcara's required assignment anchor, inner `refl`, and outer `sko_forall`.
-fn validate_sko_forall_with_authority(
-    terms: &TermStore,
-    step: ProofId,
-    clause: &[TermId],
-    premise_count: usize,
-    args: &[TermId],
-    authority: SkolemWitnessAuthority,
-    work: &mut usize,
-) -> Result<(), ProofCheckError> {
-    validate_sko_forall_with_authority_and_progress(
-        terms,
-        step,
-        clause,
-        premise_count,
-        args,
-        authority,
-        work,
-        &mut |_, _| true,
-    )
-}
-
 /// Preserve the collector's proof-wide local counter while allowing it to
 /// supply one shared callback when its remaining authority phases are metered.
 #[allow(clippy::too_many_arguments)] // Exact legacy inputs plus the shared caller envelope.

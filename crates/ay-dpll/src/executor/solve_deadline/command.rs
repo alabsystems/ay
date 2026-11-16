@@ -124,6 +124,7 @@ impl CommandDeadlineScope {
         self.was_active
     }
 
+    #[cfg(test)]
     pub(crate) fn previous(&self) -> (Option<Instant>, Option<Instant>) {
         self.previous
     }
@@ -143,7 +144,7 @@ impl Drop for CommandDeadlineScope {
 pub(crate) struct SolveCallDeadlineScope {
     solve: SolveDeadlineCell,
     previous: Option<Instant>,
-    command: Option<CommandDeadlineScope>,
+    _command: Option<CommandDeadlineScope>,
 }
 
 impl SolveCallDeadlineScope {
@@ -154,13 +155,13 @@ impl SolveCallDeadlineScope {
         Self {
             solve: solve.clone(),
             previous: solve.get(),
-            command,
+            _command: command,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn previous(&self) -> Option<Instant> {
-        self.command
+        self._command
             .as_ref()
             .map_or(self.previous, |command| command.previous().0)
     }

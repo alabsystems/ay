@@ -198,8 +198,8 @@ fn two_adapters_and_model_clone_share_the_original_cumulative_counter() {
     let used = counter(&model);
     let capture_before = used.load(Ordering::Acquire);
     let cloned = model.clone();
-    let mut first = PinAdmission::capture(&exec, &model).expect("same original owner");
-    let mut second = PinAdmission::capture(&exec, &cloned).expect("clone carries original owner");
+    let first = PinAdmission::capture(&exec, &model).expect("same original owner");
+    let second = PinAdmission::capture(&exec, &cloned).expect("clone carries original owner");
     assert!(Arc::ptr_eq(&first.used, &second.used));
     let before = used.load(Ordering::Acquire);
     assert_eq!(
@@ -226,8 +226,7 @@ fn two_adapters_and_model_clone_share_the_original_cumulative_counter() {
 fn exact_limit_zero_poll_succeeds_but_excess_refuses_all_followup_work() {
     let (exec, model) = fixture();
     let used = counter(&model);
-    let mut admission =
-        PinAdmission::capture(&exec, &model).expect("paid original source validation");
+    let admission = PinAdmission::capture(&exec, &model).expect("paid original source validation");
     assert!(used.load(Ordering::Acquire) < MAX_FUNCTIONAL_WORK - 5);
     used.store(MAX_FUNCTIONAL_WORK - 5, Ordering::Release);
     assert_eq!(admission.pay(5, 0), Ok(()));
@@ -314,7 +313,7 @@ fn original_raw_interrupt_is_precise_and_reset_cannot_revive_construction() {
     let (mut exec, model) = fixture();
     let interrupt = Arc::new(AtomicBool::new(false));
     exec.set_interrupt(Arc::clone(&interrupt));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("original cancel carrier");
+    let admission = PinAdmission::capture(&exec, &model).expect("original cancel carrier");
     interrupt.store(true, Ordering::Release);
     assert_eq!(admission.pay(1, 0), Err(UnknownOrigin::InterruptFlag));
     interrupt.store(false, Ordering::Release);
@@ -329,7 +328,7 @@ fn original_raw_interrupt_is_precise_and_reset_cannot_revive_construction() {
 #[test]
 fn original_live_deadline_refusal_stays_precise_after_control_restoration() {
     let (mut exec, model) = fixture();
-    let mut admission = PinAdmission::capture(&exec, &model).expect("live original end");
+    let admission = PinAdmission::capture(&exec, &model).expect("live original end");
     exec.set_deadline(Some(Instant::now()));
     assert_eq!(admission.pay(0, 0), Err(UnknownOrigin::SolveDeadline));
     assert_eq!(
@@ -349,7 +348,7 @@ fn captured_original_end_cannot_be_extended_or_removed_before_its_first_poll() {
         let (mut exec, model) = fixture();
         let end = Instant::now() + Duration::from_secs(1);
         exec.set_deadline(Some(end));
-        let mut admission = PinAdmission::capture(&exec, &model).expect("original end not expired");
+        let admission = PinAdmission::capture(&exec, &model).expect("original end not expired");
         exec.set_deadline(restore);
         std::thread::sleep(end.saturating_duration_since(Instant::now()));
         assert_eq!(admission.pay(0, 0), Err(UnknownOrigin::SolveDeadline));
@@ -372,10 +371,9 @@ fn aggregate_original_arena_limit_refuses_one_byte_over_without_refund() {
         .retained_metadata_bytes_for_test();
     assert!(retained > 0);
     // The retained admission now owns a real Arc arena in addition to payload.
-    let arena_owner = std::mem::size_of::<crate::executor::model::EvaluationArena>()
-        + 2 * std::mem::size_of::<usize>();
+    let arena_owner = size_of::<EvaluationArena>() + 2 * size_of::<usize>();
     exec.set_term_memory_limit(Some(source + retained + arena_owner + 31));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("source fits original arena");
+    let admission = PinAdmission::capture(&exec, &model).expect("source fits original arena");
     assert_eq!(admission.pay(0, 16), Ok(()));
     assert_eq!(admission.pay(0, 16), Err(UnknownOrigin::MemoryBudget));
     assert_eq!(admission.pay(0, 0), Err(UnknownOrigin::MemoryBudget));
@@ -390,7 +388,7 @@ fn final_post_arena_cleanup_poll_revokes_a_previously_healthy_result() {
     let (mut exec, model) = fixture();
     let interrupt = Arc::new(AtomicBool::new(false));
     exec.set_interrupt(Arc::clone(&interrupt));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("original admission");
+    let admission = PinAdmission::capture(&exec, &model).expect("original admission");
     admission.pay(1, 128).expect("prepaid scratch");
     interrupt.store(true, Ordering::Release);
     assert_eq!(
@@ -432,7 +430,7 @@ fn final_live_producer_memory_check_cannot_be_bypassed_by_scratch_cleanup() {
     );
 }
 
-fn original_callback(flag: &Arc<AtomicBool>) -> ay_core::resource::CheckStop {
+fn original_callback(flag: &Arc<AtomicBool>) -> CheckStop {
     let flag = Arc::clone(flag);
     Arc::new(move || flag.load(Ordering::Acquire))
 }
@@ -467,7 +465,7 @@ fn original_callback_reset_cannot_revive_a_refused_construction() {
     let (exec, model) = fixture();
     let flag = Arc::new(AtomicBool::new(false));
     let scope = enter_check_stop(original_callback(&flag));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("original callback");
+    let admission = PinAdmission::capture(&exec, &model).expect("original callback");
     admission
         .pay(7, 16)
         .expect("healthy debit under original callback");
@@ -501,7 +499,7 @@ fn original_callback_survives_scope_restoration_and_a_healthy_replacement() {
     let (exec, model) = fixture();
     let flag = Arc::new(AtomicBool::new(false));
     let scope = enter_check_stop(original_callback(&flag));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("original callback captured");
+    let admission = PinAdmission::capture(&exec, &model).expect("original callback captured");
     drop(scope);
     let replacement = enter_check_stop(Arc::new(|| false));
     flag.store(true, Ordering::Release);
@@ -523,7 +521,7 @@ fn original_callback_final_fence_refuses_after_arena_cleanup_and_scope_drop() {
     let (exec, model) = fixture();
     let flag = Arc::new(AtomicBool::new(false));
     let scope = enter_check_stop(original_callback(&flag));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("original callback");
+    let admission = PinAdmission::capture(&exec, &model).expect("original callback");
     admission
         .pay(5, 128)
         .expect("scratch prepaid under original callback");
@@ -550,7 +548,7 @@ fn precise_original_raw_interrupt_precedes_an_opaque_callback_stop() {
     exec.set_interrupt(Arc::clone(&raw));
     let flag = Arc::new(AtomicBool::new(false));
     let scope = enter_check_stop(original_callback(&flag));
-    let mut admission = PinAdmission::capture(&exec, &model).expect("both original sources");
+    let admission = PinAdmission::capture(&exec, &model).expect("both original sources");
     raw.store(true, Ordering::Release);
     flag.store(true, Ordering::Release);
     assert_eq!(admission.pay(0, 0), Err(UnknownOrigin::InterruptFlag));

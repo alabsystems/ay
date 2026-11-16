@@ -184,7 +184,7 @@ fn strict_dispatch_does_not_append_clause_after_refusal() {
             None,
             &mut |_, _| false,
         ));
-        assert!(derived.is_empty());
+        assert_eq!(derived, []);
         crate::checker::validate_step_with_datatypes_and_progress(
             &fixture.terms,
             &mut derived,

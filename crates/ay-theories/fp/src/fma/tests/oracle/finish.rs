@@ -9,7 +9,7 @@ impl FpSolver<'_> {
         z: &FpDecomposed,
     ) -> Special {
         let precision = x.precision;
-        let result = {
+        {
             let x_nan = self.is_nan(x);
             let y_nan = self.is_nan(y);
             let z_nan = self.is_nan(z);
@@ -60,8 +60,7 @@ impl FpSolver<'_> {
                 xy_zero,
                 both_zero,
             }
-        };
-        result
+        }
     }
 
     pub(super) fn fma_finish_legacy(

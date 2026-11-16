@@ -2573,7 +2573,7 @@ impl Context {
     /// a collision-safe private declaration does not own the canonical core.
     /// This checks metadata only and grants no assertion or model authority.
     pub fn canonical_operator_binding_is_unambiguous(&self, identity: &str) -> bool {
-        if identity.len() > 256 || !super::is_canonical_theory_operator_identity(identity) {
+        if identity.len() > 256 || !is_canonical_theory_operator_identity(identity) {
             return false;
         }
         let coherent = |surface: &str| {
@@ -2597,10 +2597,7 @@ impl Context {
                 Some(_) => false,
             }
         };
-        coherent(identity)
-            && self
-                .dt_surface_name(identity)
-                .is_none_or(|surface| coherent(surface))
+        coherent(identity) && self.dt_surface_name(identity).is_none_or(coherent)
     }
 
     /// Resolve one core term identity to its exact declaration signature.

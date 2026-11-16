@@ -203,7 +203,7 @@ fn lrat_writer_fails_closed_on_unrepresentable_original_count() {
     assert!(writer.has_io_error());
     assert_eq!(writer.add(&[], &[]).unwrap(), 0);
     drop(writer);
-    assert!(buf.is_empty());
+    assert_eq!(buf.len(), 0);
 }
 
 #[test]

@@ -79,10 +79,9 @@ use super::datatype_array_fields::{
     TypedArrayParseBudget, MAX_TYPED_ARRAY_DEPTH,
 };
 use super::gate_decision::gate_keeps_sat;
-use super::{
-    CertifiedConstInterpRead, CertifiedConstInterpWitness, EvalValue, Model,
-    QuantifiedConfirmationModelEpoch,
-};
+#[cfg(test)]
+use super::CertifiedConstInterpWitness;
+use super::{CertifiedConstInterpRead, EvalValue, Model, QuantifiedConfirmationModelEpoch};
 use crate::ematching::contains_quantifier;
 use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
 use crate::executor::{Executor, QueryAuthorityEpoch};
@@ -130,7 +129,7 @@ impl Executor {
             }
             if matches!(
                 self.ctx.terms.get(root),
-                ay_core::TermData::Const(ay_core::Constant::Bool(false))
+                TermData::Const(ay_core::Constant::Bool(false))
             ) {
                 super::construction_owner::pay_metadata(self, 0, 0).ok()?;
                 return Some(true);
@@ -153,12 +152,10 @@ impl Executor {
                 .evaluation_attempt()
                 .record_stop(UnknownOrigin::MemoryBudget));
         };
-        let bytes = bound
-            .checked_mul(std::mem::size_of::<TermId>())
-            .ok_or_else(|| {
-                self.evaluation_attempt()
-                    .record_stop(UnknownOrigin::MemoryBudget)
-            })?;
+        let bytes = bound.checked_mul(size_of::<TermId>()).ok_or_else(|| {
+            self.evaluation_attempt()
+                .record_stop(UnknownOrigin::MemoryBudget)
+        })?;
         super::construction_owner::pay_metadata(self, 0, bytes)?;
         let mut roots = Vec::new();
         roots.try_reserve_exact(bound).map_err(|_| {
@@ -167,13 +164,13 @@ impl Executor {
         })?;
         let bytes_after = roots
             .capacity()
-            .checked_mul(std::mem::size_of::<TermId>())
+            .checked_mul(size_of::<TermId>())
             .ok_or_else(|| {
                 self.evaluation_attempt()
                     .record_stop(UnknownOrigin::MemoryBudget)
             })?;
         super::construction_owner::pay_metadata(self, 0, bytes_after.saturating_sub(bytes))?;
-        self.visit_independent_gate_query_roots(
+        let _ = self.visit_independent_gate_query_roots(
             || super::construction_owner::pay_metadata(self, 1, 0),
             |root| {
                 roots.push(root);
@@ -577,7 +574,7 @@ impl ModelView for IndependentModelView<'_> {
             || super::recovery_admission::RecoveryAdmission::current_for(self.exec).is_some()
     }
 
-    fn admit_evaluation_work(&self, work: usize, bytes: usize) -> std::result::Result<(), String> {
+    fn admit_evaluation_work(&self, work: usize, bytes: usize) -> Result<(), String> {
         super::recovery_admission::pay_for(self.exec, work, bytes)
             .then_some(())
             .ok_or_else(|| "private model recovery admission refused".to_string())
@@ -1857,8 +1854,7 @@ impl IndependentModelView<'_> {
         if depth == 0
             || !super::recovery_admission::pay_current(
                 1,
-                2 * std::mem::size_of::<(TermId, Vec<TermId>)>()
-                    + 2 * std::mem::size_of::<TermId>(),
+                2 * size_of::<(TermId, Vec<TermId>)>() + 2 * size_of::<TermId>(),
             )
         {
             return;
@@ -1866,7 +1862,7 @@ impl IndependentModelView<'_> {
         if let TermData::App(_, args) = self.exec.ctx.terms.get(cand) {
             if !super::recovery_admission::pay_current(
                 args.len(),
-                args.len().saturating_mul(std::mem::size_of::<TermId>()),
+                args.len().saturating_mul(size_of::<TermId>()),
             ) {
                 return;
             }
@@ -2011,7 +2007,7 @@ impl IndependentModelView<'_> {
             };
             if !super::recovery_admission::pay_current(
                 children,
-                children.saturating_mul(std::mem::size_of::<TermId>()),
+                children.saturating_mul(size_of::<TermId>()),
             ) {
                 return false;
             }
@@ -4169,7 +4165,7 @@ impl Executor {
         };
         let view = IndependentModelView::new(self, model);
         if view.ensure_def_index().is_err() {
-            return ();
+            return;
         }
         let mut flat: Vec<TermId> = Vec::new();
         let mut stack = vec![assertion];
@@ -4413,9 +4409,6 @@ impl Executor {
         if result != SolveResult::Sat {
             return result;
         }
-        if !self.independent_model_gate_enabled() {
-            return result;
-        }
         // This branch is reachable only in direct regression use or if a future
         // funnel reordering presents the recorded CannotConfirm state as Sat.
         if self.last_statistics.get_string("model_check_gate.result") != Some("cannot-confirm") {
@@ -4604,9 +4597,6 @@ impl Executor {
         result: SolveResult,
     ) -> SolveResult {
         if result != SolveResult::Sat {
-            return result;
-        }
-        if !self.independent_model_gate_enabled() {
             return result;
         }
         // Defense in depth for a recorded CannotConfirm state. In the public
@@ -5249,9 +5239,6 @@ impl Executor {
         // recursive paths.
         self.revoke_quantified_model_confirmation_authority();
         if result != SolveResult::Sat {
-            return result;
-        }
-        if !self.independent_model_gate_enabled() {
             return result;
         }
         // Nested isolated solves must never recurse into this gate.
@@ -9302,9 +9289,7 @@ mod tests {
             "two constructor trees for one exact same-sort carrier must poison it"
         );
         assert!(
-            values
-                .get(&Sort::Uninterpreted("ForeignDatatype".to_string()))
-                .is_none(),
+            !values.contains_key(&Sort::Uninterpreted("ForeignDatatype".to_string())),
             "carrier authority must remain sort-local"
         );
     }

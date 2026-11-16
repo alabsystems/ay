@@ -91,7 +91,7 @@ fn the_kissat_environment_proves_the_equivalence_and_completes_a_pass() {
     let outcome = sweeper.sweep_with_kitten(&clauses, &vals, &frozen, u64::MAX);
     assert!(!outcome.unsat);
     assert_eq!(outcome.contradiction, None);
-    assert!(outcome.new_units.is_empty(), "{:?}", outcome.new_units);
+    assert_eq!(outcome.new_units.len(), 0, "{:?}", outcome.new_units);
     assert_eq!(
         sweeper.stats.kitten_equivalences, 1,
         "later environments must not prove it again"

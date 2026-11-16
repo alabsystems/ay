@@ -80,7 +80,7 @@ fn counted_stop(polls: &Cell<u32>) -> impl Fn() -> bool + '_ {
 }
 
 fn assert_core_subset(core: &[Literal], assumptions: &[Literal]) {
-    assert!(!core.is_empty(), "empty core");
+    assert_ne!(core.len(), 0, "empty core");
     for lit in core {
         assert!(
             assumptions.contains(lit),

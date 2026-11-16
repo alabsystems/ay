@@ -104,7 +104,7 @@ fn solve_unsat_with_drat_proof(
         SatResult::Unsat(_) => {
             let writer = solver.take_proof_writer().expect("proof writer");
             let proof_bytes = writer.into_vec().expect("proof flush");
-            assert!(!proof_bytes.is_empty(), "{label}: DRAT proof is empty");
+            assert_ne!(proof_bytes.len(), 0, "{label}: DRAT proof is empty");
 
             let dimacs = super::common::clauses_to_dimacs(num_vars, clauses);
             super::common::verify_drat_proof(&dimacs, &proof_bytes, label);
@@ -261,7 +261,7 @@ fn solve_and_verify_bidirectional(
         SatResult::Unsat(_) => {
             let writer = solver.take_proof_writer().expect("proof writer");
             let proof_bytes = writer.into_vec().expect("proof flush");
-            assert!(!proof_bytes.is_empty(), "{label}: DRAT proof is empty");
+            assert_ne!(proof_bytes.len(), 0, "{label}: DRAT proof is empty");
             let dimacs = super::common::clauses_to_dimacs(num_vars, clauses);
             super::common::verify_drat_proof(&dimacs, &proof_bytes, label);
             (0, 1, 0)

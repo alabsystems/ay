@@ -15,13 +15,13 @@ mimalloc = { version = "0.1", optional = true, default-features = false }
 ay-core.workspace = true
 ay-sat = { workspace = true, optional = true }
 ay-dpll.workspace = true
-ay-milp.workspace = true
+ay-milp = { workspace = true, optional = true }
 ay-drat-check = { workspace = true, optional = true }
 ay-frontend.workspace = true
 ay-lrat-check = { workspace = true, optional = true }
 ay-proof.workspace = true
 ay-allsat.workspace = true
-ay-count.workspace = true
+ay-count = { workspace = true, optional = true }
 ay-chc.workspace = true
 ay-sys = { workspace = true, optional = true }
 ay-translate.workspace = true
@@ -81,6 +81,7 @@ cli = [
     "dep:tempfile",
     "dep:zip",
     "dep:ay-bisect",
+    "dep:ay-count",
     "dep:ay-drat-check",
     "dep:ay-flatzinc-parser",
     "dep:ay-flatzinc-smt",
@@ -88,6 +89,7 @@ cli = [
     "dep:ay-lp",
     "dep:ay-lrat-check",
     "dep:ay-maxsat",
+    "dep:ay-milp",
     "dep:ay-pb",
     "dep:ay-veripb",
     "dep:ay-qbf",

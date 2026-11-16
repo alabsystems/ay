@@ -41,7 +41,7 @@ fn constant_zero_shift_observation_needs_no_retained_variable() {
     );
     assert_eq!(formula.vars(), vec![local.clone()]);
     let projected = closed(&formula, &[]);
-    assert!(projected.vars().is_empty());
+    assert_eq!(projected.vars(), [] as [ChcVar; 0]);
     assert!(oracle::truth(&projected, &[]));
     // The same operand must not become existential when the caller retains it.
     let retained = closed(&formula, &[local]);

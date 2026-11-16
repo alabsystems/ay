@@ -62,7 +62,7 @@ impl<'terms> Meter<'terms, '_> {
                 .checked_mul(2)
                 .ok_or(ProofCheckError::ResourceLimit)?;
             let bytes = capacity
-                .checked_mul(std::mem::size_of::<T>())
+                .checked_mul(size_of::<T>())
                 .ok_or(ProofCheckError::ResourceLimit)?;
             // Charge the entire replacement allocation and old-element copy,
             // not merely the extra slot. Existing storage remains paid for.
@@ -77,7 +77,7 @@ impl<'terms> Meter<'terms, '_> {
 
     pub(super) fn flags(&mut self, len: usize) -> Result<Vec<bool>, ProofCheckError> {
         let bytes = len
-            .checked_mul(std::mem::size_of::<bool>())
+            .checked_mul(size_of::<bool>())
             .ok_or(ProofCheckError::ResourceLimit)?;
         self.charge(len, bytes)?;
         let mut flags = Vec::new();

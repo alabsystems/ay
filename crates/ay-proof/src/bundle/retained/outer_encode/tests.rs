@@ -222,7 +222,7 @@ fn complete_count_and_emit_work_cannot_be_refunded_between_passes() {
 #[test]
 fn any_original_deadline_expiry_refuses_before_caller_entry() {
     let source = bundle();
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for position in 0..3 {
         let mut outer = limits();
         let mut inner = wire();

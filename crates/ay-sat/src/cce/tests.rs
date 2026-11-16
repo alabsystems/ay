@@ -117,7 +117,7 @@ fn test_not_blocked_mutual_resolution() {
     let freeze = vec![0u32; num_vars];
     let watches = empty_watches(num_vars);
     let result = cce.run_round(&arena, &vals, &freeze, &watches, 1_000_000);
-    assert!(result.is_empty(), "learned clauses should be skipped");
+    assert_eq!(result.len(), 0, "learned clauses should be skipped");
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn test_all_frozen_clause_skipped() {
     let freeze = vec![1u32; num_vars];
     let watches = empty_watches(num_vars);
     let result = cce.run_round(&arena, &vals, &freeze, &watches, 1_000_000);
-    assert!(result.is_empty(), "all-frozen clause should be skipped");
+    assert_eq!(result.len(), 0, "all-frozen clause should be skipped");
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn test_learned_clauses_skipped() {
     let freeze = vec![0u32; num_vars];
     let watches = empty_watches(num_vars);
     let result = cce.run_round(&arena, &vals, &freeze, &watches, 1_000_000);
-    assert!(result.is_empty(), "learned clauses should be skipped");
+    assert_eq!(result.len(), 0, "learned clauses should be skipped");
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn test_effort_limit_respected() {
     let freeze = vec![0u32; num_vars];
     let watches = empty_watches(num_vars);
     let result = cce.run_round(&arena, &vals, &freeze, &watches, 0);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 0);
 }
 
 #[test]

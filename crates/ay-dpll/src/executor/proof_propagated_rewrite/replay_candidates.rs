@@ -50,7 +50,7 @@ pub(super) fn and_descendants(
     meter.charge(0, 0)?;
     let count = records.len();
     let sort_work = count
-        .checked_mul((usize::BITS - count.leading_zeros()) as usize)
+        .checked_mul(count.bit_width() as usize)
         .ok_or(CensusDecline::BoundedMiss)?;
     meter.charge(
         sort_work,

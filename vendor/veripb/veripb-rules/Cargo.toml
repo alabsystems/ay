@@ -9,10 +9,12 @@ repository.workspace = true
 readme = "README.md"
 description = "Data structures for VeriPB rules."
 
+[features]
+docs = ["dep:katexit"]
+
 [dependencies]
 itertools = "0.15.0"
-# Rendering LaTeX in docs.
-katexit = "0.1.5"
+katexit = { version = "0.1.5", optional = true }
 logos = "0.16.1"
 malachite-bigint = "0.10.0"
 thiserror = "2.0.20"
@@ -26,3 +28,6 @@ path = "../veripb-formula"
 name = "veripb_rules"
 path = "src/lib.rs"
 crate-type = ["rlib"]
+
+[package.metadata.docs.rs]
+features = ["docs"]

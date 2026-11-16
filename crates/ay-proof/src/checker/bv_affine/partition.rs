@@ -70,13 +70,14 @@ pub(crate) fn partition_identity(
             return None;
         }
         let (_, _, width) = equality(terms, &[*leaves.first()?])?;
-        super::context::validate_source(terms, *root, width)?;
+        context::validate_source(terms, *root, width)?;
         let mut normalizer = Normalizer {
             terms,
             width,
             mask: u128::MAX >> (128 - width),
             nodes: 0,
             work: 0,
+            metadata_work: 0,
             scale_constant_products: false,
             accept_elaborated_shifts: false,
         };

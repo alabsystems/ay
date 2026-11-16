@@ -122,7 +122,7 @@ fn test_htr_run_integration() {
     let result = htr.run(&clauses, &vals, 100);
 
     // Should produce at least one resolvent
-    assert!(!result.resolvents.is_empty());
+    assert_ne!(result.resolvents.len(), 0);
     assert!(result.resolvents.iter().any(|(r, _, _)| r.len() == 3));
 }
 
@@ -166,7 +166,7 @@ fn test_htr_skips_assigned() {
     let result = htr.run(&clauses, &vals, 100);
 
     // Should produce no resolvents since pivot variable is assigned
-    assert!(result.resolvents.is_empty());
+    assert_eq!(result.resolvents.len(), 0);
 }
 
 #[test]

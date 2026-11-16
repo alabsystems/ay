@@ -25,9 +25,7 @@ mod strict_memo;
 #[cfg(test)]
 #[path = "check/strict_memo_tests.rs"]
 mod strict_memo_tests;
-pub(in crate::executor) use self::strict_memo::{
-    document_payload, StrictWalkKey, StrictWalkMemo, STRICT_WALK_MEMO_MAX_PAYLOAD,
-};
+pub(in crate::executor) use self::strict_memo::{StrictWalkKey, StrictWalkMemo};
 #[path = "strict_check_progress.rs"]
 mod strict_check_progress;
 use self::strict_check_progress::check_with_executor_progress;

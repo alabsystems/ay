@@ -998,7 +998,7 @@ fn fmla_postcheck_admission_omits_unretained_learned_lrat_artifact() {
     .unwrap();
 
     assert_eq!(evidence.status, "committed_checker_backed_admission");
-    assert!(evidence.learned_lrat_dry_run_artifact.is_empty());
+    assert_eq!(evidence.learned_lrat_dry_run_artifact, "");
     let args = read_fake_ay_args(&fixture.args_log);
     assert!(!args
         .iter()

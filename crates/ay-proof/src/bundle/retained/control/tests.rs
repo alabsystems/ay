@@ -63,9 +63,7 @@ fn caught_callback_panic_and_final_deadline_cannot_publish_or_restart() {
         end,
         &mut |_, _| {
             calls.set(calls.get() + 1);
-            if calls.get() == 2 {
-                panic!("caught progress panic");
-            }
+            assert!(calls.get() != 2, "caught progress panic");
             true
         },
         |control| {
@@ -86,7 +84,7 @@ fn caught_callback_panic_and_final_deadline_cannot_publish_or_restart() {
             true
         },
         |control| {
-            control.deadline = Instant::now() - Duration::from_secs(1);
+            control.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
             Err::<(), _>(TransportError::InvalidJson)
         },
     );

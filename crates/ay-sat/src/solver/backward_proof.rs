@@ -444,6 +444,7 @@ impl Solver {
     /// Resource-bounded equivalent of [`Self::reconstruct_lrat_backward`].
     /// The graph walk and emitted ordering are identical; every owned vector
     /// growth is fallible and accounted before allocation.
+    #[cfg(test)]
     pub(crate) fn reconstruct_lrat_backward_bounded(
         &self,
         limits: &BackwardProofLimits,
@@ -828,8 +829,7 @@ impl Solver {
                     let reason_ref = ClauseRef(var_data.reason);
                     let reason_id = self.clause_id(reason_ref);
                     let planned = usize::try_from(reason_id)
-                        .ok()
-                        .is_some_and(|index| planned_step_ids.contains(index));
+                        .is_ok_and(|index| planned_step_ids.contains(index));
                     let planned_visible =
                         self.proof_manager
                             .as_ref()
@@ -1092,7 +1092,7 @@ mod tests {
             hints: vec![1i64, 2, 3],
         };
         assert_eq!(step.clause_id, 42);
-        assert!(step.literals.is_empty());
+        assert_eq!(step.literals.len(), 0);
         assert_eq!(step.hints, vec![1i64, 2, 3]);
     }
 
@@ -1102,7 +1102,7 @@ mod tests {
             steps: Vec::new(),
             complete: true,
         };
-        assert!(result.steps.is_empty());
+        assert_eq!(result.steps.len(), 0);
         assert!(result.complete);
     }
 
@@ -1261,7 +1261,7 @@ mod tests {
             .reconstruct_lrat_backward_bounded(&limits)
             .expect("22 unit hints fit inside a 16 KiB reconstruction envelope");
         assert!(backward.complete);
-        assert!(backward.steps.is_empty());
+        assert_eq!(backward.steps.len(), 0);
         let expected_hints: Vec<u64> =
             (1..=u64::try_from(ORIGINAL_COUNT).expect("small fixture clause count")).collect();
         assert_eq!(backward.empty_hints, expected_hints);

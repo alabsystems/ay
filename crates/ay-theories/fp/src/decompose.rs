@@ -30,6 +30,7 @@ impl FpSolver<'_> {
     /// children. Unrecognized shapes still fail closed via
     /// [`Self::encode_bool_condition_gap`] (sets `has_encoding_gap`, so the
     /// solver returns Unknown rather than a possibly-unsound SAT).
+    #[cfg(test)]
     pub(crate) fn encode_bool_condition(&mut self, bool_term: TermId) -> CnfLit {
         uninterrupted(|control| self.encode_bool_condition_with_control(bool_term, control))
     }
@@ -74,7 +75,7 @@ impl FpSolver<'_> {
     }
 
     /// Consistent CNF literal for a free Boolean input term (see the
-    /// `TermData::Var` arm of [`Self::encode_bool_condition`]).
+    /// `TermData::Var` arm of [`Self::encode_bool_condition_with_control`]).
     fn bool_input_lit_with_control<C: BuildControl>(
         &mut self,
         bool_term: TermId,
@@ -174,7 +175,7 @@ impl FpSolver<'_> {
             }
             // Boolean connectives — a condition subformula the outer Tseitin
             // walk never reached (typically buried inside a BV/FP ITE). Gate
-            // recursively; each child goes back through `encode_bool_condition`
+            // recursively; each child goes back through `encode_bool_condition_with_control`
             // (so children that DO have Tseitin vars are linked, not re-blasted).
             "and" => {
                 let mut acc = self.const_true();
@@ -232,7 +233,7 @@ impl FpSolver<'_> {
             }
             // Nullary Boolean constant symbol (a `declare-const b Bool` that
             // reaches here as a 0-ary application): same free-input treatment
-            // as `TermData::Var` in `encode_bool_condition`.
+            // as `TermData::Var` in `encode_bool_condition_with_control`.
             _ if args.is_empty() && matches!(self.terms.sort(bool_term), Sort::Bool) => {
                 self.bool_input_lit_with_control(bool_term, control)?
             }

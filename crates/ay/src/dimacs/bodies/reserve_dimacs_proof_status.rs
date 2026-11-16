@@ -136,19 +136,17 @@ fn reject_preexisting_dimacs_status(
                 Err(error) => error,
             };
             // An exit that already settled the lock owns it now.
-            let cleanup = match reservation.custody.claim_settling() {
-                Ok(claim) => {
-                    let removed = remove_authenticated_visible_file(
-                        &reservation.lock_path,
-                        &reservation.lock_descriptor,
-                        reservation.lock_identity,
-                        "DIMACS proof status transaction lock",
-                        DimacsPublicationInvalidation::Empty,
-                    );
-                    claim.finish(removed.is_ok());
-                    removed
-                }
-                Err(settled) => return Err(settled),
+            let cleanup = {
+                let claim = reservation.custody.claim_settling()?;
+                let removed = remove_authenticated_visible_file(
+                    &reservation.lock_path,
+                    &reservation.lock_descriptor,
+                    reservation.lock_identity,
+                    "DIMACS proof status transaction lock",
+                    DimacsPublicationInvalidation::Empty,
+                );
+                claim.finish(removed.is_ok());
+                removed
             };
             Err(status_transaction_error(
                 error,

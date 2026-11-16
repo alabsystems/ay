@@ -10,6 +10,7 @@ mod exact_division_withheld;
 mod memo;
 mod reader;
 mod refusal;
+mod signed_literal_authority;
 mod speculative;
 
 #[test]

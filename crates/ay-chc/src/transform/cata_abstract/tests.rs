@@ -16,7 +16,7 @@ include!("tests/fixtures.rs");
 fn ladder_is_nonempty_for_recursive_list_problem() {
     // Default (v2) ladder: element/ordering levels off.
     let ladder = build_cata_ladder(&equal_shape_problem(), false);
-    assert!(!ladder.is_empty());
+    assert_ne!(ladder, [] as [Vec<CataKind>; 0]);
     // Level 0 is the lean {Size}-only base pool (CATA v2); RootDisc is L1.
     assert_eq!(
         ladder[0],

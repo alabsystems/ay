@@ -4,7 +4,7 @@
 
 //! The one place this lowering writes proof commands.
 
-use super::{AlethePrinter, MAX_OUTPUT_BYTES};
+use super::{super::CheckableRule, AlethePrinter, MAX_OUTPUT_BYTES};
 
 /// A bounded buffer of proof commands under one fresh label prefix.
 pub(super) struct Emitter<'p, 'a> {
@@ -72,13 +72,18 @@ impl<'p, 'a> Emitter<'p, 'a> {
         premises: &[&str],
         args: Option<&str>,
     ) -> Option<()> {
-        // WIRE-RULE BOUND: every step of this lowering is printed here, so no
-        // name outside the pinned checker's implemented set can reach the
-        // wire. See `PackedProof::named_step` for the rationale and
-        // `tests/wire_rule_coverage.rs` for the probe that re-proves the set.
-        if !ay_core::is_checkable_alethe_rule(rule) {
-            return None;
-        }
+        let rule = CheckableRule::new(rule)?;
+        self.command_with_rule(label, lits, rule, premises, args)
+    }
+
+    fn command_with_rule(
+        &mut self,
+        label: &str,
+        lits: &[String],
+        rule: CheckableRule,
+        premises: &[&str],
+        args: Option<&str>,
+    ) -> Option<()> {
         let mut text = format!("(step {label} (cl");
         for lit in lits {
             text.push(' ');

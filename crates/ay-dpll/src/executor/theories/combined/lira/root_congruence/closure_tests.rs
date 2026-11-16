@@ -109,5 +109,5 @@ fn the_body_of_a_quantifier_is_not_a_node() {
     let closure = Closure::new(&terms, &[quantified]);
 
     assert_eq!(closure.len(), 1, "the quantified term is a leaf");
-    assert!(closure.children(closure.node(quantified)).is_empty());
+    assert_eq!(closure.children(closure.node(quantified)), &[] as &[u32]);
 }

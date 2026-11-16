@@ -13,6 +13,10 @@ impl Circuit<'_, '_, '_> {
         })
     }
 
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "conversion interns atoms into this mutable proof circuit"
+    )]
     pub(super) fn from_value(&mut self, value: Value) -> Option<Word> {
         let bits = value
             .bits

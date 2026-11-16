@@ -354,8 +354,7 @@ mod tests {
             values: Default::default(),
         };
         for term in [real, integer, opaque] {
-            lra.values
-                .insert(term, num_rational::BigRational::from_integer(3.into()));
+            lra.values.insert(term, BigRational::from_integer(3.into()));
         }
         assert!(!real_values_are_merged(&euf, &lra, &terms));
         merge_lra_values(&mut euf, &lra, &terms);

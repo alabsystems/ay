@@ -7,14 +7,16 @@ use ay_core::{FpOp, Symbol};
 use std::{cell::Cell, ops::ControlFlow, time::Duration};
 
 fn limits() -> ResolutionProofLimits {
-    let mut limits = ResolutionProofLimits::default();
-    limits.deadline = Some(Instant::now() + Duration::from_secs(30));
-    limits.max_num_vars = 100_000;
-    limits.max_conflicts = Some(50_000);
-    limits.max_decisions = Some(100_000);
-    limits.max_proof_output_bytes = 16 * 1024 * 1024;
-    limits.max_codec_bytes = 32 * 1024 * 1024;
-    limits.max_backward_reconstruction_bytes = 32 * 1024 * 1024;
+    let mut limits = ResolutionProofLimits {
+        deadline: Some(Instant::now() + Duration::from_secs(30)),
+        max_num_vars: 100_000,
+        max_conflicts: Some(50_000),
+        max_decisions: Some(100_000),
+        max_proof_output_bytes: 16 * 1024 * 1024,
+        max_codec_bytes: 32 * 1024 * 1024,
+        max_backward_reconstruction_bytes: 32 * 1024 * 1024,
+        ..ResolutionProofLimits::default()
+    };
     limits.validation.max_work = 2_000_000;
     limits.validation.max_bytes = 32 * 1024 * 1024;
     limits
@@ -73,7 +75,7 @@ fn context<'a>(terms: &'a TermStore, assertions: &'a [TermId]) -> NativeFpProofC
 #[test]
 fn whole_strict_native_fp_entry_is_usable_but_legacy_callback_remains_schema_only() {
     let (terms, proof, assertions, _) = fixture();
-    assert!(crate::check_proof_strict_with_typed_context_and_progress(
+    assert!(check_proof_strict_with_typed_context_and_progress(
         &proof,
         &terms,
         None,

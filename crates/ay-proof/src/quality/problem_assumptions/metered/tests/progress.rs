@@ -120,7 +120,7 @@ fn unique_wide_closure_prices_tree_nodes_and_explicit_vector_growth() {
     for index in 0..256 {
         let leaf = fixture
             .terms
-            .mk_var(&format!("wide_authored_{index}"), Sort::Bool);
+            .mk_var(format!("wide_authored_{index}"), Sort::Bool);
         leaves.push(leaf);
         fixture.proof.add_assume(leaf, None);
     }

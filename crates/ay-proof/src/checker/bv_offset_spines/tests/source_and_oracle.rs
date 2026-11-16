@@ -195,8 +195,9 @@ fn bv_offset_spines_exhaustive_and_exact_plan_agree_with_pinned_z3() {
         .filter(|l| !l.is_empty())
         .collect();
     assert_eq!(actual, expected, "oracle={}\n{output}", oracle.identity());
-    assert!(std::fs::read(directory.join("offset-spines-z3.stderr"))
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        std::fs::read(directory.join("offset-spines-z3.stderr")).unwrap(),
+        Vec::<u8>::new()
+    );
     std::fs::write(directory.join("offset-spines-z3-receipt.json"),serde_json::to_vec_pretty(&serde_json::json!({"oracle":oracle.identity(),"queries":expected.len(),"unsat":expected.iter().filter(|x|**x=="unsat").count(),"sat":expected.iter().filter(|x|**x=="sat").count(),"unknown":0})).unwrap()).unwrap();
 }

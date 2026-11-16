@@ -884,8 +884,8 @@ impl Decompose {
             self.dfs.resize(num_lits, DfsEntry::default());
             let old_len = self.reprs.len();
             self.reprs.resize(num_lits, Literal(0));
-            for i in old_len..num_lits {
-                self.reprs[i] = Literal(i as u32);
+            for (i, repr) in self.reprs[old_len..num_lits].iter_mut().enumerate() {
+                *repr = Literal((old_len + i) as u32);
             }
         }
     }
@@ -947,8 +947,8 @@ impl Decompose {
             *e = DfsEntry::default();
         }
         // Reset representatives to identity.
-        for i in 0..num_lits {
-            self.reprs[i] = Literal(i as u32);
+        for (i, repr) in self.reprs[..num_lits].iter_mut().enumerate() {
+            *repr = Literal(i as u32);
         }
 
         let mut combined = DecomposeResult {

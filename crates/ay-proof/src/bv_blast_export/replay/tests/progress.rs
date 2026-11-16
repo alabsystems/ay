@@ -64,21 +64,20 @@ fn caught_callback_panic_keeps_the_same_budget_refused() {
     let proof = fixture(BvOp::Xor, 1);
     let limits = limits(&proof);
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        if calls == 1 {
-            panic!("cancel callback payload");
-        }
-        true
-    };
-    let mut budget = ReplayBudget::new(&limits, &mut callback);
-    let panic = catch_unwind(AssertUnwindSafe(|| budget.poll())).unwrap_err();
-    assert_eq!(
-        panic.downcast_ref::<&str>(),
-        Some(&"cancel callback payload")
-    );
-    assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
-    drop(budget);
+    {
+        let mut callback = || {
+            calls += 1;
+            assert!(calls != 1, "cancel callback payload");
+            true
+        };
+        let mut budget = ReplayBudget::new(&limits, &mut callback);
+        let panic = catch_unwind(AssertUnwindSafe(|| budget.poll())).unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"cancel callback payload")
+        );
+        assert_eq!(budget.poll(), Err(BvBlastValidateError::Cancelled));
+    }
     assert_eq!(calls, 1);
 }
 
@@ -90,27 +89,29 @@ fn long_literal_edges_poll_inside_resolution_and_set_comparison() {
     let mut right = left.clone();
     right[0] = Lit::neg(0);
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        calls != 12
-    };
-    let mut budget = ReplayBudget::new(&limits, &mut callback);
-    assert_eq!(
-        sets::resolve(&left, &right, 0, &mut budget),
-        Err(BvBlastValidateError::Cancelled)
-    );
-    drop(budget);
+    {
+        let mut callback = || {
+            calls += 1;
+            calls != 12
+        };
+        let mut budget = ReplayBudget::new(&limits, &mut callback);
+        assert_eq!(
+            sets::resolve(&left, &right, 0, &mut budget),
+            Err(BvBlastValidateError::Cancelled)
+        );
+    }
     assert_eq!(calls, 12);
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        calls != 12
-    };
-    let mut budget = ReplayBudget::new(&limits, &mut callback);
-    assert_eq!(
-        sets::clause_eq(&left, &left, &mut budget),
-        Err(BvBlastValidateError::Cancelled)
-    );
-    drop(budget);
+    {
+        let mut callback = || {
+            calls += 1;
+            calls != 12
+        };
+        let mut budget = ReplayBudget::new(&limits, &mut callback);
+        assert_eq!(
+            sets::clause_eq(&left, &left, &mut budget),
+            Err(BvBlastValidateError::Cancelled)
+        );
+    }
     assert_eq!(calls, 12);
 }

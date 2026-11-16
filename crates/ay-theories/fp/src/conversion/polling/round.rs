@@ -49,7 +49,7 @@ impl FpSolver<'_> {
         self.conversion_poll(control)?;
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
-        let bias = u64::from(precision.bias());
+        let bias = precision.bias();
         let w = exp.len();
         debug_assert_eq!(sig.len(), sb + 4, "sig must be sbits+4 wide");
         debug_assert!(w >= eb + 2, "exp must be at least ebits+2 wide");

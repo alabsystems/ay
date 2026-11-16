@@ -53,8 +53,7 @@ impl HeapPolicy for HeapCounted<'_> {
         try_reserve(self.0, values, additional)
     }
     fn sift(&self, s: &VSIDS) -> Result<()> {
-        self.0
-            .admit((usize::BITS - s.heap.len().leading_zeros()) as usize + 1, 0)
+        self.0.admit(s.heap.len().bit_width() as usize + 1, 0)
     }
     fn rebuild(&self, s: &VSIDS) -> Result<()> {
         s.prepare_analysis_rebuild(self.0)
@@ -63,8 +62,7 @@ impl HeapPolicy for HeapCounted<'_> {
         s.prepare_analysis_heap_debug(self.0)
     }
     fn sparse_entry(&self, s: &VSIDS) -> Result<()> {
-        self.0
-            .admit(80, std::mem::size_of::<([u32; 32], [u32; 32])>())?;
+        self.0.admit(80, size_of::<([u32; 32], [u32; 32])>())?;
         if !s.heap_repair_scratch.is_empty() || !s.heap_repair_order.is_empty() {
             return Err(invalid(
                 self.0,
@@ -86,7 +84,7 @@ impl VSIDS {
             return Ok(());
         }
         if in_heap == 1 {
-            let depth = (usize::BITS - self.heap.len().leading_zeros()) as usize + 1;
+            let depth = self.heap.len().bit_width() as usize + 1;
             pay_product(owner, depth, 2)?;
         } else {
             self.prepare_analysis_rebuild(owner)?;
@@ -94,7 +92,7 @@ impl VSIDS {
         self.prepare_analysis_heap_debug(owner)
     }
     fn prepare_analysis_rebuild(&self, owner: &CountedAdmission) -> Result<()> {
-        let depth = (usize::BITS - self.heap.len().leading_zeros()) as usize + 1;
+        let depth = self.heap.len().bit_width() as usize + 1;
         pay_product(owner, self.heap.len() / 2, depth)?;
         self.prepare_analysis_heap_debug(owner)
     }

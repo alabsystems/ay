@@ -68,10 +68,10 @@ fn assert_clean(root: &RootPropagation) {
     assert!(root.index_retired.is_clear());
     assert!(root.assign.iter().all(Option::is_none));
     assert!(root.cand_reason.iter().all(|&id| id == 0));
-    assert!(root.row_trail.is_empty());
-    assert!(root.cand_order.is_empty());
-    assert!(root.cone_vars.is_empty());
-    assert!(root.cone_stack.is_empty());
+    assert_eq!(root.row_trail.len(), 0);
+    assert_eq!(root.cand_order.len(), 0);
+    assert_eq!(root.cone_vars.len(), 0);
+    assert_eq!(root.cone_stack.len(), 0);
     assert!(root.cone_mark.iter().all(|&mark| mark == 0));
 }
 

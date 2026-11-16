@@ -51,8 +51,14 @@ fn lowering_every_callback_refuses_without_partial_transition_system() {
         lower_loop_controlled(&problem, BlastWidth::new(8), &control).expect("Boolean CFG lowers");
     assert_eq!(baseline.orig_header, Some(header));
     assert_eq!(baseline.ts.num_state_vars, 1);
-    assert!(!baseline.ts.init_clauses.is_empty());
-    assert!(!baseline.ts.trans_clauses.is_empty());
+    assert_ne!(
+        baseline.ts.init_clauses,
+        [] as [std::vec::Vec<ay_sat::Literal>; 0]
+    );
+    assert_ne!(
+        baseline.ts.trans_clauses,
+        [] as [std::vec::Vec<ay_sat::Literal>; 0]
+    );
     let full = calls.get();
     assert!(full > 30, "actual linearization and encoding traversals");
     for stop in 1..=full {

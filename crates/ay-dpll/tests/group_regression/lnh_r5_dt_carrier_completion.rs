@@ -59,7 +59,7 @@ fn chc_replay_verdict(script: &str, budget: Duration) -> Option<bool> {
         .expect("the renderer's header");
     let mut solver = Solver::try_new(Logic::All).expect("solver");
     let assertions = solver.parse_smtlib2(body).expect("parse");
-    assert!(!assertions.is_empty());
+    assert_ne!(assertions, [] as [ay_dpll::Term; 0]);
     drop(assertions);
     solver.set_timeout(Some(budget));
     let verdict = solver.check_sat_interruptible_internal_query(|| false);

@@ -193,7 +193,7 @@ fn repeated_checks_share_prepaid_work_and_expired_deadline_never_calls_back() {
     assert_eq!(outcome.usage.charged_work, 13);
     let mut calls = 0;
     let expired = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| {
             calls += 1;
             true

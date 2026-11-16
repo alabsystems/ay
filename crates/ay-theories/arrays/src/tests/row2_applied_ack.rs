@@ -17,13 +17,13 @@ fn current_read_acknowledgments_survive_applied_memo_eviction() {
     let index = terms.mk_var("store_index", Sort::Int);
     let value = terms.mk_var("value", Sort::Int);
     let stored = terms.mk_store(base, index, value);
-    terms.mk_eq(alias, stored);
+    let _ = terms.mk_eq(alias, stored);
     for n in 0..READS {
         let read_index = terms.mk_var(format!("read_index_{n}"), Sort::Int);
         let read = terms.mk_select(alias, read_index);
         let base_read = terms.mk_select(base, read_index);
-        terms.mk_eq(index, read_index);
-        terms.mk_eq(read, base_read);
+        let _ = terms.mk_eq(index, read_index);
+        let _ = terms.mk_eq(read, base_read);
     }
 
     let mut solver = ArraySolver::new(&terms);

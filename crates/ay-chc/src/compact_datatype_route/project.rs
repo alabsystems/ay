@@ -26,7 +26,7 @@ impl<'a> Projection<'a> {
         problem: &'a ChcProblem,
         path: &[usize],
         variables: &Variables<'a>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<Self> {
         let mut projection = Self {
             formula: ChcExpr::Bool(true),
@@ -55,7 +55,7 @@ impl<'a> Projection<'a> {
         expr: &'a ChcExpr,
         depth: usize,
         memo: &mut DetHashMap<*const ChcExpr, Arc<ChcExpr>>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<Arc<ChcExpr>> {
         owner.admit(1, 0)?;
         if depth >= MAX_DEPTH {
@@ -99,7 +99,7 @@ impl<'a> Projection<'a> {
         Ok(value)
     }
 
-    fn scalar(&mut self, read: Read<'a>, owner: &mut Owner) -> Result<ChcExpr> {
+    fn scalar(&mut self, read: Read<'a>, owner: &mut Owner<'_>) -> Result<ChcExpr> {
         let sort = read.sort.scalar()?;
         owner.admit(read.path.len().saturating_add(1), 0)?;
         let key = (read.root, read.path);
@@ -150,7 +150,7 @@ fn read<'a>(
     variables: &Variables<'a>,
     frame: usize,
     mut expr: &'a ChcExpr,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Read<'a>> {
     let mut selectors = Vec::new();
     while let ChcExpr::FuncApp(name, sort, args) = expr {

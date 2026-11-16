@@ -343,7 +343,7 @@ fn every_success_and_partial_integer_error_poll_refuses_after_cleanup() {
 #[test]
 fn original_deadline_and_canonical_failure_cannot_be_retried_or_published() {
     let expired = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired") },
         |control| certificate(raw(SAMPLE), control),
     );

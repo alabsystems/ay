@@ -109,12 +109,12 @@ impl<'a> ArrayCompletion<'a> {
 }
 
 fn extraction_bytes(members: usize, classes: usize) -> Option<usize> {
-    let member_bytes = members.checked_mul(std::mem::size_of::<CompletedArrayAssignment>())?;
+    let member_bytes = members.checked_mul(size_of::<CompletedArrayAssignment>())?;
     // Arc owns one moved ModelValue, two reference counts and conservative
     // allocator bookkeeping, in addition to the temporary root/Arc vector.
     let class_bytes = classes.checked_mul(
-        std::mem::size_of::<ModelValue>()
-            .checked_add(std::mem::size_of::<(TermId, Arc<ModelValue>)>())?
+        size_of::<ModelValue>()
+            .checked_add(size_of::<(TermId, Arc<ModelValue>)>())?
             .checked_add(64)?,
     )?;
     member_bytes.checked_add(class_bytes)

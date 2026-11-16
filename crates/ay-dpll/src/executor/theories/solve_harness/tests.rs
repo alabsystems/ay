@@ -8,7 +8,9 @@ use ay_frontend::parse;
 use num_rational::BigRational;
 use num_traits::FromPrimitive;
 
+mod auflia_varsubst;
 mod int_const_subst_zero_divisor;
+mod lia_varsubst;
 mod split_atoms;
 mod ufnia_varsubst;
 

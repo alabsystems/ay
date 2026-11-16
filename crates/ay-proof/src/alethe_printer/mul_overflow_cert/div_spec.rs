@@ -16,7 +16,7 @@ use super::term::T;
 /// The base invariant (stage `n`: everything zero, bound 0) and the chain of
 /// stage instances down to `x` itself; returns `(quotient bits, remainder bits, step)`.
 pub(crate) fn division_spec(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     ds: &DivStage,
     xb: &[T],
     yb: &[T],
@@ -31,7 +31,7 @@ pub(crate) fn division_spec(
 /// of the quantified stage lemma. A stage that is not the checker's divider
 /// step from the one above it carries no invariant: `None`.
 pub(crate) fn division_spec_over(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     ds: &DivStage,
     xb: &[T],
     yb: &[T],
@@ -76,7 +76,7 @@ pub(crate) fn division_spec_over(
     Some((q0, r0, fact))
 }
 
-fn base(p: &mut Proof, n: u32, yb: &[T], c_n: T, nz: S) -> Option<S> {
+fn base(p: &mut Proof<'_>, n: u32, yb: &[T], c_n: T, nz: S) -> Option<S> {
     let nn = 2 * n;
     let ff = p.t.ff;
     let zeros = vec![ff; n as usize];
@@ -118,7 +118,7 @@ fn base(p: &mut Proof, n: u32, yb: &[T], c_n: T, nz: S) -> Option<S> {
 }
 
 /// `(cl (not u))` for a ground comparison `u` that evaluates to false; `lit` is `(not u)`.
-fn ground_not(p: &mut Proof, lit: T) -> Option<S> {
+fn ground_not(p: &mut Proof<'_>, lit: T) -> Option<S> {
     let u = p.t.args(lit)[0];
     let ff = p.t.ff;
     let e = p.t.eq(u, ff);

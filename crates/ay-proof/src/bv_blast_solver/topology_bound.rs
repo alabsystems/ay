@@ -62,7 +62,7 @@ pub(super) fn shift(width: usize) -> usize {
     // Each of ceil(log2(width)) stages and the final saturation layer uses
     // width four-gate multiplexers. One zero gate and at most width-1 OR
     // gates cover the complete high-count reduction, including width one.
-    let stages = usize::BITS - width.saturating_sub(1).leading_zeros();
+    let stages = width.saturating_sub(1).bit_width();
     width
         .saturating_mul(4)
         .saturating_mul(stages as usize + 1)

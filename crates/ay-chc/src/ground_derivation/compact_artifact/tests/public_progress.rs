@@ -39,7 +39,7 @@ fn public_precancellation_precedes_malformed_bytes() {
 fn public_borrowed_callback_stops_within_decode_or_original_replay() {
     let (problem, artifact) = artifact(3);
     let calls = Cell::new(0);
-    validate_chc_compact_ground_derivation_artifact_with_progress(
+    let _ = validate_chc_compact_ground_derivation_artifact_with_progress(
         &problem,
         artifact.bytes(),
         &mut || {
@@ -77,9 +77,7 @@ fn public_callback_panic_returns_no_validated_evidence() {
         artifact.bytes(),
         &mut || {
             calls.set(calls.get() + 1);
-            if calls.get() == 40 {
-                panic!("caller interrupted during compact replay");
-            }
+            assert_ne!(calls.get(), 40, "caller interrupted during compact replay");
             true
         },
     )

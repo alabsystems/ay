@@ -44,7 +44,7 @@ fn trees(source: &QuantifiedChcProblem) -> Vec<Derivation> {
     let result = enumerate(source, &control).unwrap();
     // Independently check the occurrence tree, not merely its source-index list.
     for tree in &result {
-        assert!(!tree.clause_indices.is_empty());
+        assert_ne!(tree.clause_indices, [] as [usize; 0]);
         assert!(tree.clause_indices.len() <= MAX_PATH_CLAUSES);
         assert_eq!(tree.clause_indices.len(), tree.premise_steps.len());
         let root = tree.clause_indices.len() - 1;
@@ -168,7 +168,7 @@ fn every_linear_candidate_and_its_order_match_the_frozen_path_enumerator() {
         expected.iter().collect::<Vec<_>>()
     );
     for tree in actual {
-        assert!(tree.premise_steps[0].is_empty());
+        assert_eq!(tree.premise_steps[0], [] as [usize; 0]);
         for (step, premises) in tree.premise_steps.iter().enumerate().skip(1) {
             assert_eq!(premises, &[step - 1]);
         }
@@ -201,7 +201,7 @@ fn recursive_joins_are_bounded_without_predicate_or_clause_deduplication() {
             HornClause::query(body(&[p])),
         ]
     });
-    assert!(trees(&rootless).is_empty());
+    assert_eq!(trees(&rootless), [] as [Derivation; 0]);
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn candidate_and_prefix_caps_never_publish_incomplete_trees() {
     });
     // All 255 admitted children still have an open second body slot. Hitting
     // the prefix cap is search incompleteness, not a partial candidate or Safe.
-    assert!(trees(&prefix_limited).is_empty());
+    assert_eq!(trees(&prefix_limited), [] as [Derivation; 0]);
 }
 
 #[test]

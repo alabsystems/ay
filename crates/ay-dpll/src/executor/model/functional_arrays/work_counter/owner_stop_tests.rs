@@ -28,10 +28,11 @@ fn fixture(end: Instant) -> (Executor, Model, TermId, Arc<AtomicBool>, CheckStop
     let scope = enter_check_stop(Arc::new(move || Instant::now() >= end));
     let mut exec = Executor::new();
     exec.set_term_memory_limit(Some(128 * 1024 * 1024));
-    assert!(exec
-        .execute_all(&parse(SOURCE).expect("bounded source"))
-        .expect("elaboration only")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&parse(SOURCE).expect("bounded source"))
+            .expect("elaboration only"),
+        [] as [String; 0]
+    );
     let raw = Arc::new(AtomicBool::new(false));
     exec.set_interrupt(Arc::clone(&raw));
     exec.begin_external_decision_query(false);
@@ -172,7 +173,7 @@ fn late_zero_fence_after_complete_lookup_survives_unpublished_snapshot_cleanup()
 #[test]
 fn direct_model_view_interruption_latches_before_evaluator_charge_hook() {
     let end = Instant::now() + Duration::from_secs(20);
-    let (mut exec, model, _, raw, scope) = fixture(end);
+    let (exec, model, _, raw, scope) = fixture(end);
     let view = IndependentModelView::new(&exec, &model);
     assert!(!view.functional_array_interrupted()); // real source inspection first
     let before = storage(&model);
@@ -204,7 +205,7 @@ fn direct_model_view_interruption_latches_before_evaluator_charge_hook() {
 #[test]
 fn native_read_and_render_refusals_survive_the_new_read_frame() {
     let end = Instant::now() + Duration::from_secs(20);
-    let (mut exec, model, leaf, raw, scope) = fixture(end);
+    let (exec, model, leaf, raw, scope) = fixture(end);
     let index = EvalValue::BitVec {
         value: 0u8.into(),
         width: 64,

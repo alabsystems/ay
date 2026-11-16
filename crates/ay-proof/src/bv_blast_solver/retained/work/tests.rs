@@ -79,7 +79,7 @@ fn caught_phase_panic_is_terminal_and_success_can_never_overflow() {
 
 #[test]
 fn earliest_deadline_refuses_before_phase_and_latches_the_attempt() {
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let future = Instant::now() + Duration::from_secs(60);
     for (a, b) in [(past, future), (future, past)] {
         let mut work = Ledger::new(WorkAllowance::new(100, a), b);
@@ -105,7 +105,7 @@ fn inspecting_allowance_deadline_neither_renews_time_nor_replaces_work() {
     })
     .unwrap();
     assert_eq!(work.remaining, 0);
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let expired = WorkAllowance::new(7, past);
     assert_eq!(expired.deadline(), past);
     assert!(matches!(

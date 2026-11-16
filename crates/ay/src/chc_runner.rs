@@ -180,16 +180,16 @@ impl ChcCliReplayArtifacts {
 /// process without returning here — the probes the board cares about are
 /// exactly the ones that time out.
 pub(crate) fn emit_horn_session_totals() {
-    static EMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if EMITTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if EMITTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    if ay::chc::engines::horn_session_stats_requested() {
-        if let Some(line) = ay::chc::engines::horn_session_totals_report() {
+    if engines::horn_session_stats_requested() {
+        if let Some(line) = engines::horn_session_totals_report() {
             safe_eprintln!("{line}");
         }
     }
-    for line in ay::chc::engines::horn_session_coverage_report() {
+    for line in engines::horn_session_coverage_report() {
         safe_eprintln!("{line}");
     }
 }

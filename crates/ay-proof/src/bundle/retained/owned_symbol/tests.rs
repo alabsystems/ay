@@ -249,7 +249,7 @@ fn expired_original_deadline_refuses_before_valid_or_malformed_symbol_work() {
             text,
             WORK,
             STORAGE,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| -> bool { panic!("expired before callback") },
         );
         assert_eq!(outcome.result, Err(TransportError::Deadline));
@@ -294,9 +294,7 @@ fn caught_arc_admission_callback_panic_is_sticky_before_public_constructor() {
         end(),
         &mut |_, bytes| {
             calls.set(calls.get() + 1);
-            if bytes == arc_bytes {
-                panic!("Arc admission refused by panic");
-            }
+            assert!(bytes != arc_bytes, "Arc admission refused by panic");
             true
         },
         |control| {

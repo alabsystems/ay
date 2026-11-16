@@ -347,7 +347,7 @@ fn expired_original_deadline_precedes_valid_and_invalid_sort_work() {
             text,
             WORK,
             STORAGE,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| {
                 calls += 1;
                 true

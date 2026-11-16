@@ -2735,7 +2735,9 @@ fn premise_synthesis_gives_up_within_its_attempt_budget_on_a_recursive_helper() 
 fn premise_synthesis_fails_closed_past_the_solve_deadline() {
     let problem = crate::parser::ChcParser::parse(RECURSIVE_HELPER_K3).expect("fixture parses");
     let _deadline = crate::smt::ScopedSolveDeadline::new(Some(
-        ay_core::time::Instant::now() - std::time::Duration::from_millis(1),
+        ay_core::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("fixture instant supports a one-millisecond offset"),
     ));
     let mut budget = 2048usize;
     let (found, steps) = synthesize_inv(&problem, 7, &mut budget);

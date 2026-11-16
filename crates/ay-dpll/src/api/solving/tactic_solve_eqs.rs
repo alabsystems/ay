@@ -491,7 +491,7 @@ mod tests {
         let cyclic = equality(&mut store, x, app);
         let result = eliminate(&mut store, vec![cyclic], &admitted).unwrap();
         assert_eq!(result.roots, [cyclic]);
-        assert!(result.definitions.is_empty());
+        assert_eq!(result.definitions.as_slice(), &[] as &[(TermId, TermId)]);
     }
 
     #[test]
@@ -504,11 +504,11 @@ mod tests {
         let admitted = owner(Arc::new(AtomicBool::new(false)));
         let result = eliminate(&mut store, vec![eq, quantifier], &admitted).unwrap();
         assert_eq!(result.roots, [eq, quantifier]);
-        assert!(result.definitions.is_empty());
+        assert_eq!(result.definitions.as_slice(), &[] as &[(TermId, TermId)]);
         store.register_declared_function("=");
         let result = eliminate(&mut store, vec![eq], &admitted).unwrap();
         assert_eq!(result.roots, [eq]);
-        assert!(result.definitions.is_empty());
+        assert_eq!(result.definitions.as_slice(), &[] as &[(TermId, TermId)]);
     }
 
     /// At the production functional-work budget (1M units), eliminating
@@ -607,9 +607,12 @@ mod tests {
         assert!(eliminate(&mut store, vec![eq], &admitted).is_err());
         assert_eq!(store.len(), count);
         let fresh = owner(Arc::clone(&stop));
-        assert!(eliminate(&mut store, vec![eq], &fresh)
-            .unwrap()
-            .roots
-            .is_empty());
+        assert_eq!(
+            eliminate(&mut store, vec![eq], &fresh)
+                .unwrap()
+                .roots
+                .as_slice(),
+            &[] as &[TermId]
+        );
     }
 }

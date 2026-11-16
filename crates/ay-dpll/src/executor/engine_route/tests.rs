@@ -137,10 +137,8 @@ fn a_qf_lra_incremental_session_keeps_the_lane() {
 #[test]
 fn every_top_level_check_is_one_search() {
     let mut exec = shed();
-    let script = format!(
-        "{}(assert (> y 1.0)) (check-sat)\n(assert (< x 0.0)) (check-sat)\n",
-        SAT_SCRIPT
-    );
+    let script =
+        format!("{SAT_SCRIPT}(assert (> y 1.0)) (check-sat)\n(assert (< x 0.0)) (check-sat)\n");
     let out = run(&mut exec, &script);
     assert_eq!(verdicts(&out), ["sat", "sat", "unsat"], "{out:?}");
     let st = &exec.last_statistics;

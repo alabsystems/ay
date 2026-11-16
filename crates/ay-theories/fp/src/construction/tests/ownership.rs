@@ -23,13 +23,13 @@ fn finish_moves_complete_caches_links_and_clauses_without_disguising_a_gap() {
     solver.bitblast_to_bv(fp, RoundingMode::RTZ, 2, true);
     solver.bitblast_to_bv(fp, RoundingMode::RTZ, 2, false);
     assert!(solver.has_encoding_gap());
-    assert!(!solver.clauses().is_empty());
+    assert_ne!(solver.clauses().len(), 0);
     assert_eq!(solver.pending_condition_links.len(), 1);
     assert_eq!(solver.to_bv_unspec_sites.len(), 2);
-    assert!(!solver.term_to_fp.is_empty());
-    assert!(!solver.bv_term_bits.is_empty());
-    assert!(!solver.bool_input_lits.is_empty());
-    assert!(!solver.ieee_nan_encodings.is_empty());
+    assert_ne!(solver.term_to_fp.len(), 0);
+    assert_ne!(solver.bv_term_bits.len(), 0);
+    assert_ne!(solver.bool_input_lits.len(), 0);
+    assert_ne!(solver.ieee_nan_encodings.len(), 0);
     assert!(solver.cached_false.is_some());
     assert!(solver.cached_true.is_some());
     let expected = solver.export_cache();
@@ -78,8 +78,8 @@ fn cancellation_is_not_an_encoding_gap_or_a_successful_empty_artifact() {
         .unwrap()
         .finish()
         .unwrap();
-    assert!(built.clauses.is_empty());
-    assert!(built.pending_condition_links.is_empty());
+    assert_eq!(built.clauses.len(), 0);
+    assert_eq!(built.pending_condition_links.len(), 0);
     assert!(!built.has_encoding_gap);
     assert_eq!(built.cache.next_var, 1);
 }

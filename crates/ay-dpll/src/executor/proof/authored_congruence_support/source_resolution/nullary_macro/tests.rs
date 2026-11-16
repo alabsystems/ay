@@ -15,7 +15,7 @@ fn executor(script: &str) -> Executor {
 
 fn raw(executor: &mut Executor, surface: &str) -> TermId {
     let commands = ay_frontend::parse(&format!("(assert {surface})")).expect("parse");
-    let [ay_frontend::command::Command::Assert(term)] = commands.as_slice() else {
+    let [Command::Assert(term)] = commands.as_slice() else {
         panic!("one assertion expected");
     };
     executor.raw_intern_surface(term).expect("raw intern")

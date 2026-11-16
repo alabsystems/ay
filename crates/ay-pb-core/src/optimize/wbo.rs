@@ -1624,7 +1624,7 @@ mod tests {
             .constraints
             .last()
             .expect("falsity backstop row should be appended");
-        assert!(falsity.terms.is_empty());
+        assert_eq!(falsity.terms.as_slice(), &[] as &[PbTerm]);
         assert_eq!(falsity.rel, PbRel::Ge);
         assert_eq!(falsity.rhs, 1);
     }

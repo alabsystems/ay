@@ -296,10 +296,10 @@ fn solve_in_posture(smt: &str, authored: bool, self_check: bool) -> (Vec<String>
 
 /// z3's first answer line, or `None` after a visible skip when no oracle exists.
 fn z3_verdict(smt: &str) -> Option<String> {
-    if !crate::common::check_z3_or_skip() {
+    if !crate::common::z3::check_z3_or_skip() {
         return None;
     }
-    let output = crate::common::solve_with_z3(smt)
+    let output = crate::common::z3::solve_with_z3(smt)
         .unwrap_or_else(|err| panic!("z3 failed on the replay: {err}\n{smt}"));
     Some(output.lines().next().unwrap_or_default().trim().to_string())
 }

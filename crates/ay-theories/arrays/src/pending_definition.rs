@@ -27,13 +27,11 @@ pub struct PendingArrayDefinition {
 
 impl PendingArrayDefinition {
     /// Source variable whose old interpretation is withheld.
-    #[must_use]
     pub fn source(self) -> TermId {
         self.source
     }
 
     /// Exact replacement expression recorded by the producer.
-    #[must_use]
     pub fn target(self) -> TermId {
         self.target
     }
@@ -141,8 +139,10 @@ impl ArrayModel {
 }
 
 fn same_array_sort(left: &Sort, right: &Sort) -> bool {
-    matches!((left, right), (Sort::Array(_), Sort::Array(_)))
-        && same_sort(left, right, &mut MAX_SORT_WORK, 0)
+    matches!((left, right), (Sort::Array(_), Sort::Array(_))) && {
+        let mut work = MAX_SORT_WORK;
+        same_sort(left, right, &mut work, 0)
+    }
 }
 
 fn same_sort(left: &Sort, right: &Sort, work: &mut usize, depth: usize) -> bool {

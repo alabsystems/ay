@@ -168,7 +168,7 @@ fn append_datatypes<P: Progress>(
         datatypes.push(entry);
     }
     progress.poll()?;
-    datatypes.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    datatypes.sort_by_key(|(name, _)| *name);
     for (name, constructors) in datatypes {
         progress.poll()?;
         let mut ctor_parts = Vec::new();

@@ -121,8 +121,14 @@ fn true_aci_simp_conclusions_are_not_flagged() {
     // rule, are not `aci_simp` steps.
     let proof = "; :rule aci_simp\n(step t1 (cl (= (bvmul a a) a)) :rule |not aci_simp|)\n\
                  (step t2 (cl (= (bvmul a #x01) a)) :rule bv_simplify)\n";
-    assert!(aci_simp_steps_pinned_carcara_misjudges("", proof).is_empty());
-    assert!(aci_simp_steps_pinned_carcara_misjudges("", "").is_empty());
+    assert_eq!(
+        aci_simp_steps_pinned_carcara_misjudges("", proof),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        aci_simp_steps_pinned_carcara_misjudges("", ""),
+        Vec::<String>::new()
+    );
 }
 
 /// A quoted symbol is not its unquoted spelling: `|#x02|`, `|2|`, `|2.0|` and

@@ -6,6 +6,7 @@
 //! and locally checked Boolean steps.
 
 use super::super::emission_progress::EmissionProgress;
+use super::super::CheckableRule;
 use super::cdcl;
 use super::print::{b36, Printer};
 use super::term::{Op, Terms, T};
@@ -190,19 +191,21 @@ impl<'a> Proof<'a> {
         s
     }
 
-    /// The one writer of a `:rule`. Its names are `&'static str` arguments
-    /// spelled across this subtree, so the bound is here: a name outside
-    /// [`ay_core::CHECKABLE_ALETHE_RULES`] (which the wire-rule probe covers)
-    /// is never written and the step is the honest hole instead.
-    /// `RULE_BOUNDED_EMITTERS` in `tests/wire_rule_coverage.rs` asserts the
-    /// bound is still here.
     fn write_step(&mut self, s: S, cl: &str, rule: &str, prem: &[S], args: &[String], extra: &str) {
+        let rule = CheckableRule::or_hole(rule);
+        self.write_step_with_rule(s, cl, rule, prem, args, extra);
+    }
+
+    fn write_step_with_rule(
+        &mut self,
+        s: S,
+        cl: &str,
+        rule: CheckableRule,
+        prem: &[S],
+        args: &[String],
+        extra: &str,
+    ) {
         let id = self.id(s);
-        let rule = if ay_core::is_checkable_alethe_rule(rule) {
-            rule
-        } else {
-            ay_core::UNPROVED_STEP_RULE
-        };
         let _ = write!(self.out, "(step {id} {cl} :rule {rule}");
         if !prem.is_empty() {
             let ps: Vec<String> = prem.iter().map(|&p| self.id(p)).collect();

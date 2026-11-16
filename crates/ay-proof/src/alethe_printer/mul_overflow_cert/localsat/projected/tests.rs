@@ -104,9 +104,9 @@ fn random(state: &mut u64) -> u64 {
 fn hidden_atoms_and_projected_duplicates_match_generated_cnf_truth_tables() {
     let mut seed = 0x4356_271a_8824_febdu64;
     for sample in 0..512 {
-        let mut db: Vec<Clause> = (0..1 + random(&mut seed) % 12)
+        let mut db: Vec<Clause> = (0..=(random(&mut seed) % 12))
             .map(|_| {
-                (0..1 + random(&mut seed) % 4)
+                (0..=(random(&mut seed) % 4))
                     .map(|_| ((1 + random(&mut seed) % 5) as T, random(&mut seed) & 1 != 0))
                     .collect()
             })

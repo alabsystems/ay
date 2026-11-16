@@ -244,7 +244,9 @@ fn precancelled_and_expired_queries_never_enter_the_smt_oracle() {
     ));
     assert_eq!(cancelled.spacer_stats.smt_solves_total, 0);
     let mut expired = solver();
-    let deadline = ay_core::time::Instant::now() - Duration::from_millis(1);
+    let deadline = ay_core::time::Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("fixture instant supports a one-millisecond offset");
     assert!(matches!(
         expired.proxied_assumption_solve(&[], &[ChcExpr::Bool(true)], Some(deadline)),
         ProxiedOutcome::Unknown

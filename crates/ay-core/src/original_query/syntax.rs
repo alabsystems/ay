@@ -163,7 +163,7 @@ pub struct Operator {
 pub enum SortNode {
     /// Builtin sort application, including array/function/indexed sorts.
     Builtin {
-        /// Closed builtin sort constructor.
+        /// Explicitly classified builtin sort head.
         head: Builtin,
         /// Authored sort indices in order.
         indices: Vec<IndexToken>,
@@ -325,7 +325,7 @@ pub enum NodeKind {
     Match {
         /// Original term being matched.
         scrutinee: NodeId,
-        /// Constructor or wildcard cases in authored order.
+        /// Constructor, variable, or wildcard cases in authored order.
         cases: Vec<MatchCase>,
     },
     /// Original annotation wrapper and ordered attributes.

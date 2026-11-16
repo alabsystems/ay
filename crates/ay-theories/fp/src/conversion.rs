@@ -11,7 +11,9 @@ use ay_core::{CnfLit, Sort};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
-use super::construction::control::{uninterrupted, BuildControl};
+#[cfg(test)]
+use super::construction::control::uninterrupted;
+use super::construction::control::BuildControl;
 use super::construction::FpBuildStage;
 use super::model_value::FpModelValue;
 use super::{FpDecomposed, FpPrecision, FpSolver, RmOperand, RM_ORDER};
@@ -22,7 +24,7 @@ impl FpSolver<'_> {
     ///
     /// * A BV-constant field is pinned to its literal bit pattern.
     /// * A symbolic (non-constant) field is bit-blasted via
-    ///   [`Self::bitblast_conv_bv_arg`] and the resulting CNF bits become the
+    ///   [`Self::bitblast_conv_bv_arg_with_control`] and the resulting CNF bits become the
     ///   corresponding FP field bits.
     ///
     /// This is critical for soundness (#bug8): when only some fields are
@@ -33,10 +35,10 @@ impl FpSolver<'_> {
     /// freely choosing exponent/significand bits.
     ///
     /// The three fields used to go through the LEAF-ONLY
-    /// [`Self::bitblast_bv_term`], which hands back fresh *unconstrained* bits
+    /// [`Self::bitblast_bv_term_with_control`], which hands back fresh *unconstrained* bits
     /// (and flags an encoding gap) for anything that is not a `Var` / 0-ary /
     /// constant. That is the identical defect already documented and fixed on
-    /// the `to_fp` path — see [`Self::bitblast_conv_bv_arg`]. In practice the
+    /// the `to_fp` path — see [`Self::bitblast_conv_bv_arg_with_control`]. In practice the
     /// constructor's operands are almost always composite: the SV-COMP /
     /// Ultimate-Automizer encoding of a `double` reinterpretation is
     /// `(fp ((_ extract 63 63) q) ((_ extract 62 52) q) ((_ extract 51 0) q))`,
@@ -48,19 +50,9 @@ impl FpSolver<'_> {
     /// `q`) and removes the spurious gap.
     ///
     /// Fails closed: a genuinely unsupported composite yields `None` from
-    /// `bitblast_conv_bv_arg`, which has already set `has_encoding_gap`, and the
+    /// `bitblast_conv_bv_arg_with_control`, which has already set `has_encoding_gap`, and the
     /// decomposition degrades to [`Self::fresh_decomposed`] — a sound Unknown,
     /// never a free `sat`.
-    pub(crate) fn decompose_fp_constructor(
-        &mut self,
-        args: &[TermId],
-        precision: FpPrecision,
-    ) -> FpDecomposed {
-        uninterrupted(|control| {
-            self.decompose_fp_constructor_with_control(args, precision, control)
-        })
-    }
-
     pub(crate) fn decompose_fp_constructor_with_control<C: BuildControl>(
         &mut self,
         args: &[TermId],
@@ -164,14 +156,6 @@ impl FpSolver<'_> {
     }
 
     /// Decompose `(_ to_fp eb sb)` based on argument count and sorts.
-    pub(crate) fn decompose_to_fp(
-        &mut self,
-        args: &[TermId],
-        precision: FpPrecision,
-    ) -> FpDecomposed {
-        uninterrupted(|control| self.decompose_to_fp_with_control(args, precision, control))
-    }
-
     pub(crate) fn decompose_to_fp_with_control<C: BuildControl>(
         &mut self,
         args: &[TermId],
@@ -217,16 +201,6 @@ impl FpSolver<'_> {
     }
 
     /// Decompose `(_ to_fp_unsigned eb sb) rm bv` — unsigned BV-to-FP.
-    pub(crate) fn decompose_to_fp_unsigned(
-        &mut self,
-        args: &[TermId],
-        precision: FpPrecision,
-    ) -> FpDecomposed {
-        uninterrupted(|control| {
-            self.decompose_to_fp_unsigned_with_control(args, precision, control)
-        })
-    }
-
     pub(crate) fn decompose_to_fp_unsigned_with_control<C: BuildControl>(
         &mut self,
         args: &[TermId],
@@ -285,12 +259,13 @@ impl FpSolver<'_> {
     ///
     /// Conversion arguments are frequently composite — e.g. unsigned int→fp is
     /// encoded as signed `to_fp` applied to `((_ zero_extend k) a)`. The leaf-
-    /// only [`Self::bitblast_bv_term`] returns fresh *unconstrained* bits for
+    /// only [`Self::bitblast_bv_term_with_control`] returns fresh *unconstrained* bits for
     /// such terms (and flags an encoding gap), which made the whole conversion
     /// collapse to Unknown. This uses the recursive composite-aware encoder
-    /// ([`Self::bitblast_bv_value`]) which handles `zero_extend`/`sign_extend`/
+    /// ([`Self::bitblast_bv_value_with_control`]) which handles `zero_extend`/`sign_extend`/
     /// `extract`/`concat`/`bv*` precisely, and fails closed (flagging the gap so
     /// the result is a sound Unknown) only on a genuinely unsupported composite.
+    #[cfg(test)]
     pub(crate) fn bitblast_conv_bv_arg(
         &mut self,
         bv_term: TermId,

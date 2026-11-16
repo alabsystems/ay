@@ -559,12 +559,11 @@ impl Executor {
         let extensional_dt_roots = match self.collect_demanded_datatype_array_extensionality(&model)
         {
             Some(evidence) if !evidence.roots.is_empty() => {
-                checked_datatype_root_augmentation(pre_dt_roots, &evidence.roots).map(|roots| {
+                checked_datatype_root_augmentation(pre_dt_roots, &evidence.roots).inspect(|_| {
                     // Authorization accompanies only the exact generated roots
                     // that were successfully appended to this construction
                     // call. A withheld slice contributes no capability.
                     extensionality_cells = evidence.cells;
-                    roots
                 })
             }
             _ => None,
@@ -1867,7 +1866,7 @@ impl Executor {
     ) {
         if super::recovery_admission::RecoveryAdmission::current_for(self).is_some() {
             let amount = self.ctx.assertions.len().checked_add(extra_roots.len());
-            let bytes = amount.and_then(|n| n.checked_mul(2 * std::mem::size_of::<TermId>()));
+            let bytes = amount.and_then(|n| n.checked_mul(2 * size_of::<TermId>()));
             if !amount
                 .zip(bytes)
                 .is_some_and(|(work, bytes)| super::recovery_admission::pay_for(self, work, bytes))
@@ -1919,7 +1918,7 @@ impl Executor {
                 if !super::recovery_admission::pay_for(
                     self,
                     args.len(),
-                    args.len().saturating_mul(std::mem::size_of::<TermId>()),
+                    args.len().saturating_mul(size_of::<TermId>()),
                 ) {
                     return (
                         Vec::new(),
@@ -2005,7 +2004,7 @@ impl Executor {
                     if !super::recovery_admission::pay_for(
                         self,
                         args.len(),
-                        args.len().saturating_mul(std::mem::size_of::<TermId>()),
+                        args.len().saturating_mul(size_of::<TermId>()),
                     ) {
                         return (
                             Vec::new(),
@@ -3678,8 +3677,8 @@ impl Executor {
         else {
             return false;
         };
-        if !progress.cells(assignments, std::mem::size_of::<(TermId, EvalValue)>())
-            || !progress.cells(exact_roots.len(), std::mem::size_of::<TermEntryStamp>())
+        if !progress.cells(assignments, size_of::<(TermId, EvalValue)>())
+            || !progress.cells(exact_roots.len(), size_of::<TermEntryStamp>())
         {
             return false;
         }
@@ -3720,7 +3719,7 @@ impl Executor {
         let mut seen = HashSet::default();
         let mut occurring_constants = HashSet::default();
         let mut occurring_functions = HashSet::default();
-        if !progress.cells(exact_roots.len(), std::mem::size_of::<TermId>()) {
+        if !progress.cells(exact_roots.len(), size_of::<TermId>()) {
             return false;
         }
         let mut stack = exact_roots.to_vec();
@@ -3731,7 +3730,7 @@ impl Executor {
             if seen.len() == seen.capacity()
                 && !progress.cells(
                     seen.capacity().saturating_mul(2).max(8),
-                    std::mem::size_of::<TermId>(),
+                    size_of::<TermId>(),
                 )
             {
                 return false;
@@ -3744,14 +3743,14 @@ impl Executor {
             }
             match self.ctx.terms.get(term) {
                 TermData::Var(_, _) => {
-                    if !progress.cells(1, std::mem::size_of::<TermId>()) {
+                    if !progress.cells(1, size_of::<TermId>()) {
                         return false;
                     }
                     occurring_constants.insert(term);
                 }
                 TermData::App(symbol, arguments) if !arguments.is_empty() => {
                     if !progress.pay(symbol.name().len(), symbol.name().len())
-                        || !progress.cells(1, std::mem::size_of::<Symbol>())
+                        || !progress.cells(1, size_of::<Symbol>())
                     {
                         return false;
                     }
@@ -3765,7 +3764,7 @@ impl Executor {
                 TermData::Ite(..) => 3,
                 _ => 0,
             };
-            if !progress.cells(children, std::mem::size_of::<TermId>()) {
+            if !progress.cells(children, size_of::<TermId>()) {
                 return false;
             }
             stack.extend(self.ctx.terms.children(term));
@@ -3773,10 +3772,7 @@ impl Executor {
         // Plan immutably. Which declarations may be completed at all is the
         // shared decision of `is_ordinary_free_primary_declaration`; what
         // follows is only this pass's extra, formula-neutral restriction.
-        if !progress.cells(
-            self.recorded_var_substitutions.len(),
-            std::mem::size_of::<TermId>(),
-        ) {
+        if !progress.cells(self.recorded_var_substitutions.len(), size_of::<TermId>()) {
             return false;
         }
         let substituted: HashSet<TermId> =
@@ -3790,19 +3786,18 @@ impl Executor {
             }
             // Copy-safety inspection is needed for actual signature/array
             // copies, not for an empty Seq default's borrowed deep sort.
-            if !info.arg_sorts.is_empty()
-                || matches!(&info.sort, Sort::Array(_) | Sort::Uninterpreted(_))
+            if (!info.arg_sorts.is_empty()
+                || matches!(&info.sort, Sort::Array(_) | Sort::Uninterpreted(_)))
+                && !progress.sort(&info.sort)
             {
-                if !progress.sort(&info.sort) {
-                    return false;
-                }
+                return false;
             }
             for sort in &info.arg_sorts {
                 if !progress.sort(sort) {
                     return false;
                 }
             }
-            if !progress.cells(1, std::mem::size_of::<(TermId, EvalValue)>()) {
+            if !progress.cells(1, size_of::<(TermId, EvalValue)>()) {
                 return false;
             }
             let identity = self.ctx.symbol_identity_name(surface_name, info);
@@ -3872,14 +3867,14 @@ impl Executor {
             };
             function_defaults.push((binding, default));
         }
-        let levels = (usize::BITS - constant_defaults.len().leading_zeros()) as usize + 1;
+        let levels = constant_defaults.len().bit_width() as usize + 1;
         let Some(sort_work) = constant_defaults.len().checked_mul(levels) else {
             return false;
         };
         if !progress.pay(sort_work, 0) {
             return false;
         }
-        let levels = (usize::BITS - function_defaults.len().leading_zeros()) as usize + 1;
+        let levels = function_defaults.len().bit_width() as usize + 1;
         let mut names = 0usize;
         for (binding, _) in &function_defaults {
             if !progress.pay(1, 0) {
@@ -3895,7 +3890,7 @@ impl Executor {
             return false;
         };
         if !progress.pay(sort_work, 0)
-            || !progress.cells(function_defaults.len(), std::mem::size_of::<usize>())
+            || !progress.cells(function_defaults.len(), size_of::<usize>())
         {
             return false;
         }
@@ -3924,7 +3919,7 @@ impl Executor {
             }
             constants_filled += 1;
         }
-        let levels = (usize::BITS - array_defaults.len().leading_zeros()) as usize + 1;
+        let levels = array_defaults.len().bit_width() as usize + 1;
         let Some(sort_work) = array_defaults.len().checked_mul(levels) else {
             return false;
         };
@@ -5135,7 +5130,7 @@ impl Executor {
             return None;
         }
         const MAX_VISITED: usize = 65_536;
-        let mut value: Option<num_bigint::BigInt> = None;
+        let mut value: Option<BigInt> = None;
         let mut visited = 0usize;
         let mut seen: HashSet<TermId> = HashSet::default();
         let mut stack: Vec<TermId> = self.ctx.assertions.to_vec();

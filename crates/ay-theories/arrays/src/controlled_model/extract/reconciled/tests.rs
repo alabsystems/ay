@@ -65,10 +65,10 @@ impl Fixture {
         ]
         .map(|(a, i)| read(&mut terms, a, i, &element));
         let defaults = [bases[0], bases[1], alias, left, right].map(|a| terms.mk_array_default(a));
-        read(&mut terms, missing, indices[2], &element);
+        let _missing_read = read(&mut terms, missing, indices[2], &element);
         let else_value = terms.mk_var("else", element.clone());
         let constant = terms.mk_const_array(index, else_value);
-        read(&mut terms, constant, indices[2], &element);
+        let _constant_read = read(&mut terms, constant, indices[2], &element);
         let equalities = [
             terms.mk_eq(alias, left),
             terms.mk_eq(left, right),
@@ -192,6 +192,5 @@ fn costs(
         .unwrap();
     drop(output);
     work.charge(0).unwrap();
-    drop(work);
     totals.get()
 }

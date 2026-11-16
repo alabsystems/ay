@@ -285,8 +285,8 @@ fn persistent_bv_and_fp_lanes_are_isolated_and_restored_on_unwind() {
     exec.incr_bv_state = Some(Box::new(IncrementalBvState::new()));
     exec.incr_fp_state = Some(Box::new(IncrementalFpState::new()));
     exec.fp_persistent_armed = true;
-    let bv = exec.incr_bv_state.as_deref().expect("BV") as *const _;
-    let fp = exec.incr_fp_state.as_deref().expect("FP") as *const _;
+    let bv = std::ptr::from_ref(exec.incr_bv_state.as_deref().expect("BV"));
+    let fp = std::ptr::from_ref(exec.incr_fp_state.as_deref().expect("FP"));
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exec.with_dt_ground_candidate_scope(
             working,
@@ -303,8 +303,14 @@ fn persistent_bv_and_fp_lanes_are_isolated_and_restored_on_unwind() {
         )
     }));
     assert!(caught.is_err());
-    assert_eq!(exec.incr_bv_state.as_deref().expect("BV") as *const _, bv);
-    assert_eq!(exec.incr_fp_state.as_deref().expect("FP") as *const _, fp);
+    assert_eq!(
+        std::ptr::from_ref(exec.incr_bv_state.as_deref().expect("BV")),
+        bv
+    );
+    assert_eq!(
+        std::ptr::from_ref(exec.incr_fp_state.as_deref().expect("FP")),
+        fp
+    );
     assert!(exec.fp_persistent_armed);
     assert_restored(&exec, &full);
 }

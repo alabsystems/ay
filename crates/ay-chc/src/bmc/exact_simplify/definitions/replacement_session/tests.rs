@@ -38,7 +38,7 @@ fn substitutions_match_legacy_for_aliases_shared_dags_and_repeated_inputs() {
         ChcOp::Add,
         vec![Arc::clone(&shared), Arc::clone(&shared), shared],
     );
-    let inputs = vec![var("x"), var("y"), repeated.clone(), repeated, var("free")];
+    let inputs = [var("x"), var("y"), repeated.clone(), repeated, var("free")];
     let mut map = DetHashMap::default();
     map.insert("x".to_owned(), nested(var("y"), 2));
     map.insert("y".to_owned(), ChcExpr::Int(3));
@@ -83,7 +83,7 @@ fn one_map_admission_saves_exactly_the_repeated_rhs_scan_polls() {
             .map(|input| session.substitute(input))
             .collect::<Option<Vec<_>>>()
     });
-    let (_, rhs_polls) = counted(|names| {
+    let ((), rhs_polls) = counted(|names| {
         for replacement in map.values() {
             names.check(replacement).unwrap();
         }
@@ -105,7 +105,7 @@ fn lazy_admission_preserves_empty_first_input_and_early_false_order() {
     let mut map = DetHashMap::default();
     map.insert("x".to_owned(), too_deep.clone());
     let (empty, _) = counted(|names| super::super::build_round(&[], &map, names));
-    assert!(empty.unwrap().conjuncts.is_empty());
+    assert_eq!(empty.unwrap().conjuncts, [] as [ChcExpr; 0]);
 
     // A distinct cheap RHS makes an eager-map regression observably add polls
     // before the deep input refuses, rather than failing at an identical walk.
@@ -138,7 +138,7 @@ fn every_session_poll_refusal_is_sticky_without_repolling() {
     let mut map = DetHashMap::default();
     map.insert("x".to_owned(), nested(ChcExpr::Int(1), 2));
     let input = var("x");
-    let (_, total) = counted(|names| {
+    let ((), total) = counted(|names| {
         let mut session = ReplacementSession::new(&map, names);
         session.substitute(&input).unwrap();
         session.substitute(&input).unwrap();
@@ -216,7 +216,7 @@ fn caught_callback_or_pure_operation_panic_cannot_rearm_session_or_owner() {
 #[test]
 fn refusal_without_control_poll_still_poisoned_on_retry_and_drop() {
     let map = DetHashMap::default();
-    let (_, polls) = counted(|names| {
+    let ((), polls) = counted(|names| {
         {
             let mut session = ReplacementSession::new(&map, names);
             assert!(session.with_names::<()>(|_| None).is_none());
@@ -233,7 +233,7 @@ fn admitted_map_never_skips_later_input_or_expanded_output_checks() {
     let mut map = DetHashMap::default();
     map.insert("x".to_owned(), nested(ChcExpr::Int(0), 1));
     let input = nested(var("x"), crate::expr::MAX_EXPR_RECURSION_DEPTH - 1);
-    let (_, _) = counted(|names| {
+    let ((), _) = counted(|names| {
         let mut session = ReplacementSession::new(&map, names);
         session.substitute(&var("x")).unwrap();
         // Both input and replacement are admitted independently, but their
@@ -241,7 +241,7 @@ fn admitted_map_never_skips_later_input_or_expanded_output_checks() {
         assert!(session.substitute(&input).is_none());
     });
     let too_deep = nested(ChcExpr::Int(0), crate::expr::MAX_EXPR_RECURSION_DEPTH);
-    let (_, _) = counted(|names| {
+    let ((), _) = counted(|names| {
         let mut session = ReplacementSession::new(&map, names);
         session.substitute(&var("x")).unwrap();
         assert!(session.substitute(&too_deep).is_none());
@@ -254,7 +254,7 @@ fn admitted_map_never_skips_later_input_or_expanded_output_checks() {
 fn changed_map_requires_new_admission_after_the_old_borrow_ends() {
     let mut map = DetHashMap::default();
     map.insert("x".to_owned(), ChcExpr::Int(1));
-    let (_, _) = counted(|names| {
+    let ((), _) = counted(|names| {
         {
             let mut session = ReplacementSession::new(&map, names);
             assert_eq!(session.substitute(&var("x")), Some(ChcExpr::Int(1)));

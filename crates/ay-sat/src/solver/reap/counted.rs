@@ -28,7 +28,7 @@ impl Reap {
     pub(in crate::solver) fn pop_counted(&mut self, owner: &CountedAdmission) -> Result<u32> {
         // Includes the unchanged kernel's bounded metadata scan, final update,
         // and eventual queue clearing. Planning storage is fixed, not a Vec.
-        owner.admit(192, std::mem::size_of::<[usize; 33]>())?;
+        owner.admit(192, size_of::<[usize; 33]>())?;
         if self.num_elements == 0 || self.min_bucket > 32 || self.max_bucket > 32 {
             return Err(invalid(owner));
         }

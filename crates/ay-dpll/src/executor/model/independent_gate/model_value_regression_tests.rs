@@ -446,13 +446,13 @@ fn fp_pin_preserves_native_129_bit_format_and_full_fraction() {
     let sort = Sort::FloatingPoint(15, 129);
     let value = fp_value(true, 127, u128::MAX, 15, 129);
     let pin = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems, None).unwrap();
-    let ay_core::TermData::App(_, fields) = terms.get(pin) else {
+    let TermData::App(_, fields) = terms.get(pin) else {
         panic!("an FP pin must retain its three fields");
     };
     assert_eq!(fields.len(), 3);
     for (&field, (expected, width)) in fields.iter().zip([(1u128, 1), (127, 15), (u128::MAX, 128)])
     {
-        let ay_core::TermData::Const(ay_core::Constant::BitVec {
+        let TermData::Const(ay_core::Constant::BitVec {
             value,
             width: actual,
         }) = terms.get(field)
@@ -489,7 +489,7 @@ fn rounding_mode_pins_to_the_literal_not_an_opaque_element() {
             panic!("expected a nullary rounding-mode application");
         };
         assert_eq!(sym.name(), short);
-        assert!(args.is_empty());
+        assert_eq!(args, [] as [TermId; 0]);
     }
     assert!(
         elems.by_token.is_empty(),

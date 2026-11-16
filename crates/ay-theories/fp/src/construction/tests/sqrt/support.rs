@@ -27,7 +27,6 @@ pub(super) fn with_owner(run: impl FnOnce(&mut WorkBudget<'_>)) {
     work.charge(0).unwrap();
     run(&mut work);
     work.charge(0).unwrap();
-    drop(work);
     original(0, 0).unwrap();
 }
 
@@ -77,11 +76,8 @@ pub(super) fn case(
         + 2)
     .checked_mul(2)
     .unwrap();
-    work.admit(
-        cells,
-        cells.checked_mul(std::mem::size_of::<i32>()).unwrap(),
-    )
-    .unwrap();
+    work.admit(cells, cells.checked_mul(size_of::<i32>()).unwrap())
+        .unwrap();
     for lit in signed_bits(&x, input) {
         work.charge(1).unwrap();
         built.clauses.push(CnfClause::unit(lit));
@@ -111,7 +107,7 @@ fn native(built: &FpBuiltEncoding, output: &[i32], wrong: bool, work: &mut WorkB
             clause
                 .literals()
                 .len()
-                .checked_mul(std::mem::size_of::<Literal>())
+                .checked_mul(size_of::<Literal>())
                 .unwrap(),
         )
         .unwrap();

@@ -211,7 +211,7 @@ fn compact_fixed_drops_root_fixed_variables_and_models_keep_their_values() {
 
     assert_eq!(solver.num_vars, 10, "every fixed variable is dropped");
     assert_eq!(solver.cold.compact_count, 1);
-    assert!(solver.trail.is_empty());
+    assert_eq!(solver.trail.len(), 0);
     assert_eq!(solver.qhead, 0);
     for i in 0..CHAIN {
         assert_eq!(solver.cold.e2i[i], UNMAPPED, "x{i} is compacted away");

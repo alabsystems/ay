@@ -91,7 +91,7 @@ fn matching_aux_free_sr_recognises_odd_kn_and_rejects_near_misses() {
     for step in &steps {
         let LexClause::Sr { clause, witness } = step;
         assert_eq!(clause.len(), 1);
-        assert!(!witness.is_empty());
+        assert_ne!(witness.len(), 0);
         assert_eq!(witness[0], clause[0], "witness must open with the pivot");
     }
 

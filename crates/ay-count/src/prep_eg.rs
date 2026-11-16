@@ -743,7 +743,7 @@ mod tests {
         let before = count(5, &clauses);
         assert_eq!(before, BigUint::from(8u32));
         let r = eliminate_defined_simplicial(5, &clauses, SECS).expect("eliminates");
-        assert!(!r.pinned.is_empty());
+        assert_ne!(r.pinned.as_slice(), &[] as &[i32]);
         assert_eq!(count(5, &r.clauses), before);
     }
 

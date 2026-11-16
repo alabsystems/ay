@@ -147,5 +147,5 @@ fn folded_original_source_ids_are_not_replaced_by_canonical_parse_roots() {
             .map(|term| term.id())
             .collect::<Vec<_>>(),
     );
-    assert!(!artifact.obligation_assertions().is_empty());
+    assert_ne!(artifact.obligation_assertions(), []);
 }

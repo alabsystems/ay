@@ -307,7 +307,7 @@ fn synthesis_retirement_layout_declines_without_allocating_or_changing_fallback(
     let mut meter = ConversionMeter::new(&limits, &mut stop).unwrap();
     let mut bytes = [0xa5; 2];
     let mut retired = SynthesisRetirement::new(&mut bytes, 17, 1, &mut meter).unwrap();
-    assert!(retired.0.is_empty());
+    assert_eq!(retired.0.len(), 0);
     assert!(!retired.contains(0, &mut meter).unwrap());
     retired.mark(0, &mut meter).unwrap();
     retired.clear(&mut meter).unwrap();

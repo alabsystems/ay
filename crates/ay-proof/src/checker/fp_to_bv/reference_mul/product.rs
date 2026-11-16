@@ -129,7 +129,7 @@ impl Reference<'_, '_> {
         x: Bits,
         y: Bits,
         finite: Bits,
-        rm_domain: RefId,
+        _rm_domain: RefId,
     ) -> Result<Output> {
         let (xn, xi, xz) = self.classifications(x)?;
         let (yn, yi, yz) = self.classifications(y)?;
@@ -156,7 +156,8 @@ impl Reference<'_, '_> {
             sign: self.select(nan, zero_sign, finite.sign)?,
             exponent: self.select(nan, all_exp, exp)?,
             fraction: self.select(nan, one_fraction, fraction)?,
-            rm_domain,
+            #[cfg(test)]
+            rm_domain: _rm_domain,
         })
     }
 }

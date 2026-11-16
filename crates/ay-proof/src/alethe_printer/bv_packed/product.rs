@@ -106,8 +106,8 @@ impl PackedProof<'_, '_> {
             .iter()
             .map(|bit| self.product_node("and", &b.bits[0], bit))
             .collect::<Option<Vec<_>>>()?;
-        for j in 1..width {
-            bits = self.product_row(&bits, &a.bits, &b.bits[j], j)?;
+        for (j, bit) in b.bits.iter().enumerate().skip(1) {
+            bits = self.product_row(&bits, &a.bits, bit, j)?;
         }
         self.define_word(&bits)?;
         let blasted = self.blast(&changed.right, bits, "bitblast_mult")?;

@@ -35,8 +35,7 @@ impl AlethePrinter<'_> {
                 .admit_emission_work(text.len() as u64)
                 .then_some(std::borrow::Cow::Borrowed(text));
         }
-        let charge =
-            super::bounds::canonical_rendering_work_upper_bound(self.terms, canonical_term)?;
+        let charge = bounds::canonical_rendering_work_upper_bound(self.terms, canonical_term)?;
         if !self.admit_emission_work(charge) {
             return None;
         }
@@ -51,6 +50,10 @@ impl AlethePrinter<'_> {
     /// only the selected leaf schema below same-head congruence. A depth-0
     /// call is the bridge ROOT: it opens the scope the Boolean-fold leaf reads
     /// (`boolean_fold/document_spelling.rs`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact authored/canonical proof schema and traversal ledgers stay explicit"
+    )]
     pub(super) fn build_authored_surface_equivalence(
         &self,
         id: &str,
@@ -110,7 +113,7 @@ impl AlethePrinter<'_> {
                     .and_then(|n| n.checked_add(id.len()))
                     .and_then(|n| n.checked_add(forward_id.len()))
                     .and_then(|n| n.checked_add(128));
-                let work = slots * std::mem::size_of::<String>()
+                let work = slots * size_of::<String>()
                     + if matches!(direction, EquivalenceDirection::CanonicalToSurface) {
                         let Some(work) = reverse_work else {
                             return false;
@@ -227,6 +230,10 @@ impl AlethePrinter<'_> {
     /// steps projecting its operands kept printing their authored overrides,
     /// which turned Carcara-valid documents `holey` (measured on the
     /// OR-substitution fuzz).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact leaf schema and output ledger stay explicit at the proof boundary"
+    )]
     fn exact_identity_leaf_step(
         &self,
         id: &str,
@@ -256,6 +263,10 @@ impl AlethePrinter<'_> {
     /// differing operand. A canonical `not` or `ite` is a head only where
     /// [`EquivalenceLeafSchema::congruent_under_not`] or
     /// [`EquivalenceLeafSchema::congruent_under_ite`] says so.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the exact authored/canonical proof schema and traversal ledgers stay explicit"
+    )]
     fn head_congruence_step(
         &self,
         id: &str,

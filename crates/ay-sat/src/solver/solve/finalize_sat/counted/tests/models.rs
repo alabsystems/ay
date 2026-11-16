@@ -207,7 +207,7 @@ fn shared_original_and_arena_validators_match_truth_tables_for_all_assignments()
 
 #[test]
 fn shared_replay_growth_is_fallible_and_preserves_ordinary_capacity_and_order() {
-    let mut stack = crate::reconstruct::ReconstructionStack::new();
+    let mut stack = ReconstructionStack::new();
     stack.push_witness_clause(vec![pos(2)], vec![pos(2), pos(0)]);
     stack.push_witness_clause(vec![neg(0)], vec![neg(0)]);
     let initial = vec![true];

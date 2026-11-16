@@ -275,7 +275,7 @@ fn strict_proofs_read_the_commands_after_the_deciding_query() {
             else {
                 panic!("the script reaches its check-sat");
             };
-            let query = matches!(*command, ay_frontend::Command::CheckSat);
+            let query = matches!(*command, Command::CheckSat);
             if query {
                 exec.observe_authored_commands_ahead(&script[start..]);
             }

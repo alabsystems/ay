@@ -10,7 +10,7 @@ fn original_callback_refuses_empty_and_conflict_before_native_evidence() {
     conflict.add_clause(vec![Literal::negative(Variable::new(0))]);
     let mut empty = Solver::new(1);
     empty.set_ic3_mode();
-    for mut solver in [conflict, empty] {
+    for mut solver in std::iter::once(conflict).chain(std::iter::once(empty)) {
         let calls = Cell::new(0);
         let result = solver.solve_incremental_ic3_interruptible(&[], || {
             calls.set(calls.get() + 1);

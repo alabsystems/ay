@@ -375,7 +375,7 @@ fn raw_overrides_and_anchor_binders_never_acquire_shared_definitions() {
 #[test]
 fn fresh_names_read_all_actual_channels_and_refuse_nonce_exhaustion() {
     let mut f = Fixture::new();
-    f.terms.mk_var("@ay_row_t1.p_0_taken", Sort::Bool);
+    let _ = f.terms.mk_var("@ay_row_t1.p_0_taken", Sort::Bool);
     let foreign = f.terms.mk_var("foreign", Sort::Bool);
     let overrides: HashMap<_, String> = [(foreign, "|@ay_row_t1.p_1_hidden|".into())]
         .into_iter()
@@ -395,7 +395,8 @@ fn fresh_names_read_all_actual_channels_and_refuse_nonce_exhaustion() {
     assert!(document.contains("(define-fun @ay_row_t1.p_4_0"));
     // Every occupied candidate is a real arena spelling. No unbounded retry.
     for nonce in 2..NONCES {
-        f.terms
+        let _ = f
+            .terms
             .mk_var(format!("@ay_row_t1.p_{nonce}_taken"), Sort::Bool);
     }
     let printer = AlethePrinter::new_with_overrides(&f.terms, Some(&overrides));

@@ -13,7 +13,7 @@ impl FpSolver<'_> {
         let eb = precision.exponent_bits() as usize;
         let ew = Self::fma_exponent_width(eb, sb);
         let ww = 2 * sb + 3;
-        let result = {
+        {
             let Product {
                 mul_sig,
                 c_sig_ext,
@@ -61,8 +61,7 @@ impl FpSolver<'_> {
                 f_sgn,
                 alignment_sticky,
             }
-        };
-        result
+        }
     }
 
     pub(super) fn fma_magnitude_legacy(
@@ -72,7 +71,7 @@ impl FpSolver<'_> {
     ) -> Magnitude {
         let sb = precision.significand_bits() as usize;
         let ww = 2 * sb + 3;
-        let result = {
+        {
             let Aligned {
                 e_sig,
                 shifted_f_sig,
@@ -131,8 +130,7 @@ impl FpSolver<'_> {
                 extra_is_zero,
                 alignment_sticky,
             }
-        };
-        result
+        }
     }
 
     pub(super) fn fma_normalize_legacy(
@@ -160,7 +158,7 @@ impl FpSolver<'_> {
             let sig_lz = self.bv_leading_zeros(&sig_abs, ew);
             let two_exp = self.const_bv(2, ew);
             let sig_lz_adj = self.bv_sub(&sig_lz, &two_exp);
-            let bias = u64::from(precision.bias());
+            let bias = precision.bias();
             let e_min_val = 1i64 - bias as i64;
             let e_min_bv = self.const_bv(e_min_val as u64, ew);
             let max_exp_delta_renorm = self.bv_sub(&res_exp_pre, &e_min_bv);

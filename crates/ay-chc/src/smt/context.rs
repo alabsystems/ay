@@ -104,23 +104,11 @@ pub(crate) const NO_PROGRESS_SAME_SIG_LIMIT: u32 = 48;
 /// between before the breaker trips. Guards the varying-query no-progress spin.
 pub(crate) const NO_PROGRESS_TOTAL_LIMIT: u32 = 256;
 
-/// Full `PersistentBvCache` cap-clears within a single solve before the breaker
-/// trips. A cap-clear (`PersistentBvCache cap hit; cleared`) means the bit-blast
-/// state exceeded `MAX_PERSISTENT_CACHE_ENTRIES` and the WHOLE cache was thrown
-/// away — a strong pathology signal (re-bitblasting the same huge nested-serde
-/// structure with no reuse). A healthy BV-heavy solve captures its state ONCE
-/// and reuses it; the reported ny-cert grind cleared it ~470 times. Beyond this
-/// small bound the solve is thrashing, not progressing, so bailing to Unknown is
-/// sound and far cheaper than grinding to the wall-clock watchdog SIGKILL.
-pub(crate) const NO_PROGRESS_BV_CACHE_CLEAR_LIMIT: u32 = 8;
-
 #[derive(Clone, Copy)]
 struct NoProgressBreaker {
     last_signature: u64,
     same_sig_streak: u32,
     total_streak: u32,
-    /// Count of full `PersistentBvCache` cap-clears observed in this solve.
-    bv_cache_clears: u32,
     tripped: bool,
 }
 
@@ -129,7 +117,6 @@ impl NoProgressBreaker {
         last_signature: 0,
         same_sig_streak: 0,
         total_streak: 0,
-        bv_cache_clears: 0,
         tripped: false,
     };
 }
@@ -166,40 +153,10 @@ pub(crate) fn note_unassignable_free_var_no_progress(signature: u64) -> bool {
     })
 }
 
-/// Record a full `PersistentBvCache` cap-clear (bit-blast thrash) for the current
-/// solve. Returns `true` iff this record TRIPPED the breaker (the transition
-/// edge, so the caller can log exactly once). Once the clear count reaches
-/// [`NO_PROGRESS_BV_CACHE_CLEAR_LIMIT`] the breaker trips and every engine loop
-/// that polls `is_cancelled` / every `check_sat` bails to Unknown, instead of
-/// re-bitblasting the same oversized structure until the wall-clock watchdog
-/// SIGKILLs the process. SOUNDNESS: the cache is a PURE optimization and this
-/// only ever forces an earlier `Unknown` — it never fabricates a Sat/Unsat.
-///
-/// Unlike the missing-var streaks, a bv-cache thrash is NOT reset by
-/// `note_solve_progress`: a decided sub-query does not undo the fact that the
-/// solve is re-blasting an oversized structure, and the count is naturally
-/// scoped to one solve by the `ScopedNoProgressBreaker` RAII reset.
-pub(crate) fn note_bv_cache_thrash_clear() -> bool {
-    NO_PROGRESS_BREAKER.with(|cell| {
-        let mut st = cell.get();
-        if st.tripped {
-            return false;
-        }
-        st.bv_cache_clears = st.bv_cache_clears.saturating_add(1);
-        let tripped_now = st.bv_cache_clears >= NO_PROGRESS_BV_CACHE_CLEAR_LIMIT;
-        if tripped_now {
-            st.tripped = true;
-        }
-        cell.set(st);
-        tripped_now
-    })
-}
-
 /// Reset the no-progress streaks after a DECIDED (Sat/Unsat) `check_sat` result:
 /// genuine progress means the solve is not spinning on an unassignable wall.
 /// Does NOT clear an already-tripped breaker (a spin already confirmed stays
 /// confirmed for the remainder of the solve; the RAII guard resets per solve).
-/// Also does NOT clear the bv-cache-thrash count (see `note_bv_cache_thrash_clear`).
 pub(crate) fn note_solve_progress() {
     NO_PROGRESS_BREAKER.with(|cell| {
         let mut st = cell.get();
@@ -244,14 +201,13 @@ type CachedBvDivKey = (BvCacheKey, BvCacheKey);
 ///
 /// The cache is a pure optimization (avoids re-bitblasting). On long-running
 /// BV-heavy CHC solves the maps can grow unboundedly, causing OOM (#8571).
-/// When this threshold is exceeded the entire cache is cleared.
+/// Capture retains only complete states within this threshold; an oversized
+/// state evicts the cache and drops its capacity.
 ///
 /// 500_000 (2026-07): a SINGLE BV-heavy query's captured bit-blast state was
-/// observed at 312,901 entries, above the previous 100_000 cap — so
-/// `clear_if_over_capacity` (a FULL clear of all maps) fired on every capture
-/// and the cache thrashed instead of ever being reused. The raised cap admits
-/// that observed single-query state while remaining bounded against the #8571
-/// OOM regime.
+/// observed at 312,901 entries, above the previous 100_000 cap. The raised cap
+/// admits that observed single-query state while remaining bounded against the
+/// #8571 OOM regime.
 pub(super) const MAX_PERSISTENT_CACHE_ENTRIES: usize = 500_000;
 
 #[derive(Default)]
@@ -309,19 +265,6 @@ impl PersistentBvCache {
         self.mux_cache.clear();
         self.unsigned_div_cache.clear();
         self.signed_div_cache.clear();
-    }
-
-    fn clear_if_over_capacity(&mut self, cap: usize) -> Option<usize> {
-        let total = self.total_entries();
-        if total <= cap {
-            return None;
-        }
-        self.clear();
-        Some(total)
-    }
-
-    pub(super) fn enforce_capacity(&mut self) -> Option<usize> {
-        self.clear_if_over_capacity(MAX_PERSISTENT_CACHE_ENTRIES)
     }
 }
 
@@ -787,6 +730,7 @@ impl SmtContext {
     }
 
     /// `true` when this context carries a `HornSmt` session (tests / locks).
+    #[cfg(test)]
     pub(crate) fn has_session(&self) -> bool {
         self.session.is_some()
     }
@@ -1045,23 +989,8 @@ mod tests {
 
         cache.clear();
         assert_eq!(cache.total_entries(), 0);
-        assert!(cache.signature.is_empty());
+        assert_eq!(cache.signature, [] as [BvCacheKey; 0]);
         assert_eq!(cache.next_var, 0);
-    }
-
-    #[test]
-    fn test_persistent_bv_cache_capacity_clear_is_sound_eviction_policy() {
-        let mut cache = PersistentBvCache {
-            signature: vec![key(7)],
-            ..Default::default()
-        };
-        cache.term_to_bits.insert(key(0), vec![1]);
-        cache.and_cache.insert((1, 2), 3);
-
-        assert_eq!(cache.clear_if_over_capacity(1), Some(2));
-        assert_eq!(cache.total_entries(), 0);
-        assert!(cache.signature.is_empty());
-        assert_eq!(cache.clear_if_over_capacity(2), None);
     }
 
     #[test]

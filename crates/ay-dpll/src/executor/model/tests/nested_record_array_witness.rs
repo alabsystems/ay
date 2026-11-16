@@ -32,9 +32,12 @@ fn commands(exec: &mut Executor, text: &str) -> Vec<String> {
 fn solve(body: &str) -> Executor {
     let mut exec = Executor::new();
     exec.set_term_memory_limit(Some(64 * 1024 * 1024));
-    assert!(commands(&mut exec, &format!("{DECLARATIONS}{body}")).is_empty());
+    assert_eq!(
+        commands(&mut exec, &format!("{DECLARATIONS}{body}")),
+        [] as [String; 0]
+    );
     let originals = exec.ctx.assertions.clone();
-    assert!(!originals.is_empty());
+    assert_ne!(originals, [] as [TermId; 0]);
     assert_eq!(commands(&mut exec, "(check-sat)"), ["sat"]);
     assert_eq!(exec.independent_gate_query_roots().unwrap(), originals);
     assert!(matches!(

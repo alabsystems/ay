@@ -191,7 +191,7 @@ fn z3_form_start_effect(items: &[SExpr]) -> Z3StartEffect {
             None => Z3StartEffect::Starts,
             // z3 refuses `(push -1)` ("value is negative"), so it starts nothing.
             Some(SExpr::Numeral(levels)) if levels.starts_with('-') => Z3StartEffect::None,
-            Some(SExpr::Numeral(levels)) => starts_if(levels.trim_start_matches('0') != ""),
+            Some(SExpr::Numeral(levels)) => starts_if(!levels.trim_start_matches('0').is_empty()),
             Some(_) => Z3StartEffect::None,
         },
         "declare-map" => starts_if(first_is_name && args.len() >= 2),

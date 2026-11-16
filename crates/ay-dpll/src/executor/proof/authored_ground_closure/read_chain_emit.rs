@@ -199,9 +199,7 @@ impl Executor {
                 clause.clone(),
                 TheoryLemmaKind::BvBitBlast,
             );
-            let step =
-                self.resolve_closure_units(emitter, lemma, clause, &[alias], &[disequality])?;
-            step
+            self.resolve_closure_units(emitter, lemma, clause, &[alias], &[disequality])?
         } else {
             emitter.admit_steps(1)?;
             emitter.proof.add_theory_lemma_with_kind(
@@ -396,7 +394,7 @@ mod authored_guard_snapshot_controls {
         assert!(exec
             .emit_read_chain_skip(&mut emitter, point, skip, 0)
             .is_none());
-        assert!(emitter.proof.steps.is_empty());
+        assert_eq!(emitter.proof.steps, [] as [ProofStep; 0]);
         let replaced = ReadSkip {
             index: point,
             index_image: point,
@@ -405,7 +403,7 @@ mod authored_guard_snapshot_controls {
         assert!(exec
             .emit_read_chain_skip(&mut emitter, point, replaced, 1)
             .is_none());
-        assert!(emitter.proof.steps.is_empty());
+        assert_eq!(emitter.proof.steps, [] as [ProofStep; 0]);
         let (negative, pivot) = exec
             .emit_read_chain_skip(&mut emitter, point, skip, 1)
             .expect("only the exact earlier authored fact is eligible");

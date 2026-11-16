@@ -17,10 +17,9 @@ fn proves(lhs: &BvExpr, rhs: &BvExpr) -> bool {
 
 /// SMT-LIB `bvudiv`/`bvurem`: a zero divisor gives all ones and the dividend.
 fn reference(x: u128, d: u128, width: u32) -> (u128, u128) {
-    if d == 0 {
-        ((1 << width) - 1, x)
-    } else {
-        (x / d, x % d)
+    match x.checked_div(d) {
+        Some(quotient) => (quotient, x % d),
+        None => ((1 << width) - 1, x),
     }
 }
 

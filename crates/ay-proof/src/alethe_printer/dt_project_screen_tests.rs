@@ -106,6 +106,10 @@ fn the_screen_predicts_the_printer() {
     // An authored spelling the projection survives.
     let same: DetHashMap<TermId, String> =
         std::iter::once((fst, "(fst (mk a b))".to_string())).collect();
+    #[expect(
+        clippy::type_complexity,
+        reason = "the test table keeps label, clause, authored overrides, and verdict explicit"
+    )]
     let cases: [(&str, Vec<TermId>, Option<&DetHashMap<TermId, String>>, bool); 6] = [
         ("selector first", vec![forward], None, true),
         ("value first", vec![reversed], None, true),

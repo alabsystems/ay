@@ -50,7 +50,7 @@ impl Admission<'_> {
 
     fn reserve<T>(&mut self, values: &mut Vec<T>, count: usize) -> Result<()> {
         let bytes = count
-            .checked_mul(std::mem::size_of::<T>())
+            .checked_mul(size_of::<T>())
             .and_then(|n| n.checked_mul(2))
             .ok_or(SnapshotTermError::ResourceLimit)?;
         self.pay(

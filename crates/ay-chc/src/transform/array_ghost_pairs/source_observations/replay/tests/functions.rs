@@ -20,7 +20,7 @@ fn preparation_borrows_the_complete_source_including_unused_function_declaration
     validate(&source, &model, &control(&token)).unwrap();
     for index in 0..source.source_problem().clauses().len() {
         let prepared = prepare(&source, &model, index, &control(&token)).unwrap();
-        assert!(std::ptr::eq(prepared.source, &source));
+        assert!(std::ptr::eq(prepared.source, &raw const source));
         assert_eq!(prepared.source.function_declarations().len(), 1);
         assert_eq!(
             prepared

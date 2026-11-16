@@ -59,7 +59,7 @@ fn array_model(solver: &BmcSolver, pred: PredicateId) -> FxHashMap<String, SmtVa
 fn nested_const_array_head_variable_is_freshened_at_level_zero() {
     let (solver, pred) = array_fact();
     let fact = &solver.problem.clauses()[0];
-    assert!(fact.body.vars().is_empty());
+    assert_eq!(fact.body.vars(), [] as [ChcVar; 0]);
     let subst = solver.mk_rule_vars(fact, pred, 0, 0);
     assert_eq!(subst.len(), 1);
     assert_eq!(name(&subst["x"]), "Head#0_0_0");
@@ -86,7 +86,7 @@ fn nested_arithmetic_head_variables_are_complete_and_shared_occurrences_stay_sha
         } else {
             ChcOp::BvAdd
         };
-        let inner = ChcExpr::Op(op.clone(), vec![Arc::new(x.clone()), Arc::new(y)]);
+        let inner = ChcExpr::Op(op, vec![Arc::new(x.clone()), Arc::new(y)]);
         let head = ChcExpr::Op(op, vec![Arc::new(inner), Arc::new(x)]);
         let fact = HornClause::new(
             ClauseBody::constraint(ChcExpr::Bool(true)),

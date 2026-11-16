@@ -344,7 +344,7 @@ fn test_min_max_proposals_requires_three_members() {
     cluster.add_member(LemmaInstance::new(1, vec![1]));
 
     let proposals = cluster.propose_min_max_blocking_cubes();
-    assert!(proposals.is_empty());
+    assert_eq!(proposals, [] as [ChcExpr; 0]);
 }
 
 #[test]

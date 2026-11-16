@@ -56,7 +56,7 @@ fn source_folded_false_bundle_is_bound_through_exact_parse_provenance() {
         .expect("source-rebuilt Assume must remain bound to its exact folded root");
     let checked = re_check_bundle_strict(&bundle).expect("bound bundle recheck");
     assert!(checked.quality.is_complete());
-    assert!(!checked.assume_terms.is_empty());
+    assert_ne!(checked.assume_terms, [] as [TermId; 0]);
     assert_eq!(checked.assume_terms, bundle.obligation_assertions);
     assert_ne!(
         bundle.obligation_assertions,
@@ -195,7 +195,7 @@ fn exact_qf_ufbvlia_native_bundle_roundtrips_with_honest_alethe_hole() {
     let checked = re_check_bundle_strict(&restored).expect("offline native bundle replay");
     assert!(checked.quality.is_complete());
     assert_eq!(checked.assume_terms, restored.obligation_assertions);
-    assert!(!checked.assume_terms.is_empty());
+    assert_ne!(checked.assume_terms, [] as [TermId; 0]);
 
     let root_count = restored.obligation_assertions.len();
     assert_eq!(restored.steps.len(), root_count * 2 + 1);

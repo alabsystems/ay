@@ -66,18 +66,28 @@ impl LiaSolver<'_> {
             // timeout). Skip upfront — HNF cuts are a pure optimization.
             let eq_count = self.assertion_view().positive_equalities.len();
             let est_rows = eq_count.saturating_mul(2);
-            let view_epoch = self.assertion_view_cache.epoch();
+            // The matrix below is a pure function of the parsed positive
+            // equalities and the variable bijection, so the barren stamp
+            // keys on their epochs — not the all-literals view epoch, which
+            // assertions the cutter never reads advance on every literal.
+            let barren_stamp = (
+                self.assertion_view_cache.pos_eq_epoch(),
+                self.var_index_epoch,
+                est_rows,
+                self.integer_vars.len(),
+            );
             let (term_to_idx, idx_to_term) = self.build_var_index();
             let n_vars = idx_to_term.len();
+            debug_assert_eq!(n_vars, barren_stamp.3);
             if est_rows > 128 || n_vars > 512 || est_rows.saturating_mul(n_vars) > 32_768 {
                 if debug {
                     safe_eprintln!("[HNF] matrix too large ({est_rows}x{n_vars}), skipping");
                 }
                 return false;
             }
-            // Barren-attempt memo: same view epoch + dims already produced
+            // Barren-attempt memo: same stamp + dims already produced
             // zero cuts — do not rebuild the matrix to fail identically.
-            if self.hnf_barren_fingerprint == Some((view_epoch, est_rows, n_vars)) {
+            if self.hnf_barren_fingerprint == Some(barren_stamp) {
                 if debug {
                     safe_eprintln!("[HNF] barren fingerprint hit, skipping");
                 }
@@ -175,7 +185,7 @@ impl LiaSolver<'_> {
                 if debug {
                     safe_eprintln!("[HNF] No cuts generated");
                 }
-                self.hnf_barren_fingerprint = Some((view_epoch, est_rows, n_vars));
+                self.hnf_barren_fingerprint = Some(barren_stamp);
                 return false;
             }
 
@@ -466,6 +476,7 @@ impl LiaSolver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ay_core::TheorySolver;
     use ay_core::{Sort, TermStore};
 
     /// `(to_int r)` is an opaque Int-sorted application, not a `Var`. It is a
@@ -540,6 +551,51 @@ mod tests {
                 .parse_equality_for_hnf(to_int_r, rhs, &term_to_idx)
                 .is_none(),
             "an equality with an uncolumned subterm must be refused, not approximated"
+        );
+    }
+
+    /// The barren-HNF memo must survive assertions that cannot change the
+    /// HNF matrix. The cutter consumes only the parsed positive equalities
+    /// and the variable bijection, so asserting an inequality (which bumps
+    /// the all-literals view epoch but neither `pos_eq_epoch` nor
+    /// `var_index_epoch`) must not send the next attempt back through the
+    /// matrix rebuild and determinant. Measured on Certora
+    /// `65782_..._6_QF_UFDTNIA`: 1,102 attempts, 0 fired in 15 s, ~83% of
+    /// the sampled wall inside `generate_cuts`, because the memo keyed on
+    /// the epoch that every asserted literal advances.
+    #[test]
+    fn hnf_barren_memo_survives_inequality_only_assertion() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let three = terms.mk_int(BigInt::from(3));
+        let ten = terms.mk_int(BigInt::from(10));
+        let x_plus_y = terms.mk_add(vec![x, y]);
+        let eq = terms.mk_eq(x_plus_y, three);
+        let lt = terms.mk_lt(x, ten);
+
+        let mut solver = LiaSolver::new(&terms);
+        solver.register_integer_var(x);
+        solver.register_integer_var(y);
+        solver.register_atom(eq);
+        solver.register_atom(lt);
+        solver.assert_literal(eq, true);
+
+        assert!(
+            !solver.try_hnf_cuts(x),
+            "a lone x + y = 3 row yields no HNF cuts"
+        );
+        let barren = solver.hnf_barren_fingerprint;
+        assert!(barren.is_some(), "barren attempt must stamp the memo");
+
+        solver.assert_literal(lt, true);
+        assert!(
+            !solver.try_hnf_cuts(x),
+            "memoized barren attempt still yields no cuts"
+        );
+        assert_eq!(
+            solver.hnf_barren_fingerprint, barren,
+            "an inequality-only assertion must not invalidate the barren memo"
         );
     }
 }

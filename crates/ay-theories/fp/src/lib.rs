@@ -341,7 +341,7 @@ pub struct FpEncodingCache {
     /// Canonical true literal (names one specific, already-pinned variable).
     pub cached_true: Option<CnfLit>,
     /// One consistent literal per free Bool input reached only below a theory
-    /// atom. See the `TermData::Var` arm of `encode_bool_condition`.
+    /// atom. See the `TermData::Var` arm of `encode_bool_condition_with_control`.
     pub bool_input_lits: HashMap<TermId, CnfLit>,
     /// `fp.to_{s,u}bv` sites already Ackermannized against each other.
     pub to_bv_unspec_sites: Vec<ToBvUnspecSite>,

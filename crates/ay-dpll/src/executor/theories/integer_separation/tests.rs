@@ -75,7 +75,7 @@ fn real_and_gap_two_labels_are_rejected_without_partial_proofs() {
         assert!(tracker
             .add_packed_guarded_integer_lemma(&mut terms, packed, clause)
             .is_none());
-        assert!(tracker.take_proof().steps.is_empty());
+        assert_eq!(tracker.take_proof().steps, [] as [ProofStep; 0]);
     }
 }
 

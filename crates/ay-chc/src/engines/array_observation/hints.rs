@@ -91,8 +91,6 @@ fn bindings(
     let original = projected.original.get_predicate(hint.predicate)?;
     let reduced = projected.reduced.get_predicate(hint.predicate)?;
     if !poll()
-        || original.id != hint.predicate
-        || reduced.id != hint.predicate
         || original.name != reduced.name
         || original.arg_sorts.len() > MAX_ARITY
         || reduced.arg_sorts.len() > MAX_ARITY

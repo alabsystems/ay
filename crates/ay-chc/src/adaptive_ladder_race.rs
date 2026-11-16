@@ -27,7 +27,7 @@
 //! SOUNDNESS: unchanged by construction. Every member is an existing stage
 //! with its own validation gating; the race only changes WHEN it runs, and a
 //! cancelled participant can only degrade to `Unknown`. The winner still
-//! passes the caller's `finalize_verified_result` boundary like any serial
+//! passes the caller's bounded finalization boundary like any serial
 //! stage's result. `Some(Unknown)` from a member (a stage giving up) is not a
 //! decision: the others keep running. Where a ground UNSAFE trace is required,
 //! a witness-free Unsafe is re-derived before it decides, or held ([`witness`]).
@@ -141,6 +141,10 @@ impl RaceState {
 
     /// Accept `outcome` as the race's decision when it is definitive and the
     /// race is still open; otherwise hand it back.
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal hands the original outcome back to fallback without a fresh unmetered allocation"
+    )]
     fn offer(
         &self,
         name: &'static str,

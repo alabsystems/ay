@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use ay_frontend::parse;
 use std::sync::{atomic::AtomicBool, Arc};
 
 const ORIGINAL: &str = include_str!("memory-roundtrip-low-extract.smt2");
@@ -9,15 +10,15 @@ const ORIGINAL: &str = include_str!("memory-roundtrip-low-extract.smt2");
 fn fixture(problem: &str) -> Executor {
     let mut executor = Executor::new();
     executor.set_produce_proofs(true);
-    for command in ay_frontend::parse(problem).expect("original compiler query") {
+    for command in parse(problem).expect("original compiler query") {
         match command {
-            ay_frontend::Command::Assert(surface) => {
+            Command::Assert(surface) => {
                 let raw = executor
                     .raw_intern_ground_bv_surface(&surface)
                     .expect("bounded source rebuild");
                 executor.ctx.add_assertion_with_parsed(raw, surface);
             }
-            ay_frontend::Command::CheckSat | ay_frontend::Command::Exit => (),
+            Command::CheckSat | Command::Exit => (),
             other => {
                 executor.execute(&other).expect("source declaration");
             }
@@ -214,11 +215,8 @@ fn original_e1_exit0_rebuilds_exact_raw_source_under_existing_limits() {
         "79fbfab7d17542fea628e919f8cb9310c88c1a1988be2edf434e15ba1f693773"
     );
     let mut executor = Executor::new();
-    for command in ay_frontend::parse(QUERY).expect("unchanged original E1 query") {
-        if !matches!(
-            command,
-            ay_frontend::Command::CheckSat | ay_frontend::Command::Exit
-        ) {
+    for command in parse(QUERY).expect("unchanged original E1 query") {
+        if !matches!(command, Command::CheckSat | Command::Exit) {
             executor
                 .execute(&command)
                 .expect("actual original declarations and assertion");
@@ -230,7 +228,7 @@ fn original_e1_exit0_rebuilds_exact_raw_source_under_existing_limits() {
     let raw = executor
         .raw_intern_shared_ground_memory_surface(&source)
         .expect("actual shared typed/raw reconstruction must fit unchanged limits");
-    assert_eq!(executor.ctx.terms.sort(raw), &ay_core::Sort::Bool);
+    assert_eq!(executor.ctx.terms.sort(raw), &Sort::Bool);
     assert_eq!(
         executor.ctx.elaborate_surface_subterm(&source),
         Some(canonical)

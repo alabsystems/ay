@@ -127,7 +127,9 @@ fn consumer_refusal_and_unwind_latch_original_without_retry() {
 fn expired_original_end_and_oversized_input_refuse_before_payload() {
     let expired = OriginalAdmission::new(
         FiniteAdmissionGrant::new(1_000_000, 1_000_000),
-        Instant::now() - Duration::from_secs(1),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset"),
         Arc::new(|| false),
     );
     assert!(consume(&expired, &envelope("true")).is_err());

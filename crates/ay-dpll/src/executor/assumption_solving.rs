@@ -470,17 +470,6 @@ impl Executor {
                     self.last_original_clause_theory_proofs = None;
                 }
             };
-            ($theory:expr, extract_lia) => {{
-                run_dpll_with_models!(@solve dpll, res, sat_unknown_reason, $theory);
-                let lia_model = if matches!(res, AssumeResult::Sat(_)) {
-                    dpll.theory_solver()
-                        .extract_model()
-                        .map(|m| LiaModel { values: m.values })
-                } else {
-                    None
-                };
-                (res, lia_model, None, None, None, None, sat_unknown_reason)
-            }};
             ($theory:expr, extract_nia) => {{
                 run_dpll_with_models!(@solve dpll, res, sat_unknown_reason, $theory);
                 let mut res = res;

@@ -57,7 +57,7 @@ pub(super) fn run_z3(path: &Path) -> Result<SolverResult> {
 
     // Retain the sole identity-checked resolver and both original time limits.
     let mut child = OwnedChild(
-        crate::common::z3_oracle()
+        crate::common::z3::z3_oracle()
             .context("no usable z3 oracle (see the AY-TEST-SKIP line)")?
             .command()
             .arg(format!("-T:{Z3_TIMEOUT_SECS}"))

@@ -26,7 +26,7 @@ impl Executor {
             let bytes = usize::try_from(u64::from(width).div_ceil(64))
                 .ok()
                 .and_then(|limbs| limbs.checked_add(1))
-                .and_then(|limbs| limbs.checked_mul(4 * std::mem::size_of::<u64>()));
+                .and_then(|limbs| limbs.checked_mul(4 * size_of::<u64>()));
             if !bytes.is_some_and(|bytes| super::evaluation_copies::pay(bytes, bytes)) {
                 return BigInt::zero();
             }

@@ -94,7 +94,7 @@ pub(super) fn exact_substitute_scalar_candidate(
         output_budget: NodeBudget::new(node_budget),
         control,
     };
-    let root_key = formula as *const ChcExpr;
+    let root_key = std::ptr::from_ref::<ChcExpr>(formula);
     let built = substituter.rewrite(formula, 0)?;
     substituter.control.boundary()?;
     if built.expanded_nodes != substituter.output_budget.used {
@@ -209,7 +209,7 @@ impl ExactSubstituter<'_> {
             return None;
         }
 
-        let key = expression as *const ChcExpr;
+        let key = std::ptr::from_ref::<ChcExpr>(expression);
         if let Some(cached) = self.template_memo.get(&key).cloned() {
             depth
                 .checked_add(cached.height)
@@ -334,7 +334,7 @@ fn count_supported_actual(
     if depth >= crate::expr::MAX_EXPR_RECURSION_DEPTH {
         return None;
     }
-    let key = expression as *const ChcExpr;
+    let key = std::ptr::from_ref::<ChcExpr>(expression);
     if let Some(cached) = memo.get(&key).copied() {
         depth
             .checked_add(cached.height)

@@ -95,12 +95,6 @@ pub(in crate::executor) struct AuthoredNegationShellSpellings {
     pub(in crate::executor) unbridgeable: HashSet<TermId>,
 }
 
-impl AuthoredNegationShellSpellings {
-    pub(in crate::executor) fn is_empty(&self) -> bool {
-        self.bridgeable.is_empty() && self.unbridgeable.is_empty()
-    }
-}
-
 /// Leading `not` applications on the AUTHORED syntax, annotations stripped.
 fn frontend_negation_shell_depth(term: &FrontendTerm) -> usize {
     let mut depth = 0usize;

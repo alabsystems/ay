@@ -28,9 +28,7 @@ pub(super) fn source_fits(
     };
     terms <= MAX_SOS_TOTAL_POLY_TERMS
         && budget.charge(
-            terms
-                * super::budget::MAX_SOS_POLY_DEGREE
-                * (super::budget::MAX_SOS_POLY_TERMS + MAX_VARS + 4),
+            terms * budget::MAX_SOS_POLY_DEGREE * (budget::MAX_SOS_POLY_TERMS + MAX_VARS + 4),
             0,
         )
         && constraints
@@ -258,6 +256,7 @@ fn sigma0_poly(
 impl SosCertificate {
     /// Re-derive source products, check exact PSD and signs, and match the
     /// polynomial identity. Resource exhaustion is rejection, never evidence.
+    #[cfg(test)]
     pub(crate) fn verify(&self, constraints: &[MultiConstraint]) -> Result<(), SosError> {
         let mut allow = |_, _| true;
         self.verify_with_progress(constraints, &mut SosProgress::new(&mut allow))

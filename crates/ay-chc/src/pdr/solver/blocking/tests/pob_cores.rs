@@ -96,7 +96,13 @@ fn every_unsat_clause_gets_one_core_at_level_two() {
     let mut pob = ProofObligation::new(p, ChcExpr::eq(x, ChcExpr::Int(5)), 2);
     let data = match solver.check_predecessor_reachability(&mut pob, &[]) {
         Ok(d) => d,
-        Err(_) => panic!("every clause is UNSAT: expected Ok(ReachabilityData)"),
+        Err(
+            BlockResult::Blocked(_)
+            | BlockResult::AlreadyBlocked
+            | BlockResult::Reachable(_)
+            | BlockResult::MustReachable(_)
+            | BlockResult::Unknown,
+        ) => panic!("every clause is UNSAT: expected Ok(ReachabilityData)"),
     };
     assert_eq!(keys(&data.cores), vec![(0, None), (1, None), (2, None)]);
     check_coverage_invariants(&data.cores, 1);
@@ -242,7 +248,12 @@ fn a_sat_clause_yields_reachable_with_lits_on_the_lane_only() {
                     );
                 }
             }
-            Err(_) => panic!("expected Reachable"),
+            Err(
+                BlockResult::Blocked(_)
+                | BlockResult::AlreadyBlocked
+                | BlockResult::MustReachable(_)
+                | BlockResult::Unknown,
+            ) => panic!("expected Reachable"),
             Ok(_) => panic!("x = 4 → x = 5 is a predecessor: expected Reachable"),
         }
     }

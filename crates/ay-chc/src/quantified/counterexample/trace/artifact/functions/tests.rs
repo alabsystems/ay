@@ -68,7 +68,7 @@ fn complete_ordered_wide_unused_and_query_named_functions_roundtrip_as_data() {
     assert!(!exported.contains('\n'));
     assert_eq!(models[1].name(), "unused wide");
     assert_eq!(models[1].result_sort(), &Sort::bitvec(136));
-    assert!(models[1].arg_sorts().is_empty());
+    assert_eq!(models[1].arg_sorts(), []);
     assert!(models[1].definition_smtlib().contains("(concat #x80 "));
     assert_eq!(models[2].name(), "query_0");
     assert_eq!(source.source_view().clauses().count(), 2);
@@ -86,9 +86,10 @@ fn complete_empty_inventory_has_one_exact_wire_without_synthetic_models() {
         QuantifiedChcProblem::parse_smtlib("(set-logic HORN) (assert false) (check-sat)").unwrap();
     let token = CancellationToken::new();
     assert_eq!(export(&[], &source, &control(&token)).unwrap(), "(model)");
-    assert!(import("(model)", &source, &control(&token))
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        import("(model)", &source, &control(&token)).unwrap(),
+        [] as [ay_dpll::api::ScalarFunctionModel; 0]
+    );
     for text in ["(model )", " (model)", "(model)\n", "(model);comment"] {
         assert!(import(text, &source, &control(&token)).is_none());
     }
@@ -97,7 +98,10 @@ fn complete_empty_inventory_has_one_exact_wire_without_synthetic_models() {
     // The only empty wire needs no parser or fixed decoder reservation.
     let small = control(&token);
     small.bytes(64 * 1024 * 1024 - 64).unwrap();
-    assert!(import("(model)", &source, &small).unwrap().is_empty());
+    assert_eq!(
+        import("(model)", &source, &small).unwrap(),
+        [] as [ay_dpll::api::ScalarFunctionModel; 0]
+    );
     assert!(small.poll().is_some());
 }
 

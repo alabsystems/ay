@@ -265,7 +265,7 @@ impl Executor {
     /// no authority: `consequence_unit` must derive both the implication root
     /// and its antecedent from the authored scope, the emitted `implies_pos`
     /// step is re-derived by the strict checker from the implication's own
-    /// structure, and `validate_forall_inst` re-replays every substitution.
+    /// structure, and `validate_forall_inst_with_progress` re-replays every substitution.
     pub(in crate::executor) fn try_translate_authored_consequence_replay_unsat_with_implied(
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
@@ -380,7 +380,7 @@ impl Executor {
     pub(in crate::executor::proof) fn install_strict_authored_candidate(
         &mut self,
         candidate: Proof,
-    ) -> std::result::Result<(), InstallRefusal> {
+    ) -> Result<(), InstallRefusal> {
         let authored = self.exact_concrete_authored_scope();
         let scope = ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored);
         if scope.is_err() {
@@ -399,8 +399,7 @@ impl Executor {
                 replay_note(|| {
                     let strict = self.problem_assertions_for_strict_proof();
                     format!(
-                        "decline: outer strict check refused: {error} (authored={:?} strict={:?})",
-                        authored, strict
+                        "decline: outer strict check refused: {error} (authored={authored:?} strict={strict:?})"
                     )
                 });
                 return Err(InstallRefusal::Strict);

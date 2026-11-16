@@ -42,7 +42,7 @@ fn local_cost(
     depth: usize,
 ) -> Option<(bool, usize, usize)> {
     *visits = visits.checked_sub(1)?;
-    if depth > super::goal::MAX_GOAL_DEPTH {
+    if depth > goal::MAX_GOAL_DEPTH {
         return None;
     }
     match *site.nodes.get(index)? {
@@ -161,7 +161,7 @@ impl Executor {
             vec![first.step, second.step],
             Vec::new(),
         );
-        Some(DerivedUnit { literal, step })
+        Some(DerivedUnit { step, literal })
     }
 
     pub(super) fn emit_ground_packing(

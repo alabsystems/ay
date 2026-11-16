@@ -113,7 +113,9 @@ fn cancellation_at_landing_discards_native_output_and_latches_refusal() {
 fn expired_ambient_wall_is_terminal_after_the_scope_is_removed() {
     let parent = CancellationToken::new();
     let commands = ay_frontend::parse(SAT).unwrap();
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let future = Instant::now() + Duration::from_secs(60);
     for local in [Some(past), None, Some(future)] {
         let old = solver(&parent);
@@ -146,7 +148,9 @@ fn expired_local_wall_allows_a_fresh_depth_without_rearming_the_attempt() {
     let parent = CancellationToken::new();
     let solver = solver(&parent);
     let commands = ay_frontend::parse(SAT).unwrap();
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let mut executor = ay_dpll::Executor::new();
     assert_eq!(
         solver.execute_controlled_batch(&mut executor, &commands, Some(past), |_, _| panic!(
@@ -171,7 +175,9 @@ fn equal_global_and_local_deadlines_take_terminal_priority() {
     let parent = CancellationToken::new();
     let solver = solver(&parent);
     let commands = ay_frontend::parse(SAT).unwrap();
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     solver.solve_deadline.set(Some(past));
     assert_eq!(
         solver.execute_controlled_batch(

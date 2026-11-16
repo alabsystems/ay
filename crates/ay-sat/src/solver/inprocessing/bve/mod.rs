@@ -356,8 +356,8 @@ pub(in crate::solver) fn kissat_eliminate_interval(irredundant_clauses: u64, pha
 /// `500 x n log10(n + 9)^2 x (4.5 (log10(C + 10) - 5)^2 + 25)` conflicts, `n`
 /// the in-search eliminations so far; Kissat's size scale is
 /// `kissat_logn (C + 1)` = `log10(C + 10)` (kimits.c:13-18, 42).
-/// `kissat_eliminate_interval` is the NLOGN shape `--sat-bve-kissat-schedule`
-/// took (with `log10(C + 1)`, kept for that switch).
+/// The legacy square-root schedule is retained only as a test oracle; this is
+/// the NLOGN shape `--sat-bve-kissat-schedule` took (with `log10(C + 1)`).
 pub(in crate::solver) fn kissat_eliminate_interval_nlog2n(
     irredundant_clauses: u64,
     eliminations: u64,

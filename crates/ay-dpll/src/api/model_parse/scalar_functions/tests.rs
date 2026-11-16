@@ -78,9 +78,10 @@ fn malformed_or_incomplete_model_envelopes_never_return_a_prefix() {
     assert!(
         parse_scalar_function_models(output, &[("f", &[], &sort), ("f", &[], &sort)]).is_none()
     );
-    assert!(parse_scalar_function_models("(model)", &[])
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        parse_scalar_function_models("(model)", &[]).unwrap(),
+        [] as [ScalarFunctionModel; 0]
+    );
 }
 
 #[test]

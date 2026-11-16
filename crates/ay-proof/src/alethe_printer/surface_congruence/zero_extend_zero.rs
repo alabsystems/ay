@@ -146,11 +146,11 @@ impl AlethePrinter<'_> {
             }
         }
         if !self.printed_clause_ledger_active.get()
-            || !self
+            || self
                 .native_zero_cong_scopes
                 .borrow()
                 .get(premise)
-                .is_some_and(|end| id < *end)
+                .is_none_or(|end| id >= *end)
         {
             return Err(invalid(
                 "premise is missing or outside its active native scope",

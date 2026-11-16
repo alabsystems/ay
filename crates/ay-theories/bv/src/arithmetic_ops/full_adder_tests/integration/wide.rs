@@ -82,14 +82,14 @@ fn compare_models(width: usize, shape: Shape, operation: Operation) {
     let mut solver = BvSolver::new(&store);
     let (a, b, active) = inputs(&mut solver, width, shape);
     let outputs = current(&mut solver, &a, &b, operation);
-    let circuit = Circuit::new(&solver);
+    let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
     let mut old = BvSolver::new(&store);
     let (old_a, old_b, old_active) = inputs(&mut old, width, shape);
     assert_eq!(active, old_active);
     assert_eq!(a, old_a);
     assert_eq!(b, old_b);
     let old_outputs = previous(&mut old, &old_a, &old_b, operation);
-    let old_circuit = Circuit::new(&old);
+    let old_circuit = Circuit::from_clauses(old.num_vars(), old.clauses());
     let mask = (BigInt::from(1) << width) - BigInt::from(1);
     for (av, bv) in cases(active) {
         let fixes = [fix_big(&a, &av), fix_big(&b, &bv)].concat();

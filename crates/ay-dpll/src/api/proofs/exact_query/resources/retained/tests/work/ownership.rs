@@ -89,7 +89,7 @@ fn internal_resource_result_latches_even_without_a_refused_sink_offer() {
                     end,
                     work,
                     |bundle, _| {
-                        assert!(!bundle.obligation_assertions().is_empty());
+                        assert_ne!(bundle.obligation_assertions(), []);
                         completed.set(true);
                         Err(ProofCheckError::ResourceLimit)
                     },

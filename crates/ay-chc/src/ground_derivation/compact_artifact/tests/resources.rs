@@ -33,7 +33,8 @@ fn cancellation_at_sampled_decode_boundaries_never_publishes_partial_evidence() 
             observed.fetch_add(1, Ordering::Relaxed);
             false
         }));
-        validate_chc_compact_ground_derivation_artifact(&problem, &bytes).expect("healthy control");
+        let _ = validate_chc_compact_ground_derivation_artifact(&problem, &bytes)
+            .expect("healthy control");
     }
     let total = calls.load(Ordering::Relaxed);
     // Sample early, middle, and terminal polls of the complete decode.

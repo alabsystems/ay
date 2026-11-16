@@ -54,7 +54,7 @@ fn counted_triage_inactive(target: &std::sync::OnceLock<Option<Vec<i64>>>) -> bo
     if let Some(cached) = target.get() {
         return cached.is_none();
     }
-    if !ay_core::captured_misc_cli_flags().is_some_and(|flags| flags.ab_triage_clause.is_none()) {
+    if ay_core::captured_misc_cli_flags().is_none_or(|flags| flags.ab_triage_clause.is_some()) {
         return false;
     }
     // Never parse a target or capture first-use environment inside an owner.

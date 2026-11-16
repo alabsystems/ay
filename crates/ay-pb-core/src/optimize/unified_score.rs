@@ -1872,7 +1872,7 @@ mod tests {
             };
             let a = run();
             let b = run();
-            assert!(!a.is_empty());
+            assert_ne!(a.as_slice(), &[] as &[(usize, u64, i128, bool)]);
             assert_eq!(
                 a, b,
                 "λ/search trajectory not deterministic per seed ({sel:?})"
@@ -2072,7 +2072,7 @@ mod tests {
         sel.flush(combined);
         // Clear = epoch bump (cp_dense idiom): dirty list emptied, epoch moved,
         // stamps intact (no reallocation, no O(n) stamp reset).
-        assert!(sel.dirty.is_empty());
+        assert_eq!(sel.dirty.as_slice(), &[] as &[u32]);
         assert_eq!(sel.epoch, epoch_before + 1);
         // Membership: v1 (score 0) is nowhere; v0/v2/v3 in their buckets.
         assert_eq!(sel.var_bucket[1], NO_BUCKET);

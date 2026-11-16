@@ -178,7 +178,10 @@ fn hostile_observer_payload_unwind_after_entry_retires_root_proof_without_late_f
     admission::prepare(&mut base, &observer, None).unwrap();
     let entry = calls.load(Ordering::SeqCst);
     calls.store(0, Ordering::SeqCst);
-    run(&mut base, conflict, &observer).unwrap();
+    assert!(matches!(
+        run(&mut base, conflict, &observer).unwrap(),
+        SatResult::Unsat(_)
+    ));
     let total = calls.load(Ordering::SeqCst);
     let cut = entry + (total - entry) / 2;
     assert!(cut > entry && cut + 1 < total);

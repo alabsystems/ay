@@ -149,9 +149,7 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
         )?;
         let first = *args.first().ok_or(CountedTermError::InvalidInput)?;
         let initial = self.store.sort(first);
-        let name;
-        let result;
-        match op {
+        let (result, name) = match op {
             CountedRingBuiltin::ToReal | CountedRingBuiltin::ToInt => {
                 if args.len() != 1 {
                     return Err(CountedTermError::InvalidInput);
@@ -164,8 +162,7 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
                 if initial != &input {
                     return Err(CountedTermError::InvalidInput);
                 }
-                result = output;
-                name = head;
+                (output, head)
             }
             _ => {
                 if !matches!(initial, Sort::Int | Sort::Real)
@@ -178,21 +175,22 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
                 {
                     return Err(CountedTermError::InvalidInput);
                 }
-                result = if op == CountedRingBuiltin::Power {
+                let result = if op == CountedRingBuiltin::Power {
                     Sort::Real
                 } else if initial == &Sort::Int {
                     Sort::Int
                 } else {
                     Sort::Real
                 };
-                name = match op {
+                let name = match op {
                     CountedRingBuiltin::Add => "+",
                     CountedRingBuiltin::Multiply => "*",
                     CountedRingBuiltin::Power => "^",
                     _ => "-",
                 };
+                (result, name)
             }
-        }
+        };
         let term = payload::named(name, args, self.owner)?;
         self.check_generated_head(&term)?;
         let result = self.intern_typed_data(term, result, Some(false));

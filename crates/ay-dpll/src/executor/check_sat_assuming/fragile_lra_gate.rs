@@ -14,7 +14,7 @@
 //! added here that turned EVERY such UNSAT into `unknown`. The mechanism
 //! behind those witnesses was never isolated. A later one was: scoped
 //! assumption sub-solves leaked the assumption literals into
-//! session-persistent SAT state (fixed by `solve_without_persistent_encoding`,
+//! session-persistent SAT state (fixed by isolating every scoped-window lane,
 //! ec28f5b4f). Absence of a known bug is not a soundness
 //! argument, so the gate is kept and its action changes.
 //!

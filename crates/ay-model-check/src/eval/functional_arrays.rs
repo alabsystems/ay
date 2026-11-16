@@ -350,7 +350,7 @@ impl Evaluator<'_> {
     }
 }
 
-struct CaptureGuard<'a>(&'a std::cell::Cell<usize>);
+struct CaptureGuard<'a>(&'a Cell<usize>);
 impl Drop for CaptureGuard<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get().saturating_sub(1));

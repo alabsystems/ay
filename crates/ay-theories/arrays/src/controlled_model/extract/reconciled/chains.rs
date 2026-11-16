@@ -12,6 +12,13 @@ pub(super) struct Chain<'a> {
     pub(super) writes: Vec<(&'a str, &'a str)>,
 }
 
+pub(super) struct DefaultSources<'a, 'values> {
+    pub(super) members: &'a [TermId],
+    pub(super) bases: &'a [TermId],
+    pub(super) unwritten: &'a [(String, String)],
+    pub(super) chains: &'a [Chain<'values>],
+}
+
 pub(super) fn capture<'a>(
     solver: &ArraySolver<'_>,
     values: &'a HashMap<TermId, String>,

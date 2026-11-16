@@ -175,11 +175,7 @@ impl PdrSolver {
             }
         }
 
-        if !checked_any_self_loop {
-            return false;
-        }
-
-        true
+        checked_any_self_loop
     }
 
     /// Check if var_i >= var_j is preserved by all transitions for a predicate.
@@ -266,10 +262,6 @@ impl PdrSolver {
             }
         }
 
-        if !checked_any_self_loop {
-            return false;
-        }
-
-        true
+        checked_any_self_loop
     }
 }

@@ -134,7 +134,7 @@ fn caught_callback_panic_cannot_restore_a_healthy_alternative() {
 fn callback_reentry_that_returns_false_is_still_a_terminal_stop() {
     let executor = Executor::new();
     let original = ay_core::resource::enter_check_stop(Arc::new(|| {
-        ay_core::resource::check_stop_requested();
+        let _ = ay_core::resource::check_stop_requested();
         false
     }));
     let caller = TraceCaller::capture(&executor);
@@ -271,7 +271,7 @@ fn successful_handoff_observation_excludes_unavailable_and_typed_stops() {
     let executor = Executor::new();
     let foreign = Executor::new();
     let caller = TraceCaller::capture(&executor);
-    let (_, transfers) = observation::observe_trace(
+    let ((), transfers) = observation::observe_trace(
         &executor.evaluation_attempt(),
         |_| panic!("unavailable, foreign or stopped captures have no inspectable transfer"),
         || {

@@ -5,14 +5,13 @@
 //! Exact, bounded decoding of a native get-value batch. The legacy whole-model
 //! parser remains best-effort; it is not used to recover these typed values.
 
-mod admission;
 #[cfg(test)]
 mod tests;
 
 use ay_core::{TermId, TermStore};
 use ay_frontend::{sexp::parse_sexp, sexp::parse_sexps, Context};
 
-use super::typed::Decoder;
+use super::{admission, typed::Decoder};
 use crate::api::types::ModelValue;
 
 pub(in crate::api) const MAX_GET_VALUE_TERMS: usize = 4096;

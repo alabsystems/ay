@@ -96,7 +96,7 @@ impl Executor {
                 .ctx
                 .assertions
                 .len()
-                .checked_mul(std::mem::size_of::<ay_core::TermId>())
+                .checked_mul(size_of::<ay_core::TermId>())
             else {
                 return "(error \"tactic root size overflow\")".into();
             };
@@ -241,7 +241,7 @@ mod tests {
         for _ in 0..128 {
             wire = exec.ctx.terms.mk_app_structural(
                 Symbol::named("opaque"),
-                &[wire, wire],
+                [wire, wire],
                 sort.clone(),
             );
         }
@@ -260,7 +260,7 @@ mod tests {
         assert!(!scope.validate(&exec));
         assert_eq!(exec.ctx.terms.true_memory_bytes(), source_bytes);
         // No term builder or formatting refusal may invent new assertions.
-        assert!(exec.ctx.assertions.is_empty());
+        assert_eq!(exec.ctx.assertions, [] as [ay_core::TermId; 0]);
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
             deep = exec
                 .ctx
                 .terms
-                .mk_app_structural(Symbol::named("not"), &[deep], Sort::Bool);
+                .mk_app_structural(Symbol::named("not"), [deep], Sort::Bool);
         }
         for term in [literal, string, deep] {
             let expected = exec.format_term(term);

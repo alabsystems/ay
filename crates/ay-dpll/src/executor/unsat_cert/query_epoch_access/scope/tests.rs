@@ -61,7 +61,7 @@ fn compact_literal_false_authority_survives_disabled_surface_retention() {
         executor
             .execute_all(&ay_frontend::parse(text).unwrap())
             .unwrap();
-        assert!(executor.ctx.assertions_parsed().is_empty());
+        assert_eq!(executor.ctx.assertions_parsed(), []);
         assert_eq!(executor.ctx.assertions, [executor.ctx.terms.false_term()]);
         open_epoch(&mut executor, true);
         // Even a retained source flag cannot grant an assumption that the
@@ -199,7 +199,7 @@ fn exact_binding_rejects_foreign_context_and_changed_order_without_arena_wide_re
             .unwrap()
             .is_none());
     }
-    executor
+    let _ = executor
         .ctx
         .terms
         .mk_var("later_unused_term", CoreSort::Bool);

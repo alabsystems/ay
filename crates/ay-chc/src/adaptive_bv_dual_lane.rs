@@ -6580,7 +6580,7 @@ impl AdaptivePortfolio {
             return PortfolioResult::Unknown;
         };
         let mut int_config = self.simple_loop_portfolio_config(budget);
-        int_config.enable_preprocessing = false; // We preprocess manually via build_int_only
+        int_config.enable_preprocessing = false; // We preprocess manually via build_int_only_with_limits
         self.prepare_portfolio_config(&mut int_config, StagedProbeBudgetProfile::BmcOnly);
 
         // Lane C: BV-native → PDR + BMC on original BV problem (#5877 Wave 3)
@@ -7401,7 +7401,7 @@ impl AdaptivePortfolio {
     /// expansion (`expand_select_store_symbolic`).
     ///
     /// Lane C preserves `Array(BV, BV)` sorts via
-    /// `PreprocessSummary::build_bv_native`, letting PDR operate on the array
+    /// `PreprocessSummary::build_bv_native_with_limits`, letting PDR operate on the array
     /// natively and emit ROW ITE expansions during inductiveness checks.
     ///
     /// Both lanes share the full inherited route budget; the first on-time

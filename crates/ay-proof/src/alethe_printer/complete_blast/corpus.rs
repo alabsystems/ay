@@ -22,7 +22,7 @@
 
 use super::*;
 use ay_core::kani_compat::DetHashMap;
-use ay_core::{Sort, Symbol, TermStore};
+use ay_core::{Sort, Symbol, TermData, TermStore};
 use num_bigint::BigInt;
 use std::time::Instant;
 
@@ -156,13 +156,7 @@ impl Reader<'_> {
             "=" | "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge" => {
                 Some(self.terms.mk_app(Symbol::named(name), args, Sort::Bool))
             }
-            "ite" => {
-                if self.terms.sort(args[1]) == &Sort::Bool {
-                    Some(self.terms.mk_ite_raw(args[0], args[1], args[2]))
-                } else {
-                    Some(self.terms.mk_ite_raw(args[0], args[1], args[2]))
-                }
-            }
+            "ite" => Some(self.terms.mk_ite_raw(args[0], args[1], args[2])),
             "concat" => {
                 let mut total = 0;
                 for arg in args {
@@ -250,6 +244,29 @@ pub(super) fn read_problem(source: &str) -> Option<(TermStore, TermId)> {
         }
     }
     assertion.map(|a| (terms, a))
+}
+
+#[test]
+fn reader_preserves_boolean_and_bit_vector_ite_sorts() {
+    let declarations = "(declare-const x (_ BitVec 4))\n\
+                        (declare-const y (_ BitVec 4))\n";
+
+    let boolean_source = format!("{declarations}(assert (ite (= x y) (= x x) (= y y)))\n");
+    let (boolean_terms, boolean_ite) = read_problem(&boolean_source).expect("Boolean ite");
+    assert!(matches!(boolean_terms.get(boolean_ite), TermData::Ite(..)));
+    assert_eq!(boolean_terms.sort(boolean_ite), &Sort::Bool);
+
+    let bit_vector_source = format!("{declarations}(assert (= (ite (= x y) x y) x))\n");
+    let (bit_vector_terms, equality) = read_problem(&bit_vector_source).expect("bit-vector ite");
+    let TermData::App(_, equality_args) = bit_vector_terms.get(equality) else {
+        panic!("bit-vector ite equality");
+    };
+    let bit_vector_ite = equality_args[0];
+    assert!(matches!(
+        bit_vector_terms.get(bit_vector_ite),
+        TermData::Ite(..)
+    ));
+    assert_eq!(bit_vector_terms.sort(bit_vector_ite), &Sort::bitvec(4));
 }
 
 /// The problem text a checker reads, with solver options and `exit` removed.

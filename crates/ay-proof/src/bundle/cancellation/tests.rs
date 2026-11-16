@@ -11,9 +11,8 @@ use ay_core::AletheRule;
 
 use super::*;
 
-mod fixtures;
-mod oracle;
-
+use super::super::cancellation_fixtures as fixtures;
+use super::oracle;
 use fixtures::{contradiction, datatype, skolem};
 
 fn assert_same(

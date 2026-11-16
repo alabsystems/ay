@@ -340,8 +340,11 @@ fn test_xor_extension_propagate_after_assign() {
 
     // No initial propagation (2 vars, not unit)
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses.as_slice(), &[] as &[Vec<Literal>]);
+    assert_eq!(
+        result.propagations.as_slice(),
+        &[] as &[(Vec<Literal>, Literal)]
+    );
 
     // Assign x0 = true
     ctx.assign(0, true);
@@ -352,7 +355,10 @@ fn test_xor_extension_propagate_after_assign() {
         result.clauses.is_empty(),
         "XOR should use lightweight propagations"
     );
-    assert!(!result.propagations.is_empty());
+    assert_ne!(
+        result.propagations.as_slice(),
+        &[] as &[(Vec<Literal>, Literal)]
+    );
 
     // Find the clause that propagates x1
     let prop_clause = result.propagations.iter().find(|(c, lit)| {
@@ -402,7 +408,7 @@ fn test_xor_extension_resyncs_after_trail_shrink_without_explicit_backtrack() {
     ctx.backtrack_to(0);
 
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses.as_slice(), &[] as &[Vec<Literal>]);
     assert_eq!(result.propagations.len(), 1);
     let (reason, propagated) = &result.propagations[0];
     assert_eq!(*propagated, Literal::negative(Variable::new(1)));
@@ -493,8 +499,11 @@ fn test_xor_extension_backtrack_recovers_non_watched_unit() {
     ctx.assign(3, false);
     ctx.assign(0, true);
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses.as_slice(), &[] as &[Vec<Literal>]);
+    assert_eq!(
+        result.propagations.as_slice(),
+        &[] as &[(Vec<Literal>, Literal)]
+    );
     assert!(result.conflict.is_none());
 
     // Add x1 and then x4 at deeper levels, but propagate only after both are on
@@ -504,8 +513,11 @@ fn test_xor_extension_backtrack_recovers_non_watched_unit() {
     ctx.new_level();
     ctx.assign(4, false);
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses.as_slice(), &[] as &[Vec<Literal>]);
+    assert_eq!(
+        result.propagations.as_slice(),
+        &[] as &[(Vec<Literal>, Literal)]
+    );
     assert!(result.conflict.is_none());
 
     // Backtrack away only x4. The row is now unit on x4=false, even though x4
@@ -949,7 +961,7 @@ fn test_preprocess_clauses_basic() {
     let (remaining, xor_ext) = preprocess_clauses(&clauses);
 
     // All clauses should be consumed by XOR detection
-    assert!(remaining.is_empty());
+    assert_eq!(remaining.as_slice(), &[] as &[Vec<Literal>]);
 
     // Should have detected XOR
     let ext = xor_ext.expect("Should detect XOR");
@@ -1038,7 +1050,7 @@ fn test_preprocess_clauses_with_stats() {
 
     let (remaining, xor_ext, stats) = preprocess_clauses_with_stats(&clauses);
 
-    assert!(remaining.is_empty());
+    assert_eq!(remaining.as_slice(), &[] as &[Vec<Literal>]);
     assert!(xor_ext.is_some());
 
     // Stats
@@ -1300,7 +1312,7 @@ fn test_parse_ext_dimacs_preserves_empty_cnf_clause() {
     let formula = parse_ext_dimacs_str("p cnf 0 1\n0\n").unwrap();
 
     assert_eq!(formula.clauses, vec![Vec::new()]);
-    assert!(formula.xors.is_empty());
+    assert_eq!(formula.xors.as_slice(), &[] as &[XorConstraint]);
 }
 
 #[test]
@@ -1433,8 +1445,8 @@ x1 2 0
 #[test]
 fn test_empty_crypto_minisat_xor_record_is_noop() {
     let formula = parse_ext_dimacs_str("p cnf 0 0\nx0\n").expect("empty XOR record parses");
-    assert!(formula.clauses.is_empty());
-    assert!(formula.xors.is_empty());
+    assert_eq!(formula.clauses.as_slice(), &[] as &[Vec<Literal>]);
+    assert_eq!(formula.xors.as_slice(), &[] as &[XorConstraint]);
     assert!(formula.solve().is_sat());
 }
 
@@ -1541,7 +1553,7 @@ fn test_write_empty_xor_parities_preserves_semantics() {
     assert_eq!(written, "p cnf 0 1\n0\n");
     let reparsed = parse_ext_dimacs_str(&written).unwrap();
     assert_eq!(reparsed.clauses, vec![Vec::new()]);
-    assert!(reparsed.xors.is_empty());
+    assert_eq!(reparsed.xors.as_slice(), &[] as &[XorConstraint]);
     assert!(reparsed.solve().is_unsat());
 }
 
@@ -1566,7 +1578,7 @@ fn test_write_ext_dimacs_rejects_variable_beyond_header_without_output() {
     let error = write_ext_dimacs(&mut output, 1, &clauses, &[])
         .expect_err("one-based variable 2 must exceed a one-variable header");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(output.is_empty());
+    assert_eq!(output.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -1576,7 +1588,7 @@ fn test_write_ext_dimacs_rejects_unrepresentable_xor_variable_without_output() {
     let error = write_ext_dimacs(&mut output, usize::MAX, &[], &xors)
         .expect_err("u32::MAX cannot be serialized as a one-based i32 variable");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(output.is_empty());
+    assert_eq!(output.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -1639,7 +1651,7 @@ p cnf 2 0
 x0
 ";
     let formula = parse_ext_dimacs_str(input).expect("CryptoMiniSat x0 record is valid");
-    assert!(formula.xors.is_empty());
+    assert_eq!(formula.xors.as_slice(), &[] as &[XorConstraint]);
 }
 
 #[test]

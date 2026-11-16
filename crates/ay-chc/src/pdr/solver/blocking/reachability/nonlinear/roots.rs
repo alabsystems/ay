@@ -34,7 +34,7 @@ fn replace_subterm(expr: &ChcExpr, target: &ChcExpr, by: &ChcExpr) -> ChcExpr {
         }
         match expr {
             ChcExpr::Op(op, args) => ChcExpr::Op(
-                op.clone(),
+                *op,
                 args.iter()
                     .map(|a| std::sync::Arc::new(replace_subterm(a, target, by)))
                     .collect(),

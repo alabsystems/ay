@@ -2088,17 +2088,6 @@ fn assertion_bound_slot(
     Some((AnyConstraint::Wide(c), v))
 }
 
-/// Every variable of the blocking clause lies in `P`.
-fn block_vars_within(slot: &AnyConstraint, p: &[u32]) -> bool {
-    fn at<C: Tier>(c: &kernel::Constraint<C>, p: &[u32]) -> bool {
-        c.terms.iter().all(|t| p.contains(&t.lit.var))
-    }
-    match slot {
-        AnyConstraint::Narrow(c) => at(c, p),
-        AnyConstraint::Wide(c) => at(c, p),
-    }
-}
-
 /// Slot ids the database holds as DERIVED rather than core.
 ///
 /// A rule that asks `Database::get_proofgoals` with `add_derived_goals =

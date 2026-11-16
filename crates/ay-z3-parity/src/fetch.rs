@@ -493,7 +493,7 @@ fn provision_download(
             "curl",
             args,
             b"",
-            Duration::from_secs(1860),
+            Duration::from_mins(31),
             "official corpus download",
         )
         .map_err(|error| error.to_string())?;
@@ -1699,7 +1699,7 @@ mod tests {
         }
         let bytes = builder.into_inner().unwrap();
         let archive = directory.join("native.tar.zst");
-        std::fs::write(
+        fs::write(
             &archive,
             zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
         )
@@ -1721,10 +1721,10 @@ mod tests {
             ],
         );
         let destination = directory.path().join("out");
-        std::fs::create_dir(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
         extract_official_native(&archive, &destination).unwrap();
         assert_eq!(
-            std::fs::read(destination.join("non-incremental/QF_UF/a.smt2")).unwrap(),
+            fs::read(destination.join("non-incremental/QF_UF/a.smt2")).unwrap(),
             b"(check-sat)\n"
         );
         assert_eq!(collect_smt2(&destination).unwrap().len(), 2);
@@ -1738,11 +1738,11 @@ mod tests {
             &[("a.smt2", b"first"), ("a.smt2", b"second")],
         );
         let destination = directory.path().join("out");
-        std::fs::create_dir(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
         assert!(extract_official_native(&archive, &destination)
             .unwrap_err()
             .contains("duplicate"));
-        assert_eq!(std::fs::read(destination.join("a.smt2")).unwrap(), b"first");
+        assert_eq!(fs::read(destination.join("a.smt2")).unwrap(), b"first");
     }
 
     #[test]
@@ -1759,13 +1759,13 @@ mod tests {
             .unwrap();
         let bytes = builder.into_inner().unwrap();
         let archive = directory.path().join("link.tar.zst");
-        std::fs::write(
+        fs::write(
             &archive,
             zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
         )
         .unwrap();
         let destination = directory.path().join("out");
-        std::fs::create_dir(&destination).unwrap();
+        fs::create_dir(&destination).unwrap();
         assert!(extract_official_native(&archive, &destination)
             .unwrap_err()
             .contains("link"));
@@ -1781,9 +1781,9 @@ mod tests {
         let mut reader = open_official_archive(&archive).unwrap();
         reader.limit = 10;
         assert!(finish_official_archive(&mut reader).is_err());
-        let mut bytes = std::fs::read(&archive).unwrap();
+        let mut bytes = fs::read(&archive).unwrap();
         bytes.truncate(bytes.len() - 2);
-        std::fs::write(&archive, bytes).unwrap();
+        fs::write(&archive, bytes).unwrap();
         let mut reader = open_official_archive(&archive).unwrap();
         assert!(finish_official_archive(&mut reader).is_err());
     }
@@ -1864,8 +1864,8 @@ mod tests {
     fn closed_provisioner_refuses_wrong_archive_size_before_extraction() {
         let temporary = tempfile::tempdir().unwrap();
         let archive = temporary.path().join("QF_UF.tar.zst");
-        std::fs::write(&archive, b"not an archive").unwrap();
-        let result = super::provision_division_child(&[
+        fs::write(&archive, b"not an archive").unwrap();
+        let result = provision_division_child(&[
             archive.display().to_string(),
             temporary.path().display().to_string(),
             "QF_UF".to_string(),
@@ -1878,7 +1878,7 @@ mod tests {
 
     #[test]
     fn closed_provisioner_rejects_path_traversal() {
-        let result = super::provision_division_child(&[
+        let result = provision_division_child(&[
             "archive".to_string(),
             "destination".to_string(),
             "../outside".to_string(),
@@ -1968,7 +1968,7 @@ mod tests {
             // SIGKILL did not run the worker's TempDir destructor. The old
             // transaction really remains, but outside the benchmark tree.
             assert!(orphan.is_dir());
-            assert!(!collect_smt2(&orphan).unwrap().is_empty());
+            assert_ne!(collect_smt2(&orphan).unwrap().as_slice(), &[] as &[String]);
             provision_fixture_division(root.path()).unwrap();
             assert_eq!(collect_smt2(&corpus).unwrap(), ["QF_UF/nested__a.smt2"]);
             assert_eq!(
@@ -2002,15 +2002,15 @@ mod tests {
 
     /// Build a `.tar.zst` whose payload is large enough that the decompressor
     /// still has output buffered when `tar` stops at the end-of-archive marker.
-    fn write_test_archive(dir: &std::path::Path, members: &[(&str, usize)]) -> PathBuf {
+    fn write_test_archive(dir: &Path, members: &[(&str, usize)]) -> PathBuf {
         let stage = dir.join("stage");
-        std::fs::create_dir_all(&stage).expect("stage dir");
+        fs::create_dir_all(&stage).expect("stage dir");
         for (name, size) in members {
-            std::fs::write(stage.join(name), vec![b'x'; *size]).expect("member");
+            fs::write(stage.join(name), vec![b'x'; *size]).expect("member");
         }
         let archive = dir.join("t.tar.zst");
         let names: Vec<&str> = members.iter().map(|(n, _)| *n).collect();
-        let tar = Command::new("tar")
+        let mut tar = Command::new("tar")
             .arg("-cf")
             .arg("-")
             .arg("-C")
@@ -2019,13 +2019,17 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .expect("tar -cf");
+        let tar_stdout = tar.stdout.take().expect("tar stdout");
         let compressed = Command::new("zstd")
             .arg("-q")
             .arg("-o")
             .arg(&archive)
-            .stdin(Stdio::from(tar.stdout.expect("tar stdout")))
-            .status()
-            .expect("zstd");
+            .stdin(Stdio::from(tar_stdout))
+            .status();
+        let archived = tar.wait();
+        let compressed = compressed.expect("zstd");
+        let archived = archived.expect("tar -cf");
+        assert!(archived.success(), "archiving the fixture failed");
         assert!(compressed.success(), "compressing the fixture failed");
         archive
     }
@@ -2116,9 +2120,9 @@ mod tests {
     fn a_truncated_archive_still_fails_the_listing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive = write_test_archive(dir.path(), &[("a.smt2", 1 << 20)]);
-        let bytes = std::fs::read(&archive).expect("read archive");
+        let bytes = fs::read(&archive).expect("read archive");
         let truncated = dir.path().join("truncated.tar.zst");
-        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).expect("write truncated");
+        fs::write(&truncated, &bytes[..bytes.len() / 2]).expect("write truncated");
         let listed_cleanly = match tar_over_zstd(&truncated, &["-tf", "-"], true) {
             Err(_) => false,
             Ok(run) => run.status.success(),
@@ -2303,7 +2307,7 @@ mod tests {
     fn explicit_all_is_accepted_and_still_conflicts_with_sample() {
         let a = parse_args(&["out".to_string(), "--all".to_string()]).expect("--all parses");
         assert!(a.all);
-        assert!(narrowing_notes(&a, 84, 84).is_empty());
+        assert_eq!(narrowing_notes(&a, 84, 84).as_slice(), &[] as &[String]);
         let both = vec![
             "out".to_string(),
             "--all".to_string(),

@@ -85,7 +85,7 @@ fn chrono_ghost_is_skipped_before_invalid_stale_reason_pointer() {
     s.add_reason_literals_admitted(lit, 2, &mut added, 10, &Counted(&owner))
         .unwrap();
     assert_eq!(added, 0);
-    assert!(s.conflict.analyzed_vars().is_empty());
+    assert_eq!(s.conflict.analyzed_vars().len(), 0);
     assert!(owner.usage().unwrap().work_admitted > 0);
 }
 

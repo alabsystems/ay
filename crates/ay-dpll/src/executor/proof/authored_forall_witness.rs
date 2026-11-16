@@ -93,7 +93,7 @@ impl Executor {
     ///
     /// The shared witness `w` is a producer-side HINT: any ground term of the
     /// binder sort works, and a fresh element is minted only when the problem
-    /// has none. `validate_forall_inst` re-checks that `w` is ground w.r.t. the
+    /// has none. `validate_forall_inst_with_progress` re-checks that `w` is ground w.r.t. the
     /// source binders and of the declared sort and that each instance is the
     /// EXACT substitution; the `or`/`resolution` steps are re-checked
     /// independently.

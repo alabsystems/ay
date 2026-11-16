@@ -38,7 +38,7 @@
 //! keyed by the identity of the counted envelope it was reached under, so it
 //! is never reused under different caps.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, mem::size_of};
 
 use super::{TermId, TermStore};
 use crate::kani_compat::{KaniHashMap, KaniHashSet};
@@ -48,11 +48,13 @@ use crate::kani_compat::{KaniHashMap, KaniHashSet};
 /// untrusted proof cannot grow either table without limit.
 const MAX_STRICT_BV_SEMANTICS_MEMO: usize = 4096;
 
+type StrictBvRefusals = KaniHashMap<(u64, Vec<TermId>), Box<str>>;
+
 /// The two tables. Deliberately not `Clone`; see [`Self::for_clone`].
 #[derive(Default)]
 pub(super) struct StrictBvSemanticsMemo {
     accepted: RefCell<KaniHashSet<Vec<TermId>>>,
-    refused: RefCell<KaniHashMap<(u64, Vec<TermId>), Box<str>>>,
+    refused: RefCell<StrictBvRefusals>,
 }
 
 impl StrictBvSemanticsMemo {

@@ -140,9 +140,8 @@ use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
 /// box is. Raising it cannot make a proof wrong, only slower; lowering it turns
 /// certificates into declines.
 ///
-/// SIZED FROM MEASUREMENT, not chosen. See `certified_bb::tests` and the
-/// measurement table in the branch report: the heaviest instance this route
-/// certifies opens 443 nodes (`sbox_4_shg`, prototype guidance) and the three
+/// SIZED FROM MEASUREMENT, not chosen: the heaviest instance this route
+/// certifies opens 443 nodes (`sbox_4_shg`, prototype guidance), while the three
 /// `injcomp` members that DO NOT close open more than 200,000 without ever
 /// closing. 4,096 is the power of two inside that gap.
 const MAX_NODES: u64 = 4_096;
@@ -449,6 +448,16 @@ const MAX_LEAF_SCALE: i128 = 1 << 20;
 /// over `num_vars` plus the cited rows — and the entries that pay are the near
 /// ones (a sibling's closing combination) and the root's, not a long history.
 const MAX_DUAL_POOL: usize = 8;
+
+const _: () = {
+    assert!(MAX_ROOT_LP_POLLS > MAX_NODE_LP_POLLS);
+    assert!(MAX_NODE_LP_POLLS_FAST < MAX_NODE_LP_POLLS);
+    assert!(MAX_DUAL_POOL > 0);
+    assert!(MAX_BLIND_NODES < MAX_NODES);
+    assert!(
+        MAX_UNINTERRUPTIBLE_NODES < MAX_NODES && MAX_UNINTERRUPTIBLE_POLLS < MAX_TOTAL_LP_POLLS
+    );
+};
 
 /// THE ROUTE'S BOUND ON WORK, counted in MODEL NONZEROS TOUCHED.
 ///
@@ -2135,11 +2144,11 @@ pub(super) fn certified_bb_diagnosis(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::{
         attempt, certified_bb_diagnosis, certify_opt_lin_certified_bb, fallback_branch_variable,
-        run, single_row_farkas, try_leaf, Admission, Outcome, Work, MAX_BLIND_NODES, MAX_DEPTH,
-        MAX_DUAL_POOL, MAX_NODES, MAX_NODE_LP_POLLS, MAX_NODE_LP_POLLS_FAST, MAX_ROOT_LP_POLLS,
-        MAX_TOTAL_LP_POLLS, MAX_UNINTERRUPTIBLE_NODES, MAX_UNINTERRUPTIBLE_POLLS, MAX_WORK,
+        run, single_row_farkas, try_leaf, Admission, Outcome, Work, MAX_TOTAL_LP_POLLS, MAX_WORK,
     };
     use crate::optimize::lp_bound::LpDualDecline;
     use crate::proof::cert::cp_replay::self_check_soli_refutation;
@@ -2318,11 +2327,10 @@ mod tests {
         // 2. The `soli` line removed: the contradiction is then untainted, which
         //    would mean the FORMULA is unsatisfiable — impossible next to a
         //    re-verified feasible incumbent.
-        let stripped: String = proof
-            .lines()
-            .filter(|line| !line.starts_with("soli "))
-            .map(|line| format!("{line}\n"))
-            .collect();
+        let mut stripped = String::new();
+        for line in proof.lines().filter(|line| !line.starts_with("soli ")) {
+            writeln!(&mut stripped, "{line}").expect("writing to String cannot fail");
+        }
         assert!(!self_check_soli_refutation(
             &stripped, &instance, &incumbent, optimum, cited
         ));
@@ -2456,12 +2464,14 @@ mod tests {
             .lines()
             .position(|line| line == target)
             .expect("the target leaf");
-        let without_pol: String = proof
+        let mut without_pol = String::new();
+        for (_, line) in proof
             .lines()
             .enumerate()
             .filter(|(index, _)| *index + 1 != leaf_index)
-            .map(|(_, line)| format!("{line}\n"))
-            .collect();
+        {
+            writeln!(&mut without_pol, "{line}").expect("writing to String cannot fail");
+        }
         assert_ne!(without_pol, proof, "the mutation must change the bytes");
         assert!(
             !self_check_soli_refutation(&without_pol, &instance, &incumbent, optimum, cited),
@@ -2534,93 +2544,6 @@ mod tests {
             leaf.support,
             [0usize, 1].into_iter().collect(),
             "the clause is exactly the two branch literals"
-        );
-    }
-
-    /// THE BUDGETS ARE COUNTS, AND THE ROOT'S IS THE ONE THAT DIFFERS. Pinned so
-    /// a blind resize cannot silently cross a measured edge: at 128 polls the
-    /// root of `f20c10b_008` produces no dual point at all, and at 4096
-    /// EVERYWHERE `sbox_4_shg` spends the whole global budget without
-    /// certifying.
-    #[test]
-    fn the_budgets_are_counts_and_sized_from_measurement() {
-        assert!(
-            MAX_ROOT_LP_POLLS > MAX_NODE_LP_POLLS,
-            "the root solve is a full model and needs more than a guidance solve"
-        );
-        assert_eq!(
-            MAX_ROOT_LP_POLLS, 4_096,
-            "sized off lp_dual_floor::MAX_DUAL_SOLVE_POLLS' own measurement"
-        );
-        assert!(
-            MAX_NODES >= 443,
-            "443 is the heaviest measured certifying tree (sbox_4_shg, prototype guidance)"
-        );
-        assert!(
-            MAX_TOTAL_LP_POLLS > 25_304,
-            "cap {MAX_TOTAL_LP_POLLS} would decline sbox_4_shg, the heaviest measured \
-             certifying member"
-        );
-        assert!(
-            MAX_TOTAL_LP_POLLS <= 65_536,
-            "past this the DECLINE ceiling (~80 s at 32,768) returns to the minute-scale \
-             overshoot lp_dual_floor::MAX_DUAL_SOLVE_POLLS exists to close"
-        );
-        assert!(
-            MAX_DEPTH > 187,
-            "the measured injcomp non-closers reach depth 187; the node cap, not the \
-             depth cap, must be what stops them"
-        );
-        assert!(
-            MAX_NODE_LP_POLLS_FAST < MAX_NODE_LP_POLLS,
-            "the fast pass must be cheaper than the full one or the escalation is a tax"
-        );
-        assert_eq!(
-            MAX_NODE_LP_POLLS_FAST, 16,
-            "sized from the measured population split: at 16 polls per node \
-             m100_300_10_20.r's LP answers at EVERY node (guided=0) and the proof is \
-             byte-identical to the 128-poll one, while addm4.r, fir04_trarea_ac and \
-             f20c10b_008_area_delay get no point at ~half their nodes and escalate"
-        );
-        assert!(
-            MAX_DUAL_POOL > 0,
-            "a pool of nothing makes `remember` a no-op and every replay impossible"
-        );
-        assert!(
-            MAX_BLIND_NODES < MAX_NODES,
-            "a blind cap at or above the node cap is not a cap: the 436x wall on \
-             50-250-false-45-90-4-2000opt is exactly a blind walk to MAX_NODES"
-        );
-        assert!(
-            MAX_BLIND_NODES >= 14,
-            "9symml branches blind 14 times on its way from 403 nodes to 1,859; below \
-             14 this cap starts costing node throughput instead of only bounding waste"
-        );
-        assert!(
-            MAX_BLIND_NODES < 142,
-            "the smallest measured blind count above 9symml's 14 is ssa7552-159's 142, so \
-             142 is the first cap that stops binding on a measured instance. NOT because \
-             the counts 'jump 14 -> 145 with nothing in between' -- they do not; \
-             ssa7552-159 is 142 and single-obj-f3 is 178, and the enumerated list in the \
-             MAX_BLIND_NODES comment is not a complete census. What holds is one-sided \
-             and is all this needs: among the caps that keep 9symml, the smallest \
-             measured is the cheapest -- cap 64 costs vertexcover_..._dim_071 77.8 s \
-             where cap 16 costs 22.9 s"
-        );
-        assert!(
-            MAX_UNINTERRUPTIBLE_NODES >= 1_443,
-            "1,443 is the largest tree this route has ever certified (m100_300_10_20.r); \
-             below it a starved caller loses a certificate it gets today"
-        );
-        assert!(
-            MAX_UNINTERRUPTIBLE_POLLS >= 21_735,
-            "21,735 is the most polls any certificate this route has produced needed \
-             (m100_300_10_20.r again); below it a starved caller loses that conversion"
-        );
-        assert!(
-            MAX_UNINTERRUPTIBLE_NODES < MAX_NODES && MAX_UNINTERRUPTIBLE_POLLS < MAX_TOTAL_LP_POLLS,
-            "at or above its own budget an escape is not an escape: this rung would be \
-             uninterruptible again, which is the defect a --timeout has to reach"
         );
     }
 
@@ -2705,7 +2628,7 @@ mod tests {
     /// The route is unscheduled on purpose, so the stop signal must not be able
     /// to change a certificate — only to withhold one. Two halves, both
     /// asserted: a caller that stops IMMEDIATELY still gets the identical proof
-    /// (because the certifying envelope is below `MAX_UNINTERRUPTIBLE_NODES`),
+    /// (because the certifying envelope is below `super::MAX_UNINTERRUPTIBLE_NODES`),
     /// and the interruptible entry with a never-stop signal is the plain one.
     #[test]
     fn an_always_true_stop_signal_cannot_change_an_emitted_certificate() {

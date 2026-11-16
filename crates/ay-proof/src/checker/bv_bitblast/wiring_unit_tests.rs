@@ -73,7 +73,8 @@ fn malformed_widths_literals_and_compound_values_keep_their_old_refusals() {
     let x = terms.mk_var("x", Sort::bitvec(8));
     let unit = terms.mk_bitvec(BigInt::from(1), 8);
     let wide_unit = terms.mk_bitvec(BigInt::from(1), 16);
-    for factor in [wide_unit] {
+    {
+        let factor = wide_unit;
         let product = terms.mk_app(Symbol::named("bvmul"), [x, factor], Sort::bitvec(8));
         let forged = equality(&mut terms, product, x);
         assert!(!holds_by_wiring(&terms, &[forged]));

@@ -7,7 +7,7 @@
 //! Each universal is instantiated at the registered ground terms of its binder
 //! sort (bit-vector constants first) with the literal substitution
 //! `forall_inst` accepts, and the instance is clausified by `or` or `implies`.
-//! The values are proposals only: `validate_forall_inst` re-derives every
+//! The values are proposals only: `validate_forall_inst_with_progress` re-derives every
 //! substitution, and an instance matters only if unit propagation over it
 //! (`facts.rs`) reaches a conflict the strict checker then replays.
 

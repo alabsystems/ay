@@ -427,7 +427,7 @@ fn terminal<T: Debug + PartialEq>(invalid: &str, valid: &str, decode: Decoder<T>
             decode,
             WORK,
             STORAGE,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             &mut |_, _| -> bool { panic!("expired before callback") },
         );
         assert_eq!(outcome.result, Err(TransportError::Deadline));

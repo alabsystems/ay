@@ -86,7 +86,7 @@ fn every_success_and_failure_cleanup_poll_refuses_terminally() {
 #[test]
 fn original_deadline_precedes_callback_and_even_malformed_input() {
     let outcome = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired before callback") },
         |control| read(b"{", 1, control),
     );
@@ -120,9 +120,7 @@ fn caught_progress_panic_poisoning_survives_another_read_and_final_cleanup() {
         end(),
         &mut |_, _| {
             calls.set(calls.get() + 1);
-            if calls.get() == 4 {
-                panic!("caught callback panic");
-            }
+            assert!(calls.get() != 4, "caught callback panic");
             true
         },
         |control| {

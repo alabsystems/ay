@@ -265,7 +265,7 @@ mod tests {
             Some(INIT_WEIGHT)
         );
         assert!(search.move_boolean(&mut || false).is_some());
-        assert!(search.unsat.is_empty());
+        assert_eq!(search.unsat, Vec::<u32>::new());
         assert!(search.atoms[atom as usize].truth);
     }
 }

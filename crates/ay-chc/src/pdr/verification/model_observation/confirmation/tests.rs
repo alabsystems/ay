@@ -128,7 +128,9 @@ fn missing_candidate_assignments_do_not_become_original_satisfaction() {
 #[test]
 fn original_expired_clause_clock_is_not_restarted_by_a_new_step_timeout() {
     let mut verifier = verifier();
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let result = verifier.confirm_original_validation_sat(
         &ChcExpr::Bool(true),
         &[],

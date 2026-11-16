@@ -28,7 +28,7 @@ pub(super) fn round_to_integral_owned(mode: Rm, value: &Fp, meter: &mut Meter<'_
     // Preserve the input sign when rounding a negative magnitude to zero.
     // Legal tiny exponent formats can overflow (e.g. (2,3), 3.5 -> 4);
     // the normal rounding kernel applies the selected IEEE overflow rule.
-    let rounded = meter.from_integer(rounded)?;
+    let rounded = meter.rational_from_integer(rounded)?;
     round_rational_owned(&rounded, value.sign, value.eb, value.sb, mode, meter)
 }
 
@@ -61,7 +61,7 @@ pub(super) fn remainder_owned(left: &Fp, right: &Fp, meter: &mut Meter<'_>) -> O
     } else {
         magnitude
     };
-    let nearest = meter.from_integer(nearest)?;
+    let nearest = meter.rational_from_integer(nearest)?;
     let product = meter.rational_binary(&y, &nearest, Arithmetic::Multiply)?;
     let exact = meter.rational_binary(&x, &product, Arithmetic::Subtract)?;
     if !rational_is_bounded(&exact) {

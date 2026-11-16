@@ -80,9 +80,7 @@ impl Executor {
             {
                 continue;
             }
-            let Some(fields) = self.ctx.constructor_selector_info(symbol.name()) else {
-                return None;
-            };
+            let fields = self.ctx.constructor_selector_info(symbol.name())?;
             if args.len() != fields.len()
                 || !fields
                     .iter()

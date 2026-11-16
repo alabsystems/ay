@@ -175,7 +175,7 @@ impl Solver {
         match self.finish_unsat_declaration_admitted(
             backward_result,
             proof_progress,
-            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
+            &conflict_analysis_minimize_lrat::root::Ordinary,
         ) {
             Ok(result) => result,
             Err(never) => match never {},
@@ -799,9 +799,9 @@ impl Solver {
     /// `level0_proof_id`, since these represent original clauses whose
     /// arena reference was cleared after propagation.
     pub(in crate::solver) fn finalize_streaming_core(&mut self) {
-        match self.finalize_streaming_core_admitted(
-            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
-        ) {
+        match self
+            .finalize_streaming_core_admitted(&conflict_analysis_minimize_lrat::root::Ordinary)
+        {
             Ok(()) => (),
             Err(never) => match never {},
         }
@@ -1014,9 +1014,8 @@ impl Solver {
     /// Cost: O(num_originals) scan of the bitmap. For typical formulas this is
     /// negligible compared to the solve time.
     pub(in crate::solver) fn extract_streaming_core(&self) -> Option<Vec<u64>> {
-        match self.extract_streaming_core_admitted(
-            &crate::solver::conflict_analysis_minimize_lrat::root::Ordinary,
-        ) {
+        match self.extract_streaming_core_admitted(&conflict_analysis_minimize_lrat::root::Ordinary)
+        {
             Ok(core) => core,
             Err(never) => match never {},
         }

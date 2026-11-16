@@ -917,15 +917,9 @@ impl Contractor<'_, '_> {
         self.linear_form(*def, depth + 1)
     }
 
-    /// Whether an asserted equality atom forces `u == v`: its normalized
-    /// linear form is `k*u - k*v = 0` for some nonzero integer `k`.
-    fn vars_asserted_equal(&self, u: TermId, v: TermId) -> bool {
-        self.vars_asserted_equal_premise(u, v).is_some()
-    }
-
-    /// As [`Self::vars_asserted_equal`], returning the justifying
-    /// literal: `Some(None)` for the same variable, `Some(Some(lit))`
-    /// via an asserted equality atom, `None` when not equal.
+    /// Return the literal justifying an asserted equality between `u` and `v`:
+    /// `Some(None)` for the same variable, `Some(Some(lit))` via an asserted
+    /// equality atom, and `None` when no asserted equality forces it.
     fn vars_asserted_equal_premise(&self, u: TermId, v: TermId) -> Option<Option<(TermId, bool)>> {
         if u == v {
             return Some(None);
@@ -1345,15 +1339,10 @@ impl Contractor<'_, '_> {
         }
     }
 
-    /// Asserted offset equality `u = v + d`: an asserted equality atom
-    /// whose normalized linear form is `k0*u - k0*v + c0 = 0` with
-    /// `k0 != 0` and `k0 | c0`, giving `d = -c0 / k0`.
-    fn vars_asserted_offset(&self, u: TermId, v: TermId) -> Option<BigInt> {
-        self.vars_asserted_offset_premise(u, v).map(|(d, _)| d)
-    }
-
-    /// As [`Self::vars_asserted_offset`], also returning the justifying
-    /// literal (`None` for the same variable).
+    /// Return an asserted offset equality `u = v + d` and its justifying
+    /// literal (`None` for the same variable). The normalized equality has
+    /// form `k0*u - k0*v + c0 = 0`, where `k0 != 0` and `k0 | c0`, giving
+    /// `d = -c0 / k0`.
     fn vars_asserted_offset_premise(
         &self,
         u: TermId,

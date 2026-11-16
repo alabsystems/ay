@@ -18,7 +18,7 @@ fn traced_removal_augmentation_refuses_before_snapshot_without_disabling_default
     );
     assert!(format!("{:?}", owner.usage().unwrap().refusal).contains("LRAT removal augmentation"));
     assert_eq!(s.stats.lrat_original_learned_snapshot_copies, 0);
-    assert!(s.min.lrat_original_learned_buf.is_empty());
+    assert_eq!(s.min.lrat_original_learned_buf.len(), 0);
     assert!(s.cold.lrat_enabled && s.shrink_enabled);
     assert_eq!(format!("{:?}", s.clause_trace()), trace);
     clean(&mut s);
@@ -128,18 +128,16 @@ fn dirty_preexisting_minimizer_state_is_not_claimed_or_cleared() {
 
 #[test]
 fn active_hint_work_is_refused_before_finalization_effects() {
-    for roots in [vec![]] {
-        let (mut s, _, _) = fixture(true, BranchHeuristic::Evsids);
-        s.mark_veripb_hints_active_for_test();
-        let owner = test_owner(10_000_000, 10_000_000);
-        let before = format!("{:?}", s.vsids);
-        assert!(s
-            .finalize_conflict_analysis_admitted(neg(4), roots, &Counted(&owner))
-            .is_err());
-        assert_eq!(format!("{:?}", s.vsids), before);
-        assert_eq!(s.conflict.learned_count(), 0);
-        assert!(owner.check().is_err());
-    }
+    let (mut s, _, _) = fixture(true, BranchHeuristic::Evsids);
+    s.mark_veripb_hints_active_for_test();
+    let owner = test_owner(10_000_000, 10_000_000);
+    let before = format!("{:?}", s.vsids);
+    assert!(s
+        .finalize_conflict_analysis_admitted(neg(4), Vec::new(), &Counted(&owner))
+        .is_err());
+    assert_eq!(format!("{:?}", s.vsids), before);
+    assert_eq!(s.conflict.learned_count(), 0);
+    assert!(owner.check().is_err());
 }
 
 #[test]

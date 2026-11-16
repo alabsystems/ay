@@ -164,7 +164,7 @@ fn sbva_counts_and_yield_signal_report_the_work_done() {
 
     assert_eq!(solver.sbva_counts(), (1, 1, 1));
     assert_eq!(solver.num_vars, 11, "one extension variable");
-    let index = crate::solver::solver_stats::inprocessing_timing_index(DiagnosticPass::Sbva)
+    let index = solver_stats::inprocessing_timing_index(DiagnosticPass::Sbva)
         .expect("SBVA is a timed pass");
     assert_eq!(solver.stats.inprocessing_pass_runs[index], 1);
     assert_eq!(solver.stats.inprocessing_pass_yields[index], 1);

@@ -266,7 +266,10 @@ mod maxsat_cli_flag_tests {
         let flags = args.engine_flags.misc_cli_flags();
         assert!(!flags.maxsat_bce, "BCE remains opt-in");
         assert!(!flags.maxsat_no_milp_race, "MILP race remains default-on");
-        assert!(args.engine_flags.solver_cli_args(false).is_empty());
+        assert_eq!(
+            args.engine_flags.solver_cli_args(false).as_slice(),
+            &[] as &[&str]
+        );
     }
 
     #[test]

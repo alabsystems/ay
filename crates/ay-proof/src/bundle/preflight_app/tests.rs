@@ -53,7 +53,7 @@ fn run(
 }
 
 fn compare(entries: &[(TermData, Sort)], symbol: &Symbol, args: &[TermId], result: &Sort) -> bool {
-    let old = crate::bundle::validate_app_signature(entries, entries.len(), symbol, args, result);
+    let old = validate_app_signature(entries, entries.len(), symbol, args, result);
     let new = run(entries, symbol, args, result);
     assert_eq!(
         old.is_ok(),

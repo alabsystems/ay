@@ -119,7 +119,7 @@ fn joint_quantifier_plan_copy_budget_is_shared_and_refusal_restores_bindings() {
         1
     );
     let charged = initial - evaluator.quantifier_state.plan_bytes_left.get();
-    assert!(charged >= 2 * 2 * std::mem::size_of::<ModelValue>());
+    assert!(charged >= 2 * 2 * size_of::<ModelValue>());
     evaluator.quantifier_state.plan_bytes_left.set(charged - 1);
     assert_eq!(
         plan(&evaluator, QuantifierKind::Forall, &bindings, body, 0).unwrap_err(),

@@ -118,10 +118,10 @@ mod tests {
         let a = terms.mk_var("a".to_string(), Sort::bitvec(8));
         let b = terms.mk_var("b".to_string(), Sort::bitvec(8));
         let minus_one = terms.mk_bitvec(num_bigint::BigInt::from(255), 8);
-        let condition = terms.mk_app(Symbol::named("="), &[minus_one, b], Sort::Bool);
-        let negated = terms.mk_app(Symbol::named("bvneg"), &[a], Sort::bitvec(8));
+        let condition = terms.mk_app(Symbol::named("="), [minus_one, b], Sort::Bool);
+        let negated = terms.mk_app(Symbol::named("bvneg"), [a], Sort::bitvec(8));
         let ite = terms.mk_ite_raw(condition, negated, a);
-        let equality = terms.mk_app(Symbol::named("="), &[a, ite], Sort::Bool);
+        let equality = terms.mk_app(Symbol::named("="), [a, ite], Sort::Bool);
         let cases = Case::candidates(&terms, &[equality]);
         assert_eq!(cases.len(), 1);
         let [holds, fails] = cases[0];
@@ -131,9 +131,9 @@ mod tests {
             (b, minus_one, condition)
         );
         // An `ite` on anything else is not.
-        let other = terms.mk_app(Symbol::named("="), &[a, b], Sort::Bool);
+        let other = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
         let ite = terms.mk_ite_raw(other, negated, a);
-        let equality = terms.mk_app(Symbol::named("="), &[a, ite], Sort::Bool);
+        let equality = terms.mk_app(Symbol::named("="), [a, ite], Sort::Bool);
         assert!(Case::candidates(&terms, &[equality]).is_empty());
     }
 }

@@ -137,7 +137,7 @@ fn accepts(source: &QuantifiedChcProblem, calls: Calls, cells: Cells, table: &[b
         assert_eq!(clauses[index].body.predicates.len(), 1);
         assert_eq!(clauses[index].body.predicates[0].0, *previous);
     }
-    assert!(clauses[3].body.predicates[0].1.is_empty());
+    assert_eq!(clauses[3].body.predicates[0].1, [] as [ChcExpr; 0]);
     assert!(clauses[3].is_query());
     let mut fact = environment(fact_args, &fact_values);
     let step = environment(step_args, &values);

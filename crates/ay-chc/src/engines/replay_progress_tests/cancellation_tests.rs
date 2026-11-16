@@ -8,8 +8,11 @@ use super::*;
 #[test]
 fn external_only_pdr_token_survives_config_drop_and_reaches_replay() {
     let parent = CancellationToken::new();
-    let mut config = PdrConfig::default();
-    config.external_cancellation_token = Some(parent.child());
+    let base = PdrConfig::default();
+    let config = PdrConfig {
+        external_cancellation_token: Some(parent.child()),
+        ..base
+    };
     let retained = config.effective_cancellation_token();
     drop(config);
     parent.cancel();
@@ -26,9 +29,12 @@ fn either_pdr_channel_reaches_typed_replay_without_poisoning_the_other() {
     for external_cancels in [false, true] {
         let regular = CancellationToken::new();
         let external = CancellationToken::new();
-        let mut config = PdrConfig::default();
-        config.cancellation_token = Some(regular.child());
-        config.external_cancellation_token = Some(external.child());
+        let base = PdrConfig::default();
+        let config = PdrConfig {
+            cancellation_token: Some(regular.child()),
+            external_cancellation_token: Some(external.child()),
+            ..base
+        };
         let retained = config.effective_cancellation_token();
         if external_cancels {
             external.cancel();

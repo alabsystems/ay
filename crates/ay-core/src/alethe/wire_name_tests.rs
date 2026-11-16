@@ -388,30 +388,20 @@ fn bv_eq_simplify_keeps_the_native_extension_out_of_generic_portable_emission() 
     // Vocabulary support does not imply that the pinned checker implements
     // every fragment of a same-named native rule. Only the dedicated Clean
     // lowering may claim the modular offset cases.
-    assert!(super::is_checkable_alethe_rule("eq_simplify"));
-    assert_eq!(super::AletheRule::EqSimplify.name(), "eq_simplify");
-    assert_eq!(
-        super::AletheRule::EqSimplify.wire_name(),
-        super::UNPROVED_STEP_RULE
-    );
+    assert!(is_checkable_alethe_rule("eq_simplify"));
+    assert_eq!(AletheRule::EqSimplify.name(), "eq_simplify");
+    assert_eq!(AletheRule::EqSimplify.wire_name(), UNPROVED_STEP_RULE);
 }
 
 #[test]
 fn bv_offset_spines_keeps_its_versioned_rule_out_of_portable_emission() {
     assert_eq!(
-        super::AletheRule::BvOffsetSpinesV1.name(),
+        AletheRule::BvOffsetSpinesV1.name(),
         "eq_simplify_bv_offset_spines"
     );
-    assert_eq!(
-        super::AletheRule::BvOffsetSpinesV1.wire_name(),
-        super::UNPROVED_STEP_RULE
-    );
-    assert!(super::is_clean_dialect_alethe_rule(
-        "eq_simplify_bv_offset_spines"
-    ));
-    assert!(!super::is_checkable_alethe_rule(
-        "eq_simplify_bv_offset_spines"
-    ));
+    assert_eq!(AletheRule::BvOffsetSpinesV1.wire_name(), UNPROVED_STEP_RULE);
+    assert!(is_clean_dialect_alethe_rule("eq_simplify_bv_offset_spines"));
+    assert!(!is_checkable_alethe_rule("eq_simplify_bv_offset_spines"));
 }
 
 #[test]

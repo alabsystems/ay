@@ -137,7 +137,7 @@ fn actual_pigeonhole_witness_survives_private_unwind() {
 fn actual_unsat_rebuild_does_not_expand_outer_premise_authority() {
     let mut exec = parsed("(set-logic QF_LIA) (declare-const x Int) (assert (= x 0))");
     exec.rebuild_trust_leaf_proof_from_original_assertions(&mut Proof::new());
-    assert!(!exec.last_proof_rebuild_originals.is_empty());
+    assert_ne!(exec.last_proof_rebuild_originals, [] as [TermId; 0]);
     exec.execute_all(
         &ay_frontend::parse(
             "(assert (= (let ((k (+ x 1))) k) 0))
@@ -155,9 +155,9 @@ fn actual_unsat_rebuild_does_not_expand_outer_premise_authority() {
         roots.clone(),
         &roots,
         |this| {
-            assert!(this.last_proof_rebuild_originals.is_empty());
+            assert_eq!(this.last_proof_rebuild_originals, [] as [TermId; 0]);
             this.rebuild_trust_leaf_proof_from_original_assertions(&mut Proof::new());
-            assert!(!this.last_proof_raw_original_assertions.is_empty());
+            assert_ne!(this.last_proof_raw_original_assertions, [] as [TermId; 0]);
             assert!(this
                 .last_proof_rebuild_originals
                 .iter()

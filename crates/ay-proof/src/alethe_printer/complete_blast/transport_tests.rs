@@ -203,7 +203,7 @@ fn a_chain_landing_on_a_strict_subset_is_weakened_to_the_derived_clause() {
     assert_eq!(chain.premises, vec!["t.c3".to_owned(), "t.c2".to_owned()]);
 
     assert!(weakening.weakening);
-    assert!(weakening.pivots.is_empty());
+    assert_eq!(weakening.pivots, []);
     assert_eq!(weakening.premises, vec![chain.name.clone()]);
     assert_eq!(
         weakening.lits,
@@ -285,11 +285,7 @@ fn a_normalized_input_clause_records_its_printed_literals() {
             SRef { gate: h, nots: 0 },
             SRef { gate: h, nots: 0 },
         ],
-        emit: ClauseEmit::Rule {
-            rule: "fixture",
-            args: None,
-            premises: Vec::new(),
-        },
+        emit: ClauseEmit::bare("refl").expect("the fixture rule is checkable"),
     });
     let lit = |gate: u32| {
         Blaster::sat_literal(SRef { gate, nots: 0 }).expect("the gate has a SAT literal")

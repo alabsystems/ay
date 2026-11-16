@@ -236,7 +236,7 @@ fn resolvent_forced_and_chains(n_in: usize) -> (usize, Vec<Vec<i32>>) {
 /// shape that turned six 0.15-186 s SAT solves into 300 s timeouts.
 #[test]
 fn a_long_enumeration_never_spends_the_solve_budget() {
-    let budget = std::time::Duration::from_secs(20);
+    let budget = Duration::from_secs(20);
     let (nv, clauses) = resolvent_forced_and_chains(34);
     let mut s = solver_from(nv, &clauses);
     s.set_solve_deadline(Some(ay_core::time::Instant::now() + budget));
@@ -274,7 +274,7 @@ fn a_long_enumeration_never_spends_the_solve_budget() {
 /// and hands the budget back to search rather than owning it to the deadline.
 #[test]
 fn a_spent_enumeration_slice_falls_through_to_search() {
-    let budget = std::time::Duration::from_secs(30);
+    let budget = Duration::from_secs(30);
     let (nv, clauses) = resolvent_forced_and_chains(34);
     let mut s = solver_from(nv, &clauses);
     s.set_solve_deadline(Some(ay_core::time::Instant::now() + budget));
@@ -284,7 +284,7 @@ fn a_spent_enumeration_slice_falls_through_to_search() {
     s.prepare_indep_enum_at_startup();
     assert_eq!(s.stats.indep_enum_admitted, 1, "the gate must admit");
     if let Some(pending) = s.cold.indep_enum_pending.as_mut() {
-        pending.budget = std::time::Duration::from_millis(200);
+        pending.budget = Duration::from_millis(200);
     }
     let t0 = ay_core::time::Instant::now();
     let outcome = s.run_parked_indep_enum();
@@ -302,7 +302,7 @@ fn a_spent_enumeration_slice_falls_through_to_search() {
         "the slice must have enumerated something"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
+        elapsed < Duration::from_secs(2),
         "the slice must stop at its own budget, not at the solve deadline: {elapsed:?}"
     );
     // Search still owns the rest of the budget, and still decides the formula.
@@ -416,7 +416,8 @@ fn xor_collapse_recognises_complete_parity_classes() {
         vec![n(3), p(4)],
         vec![p(3), n(4)],
     ];
-    let (kinds, starts, lits) = collapse_xors(&raw);
+    let (kinds, starts, lits, xor_count) = collapse_constraints(&raw, false);
+    assert_eq!(xor_count, 2);
     assert_eq!(
         kinds.len(),
         2,
@@ -437,7 +438,8 @@ fn xor_collapse_leaves_incomplete_classes_alone() {
     let n = |v: u32| v * 2 + 1;
     // The AND-gate shape: three clauses, no complete parity class anywhere.
     let raw = vec![vec![n(2), p(0)], vec![n(2), p(1)], vec![p(2), n(0), n(1)]];
-    let (kinds, _, _) = collapse_xors(&raw);
+    let (kinds, _, _, xor_count) = collapse_constraints(&raw, false);
+    assert_eq!(xor_count, 0);
     assert_eq!(kinds.len(), 3);
     assert!(kinds.iter().all(|&k| k == KIND_CLAUSE));
 }
@@ -449,12 +451,14 @@ fn and_collapse_recognises_two_input_gates() {
     let p = |v: u32| v * 2;
     let n = |v: u32| v * 2 + 1;
     let raw = vec![vec![n(2), p(0)], vec![n(2), p(1)], vec![p(2), n(0), n(1)]];
-    let (kinds, starts, lits) = collapse_constraints(&raw, true);
+    let (kinds, starts, lits, xor_count) = collapse_constraints(&raw, true);
+    assert_eq!(xor_count, 0);
     assert_eq!(kinds, vec![KIND_AND]);
     assert_eq!(starts, vec![0, 3]);
     assert_eq!(lits, vec![p(2), p(0), p(1)]);
     // Off, the same clauses stay clauses.
-    let (kinds, _, _) = collapse_constraints(&raw, false);
+    let (kinds, _, _, xor_count) = collapse_constraints(&raw, false);
+    assert_eq!(xor_count, 0);
     assert!(kinds.iter().all(|&k| k == KIND_CLAUSE));
 }
 

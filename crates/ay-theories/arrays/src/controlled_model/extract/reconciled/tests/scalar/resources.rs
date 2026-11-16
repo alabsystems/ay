@@ -83,7 +83,9 @@ fn original_expired_end_refuses_scalar_preparation_without_replacing_the_end() {
     let source = fixture.solver();
     let values = fixture.values();
     let original = owner(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a current instant has an earlier representable second"),
         1_000_000,
         128 << 20,
     );

@@ -67,7 +67,7 @@ fn substitution_matcher_charges_duplicate_frame_pushes_independently() {
         total < 512
     };
     let mut meter = QuantifierMeter::new(ProofId(0), "forall_inst", &mut work, &mut progress);
-    assert_resource(substitution::matches_single_substitution(
+    assert_resource(matches_single_substitution(
         &fixture.terms,
         fixture.body,
         fixture.instance,

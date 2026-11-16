@@ -46,8 +46,7 @@ use num_rational::BigRational;
 use super::super::ledger::{FarkasLedger, LedgerKind};
 use super::super::theory_box::TheoryBox;
 use super::super::{
-    BudgetKind, HornCheck, HornSmt, PoisonKind, SessionConfig, TheoryKind, UnknownReason,
-    UnsupportedKind,
+    BudgetKind, HornCheck, HornSmt, PoisonKind, SessionConfig, UnknownReason, UnsupportedKind,
 };
 use super::{BridgeExit, BridgeParts, BridgeState, BridgeStats, TheoryBridge};
 use crate::smt::model_verify::collect_theory_atoms_into;
@@ -836,7 +835,10 @@ fn propagation_of_an_already_false_target_is_a_conflict() {
     bridge.init();
     let out = bridge.propagate(&ctx);
     assert_eq!(out.conflict, Some(vec![pos(v[2]), neg(v[0])]));
-    assert!(out.propagations.is_empty());
+    assert_eq!(
+        out.propagations,
+        [] as [(std::vec::Vec<ay_sat::Literal>, ay_sat::Literal); 0]
+    );
     assert_eq!(bridge.stats().propagation_conflicts, 1);
 }
 
@@ -859,7 +861,9 @@ fn stop_predicate_and_deadline_end_the_solve_as_budget() {
     );
     drop(bridge);
 
-    let past = Instant::now() - Duration::from_millis(1);
+    let past = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("fixture instant supports a one-millisecond offset");
     let mut bridge = rig.parts.bridge(Some(past), &never);
     bridge.init();
     assert!(matches!(bridge.check(&ctx), ExtCheckResult::Unknown));
@@ -1178,7 +1182,10 @@ fn implied_model_equality_is_tier_two_and_restarts_with_originals() {
     bridge.mint.seen_model_eq.insert((x.min(y), x.max(y)));
     assert!(matches!(bridge.check(&ctx), ExtCheckResult::Unknown));
     assert_eq!(bridge.exit(), BridgeExit::TheoryIncomplete);
-    assert!(bridge.take_originals().is_empty());
+    assert_eq!(
+        bridge.take_originals(),
+        [] as [std::vec::Vec<ay_sat::Literal>; 0]
+    );
 }
 
 #[test]
@@ -1275,7 +1282,10 @@ fn hint_model_equality_triangle_axioms_then_convergence() {
         "try the equality first"
     );
     assert_eq!(bridge.mint.model_eq_rounds, 1);
-    assert!(bridge.take_originals().is_empty());
+    assert_eq!(
+        bridge.take_originals(),
+        [] as [std::vec::Vec<ay_sat::Literal>; 0]
+    );
     // Same pair again in this query: nothing new -> one re-check without the
     // `assume_eqs` preference -> the same hint again -> Sat (§4.3).
     assert!(matches!(bridge.check(&ctx), ExtCheckResult::Sat));
@@ -1442,7 +1452,7 @@ struct LraRig {
 impl LraRig {
     fn new() -> Self {
         let mut own = Box::new(SmtContext::new());
-        let theory = TheoryBox::new_for(TheoryKind::Lra, &mut own);
+        let theory = TheoryBox::new(&mut own);
         let mut parts = Parts::with_theory(theory);
         parts.own = own;
         parts.theory.rebind(&mut parts.own);
@@ -1848,7 +1858,7 @@ fn horn_check_assuming_unsat_returns_a_core_within_the_query() {
 #[test]
 fn lra_bounds_are_trailed_in_the_scope_of_the_check_repro() {
     let mut own = Box::new(SmtContext::new());
-    let mut theory = TheoryBox::new_for(TheoryKind::Lra, &mut own);
+    let mut theory = TheoryBox::new(&mut own);
     let x = own.terms.mk_var("x", Sort::Real);
     let y = own.terms.mk_var("y", Sort::Real);
     let c0 = own.terms.mk_rational(r(0));
@@ -1880,7 +1890,6 @@ fn lra_bounds_are_trailed_in_the_scope_of_the_check_repro() {
     ));
     // Pop the disequality's scope only.
     t.pop();
-    drop(t);
     if let TheoryBox::Lra(l) = &theory {
         let (lo, hi) = l.get_bounds(x).expect("x is an LRA variable");
         assert!(
@@ -1892,7 +1901,6 @@ fn lra_bounds_are_trailed_in_the_scope_of_the_check_repro() {
     let t = theory.as_dyn();
     t.assert_literal(lt, true);
     let verdict = t.check();
-    drop(t);
     let (xv, yv) = (
         theory.arith_value(x).unwrap(),
         theory.arith_value(y).unwrap(),

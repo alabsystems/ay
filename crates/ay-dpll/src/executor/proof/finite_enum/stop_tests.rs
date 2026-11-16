@@ -154,7 +154,7 @@ fn real_finite_enum_capability_route_cannot_bypass_original_cancellation() {
     )
     .unwrap();
     let mut executor = Executor::new();
-    assert!(executor.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(executor.execute_all(&commands).unwrap(), [] as [String; 0]);
     executor.begin_public_solve(false);
     executor.bind_unsat_query_assumptions(&[]);
     // Singleton constants become their sole constructor during elaboration,

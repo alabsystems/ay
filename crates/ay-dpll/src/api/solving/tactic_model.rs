@@ -70,6 +70,10 @@ struct NamespaceBinding {
 
 #[derive(Debug, Clone)]
 enum Reconstruction {
+    #[expect(
+        clippy::rc_buffer,
+        reason = "preserves the already reserve_counted Vec allocation and its admitted custody"
+    )]
     Encoded(Arc<Vec<Binding>>),
     Fixed(Arc<fixed::Witness>),
     Equations(Arc<equations::Layer>),
@@ -128,10 +132,7 @@ impl TacticModelConverter {
             }
         }
         owner
-            .admit(
-                1,
-                std::mem::size_of::<Source>() + 2 * std::mem::size_of::<usize>(),
-            )
+            .admit(1, size_of::<Source>() + 2 * size_of::<usize>())
             .map_err(|_| refused(owner))?;
         let source = Arc::new(Source {
             stamp: terms.snapshot_stamp(),
@@ -252,10 +253,7 @@ impl TacticModelConverter {
         owner: &dyn TermConstructionAdmission,
     ) -> Result<Self, TacticFailure> {
         owner
-            .admit(
-                1,
-                std::mem::size_of::<Vec<Binding>>() + 2 * std::mem::size_of::<usize>(),
-            )
+            .admit(1, size_of::<Vec<Binding>>() + 2 * size_of::<usize>())
             .map_err(|_| refused(owner))?;
         let result = Self {
             source: Arc::clone(&self.source),
@@ -407,7 +405,7 @@ impl TacticModelConverter {
             }
             fn leaf_value(&self, id: TermId) -> Option<ay_model_check::ModelValue> {
                 self.owner
-                    .admit(self.bindings.len(), std::mem::size_of::<u64>())
+                    .admit(self.bindings.len(), size_of::<u64>())
                     .ok()?;
                 let binding = self.bindings.iter().find(|binding| binding.source == id)?;
                 let key = name(self.terms, id)?;
@@ -514,7 +512,7 @@ fn copy_scalar_model(
         .and_then(|n| n.checked_add(bindings.len()))
         .ok_or_else(|| refused(owner))?;
     let entries = count
-        .checked_mul(std::mem::size_of::<(String, ModelValue)>())
+        .checked_mul(size_of::<(String, ModelValue)>())
         .and_then(|n| n.checked_mul(4))
         .and_then(|n| n.checked_add(if count == 0 { 0 } else { 4096 }))
         .ok_or_else(|| refused(owner))?;
@@ -604,7 +602,7 @@ fn copy_scalar_model(
         }
         let words = usize::try_from(value.bits().div_ceil(32)).map_err(|_| refused(owner))?;
         let bytes = words
-            .checked_mul(std::mem::size_of::<u64>())
+            .checked_mul(size_of::<u64>())
             .and_then(|n| n.checked_add(name.len()))
             .ok_or_else(|| refused(owner))?;
         owner

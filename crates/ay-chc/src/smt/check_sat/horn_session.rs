@@ -302,7 +302,9 @@ impl SmtContext {
         }
         if let Some(b) = budget {
             if elapsed > b {
-                let over = elapsed - b;
+                let over = elapsed
+                    .checked_sub(b)
+                    .expect("elapsed time was checked above the budget");
                 totals
                     .overrun_us
                     .record(u64::try_from(over.as_micros()).unwrap_or(u64::MAX));
@@ -327,17 +329,16 @@ impl SmtContext {
         }
 
         // --- strict posture ---------------------------------------------------
-        if lane::session_strict() && matches!(unknown_reason, "poisoned" | "theory_incomplete") {
-            panic!(
-                "chc-session-strict: session answered {unknown_reason} ({lane_result}) for {}",
-                crate::smt::session::dump::script_for(expr, false)
-            );
-        }
+        assert!(
+            !(lane::session_strict() && matches!(unknown_reason, "poisoned" | "theory_incomplete")),
+            "chc-session-strict: session answered {unknown_reason} ({lane_result}) for {}",
+            crate::smt::session::dump::script_for(expr, false)
+        );
 
         // --- audit of session UNSATs on a fresh Verification context ---------
         if lane_result == "unsat" {
             let every = lane::session_audit_every();
-            if every > 0 && totals.unsat.load(Ordering::Relaxed) % every == 0 {
+            if every > 0 && totals.unsat.load(Ordering::Relaxed).is_multiple_of(every) {
                 totals.audits.fetch_add(1, Ordering::Relaxed);
                 let mut fresh = SmtContext::new();
                 let check =
@@ -348,9 +349,7 @@ impl SmtContext {
                         "HornSmt session answered UNSAT where the legacy bridge answers SAT:\n{}",
                         crate::smt::session::dump::script_for(expr, false)
                     );
-                    if lane::session_strict() {
-                        panic!("chc-session-strict: {msg}");
-                    }
+                    assert!(!lane::session_strict(), "chc-session-strict: {msg}");
                     tracing::error!("{msg}");
                     // Fail closed: neither side is trusted on a disagreement.
                     return Some(SmtResult::Unknown);

@@ -43,7 +43,7 @@ fn div_witness_index_is_exact_snapshot_keyed_and_bounded() {
             divisor: Some(divisor),
         }]
     );
-    assert!(first.candidates(DivWitnessFamily::LiteralMod).is_empty());
+    assert_eq!(first.candidates(DivWitnessFamily::LiteralMod), []);
 
     let same_snapshot = exec.div_witness_index_cache.index(&exec.ctx.terms);
     assert!(Arc::ptr_eq(&first, &same_snapshot));
@@ -72,9 +72,7 @@ fn div_witness_index_is_exact_snapshot_keyed_and_bounded() {
     exec.ctx.terms.rollback_to(checkpoint);
     let after_rollback = exec.div_witness_index_cache.index(&exec.ctx.terms);
     assert_eq!(exec.div_witness_index_cache.build_count(), 3);
-    assert!(after_rollback
-        .candidates(DivWitnessFamily::LiteralMod)
-        .is_empty());
+    assert_eq!(after_rollback.candidates(DivWitnessFamily::LiteralMod), []);
 
     // Replacement can preserve both length and contents. The opaque physical
     // store identity must still retire the predecessor index.

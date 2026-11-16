@@ -5,6 +5,35 @@
 use super::*;
 use std::process::Command;
 
+#[test]
+fn command_refuses_an_unchecked_rule_without_publishing_or_spending_work() {
+    let terms = TermStore::new();
+    let printer = AlethePrinter::new(&terms);
+    let mut emitter = Emitter::new(&printer, "g".into());
+    let lits = ["p".to_string()];
+    let before_work = printer.work_used();
+
+    assert_eq!(
+        emitter.command("manual", &lits, "invented_rule", &[], None),
+        None
+    );
+    assert_eq!(emitter.out, "");
+    assert_eq!(printer.work_used(), before_work);
+
+    assert_eq!(
+        emitter.step(&lits, "invented_rule", &[], None),
+        None,
+        "the outer step must still allocate its historical fresh label first"
+    );
+    assert_eq!(emitter.out, "");
+    assert_eq!(printer.work_used(), before_work);
+    assert_eq!(
+        emitter.step(&lits, "refl", &[], None).as_deref(),
+        Some("g1")
+    );
+    assert_eq!(emitter.out, "(step g1 (cl p) :rule refl)\n");
+}
+
 const ONES: &str = "#b1111111111111111111111111111111111111111111111111111111111111111";
 const MINUS_TWO: &str = "#xfffffffffffffffe";
 const TWO: &str = "#x0000000000000002";

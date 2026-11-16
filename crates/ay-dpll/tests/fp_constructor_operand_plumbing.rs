@@ -6,7 +6,7 @@
 
 //! Composite operands of the 3-argument `(fp s e m)` constructor.
 //!
-//! `decompose_fp_constructor` resolved its three fields through the LEAF-ONLY
+//! `decompose_fp_constructor_with_control` resolved its three fields through the LEAF-ONLY
 //! `bitblast_bv_term`, which returns fresh *unconstrained* bits (and raises the
 //! encoding-gap flag) for anything that is not a `Var` / 0-ary / constant. The
 //! identical defect had already been found and fixed on the `to_fp` path, where

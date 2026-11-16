@@ -88,7 +88,7 @@ fn real_materialization_and_pinned_retry_preserve_ordinary_ids_rows_and_counters
         );
         assert_eq!(counted.stats.lrat_materialize_emitted_unit_lines, 0);
         assert_eq!(counted.stats.lrat_materialize_hidden_trusted_units, 0);
-        assert!(counted.cold.lrat_materialize_hints_buf.is_empty());
+        assert_eq!(counted.cold.lrat_materialize_hints_buf.len(), 0);
         assert_eq!(
             counted.cold.lrat_materialize_hints_buf.capacity(),
             ordinary.cold.lrat_materialize_hints_buf.capacity()
@@ -155,11 +155,11 @@ fn run(s: &mut Solver, conflict: ClauseRef) -> Result<Learned, SatUnknownReason>
 }
 
 fn clean(s: &Solver) {
-    assert!(s.min.lrat_to_clear.is_empty());
+    assert_eq!(s.min.lrat_to_clear.len(), 0);
     assert!(s.min.minimize_flags.iter().all(|&v| v == 0));
     assert!(s.var_data.iter().all(|v| !v.is_seen()));
-    assert!(s.cold.lrat_materialize_hints_buf.is_empty());
-    assert!(s.conflict.analyzed_vars().is_empty());
+    assert_eq!(s.cold.lrat_materialize_hints_buf.len(), 0);
+    assert_eq!(s.conflict.analyzed_vars().len(), 0);
     assert_eq!(s.conflict.learned_count(), 0);
 }
 

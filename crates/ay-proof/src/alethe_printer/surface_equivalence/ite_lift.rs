@@ -254,13 +254,13 @@ fn emit_branch_facts(id: &str, shape: &LiftShape<'_>, steps: &mut Vec<String>) -
         else_hypotheses,
         ..
     } = shape;
-    super::super::ite_branch_projection::emit_definition_branches(
+    ite_branch_projection::emit_definition_branches(
         id,
         ite,
         condition,
         then_value,
         else_value,
-        super::super::ite_branch_projection::EqualityOrientation::IteFirst,
+        ite_branch_projection::EqualityOrientation::IteFirst,
         steps,
     );
     let mut reflexivities = Vec::with_capacity(kept.len());

@@ -2711,7 +2711,7 @@ mod tests {
     fn add_poly_cancels_to_empty() {
         let a = vec![mono(3, &[(0, 1)])];
         let b = vec![mono(-3, &[(0, 1)])];
-        assert!(add_poly(a, b).expect("no overflow").is_empty());
+        assert_eq!(add_poly(a, b).expect("no overflow"), Vec::<Mono>::new());
     }
 
     #[test]

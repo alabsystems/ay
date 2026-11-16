@@ -157,7 +157,22 @@ fn unbound_wrong_name_wrong_sort_and_duplicate_input_links_refuse() {
     }; 2];
     assert!(matches!(
         refusal(&terms, root, &inputs),
-        FpAdapterError::Invalid(_)
+        FpAdapterError::Invalid("duplicate or aliased input")
+    ));
+    let alias = terms.mk_fresh_named_var("original_x", Sort::FloatingPoint(11, 53));
+    let inputs = [
+        FpInputBinding {
+            source: input,
+            target: &correct,
+        },
+        FpInputBinding {
+            source: alias,
+            target: &correct,
+        },
+    ];
+    assert!(matches!(
+        refusal(&terms, root, &inputs),
+        FpAdapterError::Invalid("duplicate or aliased input")
     ));
 }
 

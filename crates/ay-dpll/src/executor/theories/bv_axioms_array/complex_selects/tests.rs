@@ -70,7 +70,7 @@ fn source_chain(depth: usize, reads: usize) -> Executor {
     }
     let mut roots = vec![*arrays.last().unwrap()];
     for position in 0..reads {
-        let index = terms.mk_var(&format!("read-{position}"), Sort::bitvec(64));
+        let index = terms.mk_var(format!("read-{position}"), Sort::bitvec(64));
         for &array in &arrays {
             roots.push(raw_read(terms, array, index));
         }

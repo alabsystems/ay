@@ -45,7 +45,7 @@ fn learned_1963_pressure_reduction_rank_bias(
     if pressure_steps == 0 {
         return 0;
     }
-    let step_log = u64::BITS - pressure_steps.leading_zeros();
+    let step_log = pressure_steps.bit_width();
     let event_bonus = record
         .fsw
         .saturating_add(record.unit)

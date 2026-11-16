@@ -779,9 +779,6 @@ impl Solver {
         )
     }
 
-    /// Zero-propagation split: (zeros by attributed level band
-    /// [0..=8, 9..=64, 65..=512, >512], zeros by mode [focused, stable],
-    /// all decisions by level band).
     /// Decisions taken with un-consumed trail entries pending BCP.
     pub fn decisions_with_pending_props(&self) -> u64 {
         self.stats.decisions_with_pending_props
@@ -796,6 +793,9 @@ impl Solver {
         )
     }
 
+    /// Zero-propagation split: (zeros by attributed level band
+    /// [0..=8, 9..=64, 65..=512, >512], zeros by mode [focused, stable],
+    /// all decisions by level band).
     pub fn prop_zero_split(&self) -> ([u64; 4], [u64; 2], [u64; 4]) {
         (
             self.stats.prop_zero_by_level,
@@ -1242,7 +1242,7 @@ impl Solver {
 
     /// Due BVE rounds refused by the scheduler gates, per gate.
     pub fn bve_gate_skip_breakdown(&self) -> Vec<(&'static str, u64)> {
-        super::inprocessing::BVE_GATE_TAGS
+        inprocessing::BVE_GATE_TAGS
             .iter()
             .zip(self.cold.bve_gate_skip_counts)
             .map(|(&tag, n)| (tag, n))
@@ -1324,6 +1324,7 @@ impl Solver {
         ]
     }
 
+    /// Return the number of learned-clause database reductions.
     pub fn num_reductions(&self) -> u64 {
         self.cold.num_reductions
     }

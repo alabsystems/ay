@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::quantified::counterexample::render_oracle as oracle;
 use crate::quantified::QuantifiedHornClause;
 use crate::{CancellationToken, ChcOp, ChcProblem, ChcSort, ClauseBody};
 use ay_core::time::Instant;
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod metadata;
-mod oracle;
 mod resources;
 
 fn op(operator: ChcOp, args: Vec<ChcExpr>) -> ChcExpr {
@@ -137,7 +137,10 @@ fn repeated_rule_occurrences_have_distinct_values_and_exact_argument_links() {
     .unwrap();
     let script = output(&source, &[0, 1, 1, 2]);
     assert_eq!(oracle::models(&script), vec![vec![0, 1, 2]]);
-    assert!(oracle::models(&output(&source, &[0, 1, 2])).is_empty());
+    assert_eq!(
+        oracle::models(&output(&source, &[0, 1, 2])),
+        [] as [std::vec::Vec<u64>; 0]
+    );
 }
 
 #[test]

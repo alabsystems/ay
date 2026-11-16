@@ -24,7 +24,7 @@
 //! - `Z3_PATH`: the z3 to use; otherwise the first z3 on `PATH` that proves it
 //!   is z3 (see `ay_test_support::z3`), never a `z3` spawned by name
 
-use crate::common::check_z3_or_skip;
+use crate::common::z3::check_z3_or_skip;
 use anyhow::{anyhow, ensure, Context, Result};
 use ay_dpll::Executor;
 use ay_frontend::parse;

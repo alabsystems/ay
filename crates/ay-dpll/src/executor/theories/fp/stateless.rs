@@ -23,7 +23,10 @@ use prepare::{FpPreparationError, PreparedFp};
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FpPhase {
     Tseitin,
+    #[cfg(test)]
     Construction(FpBuildProgress),
+    #[cfg(not(test))]
+    Construction,
     CongruenceScan,
     CongruencePlan,
     ClauseTransfer,
@@ -33,6 +36,20 @@ pub(super) enum FpPhase {
     SatReturned,
     ModelExtracted,
     Publication,
+}
+
+impl FpPhase {
+    fn construction(progress: FpBuildProgress) -> Self {
+        #[cfg(test)]
+        {
+            Self::Construction(progress)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = progress;
+            Self::Construction
+        }
+    }
 }
 
 fn checkpoint(

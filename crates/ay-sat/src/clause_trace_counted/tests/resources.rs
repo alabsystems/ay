@@ -65,10 +65,9 @@ fn every_preparation_poll_refuses_before_semantic_row_publication() {
     let mut baseline = fixture();
     let owner = observer(usize::MAX, &calls);
     let literals = [pos(0)];
-    let token = baseline
+    baseline
         .prepare_counted_add(9, &literals, false, &[1, 2], &owner)
         .unwrap();
-    drop(token);
     let total = calls.load(Ordering::SeqCst);
     assert!(total > 10);
     for cut in 0..total {

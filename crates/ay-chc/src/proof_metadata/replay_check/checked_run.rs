@@ -57,16 +57,6 @@ impl<'a> ChcCheckedReplayObligationPayload<'a> {
         }
     }
 
-    /// Compatibility alias for [`Self::payload_bytes`].
-    ///
-    /// Historically every retained payload was an SMT query. New code should
-    /// use [`Self::smt_query_bytes`] or
-    /// [`Self::ground_derivation_artifact_bytes`] before interpreting bytes.
-    #[deprecated(note = "use payload_bytes or a typed payload accessor")]
-    pub fn query_bytes(&self) -> &'a [u8] {
-        self.payload_bytes()
-    }
-
     /// Return the exact SMT-LIB query bytes executed for this row, or `None`
     /// when this Unsafe row carries a deciding ground derivation instead.
     pub fn smt_query_bytes(&self) -> Option<&'a [u8]> {
@@ -146,7 +136,7 @@ pub(super) enum SealedReplayObligationPayload {
 /// Retained authority is established only by consuming the adapter's opaque
 /// live-query capability, never by hashing or internally rechecking raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SmtSourceAuthority {
+pub(super) enum SmtSourceAuthority {
     Legacy,
     RetainedLiveQuery,
 }
@@ -654,7 +644,7 @@ fn recheck_smt_payload_with_control(
     if expected == "unsat" {
         // This fresh certificate is checked and discarded below, not published
         // as diagnostic evidence. Keep native authority but omit unused text.
-        let cert = crate::smt::executor_adapter::smtlib_strict_unsat_cert_native_only_with_limit(
+        let cert = crate::smt::executor_adapter::check_plain_unsat_native_with_limit(
             query,
             control.limit(),
         );

@@ -19,10 +19,7 @@ fn bv64_indices_and_byte_values_remove_1008_literal_copies_per_read() {
     assert_eq!(new.len(), old.len());
     assert_eq!(old_literals, 1297);
     assert_eq!(new_literals, 289);
-    assert_eq!(
-        (old_literals - new_literals) * std::mem::size_of::<i32>(),
-        4032
-    );
+    assert_eq!((old_literals - new_literals) * size_of::<i32>(), 4032);
     assert_eq!(new.iter().flatten().map(|lit| lit.abs()).max(), Some(89));
     assert_eq!(new[..16].iter().map(Vec::len).sum::<usize>(), 48);
     assert_eq!(&new[16..], &old[16..]);

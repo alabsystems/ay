@@ -187,7 +187,7 @@ fn sorted_adversarial_insertions_keep_avl_height_and_linear_population() {
     }
     assert_eq!(cells.rows.len(), keys.len());
     assert_eq!(cells.nodes.len(), keys.len());
-    super::index::assert_balanced(&cells);
+    index::assert_balanced(&cells);
     assert_eq!(cells.finish().unwrap().rows().len(), keys.len());
 }
 
@@ -217,9 +217,7 @@ fn work_one_short_and_row_ceiling_refuse_on_the_same_terminal_ledger() {
 #[test]
 fn storage_one_short_refuses_before_reservation_and_cannot_reset_per_array() {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let bytes = std::mem::size_of::<Row<'_>>()
-        + std::mem::size_of::<Node<'_>>()
-        + std::mem::size_of::<ModelCellRow<'_>>();
+    let bytes = size_of::<Row<'_>>() + size_of::<Node<'_>>() + size_of::<ModelCellRow<'_>>();
     let mut remaining = bytes - 1;
     let mut admission = |_work: usize, bytes: usize| {
         if std::time::Instant::now() >= end {

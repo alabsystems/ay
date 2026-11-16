@@ -80,36 +80,93 @@ fn metered_declaration_namespace_preserves_exact_names_and_legacy_results() {
     validate(&bundle, &mut |_, _| true).expect("metered constructor pass");
 }
 
-#[test]
-fn metered_declaration_preflight_rejects_empty_duplicate_and_cross_role_names() {
-    let mut cases = Vec::new();
+/// The fixture with its datatype renamed to `""`, carrier sorts included.
+fn empty_datatype_fixture() -> SerializableProofBundle {
     let mut bundle = fixture();
     bundle.datatype_declarations[0].0.clear();
-    cases.push((
-        bundle,
-        "datatype declaration name \"\" is empty or duplicated",
+    for (data, sort) in &mut bundle.term_entries {
+        if matches!(data, TermData::Var(name, _) if name.as_str() == "empty")
+            || matches!(data, TermData::App(Symbol::Named(name), _) if name.as_str() == "pair")
+        {
+            *sort = Sort::Uninterpreted(String::new());
+        }
+    }
+    bundle
+}
+
+/// The fixture plus the nullary constructor `""`, its empty selector list and
+/// its bound term.
+fn empty_constructor_fixture() -> SerializableProofBundle {
+    let mut bundle = fixture();
+    bundle.datatype_declarations[0].1.push(String::new());
+    bundle
+        .constructor_selectors
+        .push((String::new(), Vec::new()));
+    bundle.term_entries.push((
+        TermData::Var(String::new(), 0),
+        Sort::Uninterpreted("Pair".to_string()),
     ));
+    bundle
+}
+
+#[test]
+fn metered_declaration_preflight_admits_empty_names_as_ordinary_identities() {
+    let bundle = empty_datatype_fixture();
+    validate(&bundle, &mut |_, _| true).expect("datatype `||`");
+
+    let bundle = empty_constructor_fixture();
+    let symbols = validate_declaration_context_with_progress(&bundle, &mut |_, _| true)
+        .expect("constructor `||`");
+    assert_eq!(symbols.get(""), Some(&"a constructor"));
+    assert_eq!(symbols.get("is-"), Some(&"a derived tester"));
+    validate(&bundle, &mut |_, _| true).expect("constructor `||` and its bound term");
+
+    let mut bundle = fixture();
+    bundle.constructor_selectors[1].1[0].clear();
+    let symbols = validate_declaration_context_with_progress(&bundle, &mut |_, _| true)
+        .expect("selector `||`");
+    assert_eq!(symbols.get(""), Some(&"a selector"));
+    validate(&bundle, &mut |_, _| true).expect("selector `||` and the constructor terms");
+}
+
+#[test]
+fn metered_declaration_preflight_rejects_duplicate_and_cross_role_names() {
+    let mut cases = Vec::new();
     let mut bundle = fixture();
     bundle
         .datatype_declarations
         .push(bundle.datatype_declarations[0].clone());
-    cases.push((
-        bundle,
-        "datatype declaration name \"Pair\" is empty or duplicated",
-    ));
+    cases.push((bundle, "datatype declaration name \"Pair\" is duplicated"));
+    let mut bundle = empty_datatype_fixture();
+    bundle
+        .datatype_declarations
+        .push((String::new(), vec!["other".to_string()]));
+    cases.push((bundle, "datatype declaration name \"\" is duplicated"));
     let mut bundle = fixture();
     bundle.datatype_declarations[0].1.clear();
     cases.push((bundle, "datatype \"Pair\" has no constructors"));
-    for name in ["", "empty"] {
-        let mut bundle = fixture();
-        bundle.datatype_declarations[0].1.push(name.to_string());
-        cases.push((bundle, "constructor declaration name"));
-    }
+    let mut bundle = fixture();
+    bundle.datatype_declarations[0].1.push("empty".to_string());
+    cases.push((
+        bundle,
+        "constructor declaration name \"empty\" is duplicated",
+    ));
+    let mut bundle = empty_constructor_fixture();
+    bundle
+        .datatype_declarations
+        .push(("Other".to_string(), vec![String::new()]));
+    cases.push((bundle, "constructor declaration name \"\" is duplicated"));
     let mut bundle = fixture();
     bundle.datatype_declarations[0]
         .1
         .push("is-empty".to_string());
     cases.push((bundle, "term symbol \"is-empty\" is ambiguous"));
+    let mut bundle = empty_constructor_fixture();
+    bundle.datatype_declarations[0].1.push("is-".to_string());
+    cases.push((bundle, "term symbol \"is-\" is ambiguous"));
+    let mut bundle = empty_constructor_fixture();
+    bundle.constructor_selectors[1].1[0].clear();
+    cases.push((bundle, "term symbol \"\" is ambiguous"));
     let mut bundle = fixture();
     bundle.constructor_selectors[0].0 = "unknown".to_string();
     cases.push((bundle, "references unknown constructor \"unknown\""));
@@ -120,12 +177,6 @@ fn metered_declaration_preflight_rejects_empty_duplicate_and_cross_role_names() 
     cases.push((
         bundle,
         "selector declaration for constructor \"empty\" is duplicated",
-    ));
-    let mut bundle = fixture();
-    bundle.constructor_selectors[1].1[0].clear();
-    cases.push((
-        bundle,
-        "selector name \"\" for constructor \"pair\" is empty",
     ));
     for name in ["empty", "is-empty", "second"] {
         let mut bundle = fixture();

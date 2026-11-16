@@ -140,7 +140,7 @@ pub(super) fn bad_state(source: &QuantifiedChcProblem, shape: Shape, calls: Call
     let ClauseHead::Predicate(error, args) = &clauses[1].head else {
         panic!("error relation")
     };
-    assert!(args.is_empty());
+    assert_eq!(args.as_slice(), []);
     assert_eq!(clauses[2].body.predicates, vec![(*error, vec![])]);
     assert!(clauses[2].is_query());
     assert_eq!(

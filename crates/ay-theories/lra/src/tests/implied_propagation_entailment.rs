@@ -581,8 +581,8 @@ fn conflict_size_counters_record_core_literals() {
             && stat(&solver, "lra_conflict_lits_total") == 0,
         "counters start at zero"
     );
-    let _ = solver.assert_literal(x_ge_2, true);
-    let _ = solver.assert_literal(x_le_1, true);
+    solver.assert_literal(x_ge_2, true);
+    solver.assert_literal(x_le_1, true);
     let result = solver.check();
     assert!(
         matches!(

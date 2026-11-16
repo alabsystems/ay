@@ -128,7 +128,7 @@ fn original_literal_walks_keep_the_absolute_deadline_and_refuse_empty_success() 
             phase: ResolutionProofPhase::Solve
         })
     );
-    assert!(target.is_empty());
+    assert_eq!(target.len(), 0);
     assert_eq!(
         compare(&[], &[], 0, expired, &live),
         Err(ResolutionProofError::DeadlineExceeded {

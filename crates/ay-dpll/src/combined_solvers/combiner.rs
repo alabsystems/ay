@@ -198,6 +198,7 @@ pub(super) enum StaticPhasePrefix {
     Delegate,
 }
 
+/// Shared Nelson–Oppen combiner for the selected theory solvers and term store.
 pub struct TheoryCombiner<'a> {
     /// A5 lazy arith-equality adapter (experiment, AY_A5_LAZY_ARITH=1):
     /// Int EQUALITY atoms are EUF-owned during search (congruence handles

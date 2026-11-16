@@ -245,14 +245,9 @@ pub(crate) fn free_dt_array_residue_extends<'a>(
                 // a member: the ONE pin site that can commit a value without
                 // evaluating its argument (`eval_selector_via_model`).
                 if let (Symbol::Named(name), [arg]) = (sym, args.as_slice()) {
-                    let Some(contains) = contains_member(terms, *arg, &members, &mut contains_memo)
-                    else {
-                        return None;
-                    };
+                    let contains = contains_member(terms, *arg, &members, &mut contains_memo)?;
                     if contains {
-                        let Some(selector_shaped) = cx.selector_shaped(name, *arg) else {
-                            return None;
-                        };
+                        let selector_shaped = cx.selector_shaped(name, *arg)?;
                         if selector_shaped {
                             match cx.parse_read_with_stores(t) {
                                 Some(read) if members.contains(&read.array) => {
@@ -287,14 +282,12 @@ pub(crate) fn free_dt_array_residue_extends<'a>(
             // constrain this extension. The generic walk includes their bodies
             // (but not solver-search triggers), conservatively retaining pins.
             data => {
-                let Some(child_count) = term_child_count(data) else {
-                    return None;
-                };
+                let child_count = term_child_count(data)?;
                 if !pending_nodes_fit(seen.len(), stack.len(), child_count, MAX_OCCURRENCE_NODES) {
                     return None;
                 }
                 let mut escaped = false;
-                if for_each_term_child(data, |c| {
+                for_each_term_child(data, |c| {
                     if members.contains(&c)
                         || (path::is_store(terms, c)
                             && contains_member(terms, c, &members, &mut contains_memo)
@@ -303,11 +296,7 @@ pub(crate) fn free_dt_array_residue_extends<'a>(
                         escaped = true;
                     }
                     stack.push(c);
-                })
-                .is_none()
-                {
-                    return None;
-                }
+                })?;
                 if escaped {
                     return None; // member under a non-App context (ite/not/let)
                 }
@@ -738,13 +727,9 @@ fn contains_member_bounded(
         }
         if expanded {
             let mut found = false;
-            if for_each_term_child(terms.get(cur), |child| {
+            for_each_term_child(terms.get(cur), |child| {
                 found |= memo.get(&child).copied().unwrap_or(false);
-            })
-            .is_none()
-            {
-                return None;
-            }
+            })?;
             if memo.len().checked_add(stack.len())?.checked_add(1)? > max_nodes {
                 return None;
             }
@@ -768,6 +753,28 @@ fn contains_member_bounded(
         }
     }
     Some(memo.get(&t).copied().unwrap_or(false))
+}
+
+/// Tiny union-find over `TermId` (path-halving find, union by direct link).
+fn find(uf: &mut HashMap<TermId, TermId>, t: TermId) -> TermId {
+    let mut cur = t;
+    loop {
+        let parent = *uf.get(&cur).unwrap_or(&cur);
+        if parent == cur {
+            return cur;
+        }
+        let grand = *uf.get(&parent).unwrap_or(&parent);
+        uf.insert(cur, grand);
+        cur = grand;
+    }
+}
+
+fn union(uf: &mut HashMap<TermId, TermId>, a: TermId, b: TermId) {
+    let ra = find(uf, a);
+    let rb = find(uf, b);
+    if ra != rb {
+        uf.insert(ra, rb);
+    }
 }
 
 #[cfg(test)]
@@ -795,8 +802,9 @@ mod contains_member_tests {
             None,
             "the expanded parent plus three pending children exceed the cap"
         );
-        assert!(
-            over_limit.is_empty(),
+        assert_eq!(
+            over_limit.len(),
+            0,
             "capacity refusal must happen before a partial memo is installed"
         );
     }
@@ -814,27 +822,5 @@ mod contains_member_tests {
             None
         );
         assert_eq!(memo, HashMap::from([(cached, false)]));
-    }
-}
-
-/// Tiny union-find over `TermId` (path-halving find, union by direct link).
-fn find(uf: &mut HashMap<TermId, TermId>, t: TermId) -> TermId {
-    let mut cur = t;
-    loop {
-        let parent = *uf.get(&cur).unwrap_or(&cur);
-        if parent == cur {
-            return cur;
-        }
-        let grand = *uf.get(&parent).unwrap_or(&parent);
-        uf.insert(cur, grand);
-        cur = grand;
-    }
-}
-
-fn union(uf: &mut HashMap<TermId, TermId>, a: TermId, b: TermId) {
-    let ra = find(uf, a);
-    let rb = find(uf, b);
-    if ra != rb {
-        uf.insert(ra, rb);
     }
 }

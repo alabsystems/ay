@@ -1202,7 +1202,7 @@ fn complete_utf8_prefix(bytes: &[u8]) -> usize {
 
 fn declared_status_from_reader(mut reader: impl std::io::Read) -> std::io::Result<DeclaredStatus> {
     let mut scanner = DeclaredStatusScanner::new();
-    let mut buffer = [0u8; DECLARED_STATUS_BUFFER_BYTES + 4];
+    let mut buffer = vec![0u8; DECLARED_STATUS_BUFFER_BYTES + 4].into_boxed_slice();
     let mut carry = 0;
     loop {
         let read = match reader.read(&mut buffer[carry..DECLARED_STATUS_BUFFER_BYTES]) {

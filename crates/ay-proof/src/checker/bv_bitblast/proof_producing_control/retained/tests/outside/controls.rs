@@ -175,7 +175,7 @@ fn entry_interior_and_final_callback_stops_cannot_publish_a_pair() {
 #[test]
 fn every_original_deadline_constrains_the_two_frame_operation_before_polling() {
     let (terms, clause) = fixture(Source::Valid);
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let calls = producer_test_counter::count();
     for operation in [Operation::Capture, Operation::Replay] {
         for expired in 0..5 {

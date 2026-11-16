@@ -83,7 +83,7 @@ fn solve_and_verify_native(dimacs_text: &str, label: &str) {
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker
@@ -134,7 +134,7 @@ fn solve_and_verify_with_drat_trim(dimacs_text: &str, label: &str) {
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker
@@ -194,7 +194,7 @@ where
     let steps =
         parse_drat(&proof_bytes).unwrap_or_else(|e| panic!("{label}: DRAT proof parse: {e}"));
 
-    assert!(!steps.is_empty(), "{label}: DRAT proof parsed to 0 steps");
+    assert_ne!(steps.len(), 0, "{label}: DRAT proof parsed to 0 steps");
 
     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
     checker
@@ -693,11 +693,11 @@ fn drat_coverage_vendored_fmla_equiv_chain() {
         SatResult::Unsat(_) => {
             let writer = solver.take_proof_writer().expect("proof writer");
             let proof_bytes = writer.into_vec().expect("flush");
-            assert!(!proof_bytes.is_empty(), "proof should not be empty");
+            assert_ne!(proof_bytes.len(), 0, "proof should not be empty");
 
             let cnf_for_check = parse_cnf(cnf_text.as_bytes()).unwrap();
             let steps = parse_drat(&proof_bytes).unwrap();
-            assert!(!steps.is_empty(), "proof should have steps");
+            assert_ne!(steps.len(), 0, "proof should have steps");
 
             let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
             checker
@@ -983,11 +983,11 @@ fn drat_coverage_sweep_test_data() {
                 SatResult::Unsat(_) => {
                     let writer = solver.take_proof_writer().expect("proof writer");
                     let proof_bytes = writer.into_vec().expect("flush");
-                    assert!(!proof_bytes.is_empty(), "{label}: empty proof");
+                    assert_ne!(proof_bytes.len(), 0, "{label}: empty proof");
 
                     let cnf_for_check = parse_cnf(cnf_text.as_bytes()).unwrap();
                     let steps = parse_drat(&proof_bytes).unwrap();
-                    assert!(!steps.is_empty(), "{label}: 0 proof steps");
+                    assert_ne!(steps.len(), 0, "{label}: 0 proof steps");
 
                     let mut checker = DratChecker::new(cnf_for_check.num_vars, true);
                     checker

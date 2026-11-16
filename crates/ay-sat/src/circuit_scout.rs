@@ -7148,7 +7148,7 @@ mod tests {
         assert_eq!(strict.audit.rows_rejected, 1);
         assert_eq!(strict.audit.literal_missing_from_clause_rows, 1);
         assert_eq!(strict.audit.stale_clause_witness_rebound_rows, 0);
-        assert!(strict.rows.is_empty());
+        assert_eq!(strict.rows.len(), 0);
 
         let residual = derive_w210_residual_source_witness_rows(
             &clauses,
@@ -7213,7 +7213,7 @@ mod tests {
         assert_eq!(residual.audit.residual_opposite_literal_rows, 0);
         assert_eq!(residual.audit.rows_rejected, 1);
         assert_eq!(residual.audit.literal_missing_from_clause_rows, 1);
-        assert!(residual.rows.is_empty());
+        assert_eq!(residual.rows.len(), 0);
     }
 
     #[test]

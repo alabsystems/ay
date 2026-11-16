@@ -255,7 +255,10 @@ fn test_relational_encoding_normalization() {
     // First clause: fact (= i 0) => Inv(i)
     // This should NOT be transformed (no body predicate)
     let init_clause = &problem.clauses()[0];
-    assert!(init_clause.body.predicates.is_empty());
+    assert_eq!(
+        init_clause.body.predicates,
+        [] as [(PredicateId, Vec<ChcExpr>); 0]
+    );
     // The head should still have a variable argument, not a constant
     if let ClauseHead::Predicate(_, args) = &init_clause.head {
         assert_eq!(args.len(), 1);
@@ -269,7 +272,10 @@ fn test_relational_encoding_normalization() {
     // Second clause: transition rule should be normalized
     // i_prime should be replaced with (+ i 1) in the head
     let trans_clause = &problem.clauses()[1];
-    assert!(!trans_clause.body.predicates.is_empty()); // Has body predicate
+    assert_ne!(
+        trans_clause.body.predicates,
+        [] as [(PredicateId, Vec<ChcExpr>); 0]
+    ); // Has body predicate
     if let ClauseHead::Predicate(_, args) = &trans_clause.head {
         assert_eq!(args.len(), 1);
         // The argument should be an expression (+ i 1), not a variable (i_prime)
@@ -307,7 +313,10 @@ fn test_relational_encoding_preserves_facts() {
 
     let clause = &problem.clauses()[0];
     // This is a fact (no body predicates)
-    assert!(clause.body.predicates.is_empty());
+    assert_eq!(
+        clause.body.predicates,
+        [] as [(PredicateId, Vec<ChcExpr>); 0]
+    );
 
     // Head should have variables, not constants
     if let ClauseHead::Predicate(_, args) = &clause.head {

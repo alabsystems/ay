@@ -11,7 +11,7 @@
 use super::*;
 
 pub(super) fn prepay_unstable(len: usize, owner: &CountedAdmission) -> AdmissionResult<()> {
-    let levels = (usize::BITS - len.leading_zeros()) as usize + 1;
+    let levels = len.bit_width() as usize + 1;
     let work = len
         .checked_mul(levels)
         .and_then(|n| n.checked_mul(64))
@@ -66,7 +66,7 @@ fn merge(
     owner: &CountedAdmission,
 ) -> AdmissionResult<()> {
     let (mut left, mut right) = (start, mid);
-    for out in start..end {
+    for slot in &mut values[start..end] {
         owner.admit(1, 0)?;
         let take_left = if right == end {
             true
@@ -78,10 +78,10 @@ fn merge(
                 >= data[source[right].variable().index()].level
         };
         if take_left {
-            values[out] = source[left];
+            *slot = source[left];
             left += 1;
         } else {
-            values[out] = source[right];
+            *slot = source[right];
             right += 1;
         }
     }

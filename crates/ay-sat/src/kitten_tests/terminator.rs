@@ -177,7 +177,7 @@ fn an_early_stopped_solve_drops_assumptions_before_a_new_healthy_query() {
     k.assume(0);
     k.set_terminator(raised());
     assert_eq!(k.solve(), 0);
-    assert!(k.assumptions.is_empty());
+    assert_eq!(k.assumptions.len(), 0);
     k.set_terminator(Terminator::default());
     k.assume(1);
     assert_eq!(
@@ -203,10 +203,10 @@ fn a_stop_after_a_previous_sat_answer_stays_unknown_and_rebinds_cleanly() {
         0,
         "an assumption refutation cannot escape the stop"
     );
-    assert!(k.assumptions.is_empty());
+    assert_eq!(k.assumptions.len(), 0);
     assert_eq!(k.failing, INVALID);
     assert!(k.failed.iter().all(|failed| !failed));
-    assert!(k.core.is_empty());
+    assert_eq!(k.core.len(), 0);
     k.set_terminator(Terminator::default());
     k.assume(0);
     assert_eq!(k.solve(), 10, "no stale failed assumption after the stop");

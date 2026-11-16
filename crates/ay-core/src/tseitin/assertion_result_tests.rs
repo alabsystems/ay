@@ -38,9 +38,9 @@ fn assertion_result_includes_previously_extracted_clauses() {
     let both = terms.mk_and(vec![a, b]);
     let mut encoder = Tseitin::new_with_proofs(&terms);
     let extracted = encoder.encode_assertion(both);
-    assert!(!extracted.def_clauses.is_empty());
+    assert_ne!(extracted.def_clauses.as_slice(), &[]);
     let all_before = encoder.all_clauses().to_vec();
-    assert!(encoder.take_new_clauses().is_empty());
+    assert_eq!(encoder.take_new_clauses().as_slice(), &[]);
     encoder.assert_term(both);
     let activation = encoder.take_new_clauses();
     assert_eq!(activation, vec![CnfClause::unit(extracted.root_lit)]);
@@ -90,9 +90,9 @@ fn assertion_result_keeps_empty_database_and_reserved_variable_floor() {
             };
             encoder.ensure_min_next_var(floor);
             let result = check_snapshot(encoder);
-            assert!(result.clauses.is_empty());
-            assert!(result.term_to_var.is_empty());
-            assert!(result.var_to_term.is_empty());
+            assert_eq!(result.clauses.as_slice(), &[]);
+            assert_eq!(result.term_to_var, Default::default());
+            assert_eq!(result.var_to_term, Default::default());
             assert_eq!(result.root, 0);
             assert_eq!(result.num_vars, floor - 1);
             assert_eq!(
@@ -107,7 +107,7 @@ fn assertion_result_keeps_empty_database_and_reserved_variable_floor() {
 fn assertion_result_keeps_wide_clause_payload_allocation() {
     let mut terms = TermStore::new();
     let inputs: Vec<_> = (0..4096)
-        .map(|index| terms.mk_var(&format!("b{index}"), Sort::Bool))
+        .map(|index| terms.mk_var(format!("b{index}"), Sort::Bool))
         .collect();
     let disjunction = terms.mk_or(inputs);
     let mut encoder = Tseitin::new_with_proofs(&terms);
@@ -130,7 +130,7 @@ fn assertion_result_preserves_restored_maps_without_inventing_old_clauses() {
     let mut resumed = Tseitin::from_state_with_proofs(&terms, state);
     assert_eq!(resumed.encode(a, true), previous_literal);
     let result = check_snapshot(resumed);
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses.as_slice(), &[]);
     assert_eq!(result.var_for_term(a), Some(previous_literal as u32));
     assert_eq!(result.num_vars, previous_literal as u32);
     assert_eq!(result.proof_annotations.as_ref().map(Vec::len), Some(0));

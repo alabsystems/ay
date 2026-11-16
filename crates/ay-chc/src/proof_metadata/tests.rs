@@ -1059,9 +1059,10 @@ fn checked_replay_summary_admits_when_manifest_binding_and_artifacts_match() {
         run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let precheck_key = manifest.admission_key_sha256();
     let summary = checked_summary_for_manifest(&manifest);
-    assert!(manifest
-        .checked_replay_summary_rejection_reasons(&summary)
-        .is_empty());
+    assert_eq!(
+        manifest.checked_replay_summary_rejection_reasons(&summary),
+        [] as [std::string::String; 0]
+    );
 
     let admitted = manifest
         .try_with_checked_replay_summary(summary)
@@ -1556,9 +1557,10 @@ fn checked_replay_summary_admits_unsafe_trace_validity_binding() {
         run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let summary = checked_summary_for_manifest(&manifest);
 
-    assert!(manifest
-        .checked_replay_summary_rejection_reasons(&summary)
-        .is_empty());
+    assert_eq!(
+        manifest.checked_replay_summary_rejection_reasons(&summary),
+        [] as [std::string::String; 0]
+    );
     let admitted = manifest
         .try_with_checked_replay_summary(summary)
         .expect("matching unsafe trace-validity summary should admit");

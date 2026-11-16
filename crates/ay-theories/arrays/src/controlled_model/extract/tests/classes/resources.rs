@@ -84,7 +84,9 @@ fn original_late_stop_after_ordered_plan_and_copy_cleanup_stays_latched_after_re
 
 #[test]
 fn already_expired_original_end_refuses_class_work_and_every_retry() {
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("a current instant has an earlier representable second");
     let fixture = ClassFixture::new();
     let solver = fixture.solver();
     let values = fixture.values();

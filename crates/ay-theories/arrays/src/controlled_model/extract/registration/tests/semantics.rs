@@ -136,7 +136,7 @@ fn retained_cleared_backing_preserves_exact_select_order_and_partial_poison() {
         .unwrap();
     assert_eq!(source.select_cache.allocation_size(), allocation);
     same(&output, &source.extract_model(&values));
-    assert!(output.array_values[&fixture.base].stores.is_empty());
+    assert_eq!(output.array_values[&fixture.base].stores.len(), 0);
     assert!(output.read_conflicted.contains(&fixture.base));
     drop(output);
     original.check().unwrap();

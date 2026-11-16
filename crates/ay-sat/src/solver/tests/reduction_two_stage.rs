@@ -271,8 +271,8 @@ fn stage2_deletes_longest_first_among_zero_score_clauses() {
         let pos = deleted.iter().position(|l| l == len).expect("survivor");
         deleted.remove(pos);
     }
-    assert!(!deleted.is_empty(), "stage 2 must delete something");
-    assert!(!surviving.is_empty(), "stage 2 must not delete everything");
+    assert_ne!(deleted.len(), 0, "stage 2 must delete something");
+    assert_ne!(surviving.len(), 0, "stage 2 must not delete everything");
     // Every deleted clause is at least as long as every survivor.
     let shortest_deleted = *deleted.iter().min().unwrap();
     let longest_survivor = *surviving.iter().max().unwrap();

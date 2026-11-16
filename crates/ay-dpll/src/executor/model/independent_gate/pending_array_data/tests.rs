@@ -12,7 +12,7 @@ fn data_executor() -> (Executor, String, ay_core::ArraySort) {
     let mut exec = Executor::new();
     let commands =
         ay_frontend::parse("(declare-datatype Cell ((cell (data (Array Int Bool)))))").unwrap();
-    assert!(exec.execute_all(&commands).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&commands).unwrap(), [] as [String; 0]);
     let info = exec.ctx.exact_datatype_member_info("cell").unwrap();
     let ctor = exec.ctx.symbol_identity_name("cell", info).to_string();
     let sort = ay_core::ArraySort {
@@ -430,6 +430,6 @@ fn prepared_original_data_declines_stale_edges_and_partial_existing_rows_without
         f.model.array_model.as_ref().unwrap().array_values[&f.record.source()],
         partial
     );
-    f.exec.ctx.terms.mk_var("new-snapshot", Sort::Bool);
+    let _ = f.exec.ctx.terms.mk_var("new-snapshot", Sort::Bool);
     assert!(!plan.is_current(&f.exec, &mut work).unwrap());
 }

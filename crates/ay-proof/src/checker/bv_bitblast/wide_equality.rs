@@ -395,10 +395,10 @@ mod tests {
             word(&mut terms, "b", 64),
             word(&mut terms, "c", 64),
         );
-        let ab = terms.mk_app(Symbol::named("concat"), &[a, b], Sort::bitvec(128));
-        let abc = terms.mk_app(Symbol::named("concat"), &[ab, c], Sort::bitvec(192));
+        let ab = terms.mk_app(Symbol::named("concat"), [a, b], Sort::bitvec(128));
+        let abc = terms.mk_app(Symbol::named("concat"), [ab, c], Sort::bitvec(192));
         let (x, y) = (word(&mut terms, "x", 96), word(&mut terms, "y", 96));
-        let xy = terms.mk_app(Symbol::named("concat"), &[x, y], Sort::bitvec(192));
+        let xy = terms.mk_app(Symbol::named("concat"), [x, y], Sort::bitvec(192));
         let slices = plan(&terms, abc, xy).unwrap();
         assert_eq!(slices.len(), 3);
         let mut requests = Vec::new();

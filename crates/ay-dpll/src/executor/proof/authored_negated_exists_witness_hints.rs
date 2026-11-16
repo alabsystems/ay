@@ -273,9 +273,9 @@ impl Executor {
             }
             match self.ctx.terms.get(node) {
                 TermData::Var(name, _) => {
-                    if !symbols.contains(&node)
-                        && !(admit_skolems && self.ctx.terms.is_skolem_symbol(name))
-                    {
+                    let admissible = symbols.contains(&node)
+                        || (admit_skolems && self.ctx.terms.is_skolem_symbol(name));
+                    if !admissible {
                         return false;
                     }
                 }

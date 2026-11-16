@@ -321,7 +321,7 @@ fn documentation_and_grouped_tests_select_only_relevant_work() {
         &Default::default(),
     )
     .unwrap();
-    assert!(docs.steps.is_empty());
+    assert_eq!(docs.steps.as_slice(), &[] as &[Step]);
     let tests = plan::select(
         "/repo".as_ref(),
         &metadata,
@@ -441,6 +441,165 @@ fn internal_lock_edges_are_local_but_external_checksums_broaden_compilation() {
         .steps
         .iter()
         .any(|s| s.args.iter().any(|a| a == "--all-targets")));
+}
+
+const BUMP_MANIFEST: &str = r#"[workspace]
+members = ["crates/ay", "crates/ay-core"]
+
+[workspace.package]
+version = "0.28.1"
+edition = "2021"
+
+[workspace.dependencies]
+ay = { version = "0.28.1", path = "crates/ay" }
+ay-core = { version = "0.28.1", path = "crates/ay-core", default-features = false }
+serde = "1"
+
+[profile.release]
+opt-level = 3
+"#;
+
+const BUMP_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "ay"
+version = "0.28.1"
+dependencies = [
+ "ay-core",
+ "serde",
+]
+
+[[package]]
+name = "ay-core"
+version = "0.28.1"
+
+[[package]]
+name = "serde"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abc"
+"#;
+
+/// Plan a change of the fixture workspace from `BUMP_MANIFEST`/`BUMP_LOCK`
+/// to these files (as `pub bump` writes them), plus any other changed paths.
+fn plan_bump(manifest: &str, lock: &str, other: &[&str]) -> plan::Plan {
+    let temp = tempfile::tempdir().unwrap();
+    let mut metadata = metadata();
+    for package in &mut metadata.packages {
+        package.version = Some("0.28.2".into());
+        package.manifest_path = temp
+            .path()
+            .join(package.manifest_path.strip_prefix("/repo").unwrap());
+        for target in &mut package.targets {
+            target.src_path = temp
+                .path()
+                .join(target.src_path.strip_prefix("/repo").unwrap());
+        }
+    }
+    std::fs::write(temp.path().join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(temp.path().join("Cargo.lock"), lock).unwrap();
+    let scope = super::scope::RustScope {
+        base_workspace_manifest: Some(BUMP_MANIFEST.into()),
+        ..Default::default()
+    };
+    let mut paths: Vec<PathBuf> = vec!["Cargo.lock".into(), "Cargo.toml".into()];
+    paths.extend(other.iter().map(PathBuf::from));
+    plan::select(temp.path(), &metadata, paths, Some(BUMP_LOCK), &scope).unwrap()
+}
+
+fn is_narrow_bump_plan(plan: &plan::Plan) -> bool {
+    !plan.broad_compile
+        && !plan
+            .steps
+            .iter()
+            .any(|step| step.kind == super::process::StepKind::RustTests || step.needs_quiet_host())
+}
+
+#[test]
+fn a_version_only_bump_plans_the_metadata_check_and_the_cli_build_only() {
+    let plan = plan_bump(
+        &BUMP_MANIFEST.replace("0.28.1", "0.28.2"),
+        &BUMP_LOCK.replace("0.28.1", "0.28.2"),
+        &[],
+    );
+    assert!(!plan.broad_compile);
+    assert_eq!(plan.steps.len(), 2, "{:?}", plan.steps);
+    // Resolution with the checked-in lockfile and no network, outside the
+    // build-slot admission that compiler work takes.
+    assert_eq!(plan.steps[0].program, "targo");
+    assert_eq!(
+        plan.steps[0].args,
+        ["metadata", "--locked", "--offline", "--format-version", "1"]
+    );
+    // The ordinary CLI build, shared with every other landing plan.
+    let build = &plan.steps[1];
+    assert_eq!(build.kind, super::process::StepKind::Command);
+    assert!(build
+        .args
+        .windows(2)
+        .any(|a| a == ["--unverified", "build"]));
+    assert!(build.args.windows(2).any(|a| a == ["-p", "ay"]));
+    assert!(build
+        .args
+        .windows(2)
+        .any(|a| a == ["--features", "cli,bench"]));
+    assert!(build.args.windows(2).any(|a| a == ["--bin", "ay"]));
+    assert!(is_narrow_bump_plan(&plan));
+}
+
+#[test]
+fn a_version_bump_with_another_hunk_plans_as_before() {
+    let manifest = BUMP_MANIFEST.replace("0.28.1", "0.28.2");
+    let lock = BUMP_LOCK.replace("0.28.1", "0.28.2");
+    assert!(is_narrow_bump_plan(&plan_bump(&manifest, &lock, &[])));
+    let other_dependency =
+        "name = \"ay-core\"\nversion = \"0.28.2\"\ndependencies = [\n \"serde\",\n]\n";
+    let variants: [(String, String, &[&str]); 6] = [
+        // A compilation setting.
+        (
+            manifest.replace("opt-level = 3", "opt-level = 1"),
+            lock.clone(),
+            &[],
+        ),
+        // An external requirement is not a path dependency into the workspace.
+        (
+            manifest.replace("serde = \"1\"", "serde = \"1.0.1\""),
+            lock.clone(),
+            &[],
+        ),
+        // An external lock entry.
+        (manifest.clone(), lock.replace("\"abc\"", "\"def\""), &[]),
+        // A local lock entry changes more than its version.
+        (
+            manifest.clone(),
+            lock.replace(
+                "name = \"ay-core\"\nversion = \"0.28.2\"\n",
+                other_dependency,
+            ),
+            &[],
+        ),
+        // A local package moves to a version other than the workspace's.
+        (manifest.clone(), lock.replacen("0.28.2", "0.29.0", 1), &[]),
+        // Another changed path.
+        (
+            manifest.clone(),
+            lock.clone(),
+            &["crates/ay-core/src/lib.rs"],
+        ),
+    ];
+    for (manifest, lock, other) in variants {
+        let plan = plan_bump(&manifest, &lock, other);
+        assert!(plan.broad_compile, "{manifest}\n{lock}\n{other:?}");
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.args.iter().any(|arg| arg == "--all-targets")));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step.kind == super::process::StepKind::RustTests
+                && step.args.windows(2).any(|a| a == ["-p", "ay-core"])));
+    }
 }
 
 fn fixture() -> (tempfile::TempDir, Runner, PathBuf) {

@@ -75,7 +75,7 @@ fn cnf_only_preserves_frozen_variable_gate_clause_and_literal_order() {
     graph
         .validate_cnf_with_limits_and_cancellation(&replay_limits(), &mut || true)
         .unwrap();
-    assert!(graph.refutation.steps.is_empty());
+    assert_eq!(graph.refutation.steps, []);
     assert!(graph.validate_with_limits(&replay_limits()).is_err());
 }
 

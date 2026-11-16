@@ -137,7 +137,7 @@ fn mark_root_cone_for_clause(
     seed_clause: &[Literal],
     meter: &mut ConversionMeter<'_>,
 ) -> Result<(), ResolutionValidationError> {
-    debug_assert!(root.cone_stack.is_empty());
+    debug_assert_eq!(root.cone_stack.len(), 0);
     for &literal in seed_clause {
         meter.charge(1)?;
         let variable = literal.variable().index();

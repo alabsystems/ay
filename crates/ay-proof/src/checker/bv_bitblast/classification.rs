@@ -12,9 +12,7 @@ use super::*;
 mod closed_bv_lia;
 mod credits;
 pub(crate) use closed_bv_lia::CLOSED_BV_LIA_CLASSIFIER_WORK;
-pub(crate) use credits::{
-    BvCreditError, ExpensiveBvCreditPlan, OrdinaryBvCredit, PrepaidBvCredits,
-};
+pub(crate) use credits::{ExpensiveBvCreditPlan, PrepaidBvCredits};
 
 #[cfg(test)]
 mod tests;
@@ -109,7 +107,7 @@ fn classify<E>(terms: &TermStore, clause: &[TermId], poll: Poll<'_, E>) -> Resul
     poll()?;
     // A wiring identity is accepted symbolically before either semantic
     // checker runs (`semantic_decision.rs`), so it never needs the producer.
-    if super::wiring::holds_by_wiring(terms, clause) {
+    if wiring::holds_by_wiring(terms, clause) {
         return Ok(false);
     }
     let Some(vars) = bounded_vars(terms, clause, poll)? else {

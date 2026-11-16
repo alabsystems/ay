@@ -126,10 +126,7 @@ fn wide_ieee_fields_fold_without_the_arithmetic_carrier() {
     for value in [reinterpret, components] {
         let conversion = app(&mut terms, "fp.to_ieee_bv", vec![value], Sort::bitvec(211));
         let result = rewriter.rewrite(&mut terms, conversion);
-        assert_eq!(
-            numeral::bv_constant(&terms, result),
-            Some((expected.clone(), 211))
-        );
+        assert_eq!(bv_constant(&terms, result), Some((expected.clone(), 211)));
     }
 
     let nan_bits = terms.mk_bitvec((BigInt::from(2047u32) << 199usize) | BigInt::from(1), 211);

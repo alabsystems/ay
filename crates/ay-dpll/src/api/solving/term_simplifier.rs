@@ -58,6 +58,7 @@ impl SimplifyParameters {
         self.rewrite.max_power_expansion.get_or_insert(maximum);
         self
     }
+    /// Merge global polynomial settings beneath explicit rewrite settings.
     pub fn with_global_polynomial(mut self, global: super::PolynomialParameters) -> Self {
         self.rewrite = self.rewrite.with_global_polynomial(global);
         self
@@ -222,11 +223,8 @@ pub(super) fn fp_literal(
     }
     // Actual native scalar conversion buffers, not the declared FP width.
     let (conversions, bytes) = match value {
-        ModelValue::FloatingPoint { .. } => (
-            3,
-            std::mem::size_of::<u128>() + 2 * std::mem::size_of::<u64>(),
-        ),
-        _ => (1, std::mem::size_of::<u64>()), // Exact fields stay borrowed.
+        ModelValue::FloatingPoint { .. } => (3, size_of::<u128>() + 2 * size_of::<u64>()),
+        _ => (1, size_of::<u64>()), // Exact fields stay borrowed.
     };
     owner.admit(conversions, bytes).map_err(|_| fail())?;
     let sign_value = BigUint::from(u8::from(sign));

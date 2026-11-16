@@ -33,7 +33,7 @@ fn ordinary_emission_recovers_misses_and_fresh_store_reads_use_the_complete_arra
     assert!(executor.last_sat_certificate.is_some());
     assert!(executor.last_model.as_ref().unwrap().has_residual_arrays());
     let base_read = fresh_read(&mut executor, b, 65);
-    let ay_core::term::TermData::App(_, arguments) = executor.ctx.terms.get(base_read) else {
+    let TermData::App(_, arguments) = executor.ctx.terms.get(base_read) else {
         panic!("fresh select");
     };
     let (data, read_key) = (arguments[0], arguments[1]);

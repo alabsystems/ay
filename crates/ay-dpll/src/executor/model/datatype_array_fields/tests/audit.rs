@@ -176,9 +176,10 @@ fn whole_array_equalities_are_not_field_reads_in_either_operand_order() {
 
     for equality in [field_first, field_second] {
         let required_terms = [equality].into_iter().collect();
-        assert!(executor
-            .exact_array_field_reads(field, &required_terms)
-            .is_empty());
+        assert_eq!(
+            executor.exact_array_field_reads(field, &required_terms),
+            [] as [TermId; 0]
+        );
     }
 
     let required_terms = [field_first, field_second, read].into_iter().collect();

@@ -8,9 +8,9 @@ pub(super) fn apply(
     id: usize,
     yes: usize,
     no: usize,
-    arena: &mut Arena,
+    arena: &mut Arena<'_>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<bool> {
     let Key::Op(op, args) = &arena.node(id).key else {
         return Ok(false);
@@ -61,9 +61,9 @@ fn read_is_value(
     mut array: usize,
     index: usize,
     value: usize,
-    arena: &Arena,
+    arena: &Arena<'_>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<bool> {
     loop {
         owner.admit(1, 0)?;
@@ -92,16 +92,16 @@ fn literal<'a, 's>(
     id: usize,
     arena: &'s Arena<'a>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<&'s Key<'a>>> {
     Ok(classes.literal(id, owner)?.map(|id| &arena.node(id).key))
 }
 
 fn bits(
     id: usize,
-    arena: &Arena,
+    arena: &Arena<'_>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<(u128, u32)>> {
     Ok(match literal(id, arena, classes, owner)? {
         Some(Key::BitVec(value, width)) if *width <= 128 => Some((*value, *width)),
@@ -112,9 +112,9 @@ fn bits(
 fn literal_equal(
     a: usize,
     b: usize,
-    arena: &Arena,
+    arena: &Arena<'_>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<bool>> {
     // Different e-classes do NOT prove disequality. Only exact, fully typed
     // concrete values do; wide bitvectors and other scalar theories decline.
@@ -135,9 +135,9 @@ fn literal_equal(
 fn fold(
     op: ChcOp,
     args: &[usize],
-    arena: &Arena,
+    arena: &Arena<'_>,
     classes: &mut Classes,
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Option<(u128, u32)>> {
     owner.admit(1, 0)?;
     match (op, args) {

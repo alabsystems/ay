@@ -22,6 +22,10 @@ use super::{counterexample, QuantifiedChcCounterexample, QuantifiedChcProblem};
 /// derivation, including every universally quantified premise in that tree.
 #[derive(Debug)]
 #[must_use = "Unknown is neither safety evidence nor a counterexample"]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "source-bound safety evidence stays by value without an unmetered allocation or public API change"
+)]
 pub enum QuantifiedChcResult {
     /// Every original clause was discharged under the quantified invariant.
     Safe(QuantifiedChcSafety),

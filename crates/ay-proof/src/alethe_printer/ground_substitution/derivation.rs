@@ -11,7 +11,7 @@ pub(super) struct Derivation<'a, 'terms> {
 }
 
 impl<'a, 'terms> Derivation<'a, 'terms> {
-    pub fn new(id: ProofId, meter: Meter<'a, 'terms>) -> Self {
+    pub(super) fn new(id: ProofId, meter: Meter<'a, 'terms>) -> Self {
         Self {
             meter,
             output: String::new(),
@@ -20,7 +20,7 @@ impl<'a, 'terms> Derivation<'a, 'terms> {
         }
     }
 
-    pub fn same(&mut self, a: &str, b: &str) -> Option<bool> {
+    pub(super) fn same(&mut self, a: &str, b: &str) -> Option<bool> {
         self.meter.spend(a.len().min(b.len()) as u64 + 1)?;
         Some(a == b)
     }
@@ -35,7 +35,7 @@ impl<'a, 'terms> Derivation<'a, 'terms> {
         Some(label)
     }
 
-    pub fn append(&mut self, text: &str) -> Option<()> {
+    pub(super) fn append(&mut self, text: &str) -> Option<()> {
         self.meter.spend(text.len() as u64)?;
         if self.output.len().checked_add(text.len())? > MAX_OUTPUT {
             return None;
@@ -44,24 +44,27 @@ impl<'a, 'terms> Derivation<'a, 'terms> {
         Some(())
     }
 
-    pub fn assume(&mut self, text: &str) -> Option<String> {
+    pub(super) fn assume(&mut self, text: &str) -> Option<String> {
         self.meter.spend(text.len() as u64 + 128)?;
         let label = self.fresh()?;
         self.append(&format!("(assume {label} {text})\n"))?;
         Some(label)
     }
 
-    pub fn step(&mut self, clause: &str, rule: &str, premises: &[String]) -> Option<String> {
-        // WIRE-RULE BOUND: every step of this derivation is printed here, so
-        // no name outside the pinned checker's implemented set can reach the
-        // wire. See `PackedProof::named_step` for the full rationale and
-        // `tests/wire_rule_coverage.rs` for the probe that re-proves the set.
-        if !ay_core::is_checkable_alethe_rule(rule) {
-            return None;
-        }
+    pub(super) fn step(&mut self, clause: &str, rule: &str, premises: &[String]) -> Option<String> {
+        let rule = CheckableRule::new(rule)?;
+        self.step_with_rule(clause, rule, premises)
+    }
+
+    fn step_with_rule(
+        &mut self,
+        clause: &str,
+        rule: CheckableRule,
+        premises: &[String],
+    ) -> Option<String> {
         let bytes = premises
             .iter()
-            .try_fold(clause.len() + rule.len() + 128, |n, p| {
+            .try_fold(clause.len() + rule.as_str().len() + 128, |n, p| {
                 n.checked_add(p.len() + 1)
             })?;
         self.meter.spend(bytes as u64)?;
@@ -77,13 +80,19 @@ impl<'a, 'terms> Derivation<'a, 'terms> {
         Some(label)
     }
 
-    pub fn eq(&mut self, a: &str, b: &str, rule: &str, premises: &[String]) -> Option<String> {
+    pub(super) fn eq(
+        &mut self,
+        a: &str,
+        b: &str,
+        rule: &str,
+        premises: &[String],
+    ) -> Option<String> {
         self.meter
             .spend((a.len().checked_add(b.len())? + 8) as u64)?;
         self.step(&format!("(= {a} {b})"), rule, premises)
     }
 
-    pub fn substitute_pinned(
+    pub(super) fn substitute_pinned(
         &mut self,
         source: &Node,
         pins: &[(&Node, &Node, String)],
@@ -117,7 +126,7 @@ impl<'a, 'terms> Derivation<'a, 'terms> {
     /// Every change produces an equality, including changes below an operator.
     /// Integer order normalization is deliberately left to a separate checked
     /// arithmetic derivation; it is never guessed from printed operand names.
-    pub fn normalize(&mut self, source: &Node) -> Option<(Node, Option<String>)> {
+    pub(super) fn normalize(&mut self, source: &Node) -> Option<(Node, Option<String>)> {
         self.meter.spend(1)?;
         let Some(head) = &source.head else {
             return Some((source.copy(&mut self.meter)?, None));

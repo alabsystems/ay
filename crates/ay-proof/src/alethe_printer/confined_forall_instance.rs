@@ -137,6 +137,10 @@ impl AlethePrinter<'_> {
         let Some(override_descendants) = self.strict_descendants_of_overridden_terms() else {
             return;
         };
+        #[expect(
+            clippy::type_complexity,
+            reason = "the tuple is the exact instance/canonical-text/per-proof-site planning schema"
+        )]
         let mut planned: Vec<(TermId, String, Vec<(ProofId, ConfinedForallInstance)>)> = Vec::new();
         for (instance, sites) in sites {
             if let Some((canonical, plans)) = self.plan_confined_instance(

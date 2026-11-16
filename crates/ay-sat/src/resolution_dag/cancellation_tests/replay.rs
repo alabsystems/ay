@@ -126,6 +126,5 @@ fn reached_independent_replay_error_has_no_new_callback() {
         validate_dag_controlled(&dag, &limits, &control),
         Err(ResolutionProofError::Validation(expected))
     );
-    drop(control);
     assert_eq!(calls, reached);
 }

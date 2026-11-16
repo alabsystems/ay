@@ -3,7 +3,7 @@
 
 //! Complete typed DAG census before any legacy FP circuit allocation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ay_core::original_query::WorkBudget;
 use ay_core::term::{TermData, TermId, TermStore};
@@ -59,11 +59,12 @@ enum Visit {
 pub(super) struct Plan {
     pub gates: usize,
     pub clauses: usize,
+    #[cfg(test)]
     pub occurrences: usize,
 }
 
 impl Plan {
-    pub fn prepay(&self, budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
+    pub(super) fn prepay(&self, budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
         // See packet cost audit: this deliberately does not tighten the fixed
         // binary64 envelope to the actual format, simplifications or memo hits.
         // It covers intermediate vectors, all CNF/cache retention and copying,
@@ -123,6 +124,7 @@ pub(super) fn plan(
     Ok(Plan {
         gates,
         clauses,
+        #[cfg(test)]
         occurrences: total.occurrences,
     })
 }
@@ -221,10 +223,9 @@ fn validate_bindings(
     bindings: &[FpInputBinding<'_>],
     budget: &mut WorkBudget<'_>,
 ) -> Result<(), FpAdapterError> {
-    let mut ids = BTreeMap::new();
-    let mut names = BTreeMap::new();
+    let mut names = BTreeSet::new();
     for binding in bindings {
-        // Bounded strings are compared in a logarithmic map, never hashed.
+        // Bounded strings are compared in an ordered set, never hashed.
         budget.charge(8192)?;
         if terms.entry_stamp(binding.source).is_none() {
             return Err(FpAdapterError::Invalid("missing input"));
@@ -240,9 +241,7 @@ fn validate_bindings(
         {
             return Err(FpAdapterError::Invalid("input name/sort mismatch"));
         }
-        if ids.insert(binding.source, ()).is_some()
-            || names.insert(name.as_str(), binding.source).is_some()
-        {
+        if !names.insert(name.as_str()) {
             return Err(FpAdapterError::Invalid("duplicate or aliased input"));
         }
     }

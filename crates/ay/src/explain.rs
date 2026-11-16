@@ -556,7 +556,10 @@ mod tests {
         );
         executor.execute(&Command::Push(1)).unwrap();
         executor.execute(&Command::Pop(1)).unwrap();
-        assert!(evaluate_explanation_assertions(&mut executor, &assertions).is_empty());
+        assert_eq!(
+            evaluate_explanation_assertions(&mut executor, &assertions).as_slice(),
+            &[] as &[Option<bool>]
+        );
     }
 
     #[test]
@@ -620,8 +623,8 @@ mod tests {
 
     #[test]
     fn test_parse_assertion_list_empty() {
-        assert!(parse_assertion_list("()").is_empty());
-        assert!(parse_assertion_list("").is_empty());
+        assert_eq!(parse_assertion_list("()").as_slice(), &[] as &[String]);
+        assert_eq!(parse_assertion_list("").as_slice(), &[] as &[String]);
     }
 
     #[test]

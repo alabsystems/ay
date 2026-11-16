@@ -215,7 +215,7 @@ fn a_synthetic_hint_authority_transition_reaches_the_actual_retry_child() {
     let mut modes = Vec::new();
     let dag = attempts(&control, |mode, owner| {
         // Compare the thin owner address without unifying callback lifetimes.
-        assert!(std::ptr::addr_eq(owner, &control));
+        assert!(std::ptr::addr_eq(owner, &raw const control));
         modes.push(mode);
         if mode == Inprocessing::Ordinary {
             Attempt::LratAuthorityFailClosed
@@ -249,7 +249,6 @@ fn an_owner_refusal_at_the_authority_transition_cannot_start_the_retry() {
     assert_eq!(result, Err(ResolutionDagError::Unknown));
     assert!(control.check_latched().is_err());
     assert_eq!(attempts_started, 1);
-    drop(control);
     assert_eq!(calls, 1);
 }
 

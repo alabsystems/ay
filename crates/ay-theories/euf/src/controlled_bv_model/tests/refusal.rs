@@ -92,10 +92,9 @@ fn dead_roots_and_corrupt_class_edges_refuse_before_indexing() {
     let mut terms = TermStore::new();
     let value = terms.mk_var("v", Sort::bitvec(8));
     let mut source = prepare(&terms, &[]);
-    assert!(matches!(
-        measured(&source, &[TermId(u32::MAX)], u64::MAX, usize::MAX).0,
-        Err(_)
-    ));
+    assert!(measured(&source, &[TermId(u32::MAX)], u64::MAX, usize::MAX)
+        .0
+        .is_err());
     source.enodes[value.0 as usize].next = u32::MAX;
     assert!(matches!(
         measured(&source, &[value], u64::MAX, usize::MAX).0,

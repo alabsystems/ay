@@ -147,15 +147,15 @@ fn circuit_repeated_source_and_malformed_children_decline_before_rendering() {
     let mut terms = ay_core::TermStore::new();
     let mut root = terms.mk_bool(true);
     for _ in 0..14 {
-        root = terms.mk_app(Symbol::named("and"), &[root, root], Sort::Bool);
+        root = terms.mk_app(Symbol::named("and"), [root, root], Sort::Bool);
     }
     let negative = terms.mk_not_raw(root);
     assert!(AlethePrinter::new(&terms)
         .format_bv_circuit_refutation(ProofId(7), &[negative])
         .is_none());
     let bit = terms.mk_bool(true);
-    let bad = terms.mk_app(Symbol::named("bvadd"), &[bit, bit], Sort::bitvec(8));
-    let eq = terms.mk_app(Symbol::named("="), &[bad, bad], Sort::Bool);
+    let bad = terms.mk_app(Symbol::named("bvadd"), [bit, bit], Sort::bitvec(8));
+    let eq = terms.mk_app(Symbol::named("="), [bad, bad], Sort::Bool);
     let negative = terms.mk_not_raw(eq);
     assert!(AlethePrinter::new(&terms)
         .format_bv_circuit_refutation(ProofId(7), &[negative])

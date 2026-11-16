@@ -1402,7 +1402,7 @@ verify = ["s", "--version"]
         let carcara = registry.find("carcara").unwrap();
         let commit = carcara.commit.as_deref().unwrap();
         let expect = carcara.verify_expect.as_deref().unwrap();
-        assert!(!expect.is_empty());
+        assert_ne!(expect, "");
         assert!(
             commit.starts_with(expect),
             "carcara verify_expect ({expect}) must be a prefix of commit ({commit})"

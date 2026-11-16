@@ -264,6 +264,6 @@ pub(crate) fn ground_linear_refutation(
     let terminal = control.poll().map_err(GroundDerivationError::from);
     match result {
         Err(error) => Err(error),
-        Ok(value) => terminal.map(|_| value),
+        Ok(value) => terminal.map(|()| value),
     }
 }

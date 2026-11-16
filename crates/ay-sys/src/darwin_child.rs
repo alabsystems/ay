@@ -40,7 +40,7 @@ pub fn observe(child: &Child, events: Events) -> io::Result<Option<Event>> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: info is writable siginfo_t storage, and P_PID selects only this
     // Child's positive PID. WNOWAIT preserves its final owner's wait status.
-    let status = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+    let status = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &raw mut info, flags) };
     if status != 0 {
         return Err(io::Error::last_os_error());
     }

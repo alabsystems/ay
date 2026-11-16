@@ -82,7 +82,7 @@ fn every_progress_refusal_is_sticky_through_final_cleanup() {
 
 #[test]
 fn both_original_and_wire_deadlines_refuse_before_callback() {
-    let past = Instant::now() - Duration::from_secs(1);
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     for expiry in 0..2 {
         let mut wire = limits();
         let deadline = if expiry == 0 { past } else { end() };

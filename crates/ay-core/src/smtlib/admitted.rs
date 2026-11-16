@@ -227,6 +227,6 @@ mod tests {
         let _ = text(Some(&tiny), "abcde");
         let _ = text(Some(&tiny), "abcde");
         assert!(tiny.check().is_err());
-        assert!(text(Some(&tiny), "a").is_empty());
+        assert_eq!(text(Some(&tiny), "a"), "");
     }
 }

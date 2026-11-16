@@ -42,11 +42,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::BvExprExportError;
-use crate::{
-    bv_blast_export::BvBlastValidateLimits,
-    bv_blast_solver::{export_bv_blast_proof_expr_with_limits, BvExprProofLimits},
-    BvExpr,
-};
+use crate::{bv_blast_export::BvBlastValidateLimits, bv_blast_solver::BvExprProofLimits, BvExpr};
 
 mod array_congruence;
 mod array_finite;
@@ -72,9 +68,7 @@ mod semantic_decision;
 mod slice_concat;
 mod wiring;
 
-use producer_limits::{
-    proof_producing_limits, proof_replay_limits, strict_producer_limits, ProducerEnvelope,
-};
+use producer_limits::{proof_producing_limits, proof_replay_limits, ProducerEnvelope};
 use proof_producing_control::Failure as ProofProducingFailure;
 use semantic_decision::validate_bv_bitblast_semantics;
 #[cfg(test)]
@@ -88,7 +82,6 @@ mod semantic_cancellation_tests;
 
 pub(crate) use classification::{
     plan_expensive_bv_credits_with_progress, validate_expensive_bv_budget_with_progress,
-    BvCreditError, ExpensiveBvCreditPlan, OrdinaryBvCredit, PrepaidBvCredits,
     CLOSED_BV_LIA_CLASSIFIER_WORK,
 };
 
@@ -1395,11 +1388,11 @@ struct ProofProducingLowerer<'a, 'p> {
     /// `(= v K)` or the case of a split (`hypotheses.rs`, `case_split.rs`) —
     /// so closed evaluation (`bounded_eval::closed_bv_in`) reads them too.
     constants: Vec<(TermId, EvalValue)>,
-    /// Scalar definitions for a DAG retry or exact signed-literal lowering.
+    /// `Some` only in the definitional retry (`proof_producing_control/definitional.rs`).
     definitions: Option<proof_producing_control::Definitions>,
 }
 
-impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
+impl<'a> ProofProducingLowerer<'a, '_> {
     fn new(terms: &'a TermStore, deadline: Instant) -> Self {
         Self {
             terms,
@@ -2046,7 +2039,6 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
         let [lhs_term, rhs_term] = args else {
             return Err(format!("`{name}` requires two arguments"));
         };
-        self.prepare_signed_literal(name, *rhs_term);
         if let Some((product, width)) = self.lower_padded_product(name, *lhs_term, *rhs_term)? {
             return Ok(BvApplicationLowering::Exact(product, width));
         }
@@ -2065,10 +2057,6 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
             ));
         }
         Self::require_same_width(name, lhs_width, rhs_width)?;
-        let lhs = match self.signed_literal_divisor(name, lhs, *rhs_term, lhs_width) {
-            Ok(quotient) => return Ok(BvApplicationLowering::Exact(quotient, lhs_width)),
-            Err(lhs) => lhs,
-        };
         let lhs = match self.power_of_two_quotient(name, lhs, *rhs_term, lhs_width) {
             Ok(quotient) => return Ok(BvApplicationLowering::Exact(quotient, lhs_width)),
             Err(lhs) => lhs,

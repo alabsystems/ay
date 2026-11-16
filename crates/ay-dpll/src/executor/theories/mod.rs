@@ -265,14 +265,6 @@ impl ArrayExtWitnessCache {
         }
     }
 
-    /// Clear provenance when the owning `TermStore` is replaced by `(reset)`.
-    pub(crate) fn clear(&mut self) {
-        self.active.clear();
-        self.retired.clear();
-        self.generated_clauses.clear();
-        self.shared_read.clear();
-    }
-
     /// Whether `witness` is an exact identity minted in the current public
     /// query. Numeric `TermId` equality alone is deliberately insufficient.
     pub(crate) fn is_active_witness(&self, terms: &TermStore, witness: TermId) -> bool {
@@ -642,10 +634,11 @@ mod unproductive_round_limits_tests {
         assert_eq!(unproductive_round_limits(1_032), (129, 1_032));
         // `--z3-mode`, the two invocations that take the budget exit.
         assert_eq!(unproductive_round_limits(1_060), (132, 1_060));
-        assert_eq!(unproductive_round_limits(2_096), (262, 2_096));
+        let (consecutive, total) = unproductive_round_limits(2_096);
+        assert_eq!((consecutive, total), (262, 2_096));
         // ...which is a 105% widening of both bounds, not a few percent.
         assert_eq!(2_096 / MAX_TOTAL_UNPRODUCTIVE_ROUNDS, 2);
-        assert!(262 > 2 * MAX_UNPRODUCTIVE_CONFLICT_ROUNDS);
+        assert!(consecutive > 2 * MAX_UNPRODUCTIVE_CONFLICT_ROUNDS);
     }
 
     /// The two measured refutations: string_search.ads_35_14 (7,618 atoms with

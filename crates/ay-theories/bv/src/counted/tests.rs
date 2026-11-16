@@ -76,7 +76,7 @@ fn reject_wrong_output(
     expected: &[bool],
 ) {
     assert_eq!(word.len(), expected.len());
-    assert!(!word.is_empty());
+    assert_ne!(word, &[] as &[CnfLit]);
     let mut solver = pinned_solver(vars, clauses, pins);
     solver.add_clause(
         word.iter()

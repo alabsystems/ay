@@ -401,7 +401,7 @@ pub(crate) enum ValidationEvidence {
     FullVerification,
 
     /// Counterexample validated via fresh PDR verification.
-    /// Used by: AdaptivePortfolio::finalize_verified_result() before exposing
+    /// Used by: AdaptivePortfolio::finalize_verified_result_with_deadline() before exposing
     /// VerifiedChcResult::Unsafe from the public verified API.
     CounterexampleVerification,
 
@@ -483,7 +483,7 @@ pub(crate) enum ValidationEvidence {
     /// Distinct from [`Self::PreprocessedQueryOnlyDischarge`] (single-run,
     /// rejected fail-closed at both promotion boundaries): this variant is
     /// only constructed by
-    /// `AdaptivePortfolio::run_preprocessed_acyclic_bmc_probe` after the
+    /// `AdaptivePortfolio::run_preprocessed_acyclic_bmc_probe_until` after the
     /// fresh-executor recheck confirmed, and both promotion boundaries gate
     /// it on the original problem being acyclic.
     CheckedQueryOnlyDischarge { query_count: usize },

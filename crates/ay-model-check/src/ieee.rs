@@ -295,7 +295,7 @@ pub fn round_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -
 /// `4*n*d*2^j  vs  ((2m+1)*d)^2`.
 #[must_use]
 pub fn sqrt_rational(value: &BigRational, eb: u32, sb: u32, rm: RoundingMode) -> Option<FpFields> {
-    if (!((2..=32).contains(&eb) && (2..=129).contains(&sb))) || !value.is_positive() {
+    if !((2..=32).contains(&eb) && (2..=129).contains(&sb) && value.is_positive()) {
         return None;
     }
     let bias = (1i64 << (eb - 1)) - 1;

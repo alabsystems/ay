@@ -273,7 +273,7 @@ fn instance_validation_requires_projected_track_state() {
 fn parser_canonicalizes_fields_ignored_by_explicit_tracks() {
     let mc = parse_instance("c t mc\np cnf 1 0\nc p show 1 0\nc p weight 1 1 0\n").unwrap();
     assert_eq!(mc.show, None);
-    assert!(mc.weights.is_empty());
+    assert_eq!(mc.weights.as_slice(), &[] as &[(i32, RawWeight)]);
     mc.validate().unwrap();
 
     let wmc = parse_instance("c t wmc\np cnf 1 0\nc p show 1 0\n").unwrap();

@@ -90,7 +90,7 @@ fn fixed_nested_vectors_preserve_order_duplicates_empty_rows_and_capacity_charge
     assert_eq!(outcome.usage.charged_bytes, bytes);
     assert_eq!(outcome.usage.returned_owned_bytes, 0); // Enclosing owner settles this.
     let empty = checked("[]", |raw, control| vector(raw, 0, control, u32_value));
-    assert!(empty.result.unwrap().is_empty());
+    assert_eq!(empty.result.unwrap().as_slice(), &[] as &[u32]);
     assert_eq!(empty.usage.charged_bytes, 0);
 }
 
@@ -264,7 +264,7 @@ fn long_whitespace_scans_are_chunk_polled_and_invalid_type_cannot_restart() {
 #[test]
 fn expired_original_deadline_precedes_decoder_and_progress() {
     let outcome = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired before callback") },
         |control| vector(raw("[1]"), 1, control, u32_value),
     );
@@ -280,9 +280,7 @@ fn caught_progress_panic_and_swallowed_refusal_cannot_publish_vectors() {
         deadline(),
         &mut |_, bytes| {
             calls.set(calls.get() + 1);
-            if bytes != 0 {
-                panic!("slot admission panic");
-            }
+            assert!(bytes == 0, "slot admission panic");
             true
         },
         |control| {

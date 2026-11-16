@@ -14,8 +14,19 @@ impl LiaSolver<'_> {
     /// (a structural property of the equation), so it is precomputed once in
     /// the atom-indexed linear cache; this is now a pure scan over cached
     /// bools instead of a per-check term-DAG re-parse with fresh BigInt maps.
-    pub(super) fn gcd_test(&self) -> Option<TheoryConflict> {
+    ///
+    /// Barren memo: the scan reads only `positive_equalities` and those
+    /// cached verdicts, so a no-conflict result is a pure function of the
+    /// positive-equality epoch. Repeat calls at an equal epoch return the
+    /// recorded `None` without rescanning (this ran twice per check on
+    /// every BCP quiescence; ~half of miniflight's sampled check time).
+    pub(super) fn gcd_test(&mut self) -> Option<TheoryConflict> {
         use num_rational::Rational64;
+
+        let pos_eq_epoch = self.assertion_view_cache.pos_eq_epoch();
+        if self.gcd_barren_pos_eq_epoch == Some(pos_eq_epoch) {
+            return None;
+        }
 
         let debug = self.debug_gcd;
         let mut tested_equalities = 0usize;
@@ -95,6 +106,7 @@ impl LiaSolver<'_> {
             "LIA GCD test completed without conflict"
         );
 
+        self.gcd_barren_pos_eq_epoch = Some(pos_eq_epoch);
         None
     }
 

@@ -58,7 +58,11 @@ fn original_raw_stop_and_absolute_end_refuse_after_reset_and_restoration() {
     assert!(!confirm(&exec, term));
     let mut fresh = loaded(end);
     let term = root(&fresh);
-    fresh.set_deadline(Some(Instant::now() - Duration::from_secs(1)));
+    fresh.set_deadline(Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock can represent one second ago"),
+    ));
     assert!(!confirm(&fresh, term));
     fresh.set_deadline(Some(end));
     fresh.begin_subset_evaluation_attempt();

@@ -47,7 +47,7 @@ fn binary_spelled(text: &str) -> Option<Vec<String>> {
     while index < tokens.len() {
         if let Some(binary) = tokens
             .get(index..index + 5)
-            .and_then(|window| indexed_constant_in_binary(window))
+            .and_then(indexed_constant_in_binary)
         {
             out.push(binary);
             index += 5;

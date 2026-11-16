@@ -89,6 +89,7 @@ mod firewall_verify;
 mod hard_exit_statistics;
 mod help_style;
 mod help_topics;
+#[cfg(target_os = "linux")]
 mod lean_verify;
 mod maxsat_cert;
 mod maxsat_proof;
@@ -2519,7 +2520,11 @@ fn run_memory_watchdog(
     on_breach();
     let mut waited = Duration::ZERO;
     while waited < grace && !critical() {
-        let step = poll.min(grace - waited);
+        let step = poll.min(
+            grace
+                .checked_sub(waited)
+                .expect("loop guard keeps waited below grace"),
+        );
         sleep(step);
         waited += step;
     }
@@ -2805,7 +2810,7 @@ pub(crate) fn eprintln_smt_error(message: impl std::fmt::Display) {
 /// Report an input file that cannot be opened/read and exit. In z3 mode this
 /// is z3's exact diagnostic and exit status (108); natively AY keeps the
 /// OS error detail and exits 1.
-pub(crate) fn exit_unreadable_input_file(path: &str, detail: &std::io::Error) -> ! {
+pub(crate) fn exit_unreadable_input_file(path: &str, detail: &io::Error) -> ! {
     if Z3_MODE_ENABLED.load(Ordering::Relaxed) {
         eprintln_smt_error(format_args!("failed to open file '{path}'"));
         std::process::exit(108);
@@ -4651,7 +4656,7 @@ fn interactive_start_screen_expected(processed: &[String]) -> bool {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
         return false;
     }
-    if std::env::var_os("AY_PLAIN_REPL").is_some_and(|v| !v.is_empty() && v != "0") {
+    if env::var_os("AY_PLAIN_REPL").is_some_and(|v| !v.is_empty() && v != "0") {
         return false;
     }
     for arg in processed.iter().skip(1) {

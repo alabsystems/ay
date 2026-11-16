@@ -11,7 +11,7 @@
 //! where the RHS evaluates to the same constant.
 //! These must be UNSAT, matching the non-commuted orientation.
 
-use crate::common::{check_z3_or_skip as z3_available, solve_with_z3};
+use crate::common::z3::{check_z3_or_skip as z3_available, solve_with_z3};
 use ntest::timeout;
 
 #[test]

@@ -52,7 +52,7 @@ fn complete_total_function_inventory_is_borrowed_once_including_unused_wide_null
     assert_eq!(view.function_models().len(), 2);
     assert_eq!(view.function_models()[0].name(), "f");
     assert_eq!(view.function_models()[1].name(), "unused wide");
-    assert!(view.function_models()[1].arg_sorts().is_empty());
+    assert_eq!(view.function_models()[1].arg_sorts(), []);
     assert_eq!(view.function_models()[1].result_sort(), &Sort::bitvec(136));
     assert_eq!(view.source().function_declarations().len(), 2);
     assert!(view.steps().all(|step| step.bindings().is_empty()));

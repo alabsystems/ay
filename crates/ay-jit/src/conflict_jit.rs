@@ -98,14 +98,14 @@ impl ConflictProcessorOutput {
         owner: &ay_core::original_query::CountedAdmission,
     ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
         use ay_core::original_query::CountedAdmissionError;
-        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        owner.admit(size_of::<Self>(), 0)?;
         let capacity = capacity.max(64);
         let total = capacity
             .checked_mul(2)
             .and_then(|n| n.checked_add(4))
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         let bytes = total
-            .checked_mul(std::mem::size_of::<u32>())
+            .checked_mul(size_of::<u32>())
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         owner.admit(total, bytes)?;
         let mut buf = Vec::new();
@@ -148,7 +148,7 @@ impl ConflictProcessorOutput {
                     .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?,
             );
             let bytes = target
-                .checked_mul(std::mem::size_of::<u32>())
+                .checked_mul(size_of::<u32>())
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             owner.admit(self.buf.len(), bytes)?;
             self.buf

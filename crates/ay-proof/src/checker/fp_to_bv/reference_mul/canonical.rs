@@ -66,6 +66,7 @@ struct Captured {
 
 #[derive(Clone, Copy)]
 enum RootMode {
+    #[cfg(test)]
     Assertions,
     NegatedClause,
 }
@@ -74,6 +75,7 @@ enum RootMode {
 /// supplies a preexisting absolute deadline, never a relative timeout or credit.
 /// Even if that deadline is later than the original owner's, SAME work checks
 /// still refuse at its original deadline. No local owner is recreated.
+#[cfg(test)]
 pub(super) fn capture<'terms, 'work, 'owner>(
     terms: &'terms TermStore,
     roots: &[TermId],
@@ -114,8 +116,8 @@ fn capture_with_mode<'terms, 'work, 'owner>(
     })
 }
 
-fn capture_inner<'terms>(
-    terms: &'terms TermStore,
+fn capture_inner(
+    terms: &TermStore,
     roots: &[TermId],
     limits: &ResolutionProofLimits,
     work: &mut WorkBudget<'_>,
@@ -133,7 +135,7 @@ fn capture_inner<'terms>(
     bind(&cnf, &dag, work)?;
     let bytes = roots
         .len()
-        .checked_mul(std::mem::size_of::<TermId>())
+        .checked_mul(size_of::<TermId>())
         .ok_or_else(|| work.refuse_exhaustion())?;
     work.admit(roots.len(), bytes)?;
     let mut owned = Vec::new();
@@ -167,6 +169,7 @@ impl Refutation<'_, '_, '_> {
     }
 }
 
+#[cfg(test)]
 fn replay_for(
     terms: &TermStore,
     roots: &[TermId],
@@ -198,6 +201,7 @@ fn replay_mode(
     deadline(limits)
 }
 
+#[cfg(test)]
 fn compile(
     terms: &TermStore,
     roots: &[TermId],
@@ -299,7 +303,9 @@ fn price_search(limits: &ResolutionProofLimits, work: &mut WorkBudget<'_>) -> Re
 
 fn bind(cnf: &circuit::Cnf, dag: &ResolutionDag, work: &mut WorkBudget<'_>) -> Result<()> {
     work.charge(1)?;
-    if dag.num_vars != cnf.num_vars || dag.original_clauses.len() != cnf.clauses.len() {
+    let variables_match = dag.num_vars == cnf.num_vars;
+    let clauses_match = dag.original_clauses.len() == cnf.clauses.len();
+    if !variables_match || !clauses_match {
         return Err(Error::Binding);
     }
     for (index, ((id, actual), expected)) in

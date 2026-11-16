@@ -362,7 +362,7 @@ const ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR: usize = 2;
 /// certification after the transformed-problem PDR solve.
 const ARRAY_GHOST_PAIR_CERTIFY_RESERVE_FRACTION: f64 = 0.25;
 /// Budget cap for the finalize-boundary re-check of a sealed ghost-pair
-/// certificate (defense in depth on top of `certify_and_seal`).
+/// certificate (defense in depth on top of `certify_and_seal_with_term_memory_limit`).
 const ARRAY_GHOST_PAIR_FINALIZE_RECHECK_BUDGET: Duration = Duration::from_secs(20);
 const DUAL_CAS_LRA_ARG_COUNT: usize = 9;
 const LIA_FARKAS_ROUTE_BUDGET: Duration = Duration::from_secs(3);
@@ -4520,8 +4520,8 @@ impl AdaptivePortfolio {
     ///
     /// This route is deliberately narrower than the adaptive dispatch: only
     /// acyclic linear array systems enter it, and a real forwarding/flattening
-    /// rewrite must occur. [`Self::run_preprocessed_acyclic_bmc_probe`] is the
-    /// acceptance boundary: transformed Unsafe evidence is promoted only
+    /// rewrite must occur. [`Self::run_preprocessed_acyclic_bmc_probe_until`]
+    /// is the acceptance boundary: transformed Unsafe evidence is promoted only
     /// after its ground derivation is translated and validated on ORIGINAL
     /// clauses, or after a fresh bounded original-problem replay. Missing or
     /// stale evidence therefore remains `None`, never `FullVerification`.
@@ -6020,14 +6020,14 @@ impl AdaptivePortfolio {
     ) -> (PortfolioResult, ValidationEvidence) {
         if std::env::var_os(REAL_LRA_PROMOTION_ENV).is_some() {
             if let Some(result) =
-                self.try_cruise_controller_mixed_phase_invariant(&features, deadline)
+                self.try_cruise_controller_mixed_phase_invariant(features, deadline)
             {
                 return (result, ValidationEvidence::FullVerification);
             }
         }
 
-        if should_prioritize_acyclic_bv_proof_prepass(&features, &self.problem) {
-            if let Some((result, evidence)) = self.try_acyclic_bmc_probe(&features, deadline) {
+        if should_prioritize_acyclic_bv_proof_prepass(features, &self.problem) {
+            if let Some((result, evidence)) = self.try_acyclic_bmc_probe(features, deadline) {
                 if self.config.verbose {
                     safe_eprintln!(
                         "Adaptive: Pre-algebraic acyclic BV BMC probe solved the problem"
@@ -6050,7 +6050,7 @@ impl AdaptivePortfolio {
             && features.is_linear
             && features.num_predicates > 128;
         let triangle_bv_diff_bound_direct_route =
-            self.should_route_triangle_bv_diff_bounds_to_bv_lane(&features);
+            self.should_route_triangle_bv_diff_bounds_to_bv_lane(features);
 
         if !matches!(features.class, ProblemClass::EntryExitOnly)
             && !large_acyclic_bv_array_graph
@@ -6062,7 +6062,7 @@ impl AdaptivePortfolio {
             // #8753: cap algebraic pre-strategy wall clock. Prior behavior
             // allowed `try_algebraic_solve` to burn the entire CHC budget on
             // SMT validation, starving PDR/IMC/TPA/LAWI.
-            let alg_budget = algebraic_prestage_budget(&features, self.config.time_budget);
+            let alg_budget = algebraic_prestage_budget(features, self.config.time_budget);
             let alg_deadline = alg_start + alg_budget;
             // #9110: the pre-strategy observes the adaptive cancellation token
             // too, so an external `cancellation_handle().cancel()` winds it
@@ -6261,11 +6261,11 @@ impl AdaptivePortfolio {
 
         let (result, evidence) = match features.class {
             ProblemClass::EntryExitOnly => (
-                self.solve_entry_exit_only(&features),
+                self.solve_entry_exit_only(features),
                 ValidationEvidence::TrivialProblem,
             ),
             ProblemClass::Trivial => (
-                self.solve_trivial(&features, deadline),
+                self.solve_trivial(features, deadline),
                 ValidationEvidence::FullVerification,
             ),
             ProblemClass::SimpleLoop if features.uses_real => (
@@ -6279,19 +6279,18 @@ impl AdaptivePortfolio {
                 // BMC, Houdini, Farkas-PDR, Kind, solo PDR) run as concurrent
                 // members next to the portfolio from t=0
                 // (`adaptive_ladder_race`), not serially for 27-39 s of 57 s.
-                let race_started = self.start_query_flag_candidate_race(&features, deadline);
+                let race_started = self.start_query_flag_candidate_race(features, deadline);
                 let outcome = if let Some(result) =
-                    self.try_accumulator_lia_unsafe_counterexample(&features)
+                    self.try_accumulator_lia_unsafe_counterexample(features)
                 {
                     result
                 } else {
-                    let members =
-                        self.simple_loop_ladder_members(&features, deadline, race_started);
+                    let members = self.simple_loop_ladder_members(features, deadline, race_started);
                     // The portfolio drops its own BMC exactly when the front
                     // BMC member races (it does not in an unbounded solve).
                     let bmc_member = members.iter().any(|member| member.name == FRONT_BMC_MEMBER);
                     self.race_ladder("simple_loop", members, || {
-                        self.solve_simple_loop_with_evidence(&features, deadline, bmc_member)
+                        self.solve_simple_loop_with_evidence(features, deadline, bmc_member)
                     })
                 };
                 self.conclude_query_flag_candidate_race(outcome)
@@ -6301,7 +6300,7 @@ impl AdaptivePortfolio {
                 // predicate problems (2+ preds), solve_complex_loop runs a
                 // non-inlined PDR pre-stage before the portfolio to preserve
                 // per-predicate structure that clause inlining would destroy.
-                let result = self.solve_complex_loop(&features, deadline);
+                let result = self.solve_complex_loop(features, deadline);
                 let evidence = Self::complex_loop_validation_evidence();
                 (result, evidence)
             }
@@ -6330,16 +6329,16 @@ impl AdaptivePortfolio {
                     // and neither waits for the other or holds back the
                     // multi-predicate staging any more.
                     let mut members = Vec::new();
-                    if self.front_bmc_probe_applies(&features) {
+                    if self.front_bmc_probe_applies(features) {
                         members.push(LadderMember::new("front_bmc", || {
-                            self.front_bmc_probe_member(&features, deadline)
+                            self.front_bmc_probe_member(features, deadline)
                         }));
                     }
                     members.push(LadderMember::new("lia_farkas_pdr", || {
-                        self.try_lia_farkas_pdr_route(&features, deadline)
+                        self.try_lia_farkas_pdr_route(features, deadline)
                     }));
                     self.race_ladder("multi_pred_linear", members, || {
-                        self.solve_multi_pred_linear(&features, deadline)
+                        self.solve_multi_pred_linear(features, deadline)
                     })
                 }
             }
@@ -6352,11 +6351,11 @@ impl AdaptivePortfolio {
                 // ORIGINAL clauses — instead of paying the multi-predicate
                 // pre-stages before the portfolio's own inliner reaches it.
                 // Anything not verified falls through to today's ladder.
-                if let Some(result) = self.try_collapse_first_nonlinear(&features, deadline) {
+                if let Some(result) = self.try_collapse_first_nonlinear(features, deadline) {
                     result
                 } else {
                     (
-                        self.solve_multi_pred_complex(&features, deadline),
+                        self.solve_multi_pred_complex(features, deadline),
                         ValidationEvidence::FullVerification,
                     )
                 }
@@ -6397,6 +6396,7 @@ impl AdaptivePortfolio {
     /// acceptance policy while exploring strategies. Before returning the public
     /// `VerifiedChcResult`, however, any `Unsafe` must be re-validated so the
     /// verified wrapper's contract holds.
+    #[cfg(test)]
     pub(crate) fn finalize_verified_result(
         &self,
         result: PortfolioResult,

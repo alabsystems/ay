@@ -163,8 +163,11 @@ fn whole_rounded_relation_keeps_three_words_original_namespace_and_ordered_roots
         let namespace = ChcProblem::new();
         let output = lower_fp_clause(&terms, &original, &inputs, &namespace, budget).unwrap();
         assert_eq!(output.source_roots(), &original);
-        assert!(std::ptr::eq(output.source_terms(), &terms));
-        assert!(std::ptr::eq(output.source_namespace(), &namespace));
+        assert!(std::ptr::eq(output.source_terms(), &raw const terms));
+        assert!(std::ptr::eq(
+            output.source_namespace(),
+            &raw const namespace
+        ));
         assert_eq!(output.input_bindings().len(), 3);
         let ChcExpr::Op(crate::ChcOp::And, entries) = output.constraint() else {
             panic!()

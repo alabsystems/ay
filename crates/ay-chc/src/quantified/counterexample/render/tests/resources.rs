@@ -50,7 +50,7 @@ fn output_cap_checks_before_copy_and_formatter_preflight_counts_shared_occurrenc
     let mut out = Output::new(&fresh);
     let above = "x".repeat(MAX_OUTPUT_BYTES + 1);
     assert!(out.push(&above).is_err());
-    assert!(out.finish().is_empty());
+    assert_eq!(out.finish(), "");
 
     // A tiny retained DAG may have exponential tree-printing cost. The
     // independent occurrence preflight refuses before invoking that printer.

@@ -9,7 +9,6 @@ mod bitblast;
 mod cnf;
 #[cfg(test)]
 mod completeness_diag;
-mod counted_query;
 mod executor_first;
 mod horn_session;
 #[cfg(test)]
@@ -27,13 +26,6 @@ mod theory_model;
 pub(in crate::smt) use model_completion::complete_model_from_bindings;
 use model_completion::evaluable_free_vars_missing_from_model;
 
-// Re-export the cumulative-budget test hooks (defined in the private `bitblast`
-// submodule) at `smt` visibility so `smt::tests_check_sat` can toggle the gate.
-#[cfg(test)]
-pub(in crate::smt) use bitblast::{
-    clear_bitblast_max_total_bits_override_for_tests,
-    set_bitblast_max_total_bits_override_for_tests,
-};
 #[cfg(test)]
 pub(in crate::smt) use executor_first::{
     record_executor_session_for_tests, take_executor_session_budgets_for_tests,
@@ -948,7 +940,7 @@ impl SmtContext {
                 std::sync::atomic::AtomicUsize::new(0);
             if let Some((offending, reason)) = expr.conjuncts().iter().find_map(|c| {
                 super::executor_sort_guard::unsupported_executor_expr_reason(c)
-                    .map(|r| (c.clone(), r))
+                    .map(|r| ((*c).clone(), r))
             }) {
                 if ILL_TYPED_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     let text = crate::pdr::model::InvariantModel::expr_to_smtlib(&offending);

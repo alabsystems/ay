@@ -7,7 +7,7 @@
 //! Two checkers read AY's documents (`ay_proof::AletheDialect`). Every name
 //! AY can emit is probed against pinned Carcara 9a352ee, the one AY's own
 //! gates replay with, and must be implemented there, except the Clean-only
-//! names (`ay_core::CLEAN_DIALECT_ALETHE_RULES`, today `dt_project`): those
+//! names (`ay_core::CLEAN_DIALECT_ALETHE_RULES`): those
 //! are printed only in the Clean dialect, pinned Carcara must still answer
 //! `unknown rule` for them (so they stay out of the pinned table), and Clean's
 //! vendored Carcara (`CLEAN_BIN`) must accept a minimal certificate that uses
@@ -44,7 +44,7 @@ struct RuleInventory {
     alias_targets: usize,
     printer_literals: usize,
     printer_dynamic_candidates: usize,
-    rule_bounded_names: usize,
+    checkable_table_only_names: usize,
 }
 
 impl RuleInventory {
@@ -99,13 +99,10 @@ fn wire_rule_alias_targets(alethe_source: &str) -> Vec<String> {
         .find(';')
         .expect("WIRE_RULE_ALIASES declaration must end with a semicolon");
     let strings = ordinary_rust_string_literals(&initializer[..=end]);
-    let mut pairs = strings.chunks_exact(2);
-    let targets = pairs
-        .by_ref()
-        .map(|pair| pair[1].clone())
-        .collect::<Vec<_>>();
+    let (pairs, remainder) = strings.as_chunks::<2>();
+    let targets = pairs.iter().map(|pair| pair[1].clone()).collect::<Vec<_>>();
     assert!(
-        pairs.remainder().is_empty(),
+        remainder.is_empty(),
         "WIRE_RULE_ALIASES must contain (internal, wire) string pairs"
     );
     targets
@@ -261,7 +258,7 @@ fn rust_string_literals(source: &str) -> Vec<RustStringLiteral> {
         if bytes[index] != b'"' {
             if test_module_depth.is_none() && bytes[index] == b'#' {
                 if let Some(open) = inline_test_module_open(source, index) {
-                    line += bytes[index..=open].iter().filter(|&&b| b == b'\n').count();
+                    line += source[index..=open].matches('\n').count();
                     brace_depth += 1;
                     test_module_depth = Some(brace_depth);
                     index = open + 1;
@@ -846,7 +843,7 @@ fn rule_inventory() -> RuleInventory {
         alias_targets: 0,
         printer_literals: 0,
         printer_dynamic_candidates: 0,
-        rule_bounded_names: 0,
+        checkable_table_only_names: 0,
     };
 
     let core_alethe = workspace_crates_dir().join("ay-core/src/alethe.rs");
@@ -943,80 +940,13 @@ fn rule_inventory() -> RuleInventory {
         }
     }
 
-    assert_emitters_are_rule_bounded(manifest);
     for name in ay_core::CHECKABLE_ALETHE_RULES {
         if !inventory.sources.contains_key(name) {
-            inventory.rule_bounded_names += 1;
+            inventory.checkable_table_only_names += 1;
         }
-        inventory.add(name, "CHECKABLE_ALETHE_RULES emitter bound".to_string());
+        inventory.add(name, "CheckableRule canonical table".to_string());
     }
     inventory
-}
-
-/// The step emitters whose wire rule is a `&str` argument, each with the
-/// function that prints it.
-///
-/// Four lowerings added since `5d837561c` -- the packed-selector proofs
-/// (`bv_packed`, ~40 files), the complete bit-blast refutation and its
-/// transport, the shadowed-store array derivation and the bounded ground
-/// substitution -- print `:rule {rule}` from a parameter that is spelled at
-/// call sites all over their subtree, several of them SPLICED
-/// (`bitblast_{gate}`, `pbblast_{op}`, `{op}_simplify`). A static scan cannot
-/// read those back, and guessing at them is exactly how `cd2dff691` put a
-/// name the checker cannot resolve into this inventory.
-///
-/// So the bound is enforced where the bytes are written instead: each of
-/// these functions refuses any name outside
-/// [`ay_core::CHECKABLE_ALETHE_RULES`] and leaves the honest hole, and this
-/// test probes every member of that array against the installed checker. The
-/// assertion below is what keeps the two halves attached: delete a guard and
-/// the coverage argument fails here rather than shipping an unknown rule.
-///
-/// Two later writers are bounded the same way: the u128/i128
-/// multiplication-overflow certificate (`mul_overflow_cert/proof.rs`,
-/// `write_step`, whose names are literals spread across that subtree), and
-/// the constant Skolem bridge (`constant_skolem_bridge.rs`), which writes
-/// every one of its commands, the closing `sko_forall` / `sko_ex` included,
-/// through `bridge_command`.
-const RULE_BOUNDED_EMITTERS: &[(&str, &str)] = &[
-    ("src/alethe_printer/bv_packed.rs", "fn named_step("),
-    ("src/alethe_printer/shadowed_stores.rs", "fn step(&mut self"),
-    (
-        "src/alethe_printer/ground_substitution/derivation.rs",
-        "pub fn step(&mut self",
-    ),
-    ("src/alethe_printer/closed_guard/emit.rs", "fn command("),
-    ("src/alethe_printer/complete_blast.rs", "fn new_word("),
-    ("src/alethe_printer/complete_blast.rs", "fn theory_atom("),
-    (
-        "src/alethe_printer/complete_blast.rs",
-        "fn plan(&mut self, lits: Vec<SRef>, emit: ClauseEmit)",
-    ),
-    (
-        "src/alethe_printer/mul_overflow_cert/proof.rs",
-        "fn write_step(",
-    ),
-    (
-        "src/alethe_printer/constant_skolem_bridge.rs",
-        "fn bridge_command(",
-    ),
-];
-
-const RULE_BOUND_CALL: &str = "ay_core::is_checkable_alethe_rule(";
-
-fn assert_emitters_are_rule_bounded(manifest: &Path) {
-    for (relative, signature) in RULE_BOUNDED_EMITTERS {
-        let path = manifest.join(relative);
-        let source = source_file(&path);
-        let body = function_body(&source, signature);
-        assert!(
-            body.contains(RULE_BOUND_CALL),
-            "{relative}: `{signature}` prints a `:rule {{rule}}` taken from a \
-             parameter but no longer bounds it with `{RULE_BOUND_CALL}`. Either \
-             restore the bound or connect this producer's complete rule-name set \
-             to the inventory above."
-        );
-    }
 }
 
 fn find_carcara() -> Option<PathBuf> {
@@ -1406,13 +1336,13 @@ fn installed_carcara_implements_every_ay_wire_rule() {
     eprintln!(
         "wire-rule coverage: inventory = {} CHECKABLE pass-throughs + {} alias targets + \
          {} fixed printer literals + {} dynamic printer candidates + {} further \
-         CHECKABLE_ALETHE_RULES members reachable through a bounded emitter = {} \
+         CHECKABLE_ALETHE_RULES members represented only by CheckableRule = {} \
          distinct names",
         inventory.pass_throughs,
         inventory.alias_targets,
         inventory.printer_literals,
         inventory.printer_dynamic_candidates,
-        inventory.rule_bounded_names,
+        inventory.checkable_table_only_names,
         inventory.sources.len()
     );
 

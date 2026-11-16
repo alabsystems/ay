@@ -93,8 +93,8 @@ impl Executor {
         };
 
         let live = self.dt_live_term_mask(term_len, []);
-        for idx in 0..term_len {
-            if !live[idx] {
+        for (idx, is_live) in live[..term_len].iter().copied().enumerate() {
+            if !is_live {
                 continue;
             }
             let term = TermId::new(idx as u32);

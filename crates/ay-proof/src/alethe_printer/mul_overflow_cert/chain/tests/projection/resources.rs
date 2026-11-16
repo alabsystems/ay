@@ -9,9 +9,9 @@ fn fixture() -> Vec<Clause> {
 }
 
 fn project(budget: &mut u64, progress: &EmissionProgress<'_>) -> Option<HashSet<Vec<bool>>> {
-    let mut db = fixture();
+    let db = fixture();
     let original = db.clone();
-    let answer = Chain::project(&mut db, &Model::default(), &[1, 2], budget, progress);
+    let answer = Chain::project(&db, &Model::default(), &[1, 2], budget, progress);
     assert_eq!(
         db, original,
         "temporary clauses never escape a refused projection"
@@ -145,11 +145,11 @@ fn observer_unwind_restores_temporary_clauses_and_cannot_revive_the_owner() {
             true
         };
         let owner = EmissionProgress::with_caller(&mut callback);
-        let mut db = fixture();
+        let db = fixture();
         let original = db.clone();
         let mut budget = 1_000_000;
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Chain::project(&mut db, &Model::default(), &[1, 2], &mut budget, &owner)
+            Chain::project(&db, &Model::default(), &[1, 2], &mut budget, &owner)
         }));
         assert!(unwind.is_err());
         assert_eq!(db, original);

@@ -58,7 +58,7 @@ fn a_native_shift_identity_has_a_checked_lowering() {
     let identity = shift_identity(&mut terms, 127, 7);
     assert!(crate::theory_lemma_bv_arithmetic_lowering_supported(
         &terms,
-        &ay_core::TheoryLemmaKind::ArithClauseTautology,
+        &TheoryLemmaKind::ArithClauseTautology,
         &[identity],
         None,
         &mut crate::ArithPolySimpPromotionBudget::standalone(),

@@ -350,6 +350,7 @@ impl LraSolver {
     /// - opposite signs with `2|x| > |y|`: `|y·δ| ≤ |y|/2 < |x|`, so the
     ///   rational part dominates, sign(x);
     /// - otherwise (opposite signs, `2|x| ≤ |y|`): materialise exactly.
+    ///
     /// Every branch is the sign of the same quantity `materialize` returns,
     /// so this agrees with `get_value(..).cmp(&0)` bit-for-bit; the
     /// `nlsat` debug oracle re-checks that on every call.

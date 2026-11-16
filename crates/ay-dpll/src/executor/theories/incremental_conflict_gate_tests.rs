@@ -23,6 +23,7 @@
 use ay_core::{TermId, TheoryConflict, TheoryLit, TheoryPropagation, TheoryResult, TheorySolver};
 use ay_frontend::parse;
 
+use crate::executor::theories::solve_harness::TheoryModels;
 use crate::executor_types::{Result, SolveResult};
 use crate::Executor;
 

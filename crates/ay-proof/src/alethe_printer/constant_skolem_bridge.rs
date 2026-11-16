@@ -54,10 +54,10 @@
 //! is the hole the base already printed.
 //!
 //! Every command this module writes goes through [`bridge_command`], which
-//! refuses a rule outside [`ay_core::CHECKABLE_ALETHE_RULES`]; the caller
-//! then prints the honest hole. That bound is what connects these `:rule`
-//! names to the wire-rule inventory (`RULE_BOUNDED_EMITTERS` in
-//! `tests/wire_rule_coverage.rs`).
+//! converts the raw name to the private [`CheckableRule`] type before a
+//! separate writer can format it; the caller prints the honest hole when the
+//! conversion fails. The external wire-rule probe checks every name the type
+//! can represent.
 //!
 //! Matching is pure and uncharged, so a body that declines leaves the
 //! emission budget exactly where the base left it; only a bridge the
@@ -134,13 +134,19 @@ impl ConstantSkolemBridge {
 /// One `(step LABEL (cl CLAUSE) :rule RULE[ :premises (..)])` command, or
 /// `None` when `rule` is not in [`ay_core::CHECKABLE_ALETHE_RULES`].
 ///
-/// This is the ONLY place the module writes a `:rule`, and the bound here is
-/// what the wire-rule inventory relies on: a rule name it cannot probe is
-/// never printed, the step is the hole instead.
+/// This is the ONLY raw rule-name entry point in the module. The separate
+/// typed writer cannot format a rule name this conversion refused.
 fn bridge_command(label: &str, clause: &str, rule: &str, premises: &[String]) -> Option<String> {
-    if !ay_core::is_checkable_alethe_rule(rule) {
-        return None;
-    }
+    let rule = CheckableRule::new(rule)?;
+    bridge_command_with_rule(label, clause, rule, premises)
+}
+
+fn bridge_command_with_rule(
+    label: &str,
+    clause: &str,
+    rule: CheckableRule,
+    premises: &[String],
+) -> Option<String> {
     let mut command = format!("(step {label} (cl {clause}) :rule {rule}");
     if !premises.is_empty() {
         command.push_str(&format!(" :premises ({})", premises.join(" ")));

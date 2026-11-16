@@ -17,10 +17,6 @@ pub(super) struct Circuit<'a> {
 }
 
 impl<'a> Circuit<'a> {
-    pub(super) fn new(solver: &'a BvSolver<'_>) -> Self {
-        Self::from_clauses(solver.num_vars(), solver.clauses())
-    }
-
     pub(super) fn from_clauses(num_vars: u32, clauses: &'a [CnfClause]) -> Self {
         let mut occurrences = vec![Vec::new(); num_vars as usize + 1];
         let mut remaining = Vec::new();

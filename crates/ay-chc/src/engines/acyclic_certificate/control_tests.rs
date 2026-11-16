@@ -73,7 +73,9 @@ fn active_first_attempt_cancellation_latches_even_when_caller_resets() {
 #[test]
 fn expired_wall_cannot_start_an_attempt_or_consume_a_memo() {
     let problem = acyclic_problem(false);
-    let deadline = ay_core::time::Instant::now() - std::time::Duration::from_secs(1);
+    let deadline = ay_core::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let _outer = crate::smt::ScopedSmtDeadline::install_until(deadline);
     let control = ScopedReplayControl::install_until(deadline, None);
     assert!(!run_bmc_attempts(BmcConfig::default(), &control, |_| {
@@ -120,10 +122,9 @@ fn healthy_original_empty_certificate_and_reachable_countercontrol_stay_checked(
     let caller = CancellationToken::new();
     let _control =
         ScopedReplayControl::install_until(ay_core::time::Instant::now() + budget, Some(&caller));
-    assert!(
-        crate::engines::chc_safe_replay_obligations(&safe, &InvariantModel::new(),)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        crate::engines::chc_safe_replay_obligations(&safe, &InvariantModel::new(),).unwrap(),
+        [] as [pdr::model::ChcReplayObligation; 0]
     );
     let error =
         crate::engines::chc_safe_replay_obligations(&unsafe_problem, &InvariantModel::new())
@@ -168,10 +169,9 @@ fn healthy_empty_model_safe_completes_original_strict_checked_replay() {
     let safe = acyclic_problem(false);
     let caller = CancellationToken::new();
     let budget = std::time::Duration::from_secs(20);
-    assert!(
-        crate::engines::chc_safe_replay_obligations(&safe, &InvariantModel::new(),)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        crate::engines::chc_safe_replay_obligations(&safe, &InvariantModel::new(),).unwrap(),
+        [] as [pdr::model::ChcReplayObligation; 0]
     );
     let run = ChcPdrProofRun::new(
         safe,
@@ -186,7 +186,10 @@ fn healthy_empty_model_safe_completes_original_strict_checked_replay() {
         .proof_run()
         .metadata()
         .trust_full_verifier_admissible());
-    assert!(!checked.summary().obligations.is_empty());
+    assert_ne!(
+        checked.summary().obligations,
+        [] as [proof_metadata::ChcCheckedReplayObligation; 0]
+    );
     assert!(!caller.is_cancelled());
 }
 

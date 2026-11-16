@@ -64,7 +64,7 @@ impl Reference<'_, '_> {
         if self.nodes.len() == self.nodes.capacity() {
             let growth = 64usize.min(self.node_limit - self.nodes.len());
             let bytes = growth
-                .checked_mul(std::mem::size_of::<Node>())
+                .checked_mul(size_of::<Node>())
                 .ok_or(ReferenceError::Width)?;
             self.storage(growth, bytes)?;
             if self.nodes.try_reserve_exact(growth).is_err() {
@@ -197,7 +197,7 @@ impl Reference<'_, '_> {
         }
         let data_width = self.width(value)?;
         let amount_width = self.width(amount)?;
-        let count_bits = u32::BITS - data_width.leading_zeros();
+        let count_bits = data_width.bit_width();
         let common = amount_width.max(count_bits);
         let amount = self.resize(amount, common)?;
         let cap = self.small(u64::from(data_width), common)?;

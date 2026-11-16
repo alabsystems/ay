@@ -511,7 +511,7 @@ fn stream_lossy_json_string(
         write_lossy_pending(writer, &mut pending, false, &mut escaped)?;
     }
     write_lossy_pending(writer, &mut pending, true, &mut escaped)?;
-    debug_assert!(pending.is_empty());
+    debug_assert_eq!(pending.as_slice(), &[] as &[u8]);
     writer.write_all(b"\"")?;
     Ok(hasher.finalize().into())
 }

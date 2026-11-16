@@ -25,7 +25,7 @@ impl SelectionStorage {
             self.extra_occ.len(),
             required.saturating_sub(occurrences.len())
         );
-        occurrences.extend(self.extra_occ.drain(..));
+        occurrences.append(&mut self.extra_occ);
         occurrences.truncate(required);
     }
 }

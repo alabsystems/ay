@@ -37,7 +37,7 @@ fn test_update_amount_through_i64_min_coefficient_is_exact() {
     solver.rows = vec![TableauRow::new(0, vec![(1, int(-4))], int(0))];
     let coeff = solver.rows[0].coeff_ref(1).expect("row carries x1").clone();
     let amount = solver.compute_update_amount_with_coeff(0, 1, BoundType::Lower, &coeff);
-    assert!(amount == InfRational::from_rational(frac(-1, 4)));
+    assert_eq!(amount, InfRational::from_rational(frac(-1, 4)));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn test_update_amount_exact_reciprocal_and_fast_path_clamp_lower_bound() {
         // a constant-zero result nor unconditional clamping can satisfy this.
         solver.vars[1].lower = None;
         let unbounded = solver.compute_update_amount_with_coeff(0, 1, BoundType::Lower, &coeff);
-        assert!(unbounded == expected_unbounded);
+        assert_eq!(unbounded, expected_unbounded);
         assert!(unbounded < amount);
     }
 }
@@ -100,7 +100,7 @@ fn test_update_amount_exact_reciprocal_and_fast_path_clamp_upper_bound() {
 
         solver.vars[1].upper = None;
         let unbounded = solver.compute_update_amount_with_coeff(0, 1, BoundType::Upper, &coeff);
-        assert!(unbounded == expected_unbounded);
+        assert_eq!(unbounded, expected_unbounded);
         assert!(unbounded > amount);
     }
 }

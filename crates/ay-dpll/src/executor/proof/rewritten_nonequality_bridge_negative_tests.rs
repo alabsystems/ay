@@ -167,25 +167,11 @@ fn the_propositional_step_is_a_tautology_under_every_assignment() {
             );
         }
     }
-    // And the mirror image is NOT a tautology, so the box contains a
-    // refutable neighbour: `(cl (not (= A G)) A (not G))` fails at A=false.
-    let mut refuted = false;
-    for a in [false, true] {
-        for g in [false, true] {
-            if (a == g) && !a && g {
-                refuted = true;
-            }
-            if (a == g) && !a && !g {
-                // `(cl ¬(A=G) A ¬G)` at A=G=false: ¬(A=G) false, A false, ¬G true — true.
-            }
-        }
-    }
-    assert!(!refuted, "A=G with A false and G true is unreachable");
     // The genuinely refutable neighbour: DROPPING the equality literal.
     let mut counterexample = None;
     for a in [false, true] {
         for g in [false, true] {
-            if !(!a || g) {
+            if a && !g {
                 counterexample = Some((a, g));
             }
         }

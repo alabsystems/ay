@@ -195,7 +195,7 @@ fn meter_proof_steps(
                 certificate,
             } => {
                 let id = ProofId(u32::try_from(index).map_err(|_| ProofCheckError::ResourceLimit)?);
-                super::nra_sos_payload::meter(terms, id, clause, certificate, pending, progress)?;
+                nra_sos_payload::meter(terms, id, clause, certificate, pending, progress)?;
             }
             ProofStep::Step {
                 rule,

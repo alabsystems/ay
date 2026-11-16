@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use ay_core::time::Instant;
 
-use super::{HornCheck, HornSmt, SessionConfig, SessionStats, TheoryKind, UnknownReason};
+use super::{HornCheck, HornSmt, SessionConfig, SessionStats, UnknownReason};
 use crate::smt::lane::ScopedSessionMode;
 use crate::smt::types::{Partition, SmtResult};
 use crate::smt::SmtContext;
@@ -204,7 +204,7 @@ fn compare_kind(kind: u64, lhs: ChcExpr, rhs: ChcExpr) -> ChcExpr {
 fn atom(rng: &mut Rng, v: &Vocab) -> ChcExpr {
     let kind = rng.below(7);
     match rng.below(10) {
-        0 | 1 | 2 => {
+        0..=2 => {
             let (l, r) = (v.real(rng), constant(rng));
             compare_kind(kind, l, r)
         }
@@ -286,7 +286,7 @@ pub(crate) fn gen_pushpop_script(rng: &mut Rng) -> PushPopScript {
                 steps.push(Step::Pop);
                 depth -= 1;
             }
-            3 | 4 | 5 | 6 if asserts < max_asserts => {
+            3..=6 if asserts < max_asserts => {
                 steps.push(Step::Assert(Arc::new(gen_conjunct(rng, &vocab))));
                 asserts += 1;
             }
@@ -687,7 +687,7 @@ pub(crate) fn run_pushpop_script(
     session_us: &mut Vec<u64>,
     legacy_us: &mut Vec<u64>,
 ) -> (Vec<(Verdict, Verdict, ChcExpr)>, SessionStats) {
-    let mut session = HornSmt::new(SessionConfig::new(TheoryKind::Lra), None);
+    let mut session = HornSmt::new(SessionConfig::new(), None);
     // Scope stack of (id, expr) — the active set is the union.
     let mut scopes: Vec<Vec<(super::AssertId, Arc<ChcExpr>)>> = vec![Vec::new()];
     let mut out = Vec::new();
@@ -1158,7 +1158,7 @@ fn top_level_forms(text: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut in_str = false;
     let mut in_sym = false;
-    let mut chars = text.chars().peekable();
+    let mut chars = text.chars();
     while let Some(c) = chars.next() {
         if in_str {
             cur.push(c);

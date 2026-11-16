@@ -37,7 +37,7 @@ fn trace(terms: &TermStore, entries: &[(TermData, Sort)]) -> Vec<(usize, usize)>
 fn borrowed_comparison_preserves_malformed_unused_and_nested_raw_identity() {
     let (terms, entries) = fixture();
     assert_eq!(terms.entries_snapshot(), entries);
-    assert!(!trace(&terms, &entries).is_empty());
+    assert_ne!(trace(&terms, &entries), Vec::new());
     for index in 0..entries.len() {
         for change_sort in [false, true] {
             let mut changed = entries.clone();
@@ -101,7 +101,7 @@ fn overdeep_right_operand_refuses_before_structural_equality() {
         Err(TermSnapshotError::ResourceLimit)
     );
     let (fresh, original) = fixture();
-    assert!(!trace(&fresh, &original).is_empty());
+    assert_ne!(trace(&fresh, &original), Vec::new());
 }
 
 #[test]

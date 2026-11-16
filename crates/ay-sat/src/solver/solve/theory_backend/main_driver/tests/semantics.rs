@@ -97,7 +97,7 @@ fn main_selection_preserves_main_route_even_with_domain_configuration() {
         assert_eq!(format!("{:?}", s.vsids), format!("{:?}", expected.vsids));
         assert_eq!(s.active_domain, expected.active_domain);
         assert_eq!(s.decision_domain, expected.decision_domain);
-        assert!(s.trail.is_empty());
+        assert_eq!(s.trail.len(), 0);
     }
 }
 

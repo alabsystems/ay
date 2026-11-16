@@ -3283,7 +3283,7 @@ mod tests {
     fn test_gcd_strengthen_empty_terms() {
         let mut c = ge(vec![], 0);
         gcd_strengthen(&mut c);
-        assert!(c.terms.is_empty());
+        assert_eq!(c.terms.as_slice(), &[] as &[PbTerm]);
     }
 
     // --- Trivial constraint detection tests ---
@@ -4327,7 +4327,7 @@ mod tests {
             PreprocessResult::Simplified {
                 instance: result, ..
             } => {
-                assert!(result.constraints.is_empty());
+                assert_eq!(result.constraints.as_slice(), &[] as &[PbConstraint]);
             }
             PreprocessResult::Unsatisfiable => panic!("empty instance should be SAT"),
             PreprocessResult::Interrupted => panic!("should not be interrupted"),
@@ -4510,7 +4510,7 @@ mod tests {
                 instance: result,
                 fixed_literals,
             } => {
-                assert!(result.constraints.is_empty());
+                assert_eq!(result.constraints.as_slice(), &[] as &[PbConstraint]);
                 assert!(fixed_literals.iter().all(|(_, &value)| !value));
                 let assignment: Vec<bool> = (1..=instance.num_vars)
                     .map(|var| fixed_literals.get(&var).copied().unwrap_or(false))
@@ -5523,7 +5523,7 @@ mod tests {
                 instance: result,
                 fixed_literals,
             } => {
-                assert!(result.constraints.is_empty());
+                assert_eq!(result.constraints.as_slice(), &[] as &[PbConstraint]);
                 assert_eq!(fixed_literals.get(&1), Some(&true));
                 assert_eq!(fixed_literals.get(&2), Some(&true));
                 assert_eq!(fixed_literals.get(&3), Some(&true));
@@ -5540,7 +5540,7 @@ mod tests {
                 instance: result,
                 fixed_literals,
             } => {
-                assert!(result.constraints.is_empty());
+                assert_eq!(result.constraints.as_slice(), &[] as &[PbConstraint]);
                 assert_eq!(fixed_literals.get(&1), Some(&false));
                 assert_eq!(fixed_literals.get(&2), Some(&false));
             }
@@ -5597,7 +5597,7 @@ mod tests {
                 instance: result,
                 fixed_literals,
             } => {
-                assert!(result.constraints.is_empty());
+                assert_eq!(result.constraints.as_slice(), &[] as &[PbConstraint]);
                 assert_eq!(fixed_literals.get(&1), Some(&true));
             }
             other => panic!("expected Simplified, got {other:?}"),

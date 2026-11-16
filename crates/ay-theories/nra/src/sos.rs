@@ -59,7 +59,7 @@
 //!   not change that verdict or establish a portable public proof.
 //! * The caller uses a separately bounded SOS-only source-to-polynomial
 //!   translator; general NRA polynomial translation remains a different lane.
-//! * [`SosCertificate::verify`] is the **independent checker**: it re-derives
+//! * [`SosCertificate::verify_with_progress`] is the **independent checker**: it re-derives
 //!   the oriented polynomials from the original constraints, verifies `Q` is
 //!   PSD by exact rational LDLᵀ, checks the multiplier signs, and confirms the
 //!   polynomial identity by exact coefficient matching. It is deliberately

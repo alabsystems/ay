@@ -137,7 +137,7 @@ fn measured(fixture: &Fixture, sweep: Sweep) -> (Option<Vec<u64>>, u64) {
     }
     .unwrap();
     assert!(owner.assign.iter().all(Option::is_none));
-    assert!(owner.touched.is_empty());
+    assert_eq!(owner.touched.len(), 0);
     (hints, meter.consumed_work())
 }
 
@@ -200,7 +200,7 @@ fn opposite_rows_and_duplicate_positions_replay_independently() {
         assert_eq!(actual, expected);
         assert_eq!(actual.as_ref(), Some(&fixture.expected[index % 2]));
         assert!(returned.assign.iter().all(Option::is_none));
-        assert!(returned.touched.is_empty());
+        assert_eq!(returned.touched.len(), 0);
         owner = returned;
         derived.push(RupStep {
             id: first_id + index as u64,
@@ -265,7 +265,7 @@ fn retirement_obeys_every_transient_stop_and_exact_work_boundary() {
             )?;
             assert_eq!(hints, Some(fixture.expected[0].clone()));
             assert!(owner.assign.iter().all(Option::is_none));
-            assert!(owner.touched.is_empty());
+            assert_eq!(owner.touched.len(), 0);
             Ok::<_, ResolutionValidationError>(meter.consumed_work())
         })();
         (result, calls.get())

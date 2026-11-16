@@ -13,8 +13,9 @@
 //! validity — a false-Safe route. These tests pin the fold semantics to the
 //! independent ay-dpll bit-blasting pipeline:
 //!
-//! 1. Random well-typed ground BV terms must fold to a constant that ay-dpll
-//!    proves equal to the original term (`(not (= T C))` is unsat).
+//! 1. Random well-typed ground BV terms must fold to a constant whose equality
+//!    with the original closed term ay-dpll confirms through its independent
+//!    model gate.
 //! 2. Width-mismatched (ill-typed) BV atoms — which sort-changing
 //!    substitutions DO produce (see `smt/convert.rs` #6047 notes) — must NOT
 //!    fold at all (fail-closed, matching the BvUDiv/BvURem width guard).
@@ -22,7 +23,9 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::pdr::model::InvariantModel;
-use crate::smt::executor_adapter::check_unsat_smtlib_via_executor;
+use crate::smt::executor_adapter::{
+    check_ground_sat_smtlib_via_counted_executor, CountedOracleVerdict,
+};
 use crate::{ChcOp, SmtValue};
 
 /// Deterministic splitmix64 RNG — no external dependency, reproducible runs.
@@ -168,17 +171,24 @@ fn bv_const_fold_differential_fuzz_vs_executor() {
         );
         folded_terms += 1;
 
-        // Differential cross-check: ay-dpll must prove term == constant.
+        // Differential cross-check: ay-dpll's independent model gate must
+        // confirm the closed equality under deterministic counted effort.
         let smt = format!(
-            "(set-logic QF_BV)\n(assert (not (= {} {})))\n(check-sat)\n",
+            "(set-logic QF_BV)\n(assert (= {} {}))\n(check-sat)\n",
             smtlib(&term),
             smtlib(&ChcExpr::BitVec(value, w)),
         );
-        assert!(
-            check_unsat_smtlib_via_executor(&smt),
-            "case {case}: ay-dpll DISAGREES with simplify_constants BV fold:\n\
-             term = {term:?}\nfolded to (_ bv{value} {w})\nquery:\n{smt}"
-        );
+        match check_ground_sat_smtlib_via_counted_executor(&smt) {
+            CountedOracleVerdict::Confirmed => {}
+            CountedOracleVerdict::Disagreed => panic!(
+                "case {case}: ay-dpll DISAGREES with simplify_constants BV fold:\n\
+                 term = {term:?}\nfolded to (_ bv{value} {w})\nquery:\n{smt}"
+            ),
+            CountedOracleVerdict::Refused => panic!(
+                "case {case}: counted ay-dpll oracle REFUSED simplify_constants BV fold:\n\
+                 term = {term:?}\nfolded to (_ bv{value} {w})\nquery:\n{smt}"
+            ),
+        }
     }
     assert_eq!(folded_terms, 140, "fuzz should have exercised every case");
 }
@@ -215,19 +225,24 @@ fn bv_cmp_const_fold_differential_fuzz_vs_executor() {
             );
         };
 
-        // If folded true, the negation must be unsat; if false, the
-        // comparison itself must be unsat.
+        // The folded truth value must be satisfiable as a closed assertion.
         let assertion = if result {
-            format!("(not {})", smtlib(&cmp))
-        } else {
             smtlib(&cmp)
+        } else {
+            format!("(not {})", smtlib(&cmp))
         };
         let smt = format!("(set-logic QF_BV)\n(assert {assertion})\n(check-sat)\n");
-        assert!(
-            check_unsat_smtlib_via_executor(&smt),
-            "case {case}: ay-dpll DISAGREES with BV comparison fold:\n\
-             cmp = {cmp:?}\nfolded to {result}\nquery:\n{smt}"
-        );
+        match check_ground_sat_smtlib_via_counted_executor(&smt) {
+            CountedOracleVerdict::Confirmed => {}
+            CountedOracleVerdict::Disagreed => panic!(
+                "case {case}: ay-dpll DISAGREES with BV comparison fold:\n\
+                 cmp = {cmp:?}\nfolded to {result}\nquery:\n{smt}"
+            ),
+            CountedOracleVerdict::Refused => panic!(
+                "case {case}: counted ay-dpll oracle REFUSED BV comparison fold:\n\
+                 cmp = {cmp:?}\nfolded to {result}\nquery:\n{smt}"
+            ),
+        }
     }
 }
 

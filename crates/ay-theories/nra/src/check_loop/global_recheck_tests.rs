@@ -263,7 +263,10 @@ fn empty_nra_authority_declines_even_with_shared_aux_bound() {
     let mut solver = NraSolver::new(&terms);
     solver.internalize_atom(square_lt_zero);
     solver.assert_shared_equality(square, minus_one, &[TheoryLit::new(shared_reason, true)]);
-    assert!(solver.asserted.is_empty());
+    assert_eq!(
+        solver.asserted.as_slice(),
+        &[] as &[(ay_core::TermId, bool)]
+    );
     assert!(!solver.monomials.is_empty());
     assert!(matches!(
         normalized_lra_check(&mut solver),

@@ -11,6 +11,8 @@ mod affine_elimination;
 mod ce_free_resolve;
 mod cert_consult;
 mod checked_isolated_solve;
+#[cfg(test)]
+pub(in crate::executor) use checked_isolated_solve::carries_name_encoded_term_ids;
 mod checked_model_rewrite;
 pub(in crate::executor) use checked_model_rewrite::CheckedModelRewriteSatAuthority;
 mod closed_universal;
@@ -32,7 +34,6 @@ mod vacuous_collapse;
 use ay_core::term::{TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::{TermData, TermId};
 use ay_frontend::SourceContextStamp;
-pub(in crate::executor) use checked_isolated_solve::carries_name_encoded_term_ids;
 pub(in crate::executor) use derived_arena::compact_derived_arena;
 pub(in crate::executor) use exact_array_negation::CheckedExactArrayNegationSatAuthority;
 
@@ -377,7 +378,7 @@ impl CheckedExactUnsat {
 #[must_use = "checked finite-expansion SAT authority must be consumed or discarded"]
 #[derive(Debug)]
 pub(in crate::executor) struct CheckedFiniteExpansionSatAuthority {
-    checked: checked_model_rewrite::CheckedModelRewriteSatAuthority,
+    checked: CheckedModelRewriteSatAuthority,
 }
 
 impl CheckedFiniteExpansionSatAuthority {
@@ -386,7 +387,7 @@ impl CheckedFiniteExpansionSatAuthority {
         roots: &[TermId],
         expanded_model_roots: &[TermId],
     ) -> Option<Self> {
-        checked_model_rewrite::CheckedModelRewriteSatAuthority::for_current(
+        CheckedModelRewriteSatAuthority::for_current(
             executor,
             roots,
             expanded_model_roots,
@@ -1804,7 +1805,7 @@ impl Executor {
         // one of those passes decided -- costs the query nothing at all.
         self.cegqi_ce_free_stash = (matches!(final_result, Ok(SolveResult::Unknown))
             && self.cegqi_ce_free_resolve_armed)
-            .then(|| CeFreeResolveStash {
+            .then_some(CeFreeResolveStash {
                 snapshot: cegqi_ce_free_snapshot,
                 ce_lemma_ids: cegqi_ce_lemma_ids,
                 category,
@@ -14416,7 +14417,7 @@ mod rebuild_tests {
         let inst = CegqiInstantiator::new(forall, &mut terms).expect("CEGQI instantiator");
         let (binders, rho) = rebuild_quantified_ce_lemma(&mut terms, forall, &inst)
             .expect("ground universal must rebuild to its ground CE lemma");
-        assert!(binders.is_empty());
+        assert_eq!(binders, [] as [(String, Sort); 0]);
         let expected = inst
             .create_ce_lemma(&mut terms)
             .expect("stored CE lemma must build");

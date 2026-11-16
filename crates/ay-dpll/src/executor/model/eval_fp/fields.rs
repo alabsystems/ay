@@ -10,9 +10,7 @@ mod tests;
 
 impl Executor {
     fn fp_field_bits(&self, model: &Model, term: TermId, width: u32) -> Option<BigInt> {
-        if self.ctx.terms.entry_stamp(term).is_none() {
-            return None;
-        }
+        self.ctx.terms.entry_stamp(term)?;
         let Sort::BitVec(declared) = self.ctx.terms.sort(term) else {
             return None;
         };

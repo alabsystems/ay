@@ -66,14 +66,35 @@
 //! an `EvalValue::Unknown`, a merged model the strict re-validation cannot
 //! confirm — restores the primary's original `Unknown` verdict and reason.
 //! A wrong SAT is the worst outcome; we never trade soundness for a decide.
+//!
+//! # Statistics
+//!
+//! Beside `fired`, `components` and `outcome`, the rescue records under
+//! `solver.partition_rescue.` the work each component solve spent on this
+//! thread (`RescueTally`) and which components own the premises of the
+//! proof installed in `last_proof` when its `unsat` returns
+//! (`partition_rescue/ownership.rs`). The loop does not clear `last_proof`,
+//! so that proof is the returning solve's only when that solve installed
+//! one.
+//! `Executor::record_rescue_tally` writes them once, after the component
+//! loop has returned, whichever exit the loop took. `component_work_max`
+//! leaves out a component whose solve returned with a live stop seen:
+//! `run_partition_components` reads `Executor::solve_interrupt_is_set` and
+//! `SolveDeadlineCell::expired` as the solve returns, since work cut by an
+//! interrupt, a deadline or a work ceiling can depend on when it fired.
 
 use ay_core::term::TermData;
+use ay_core::time::Instant;
 use ay_core::{Sort, TermId};
 
 use super::model::{EvalValue, Model};
+use super::proof::assembly_observations;
 use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::features::is_builtin_symbol_name;
+
+#[path = "partition_rescue/ownership.rs"]
+mod ownership;
 
 #[cfg(test)]
 #[path = "partition_rescue/resource_stop_tests.rs"]
@@ -89,6 +110,90 @@ struct RescueStateGuard {
     qfax_refinement_clause: Option<Vec<(TermId, bool)>>,
     last_assumption_core: Option<Vec<TermId>>,
     last_model_validated: bool,
+}
+
+/// The work of the components one rescue visited, read on this thread
+/// around each component solve (`ComponentReading`); work other threads run
+/// is not in it. The component loop fills it and
+/// `Executor::record_rescue_tally` writes it after the loop has returned, so
+/// every exit of the loop is recorded. Each field except `winner` names the
+/// `solver.partition_rescue.` key it is written under.
+#[derive(Default)]
+struct RescueTally {
+    /// Components whose solve the loop called (`components_visited`).
+    visited: u64,
+    /// Search work units (`ay_core::resource::thread_work_units`) of the
+    /// visited components, summed (`component_work_total`).
+    work_total: u64,
+    /// The most search work units of one component that returned Sat or
+    /// Unsat with no live stop seen as its solve returned, and that the loop
+    /// accepted past its finite-array and recorded-stop checks
+    /// (`component_work_max`); `None` while none has. A live stop is the
+    /// interrupt flag raised or `solve_deadline.expired()` (the deadline
+    /// passed or a work ceiling reached), read by `run_partition_components`.
+    decided_work_max: Option<u64>,
+    /// The largest growth of `assembly_observations::thread_assembly_units`
+    /// across one visited component's solve (`component_assembly_work_max`):
+    /// the search work units of the outermost UNSAT proof assemblies that
+    /// ended during it. When the rescue itself runs inside a counting
+    /// assembly scope, its components' assemblies are nested in that scope
+    /// and the growth is 0.
+    assembly_work_max: u64,
+    /// The most assembly observations of one visited component
+    /// (`assembly_observations::thread_observations`;
+    /// `component_observations_max`).
+    observations_max: u64,
+    /// The longest wall time of one visited component's solve, in seconds,
+    /// over every visited component whatever it returned
+    /// (`component_seconds_max`). It can differ between runs of one input.
+    seconds_max: f64,
+    /// The index of the component whose `unsat` the loop returned.
+    winner: Option<usize>,
+}
+
+/// This thread's counters, read just before one component solve.
+struct ComponentReading {
+    work: u64,
+    assembly_work: u64,
+    observations: u64,
+    started_at: Instant,
+}
+
+impl ComponentReading {
+    fn now() -> Self {
+        Self {
+            work: ay_core::resource::thread_work_units(),
+            assembly_work: assembly_observations::thread_assembly_units(),
+            observations: assembly_observations::thread_observations(),
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl RescueTally {
+    /// Count one visited component, from the counters read `before` its
+    /// solve to their values now. Returns its search work units.
+    fn visit(&mut self, before: ComponentReading) -> u64 {
+        let work = ay_core::resource::thread_work_units().saturating_sub(before.work);
+        let assembly_work =
+            assembly_observations::thread_assembly_units().saturating_sub(before.assembly_work);
+        let observations =
+            assembly_observations::thread_observations().saturating_sub(before.observations);
+        self.visited += 1;
+        self.work_total = self.work_total.saturating_add(work);
+        self.assembly_work_max = self.assembly_work_max.max(assembly_work);
+        self.observations_max = self.observations_max.max(observations);
+        self.seconds_max = self
+            .seconds_max
+            .max(before.started_at.elapsed().as_secs_f64());
+        work
+    }
+
+    /// Count a visited component of `work` search units whose Sat or Unsat
+    /// the loop accepted with no live stop seen as its solve returned.
+    fn decided(&mut self, work: u64) {
+        self.decided_work_max = Some(self.decided_work_max.map_or(work, |max| max.max(work)));
+    }
 }
 
 impl Executor {
@@ -132,12 +237,16 @@ impl Executor {
         // components now do: it comes back only with the refusal's `unknown`.
         let refusal = self.hold_refusal_diagnostic();
 
-        match self.run_partition_components(
+        let mut tally = RescueTally::default();
+        let decided = self.run_partition_components(
             &components,
             &connectors,
             pre_dispatch_assertions,
+            &mut tally,
             &mut Self::solve_partition_component,
-        ) {
+        );
+        self.record_rescue_tally(&tally, &connectors);
+        match decided {
             Some(decided) => {
                 let label = match &decided {
                     Ok(SolveResult::Sat) => "sat",
@@ -198,14 +307,67 @@ impl Executor {
         true
     }
 
+    /// Write `tally` under `solver.partition_rescue.` (the key of each value
+    /// is named on its `RescueTally` field). A maximum over no component is
+    /// not written, so an absent key and a zero say different things. When
+    /// the loop returned a component's `unsat` and a proof is installed, the
+    /// ownership of that proof's premises (`ownership.rs`) is written too:
+    /// `borrowed_rows`, `unowned_premises`, and `borrow_lender` when a row is
+    /// borrowed.
+    fn record_rescue_tally(&mut self, tally: &RescueTally, connectors: &[Connector]) {
+        let owners = tally
+            .winner
+            .and_then(|winner| self.published_proof_lenders(winner, connectors));
+        let statistics = &mut self.last_statistics;
+        statistics.set_int("solver.partition_rescue.components_visited", tally.visited);
+        statistics.set_int(
+            "solver.partition_rescue.component_work_total",
+            tally.work_total,
+        );
+        if let Some(work) = tally.decided_work_max {
+            statistics.set_int("solver.partition_rescue.component_work_max", work);
+        }
+        if tally.visited > 0 {
+            statistics.set_int(
+                "solver.partition_rescue.component_assembly_work_max",
+                tally.assembly_work_max,
+            );
+            statistics.set_int(
+                "solver.partition_rescue.component_observations_max",
+                tally.observations_max,
+            );
+            statistics.set_float(
+                "solver.partition_rescue.component_seconds_max",
+                tally.seconds_max,
+            );
+        }
+        if let Some(owners) = owners {
+            statistics.set_int(
+                "solver.partition_rescue.borrowed_rows",
+                owners.borrowed_rows,
+            );
+            statistics.set_int(
+                "solver.partition_rescue.unowned_premises",
+                owners.unowned_premises,
+            );
+            if let Some(lender) = owners.lender {
+                statistics.set_int("solver.partition_rescue.borrow_lender", lender as u64);
+            }
+        }
+    }
+
     /// Solve each component, combine verdicts, and (all-SAT) merge + strictly
     /// re-validate the merged model. `Some(Ok(..))` is a definite verdict;
     /// `None` means fail-closed → the caller restores the primary `Unknown`.
+    /// Each component solve is counted in `tally`, whatever it returns; one
+    /// that returns Sat or Unsat counts as decided only when no live stop
+    /// (`RescueTally::decided_work_max`) is seen as it returns.
     fn run_partition_components(
         &mut self,
         components: &[Vec<TermId>],
         connectors: &[Connector],
         pre_dispatch_assertions: &[TermId],
+        tally: &mut RescueTally,
         solve_component: &mut impl FnMut(&mut Self, &[TermId]) -> Result<SolveResult>,
     ) -> Option<Result<SolveResult>> {
         let guard = RescueStateGuard {
@@ -222,12 +384,21 @@ impl Executor {
         let mut component_models: Vec<Option<Model>> = Vec::with_capacity(components.len());
         let mut any_unknown = false;
 
-        for component in components {
+        for (index, component) in components.iter().enumerate() {
             if self.external_stop_reason().is_some() || self.solve_deadline.expired() {
                 self.restore_after_rescue(&guard);
                 return None;
             }
-            let result = match solve_component(self, component) {
+            let before = ComponentReading::now();
+            let solved = solve_component(self, component);
+            // Reads only: the interrupt flag, then the work ceiling, the
+            // deadline cell and the clock (`SolveDeadlineCell::expired`; in
+            // test builds its deadline read also calls a `watch_for_testing`
+            // observer). A Sat or Unsat returned under a live stop is not
+            // counted as decided.
+            let live_stop = self.solve_interrupt_is_set() || self.solve_deadline.expired();
+            let work = tally.visit(before);
+            let result = match solved {
                 Ok(r) => r,
                 Err(e) => {
                     // A hard solver error must not surface from a rescue: restore
@@ -270,6 +441,10 @@ impl Executor {
             }
             match result {
                 SolveResult::Unsat(cert) => {
+                    if !live_stop {
+                        tally.decided(work);
+                    }
+                    tally.winner = Some(index);
                     // Subset monotonicity: an UNSAT subset of the asserted
                     // conjuncts refutes the whole conjunction — sound with NO
                     // reliance on the disjointness analysis. Restore the FULL
@@ -289,6 +464,9 @@ impl Executor {
                     component_models.push(None);
                 }
                 SolveResult::Sat => {
+                    if !live_stop {
+                        tally.decided(work);
+                    }
                     // Clone the component's model out before the next solve
                     // overwrites `last_model`. A Sat with no usable model cannot
                     // contribute to the merge → fail closed (record it as None so

@@ -22,7 +22,7 @@ fn sort_presence(root: &Sort) -> Option<bool> {
     let mut work = 1024usize;
     while let Some(sort) = pending.pop() {
         work = work.checked_sub(1)?;
-        if !seen.insert(sort as *const Sort) {
+        if !seen.insert(std::ptr::from_ref(sort)) {
             continue;
         }
         match sort {
@@ -145,13 +145,13 @@ mod tests {
         let t = store.mk_bool(true);
         let mut wide = t;
         for _ in 0..4096 {
-            wide = store.mk_app(Symbol::named("and"), &[wide, t], Sort::Bool);
+            wide = store.mk_app(Symbol::named("and"), [wide, t], Sort::Bool);
         }
         assert_eq!(store.finite_field_presence(wide), Some(false));
         let field = crate::FiniteFieldSort::new(7).unwrap();
         let x = store.mk_var("x", Sort::FiniteField(field));
         let one = store.mk_finite_field(1, field);
-        let equality = store.mk_app(Symbol::named("="), &[x, one], Sort::Bool);
+        let equality = store.mk_app(Symbol::named("="), [x, one], Sort::Bool);
         assert_eq!(store.finite_field_presence(equality), Some(true));
         let cloned = store.clone();
         assert_eq!(cloned.finite_field_presence(equality), Some(true));

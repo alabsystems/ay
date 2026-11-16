@@ -23,7 +23,7 @@ fn retained_models_preserve_complete_source_order_and_canonical_roundtrip() {
     assert_eq!(models[0].result_sort(), &byte);
     assert_eq!(models[1].name(), "unused wide");
     assert_eq!(models[1].result_sort(), &wide);
-    assert!(models[1].arg_sorts().is_empty());
+    assert_eq!(models[1].arg_sorts(), []);
     let canonical = format!(
         "(model {})",
         models
@@ -61,9 +61,10 @@ fn retained_inventory_is_exact_even_for_unused_and_empty_source_declarations() {
         );
     }
     assert!(ScalarFunctionModel::decode_smtlib(complete, &[]).is_err());
-    assert!(ScalarFunctionModel::decode_smtlib("(model)", &[])
-        .expect("empty exact inventory")
-        .is_empty());
+    assert_eq!(
+        ScalarFunctionModel::decode_smtlib("(model)", &[]).expect("empty exact inventory"),
+        [] as [ScalarFunctionModel; 0]
+    );
     assert!(ScalarFunctionModel::decode_smtlib(
         complete,
         &[("f", &[][..], &byte), ("unused", &[][..], &byte)]

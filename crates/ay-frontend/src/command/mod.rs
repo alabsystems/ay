@@ -1431,7 +1431,7 @@ impl Command {
                     ));
                 }
                 let mut parameters = Vec::new();
-                for pair in items[2..].chunks_exact(2) {
+                for pair in items[2..].as_chunks::<2>().0 {
                     let SExpr::Keyword(name) = &pair[0] else {
                         return Err(ParseError::new("simplify parameter requires a keyword"));
                     };

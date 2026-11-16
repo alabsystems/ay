@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(witness.entries[0].premises, vec![1]);
         assert_eq!(witness.entries[3].level, 0);
         assert_eq!(witness.entries[3].incoming_clause, Some(0));
-        assert!(witness.entries[3].premises.is_empty());
+        assert_eq!(witness.entries[3].premises, [] as [usize; 0]);
         // The transition clause's own variables are pinned from the states.
         assert_eq!(
             witness.entries[0].instances.get("x"),

@@ -34,14 +34,14 @@ fn long_resolution_matches_reference_order_and_rejects_tautologies() {
                 &a,
                 &right,
                 0,
-                &mut RupExpansionState::new(0, None, &mut || true),
+                &mut RupExpansionState::<'_>::new(0, None, &mut || true),
             )
             .unwrap();
             let actual = resolve_pair(
                 &a,
                 &right,
                 0,
-                &mut RupExpansionState::new(0, Some(caps()), &mut || true),
+                &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true),
             )
             .unwrap();
             assert_eq!(actual, expected, "width {width}, mutation {change}");
@@ -57,20 +57,20 @@ fn indexed_equality_preserves_duplicate_and_polarity_semantics() {
     assert!(equal(
         &a,
         &b,
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
     b.push(Lit::neg(1));
     assert!(!equal(
         &a,
         &b,
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
     assert!(!equal(
         &a,
         &a[1..],
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
 }
@@ -86,7 +86,7 @@ fn indexed_membership_respects_allocation_and_every_cancellation_boundary() {
             &a,
             &b,
             0,
-            &mut RupExpansionState::new(0, Some(limits), &mut || true)
+            &mut RupExpansionState::<'_>::new(0, Some(limits), &mut || true)
         ),
         Err(BvSolvedExportError::ResourceLimit {
             resource: "RUP expansion bytes",
@@ -98,7 +98,7 @@ fn indexed_membership_respects_allocation_and_every_cancellation_boundary() {
         &a,
         &b,
         0,
-        &mut RupExpansionState::new(0, Some(caps()), &mut || {
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || {
             polls += 1;
             true
         }),
@@ -110,7 +110,7 @@ fn indexed_membership_respects_allocation_and_every_cancellation_boundary() {
             &a,
             &b,
             0,
-            &mut RupExpansionState::new(0, Some(caps()), &mut || {
+            &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || {
                 calls += 1;
                 calls != stop
             }),
@@ -128,20 +128,20 @@ fn indexed_subset_respects_duplicate_and_polarity_semantics() {
     assert!(subset(
         &a,
         &b,
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
     a.push(Lit::neg(1));
     assert!(!subset(
         &a,
         &b,
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
     assert!(!subset(
         &b,
         &b[1..],
-        &mut RupExpansionState::new(0, Some(caps()), &mut || true)
+        &mut RupExpansionState::<'_>::new(0, Some(caps()), &mut || true)
     )
     .unwrap());
 }

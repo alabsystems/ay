@@ -58,8 +58,7 @@ impl Executor {
         }
         let mut current = steps.len().checked_sub(1)?;
         let mut clause = bridge.derivation.clause.clone();
-        for position in 0..arity {
-            let pivot = bridge.derivation.clause[position];
+        for (position, &pivot) in bridge.derivation.clause[..arity].iter().enumerate() {
             clause.retain(|&literal| literal != pivot);
             let id = steps.len();
             steps.push(ProofStep::Step {

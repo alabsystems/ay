@@ -123,7 +123,7 @@ fn test_parse_solve_satisfy() {
     let input = "solve satisfy;\n";
     let model = parse_flatzinc(input).expect("should parse");
     assert_eq!(model.solve.kind, SolveKind::Satisfy);
-    assert!(model.solve.annotations.is_empty());
+    assert_eq!(model.solve.annotations.as_slice(), &[]);
 }
 
 #[test]

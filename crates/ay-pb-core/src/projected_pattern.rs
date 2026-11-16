@@ -2106,7 +2106,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(empty.cost, 0);
-        assert!(empty.pattern_indices.is_empty());
+        assert_eq!(empty.pattern_indices.as_slice(), &[] as &[u32]);
         assert_eq!(empty.used_resources, vec![0, 0]);
 
         // A complete local frontier may legitimately contain a pattern that

@@ -1330,7 +1330,7 @@ impl ChcExpr {
             })
         }
 
-        let result = match simplify_inner(self, &budget, 0, &mut memo) {
+        let result = match simplify_inner(self, budget, 0, &mut memo) {
             Some(result) => result,
             None if budget.stopped() => return None,
             None => self.clone(),

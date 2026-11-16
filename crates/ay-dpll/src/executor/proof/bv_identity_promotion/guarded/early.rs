@@ -121,8 +121,7 @@ impl Executor {
         ) else {
             return false;
         };
-            let Some(source_work) =
-                source_work.checked_add(std::mem::size_of::<(TermId, String)>() * 2)
+            let Some(source_work) = source_work.checked_add(size_of::<(TermId, String)>() * 2)
             else {
                 return false;
             };

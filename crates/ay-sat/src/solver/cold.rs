@@ -108,7 +108,7 @@ impl OriginalLedger {
         self.literals
             .len()
             .checked_add(len)
-            .filter(|n| *n <= u32::MAX as usize)
+            .filter(|n| u32::try_from(*n).is_ok())
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         self.offsets
             .len()
@@ -608,7 +608,7 @@ pub(crate) struct ColdState {
     /// classifier decides (`u64::MAX`: never), the learned-clause shapes it
     /// reads, and whether a lock waits for the next switch into stable mode.
     pub(super) stable_lock_at: u64,
-    pub(super) learned_shapes: Option<Box<super::stable_lock::LearnedShapeHistogram>>,
+    pub(super) learned_shapes: Option<Box<stable_lock::LearnedShapeHistogram>>,
     pub(super) stable_lock_pending: bool,
     /// `--sat-reorder-kissat`: the conflict count of the next search-loop
     /// reorder, and how many have run.
@@ -624,7 +624,7 @@ pub(crate) struct ColdState {
     /// `--sat-bump-reasons-kissat`: the switch and Kissat's per-mode decision
     /// rate (see `conflict_analysis_bumping.rs`).
     pub(super) bump_reasons_kissat: bool,
-    pub(super) kissat_decision_rate: [super::conflict_analysis_bumping::KissatSmooth; 2],
+    pub(super) kissat_decision_rate: [conflict_analysis_bumping::KissatSmooth; 2],
     /// CDCL search decisions only (Kissat's DECISIONS, decide.c): the
     /// `--sat-bump-reasons-kissat` rate reads this, not `num_decisions`, which
     /// also counts preprocessing, probing, vivification and backbone decisions.
@@ -646,7 +646,7 @@ pub(crate) struct ColdState {
     /// `--sat-vivify-order-kissat`: Kissat's literal order for vivification.
     pub(super) vivify_order_kissat: bool,
     /// Kissat's irredundant vivification delay under `--sat-vivify-kissat`.
-    pub(super) vivify_irr_kissat_delay: super::subst_kissat::KissatDelay,
+    pub(super) vivify_irr_kissat_delay: subst_kissat::KissatDelay,
     /// `--sat-eliminate-cadence-kissat` and Kissat's `eliminations`: the
     /// in-search elimination calls so far (see `Solver::bve`).
     pub(super) eliminate_cadence_kissat: bool,
@@ -657,7 +657,7 @@ pub(crate) struct ColdState {
     /// simplification round's passes run on Kissat's cadence.
     pub(super) probe_round_kissat: bool,
     /// Kissat's sweep delay under `--sat-probe-round-kissat`.
-    pub(super) sweep_kissat_delay: super::subst_kissat::KissatDelay,
+    pub(super) sweep_kissat_delay: subst_kissat::KissatDelay,
     /// `--sat-reduce-protect-kissat`: reduction protects glue-1 clauses only
     /// while used and decays reasons' `used` too.
     pub(super) reduce_protect_kissat: bool,
@@ -681,7 +681,7 @@ pub(crate) struct ColdState {
     /// (compact_fixed.rs).
     pub(super) compact_fixed: bool,
     /// Kissat's congruence delay under `--sat-subst-kissat`.
-    pub(super) congruence_kissat_delay: super::subst_kissat::KissatDelay,
+    pub(super) congruence_kissat_delay: subst_kissat::KissatDelay,
     /// `--sat-restart-gate-kissat` (see `Solver::should_restart`).
     pub(super) restart_gate_kissat: bool,
     /// `--sat-best-stable-kissat`, `--sat-restart-fixpoint-kissat`.
@@ -1394,7 +1394,7 @@ pub(crate) struct ColdState {
     /// run that never compacts produces byte-identical proofs.
     pub(super) proof_vars_compacted: bool,
     /// `--sat-veripb-hints` state (`veripb_hints.rs`).
-    pub(super) veripb_hints: super::veripb_hints::VeripbHintState,
+    pub(super) veripb_hints: veripb_hints::VeripbHintState,
     /// Whether the empty clause derivation was already written to proof_manager.
     /// Prevents duplicate empty-clause entries between mark_empty_clause and
     /// finalize_unsat_proof (#4123).
@@ -2383,7 +2383,7 @@ impl ColdState {
     }
 
     /// Create the full cold solver tail for `Solver::build`.
-    pub(super) fn new<A: super::construction::Construction>(
+    pub(super) fn new<A: construction::Construction>(
         num_vars: usize,
         clauses_capacity: usize,
         lrat_enabled: bool,
@@ -2437,14 +2437,13 @@ impl ColdState {
                 .stable_lock_at
                 .unwrap_or(u64::MAX),
             learned_shapes: if ay_core::sat_ab_switches().stable_lock_at.is_some() {
-                Some(a.boxed(a.choose(
-                    || super::stable_lock::LearnedShapeHistogram::new(),
-                    |owner| {
-                        super::stable_lock::LearnedShapeHistogram::build_admitted(
-                            &super::construction::Counted(owner),
-                        )
-                    },
-                )?)?)
+                Some(
+                    a.boxed(a.choose(stable_lock::LearnedShapeHistogram::new, |owner| {
+                        stable_lock::LearnedShapeHistogram::build_admitted(&construction::Counted(
+                            owner,
+                        ))
+                    })?)?,
+                )
             } else {
                 None
             },
@@ -2452,7 +2451,7 @@ impl ColdState {
             // Never due when `--sat-reorder-kissat` is off, so the search loop's
             // due test stays a single comparison on the default path.
             kissat_reorder_next: if ay_core::sat_ab_switches().reorder_kissat == Some(true) {
-                super::constants::REORDER_INTERVAL
+                REORDER_INTERVAL
             } else {
                 u64::MAX
             },
@@ -2673,7 +2672,7 @@ impl ColdState {
             jump_reasons_enabled: false, // computed in init_solve (#8034)
             veripb_stated_root_units: Vec::new(),
             proof_vars_compacted: false,
-            veripb_hints: super::veripb_hints::VeripbHintState::default(),
+            veripb_hints: veripb_hints::VeripbHintState::default(),
             empty_clause_in_proof: false,
             empty_clause_lrat_id: None,
             empty_clause_scope_depth: 0,

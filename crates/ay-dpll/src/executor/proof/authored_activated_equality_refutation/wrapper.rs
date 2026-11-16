@@ -29,10 +29,7 @@ impl Executor {
         let Some(count) = source.len().checked_add(assumptions.len()) else {
             return;
         };
-        if count == 0
-            || count > MAX_ROOTS
-            || !progress(count, count * std::mem::size_of::<TermId>())
-        {
+        if count == 0 || count > MAX_ROOTS || !progress(count, count * size_of::<TermId>()) {
             return;
         }
         let mut originals = Vec::new();

@@ -246,9 +246,10 @@ impl Executor {
         self.deep_qe_retry_armed = true;
         let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if self.test_panic_in_deep_qe_retry {
-                panic!("test hook: panic inside the deep-QE retry");
-            }
+            assert!(
+                !self.test_panic_in_deep_qe_retry,
+                "test hook: panic inside the deep-QE retry"
+            );
             self.check_sat_internal()
         }));
         self.deep_qe_retry_armed = false;
@@ -367,9 +368,10 @@ impl Executor {
         let borrowed = self.arm_quantified_trace_for_retry();
         let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if self.test_panic_in_quantified_trace_retry {
-                panic!("test hook: panic inside the quantified trace retry");
-            }
+            assert!(
+                !self.test_panic_in_quantified_trace_retry,
+                "test hook: panic inside the quantified trace retry"
+            );
             self.check_sat_internal()
         }));
         self.quantified_trace_retry_armed = false;

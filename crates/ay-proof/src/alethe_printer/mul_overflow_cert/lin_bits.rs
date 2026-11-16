@@ -9,7 +9,7 @@ use super::helpers::{eq_step, project, transfer};
 use super::proof::{Proof, S};
 
 /// From `(cl (= W1 W2))`, the steps `(cl (= a_i b_i))` for every bit.
-pub(crate) fn bit_facts(p: &mut Proof, eq: S) -> Option<Vec<S>> {
+pub(crate) fn bit_facts(p: &mut Proof<'_>, eq: S) -> Option<Vec<S>> {
     let e = p.unit(eq);
     let (w1, w2) = (p.t.args(e)[0], p.t.args(e)[1]);
     let (b1, b2) = (p.t.bits(w1), p.t.bits(w2));

@@ -66,7 +66,7 @@ fn authenticated_children_scrub_loader_environment_and_bound_artifact_files() {
         .unwrap();
         assert_eq!(captured.exit_code, Some(0));
         assert_eq!(captured.stdout, b"environment-ok\n");
-        assert!(captured.stderr.is_empty());
+        assert_eq!(captured.stderr.as_slice(), &[] as &[u8]);
     }
     let args = vec![
         "if=/dev/zero".to_string(),

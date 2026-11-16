@@ -249,7 +249,7 @@ fn validation_formula_proves_unsat_checked(
 ) -> ValidationResult<bool> {
     budget::run(budget, || {
         let raw_conjuncts: Vec<ChcExpr> =
-            budget::cloned(budget::conjuncts(&formula, budget)?, budget)?;
+            budget::cloned(budget::conjuncts(formula, budget)?, budget)?;
         if bool_encoded_exclusions_are_syntactically_unsat_checked(&raw_conjuncts, budget)? {
             return Ok(true);
         }
@@ -676,20 +676,18 @@ fn collect_validation_interval_bound_checked(
         Ok({
             let simplified = budget::simplify(conjunct, budget)?;
             if let Some((op, lhs, rhs)) = validation_interval_atom(&simplified) {
-                return Ok(collect_validation_direct_bound_checked(
-                    op, lhs, rhs, env, budget,
-                )?);
+                return collect_validation_direct_bound_checked(op, lhs, rhs, env, budget);
             }
             if let ChcExpr::Op(ChcOp::Not, args) = &simplified {
                 if args.len() == 1 {
                     if let Some((op, lhs, rhs)) = validation_interval_atom(args[0].as_ref()) {
-                        return Ok(collect_validation_direct_bound_checked(
+                        return collect_validation_direct_bound_checked(
                             negated_validation_comparison(op),
                             lhs,
                             rhs,
                             env,
                             budget,
-                        )?);
+                        );
                     }
                 }
             }
@@ -917,11 +915,11 @@ fn propagate_validation_implication_bound_checked(
             };
             if matches!(op, ChcOp::Implies) && args.len() == 2 {
                 if validation_atom_is_true_checked(args[0].as_ref(), env, budget)? {
-                    return Ok(collect_validation_interval_bound_checked(
+                    return collect_validation_interval_bound_checked(
                         args[1].as_ref(),
                         env,
                         budget,
-                    )?);
+                    );
                 }
                 return Ok(true);
             }
@@ -932,18 +930,14 @@ fn propagate_validation_implication_bound_checked(
                 validation_or_implication_parts(args[0].as_ref(), args[1].as_ref())
             {
                 if validation_atom_is_true_checked(antecedent, env, budget)? {
-                    return Ok(collect_validation_interval_bound_checked(
-                        consequent, env, budget,
-                    )?);
+                    return collect_validation_interval_bound_checked(consequent, env, budget);
                 }
             }
             if let Some((antecedent, consequent)) =
                 validation_or_implication_parts(args[1].as_ref(), args[0].as_ref())
             {
                 if validation_atom_is_true_checked(antecedent, env, budget)? {
-                    return Ok(collect_validation_interval_bound_checked(
-                        consequent, env, budget,
-                    )?);
+                    return collect_validation_interval_bound_checked(consequent, env, budget);
                 }
             }
             true
@@ -3016,7 +3010,7 @@ fn validation_body_syntactically_implies_head_checked(
         }
         let alias_substitution = validation_alias_substitution_checked(body, budget)?;
         let mut implied = FxHashSet::default();
-        for expr in budget::conjuncts(&body, budget)? {
+        for expr in budget::conjuncts(body, budget)? {
             implied.insert(validation_alias_normalized_expr_key_checked(
                 expr,
                 &alias_substitution,
@@ -3030,7 +3024,7 @@ fn validation_body_syntactically_implies_head_checked(
             budget,
         )?;
         let active_diff_shape = extract_active_diff_invariant_shape(head, budget)?;
-        for (index, conjunct) in budget::conjuncts(&head, budget)?.into_iter().enumerate() {
+        for (index, conjunct) in budget::conjuncts(head, budget)?.into_iter().enumerate() {
             if index % VALIDATION_FASTPATH_POLL_STRIDE == 0 {
                 check(budget)?;
             }
@@ -3267,7 +3261,7 @@ fn validation_body_implies_linear_equality_checked(
         if let Some(head_key) =
             validation_linear_equality_key_checked(conjunct, &substitution, budget)?
         {
-            for body_conjunct in budget::conjuncts(&body, budget)? {
+            for body_conjunct in budget::conjuncts(body, budget)? {
                 if validation_linear_equality_key_checked(body_conjunct, &substitution, budget)?
                     .as_deref()
                     == Some(head_key.as_str())
@@ -3284,7 +3278,7 @@ fn validation_body_implies_linear_equality_checked(
         if head_poly.is_empty() {
             return Ok(true);
         }
-        for body_conjunct in budget::conjuncts(&body, budget)? {
+        for body_conjunct in budget::conjuncts(body, budget)? {
             if validation_poly_equality_normalized_checked(body_conjunct, &substitution, budget)?
                 .is_some_and(|body_poly| body_poly == head_poly)
             {
@@ -3495,7 +3489,7 @@ fn validation_body_implies_linear_inequality_checked(
         else {
             return Ok(false);
         };
-        for body_conjunct in budget::conjuncts(&body, budget)? {
+        for body_conjunct in budget::conjuncts(body, budget)? {
             if validation_linear_inequality_key_checked(body_conjunct, &substitution, budget)?
                 .as_deref()
                 == Some(head_key.as_str())
@@ -3510,7 +3504,7 @@ fn validation_body_implies_linear_inequality_checked(
         };
         let mut body_equalities = Vec::new();
         let mut body_inequalities = Vec::new();
-        for body_conjunct in budget::conjuncts(&body, budget)? {
+        for body_conjunct in budget::conjuncts(body, budget)? {
             if let Some(equality) =
                 validation_linear_equality_expr_checked(body_conjunct, &substitution, budget)?
             {
@@ -3858,7 +3852,7 @@ fn validation_body_preserves_linear_mod_residue_checked(
         else {
             return Ok(false);
         };
-        for body_conjunct in budget::conjuncts(&body, budget)? {
+        for body_conjunct in budget::conjuncts(body, budget)? {
             let substituted = budget::substitute(body_conjunct, &substitution, budget)?;
             let body_expr = budget::simplify(&substituted, budget)?;
             if let Some(value) = validation_linear_mod_residue_atom_checked(&body_expr, budget)? {
@@ -3884,7 +3878,7 @@ fn validation_body_equalities_imply_linear_mod_residue_checked(
 ) -> ValidationResult<bool> {
     budget::run(budget, || {
         let mut equalities = Vec::new();
-        for conjunct in budget::conjuncts(&body, budget)? {
+        for conjunct in budget::conjuncts(body, budget)? {
             if let Some(value) =
                 validation_linear_equality_expr_checked(conjunct, substitution, budget)?
             {
@@ -3920,14 +3914,14 @@ fn validation_body_linear_substitution_checked(
 ) -> ValidationResult<Vec<(ChcVar, ChcExpr)>> {
     budget::run(budget, || {
         let mut substitution = budget::cloned(alias_substitution, budget)?;
-        let max_rounds = budget::conjuncts(&body, budget)?
+        let max_rounds = budget::conjuncts(body, budget)?
             .len()
             .saturating_add(4)
             .clamp(1, 32);
         for _ in 0..max_rounds {
             check(budget)?;
             let before = substitution.len();
-            for conjunct in budget::conjuncts(&body, budget)? {
+            for conjunct in budget::conjuncts(body, budget)? {
                 let substituted = budget::substitute(conjunct, &substitution, budget)?;
                 let simplified = budget::simplify(&substituted, budget)?;
                 let Some((var, expr)) = validation_linear_expr_alias(&simplified, budget)? else {
@@ -4072,7 +4066,7 @@ fn validation_alias_substitution_checked(
 ) -> ValidationResult<Vec<(ChcVar, ChcExpr)>> {
     budget::run(budget, || {
         let mut parent = FxHashMap::default();
-        for conjunct in budget::conjuncts(&body, budget)? {
+        for conjunct in budget::conjuncts(body, budget)? {
             check(budget)?;
             let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
                 continue;
@@ -4101,7 +4095,7 @@ fn validation_alias_substitution_checked(
                 substitution.push((var, ChcExpr::var(root)));
             }
         }
-        for conjunct in budget::conjuncts(&body, budget)? {
+        for conjunct in budget::conjuncts(body, budget)? {
             check(budget)?;
             let Some((var, expr)) = validation_bool_expr_alias(conjunct) else {
                 continue;
@@ -4262,7 +4256,7 @@ fn extract_active_diff_invariant_shape(
     let mut eps: Option<ChcVar> = None;
     let mut diff_clause_count = 0usize;
 
-    for conjunct in budget::conjuncts(&head, budget)? {
+    for conjunct in budget::conjuncts(head, budget)? {
         let Some((active_a, active_b, clause_eps, value_a, value_b)) =
             parse_active_diff_invariant_clause(conjunct, budget)?
         else {

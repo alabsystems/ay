@@ -104,7 +104,7 @@ fn source_exists(width: u32, state: [u128; 7], path: Path) -> bool {
             common
                 && match path {
                     Path::Equality => s <= a && a != 0 && (q != 0) == (b == 0),
-                    Path::MergedTrue => q != 0 && (s > a || (s <= a && a == 0)),
+                    Path::MergedTrue => q != 0 && (s > a || a == 0),
                 }
         })
     })

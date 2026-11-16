@@ -10,7 +10,9 @@ use crate::CancellationToken;
 fn expired_ambient_wall_refuses_before_callback_and_binding() {
     let run = truth_run();
     let before = run.metadata().to_json_value();
-    let deadline = Instant::now() - Duration::from_secs(1);
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant supports a one-second offset");
     let _outer = ScopedSmtDeadline::install_until(deadline);
     assert_interrupted(run.run_checked_replay_with_binding_factory(
         Instant::now(),

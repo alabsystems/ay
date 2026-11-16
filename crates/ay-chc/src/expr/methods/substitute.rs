@@ -508,7 +508,7 @@ impl ChcExpr {
         // shallow clone (child `Arc`s are shared, refcount-bumped); the only
         // fresh node is the root itself, so intra-input sharing is fully kept.
         let root = Arc::new(self.clone());
-        let result = match Self::subst_inner(&root, &budget, 0, lookup, &mut memo) {
+        let result = match Self::subst_inner(&root, budget, 0, lookup, &mut memo) {
             Some(result) => Arc::try_unwrap(result).unwrap_or_else(|arc| (*arc).clone()),
             None if budget.stopped() => return None,
             None => self.clone(),

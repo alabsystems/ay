@@ -360,7 +360,7 @@ fn every_success_and_duplicate_failure_callback_refuses_through_cleanup() {
 #[test]
 fn original_deadline_and_caught_metadata_callback_panic_remain_terminal() {
     let outcome = control::run(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         &mut |_, _| -> bool { panic!("expired") },
         |control| bitvec(raw(r#"{"width":8}"#), control),
     );
@@ -370,9 +370,7 @@ fn original_deadline_and_caught_metadata_callback_panic_remain_terminal() {
         end(),
         &mut |_, bytes| {
             calls.set(calls.get() + 1);
-            if bytes > 0 {
-                panic!("metadata allocation");
-            }
+            assert!(bytes == 0, "metadata allocation");
             true
         },
         |control| {

@@ -255,7 +255,7 @@ impl Executor {
         if count == 0 || count > ay_core::NraSosCertificate::MAX_CLAUSE_SLOTS {
             return Ok(None);
         }
-        if !control.poll(count, count * std::mem::size_of::<TermId>()) {
+        if !control.poll(count, count * size_of::<TermId>()) {
             return refusal(&control);
         }
         let assertions = epoch.assertions.clone().into_boxed_slice();

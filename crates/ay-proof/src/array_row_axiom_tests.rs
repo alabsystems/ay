@@ -121,7 +121,7 @@ fn a_term_with_no_store_yields_no_instance() {
     let a1 = array(&mut terms, "a1");
     let i0 = index(&mut terms, "i0");
     let read = select(&mut terms, a1, i0);
-    assert!(plan_row1_axiom_instances(&mut terms, &[read]).is_empty());
+    assert_eq!(plan_row1_axiom_instances(&mut terms, &[read]), []);
 }
 
 /// The cap is real, not decorative: a chain longer than the cap yields exactly

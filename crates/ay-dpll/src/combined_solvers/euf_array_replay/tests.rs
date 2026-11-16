@@ -120,10 +120,10 @@ fn literal_incidence_activates_once_and_pop_invalidation_rebuilds() {
     let mut cache = EufArrayNotifyReplayCache::default();
 
     cache.ensure_forest(&imported, &local, &assignments, &mut parent);
-    assert!(cache.unapplied_forest().is_empty());
+    assert_eq!(cache.unapplied_forest(), []);
     assignments.insert(first.term, first.value);
     cache.assignment_added(first, &imported, &local, &mut parent);
-    assert!(cache.unapplied_forest().is_empty());
+    assert_eq!(cache.unapplied_forest(), []);
     assignments.insert(second.term, second.value);
     cache.assignment_added(second, &imported, &local, &mut parent);
     assert_eq!(cache.unapplied_forest(), &[(TermId(1), TermId(2))]);
@@ -134,7 +134,7 @@ fn literal_incidence_activates_once_and_pop_invalidation_rebuilds() {
     cache.invalidate_assignment();
     cache.ensure_forest(&imported, &local, &assignments, &mut parent);
     assert_eq!(cache.forest_rebuilds(), 2);
-    assert!(cache.unapplied_forest().is_empty());
+    assert_eq!(cache.unapplied_forest(), []);
 }
 
 #[test]

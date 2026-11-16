@@ -123,10 +123,7 @@ impl EufSolver<'_> {
         const WARMUP: u64 = 512;
         self.lazy_emit_counter = self.lazy_emit_counter.saturating_add(1);
         let n = self.lazy_emit_counter;
-        if n <= WARMUP || n.is_multiple_of(64) {
-            return false;
-        }
-        true
+        !(n <= WARMUP || n.is_multiple_of(64))
     }
 
     /// Propagate implied equalities: `(= a b) = true` when `find(a) = find(b)`.

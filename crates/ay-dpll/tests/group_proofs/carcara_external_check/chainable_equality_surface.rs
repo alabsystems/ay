@@ -60,7 +60,7 @@ fn equiv_source_arities(proof: &str) -> Vec<(usize, String)> {
         let operands = source
             .strip_prefix("(= ")
             .and_then(|t| t.strip_suffix(')'))
-            .map_or(0, |inner| count_terms(inner));
+            .map_or(0, count_terms);
         arities.push((operands, line.to_string()));
     }
     arities

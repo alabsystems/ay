@@ -149,7 +149,7 @@ fn unreasoned_sentinel_edges_keep_overapproximate_candidates_for_uninterpreted_i
     solver.assert_literal(a_one, true);
     solver.assert_literal(b_two, true);
     prepare(&mut solver);
-    assert!(check_oracle(&solver).is_empty());
+    assert_eq!(check_oracle(&solver).len(), 0);
     assert!(solver.assert_external_equality(i, j));
     prepare(&mut solver);
     assert!(solver.eq_adj[&i]
@@ -175,7 +175,7 @@ fn index_merge_push_pop_and_frozen_window_memo_preserve_old_sorted_results() {
         solver.assert_literal(binding, true);
     }
     prepare(&mut solver);
-    assert!(check_oracle(&solver).is_empty());
+    assert_eq!(check_oracle(&solver).len(), 0);
     solver.push();
     solver.assert_literal(ij, true);
     prepare(&mut solver);
@@ -193,5 +193,5 @@ fn index_merge_push_pop_and_frozen_window_memo_preserve_old_sorted_results() {
     }
     solver.pop();
     prepare(&mut solver);
-    assert!(check_oracle(&solver).is_empty());
+    assert_eq!(check_oracle(&solver).len(), 0);
 }

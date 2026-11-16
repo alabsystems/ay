@@ -17,7 +17,6 @@ pub(super) enum ReplayLimitRefusal {
 
 #[derive(Clone, Copy)]
 pub(crate) enum ReplayLimit<'a> {
-    Legacy,
     Until(Instant),
     Cancellable {
         deadline: Instant,
@@ -28,7 +27,6 @@ pub(crate) enum ReplayLimit<'a> {
 impl<'a> ReplayLimit<'a> {
     pub(super) fn deadline(self) -> Option<Instant> {
         match self {
-            Self::Legacy => None,
             Self::Until(deadline) | Self::Cancellable { deadline, .. } => Some(deadline),
         }
     }
@@ -36,7 +34,7 @@ impl<'a> ReplayLimit<'a> {
     pub(crate) fn cancellation(self) -> Option<&'a ReplayCancellation> {
         match self {
             Self::Cancellable { cancellation, .. } => Some(cancellation),
-            Self::Legacy | Self::Until(_) => None,
+            Self::Until(_) => None,
         }
     }
 

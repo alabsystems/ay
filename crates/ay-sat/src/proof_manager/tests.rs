@@ -312,7 +312,7 @@ fn test_lrat_derived_empty_without_hints_is_hidden_and_fails_closed() {
         .into_output()
         .into_vec()
         .expect("writer remains readable");
-    assert!(proof.is_empty(), "invalid `3 0 0` must never be serialized");
+    assert_eq!(proof.len(), 0, "invalid `3 0 0` must never be serialized");
 }
 
 #[test]
@@ -328,7 +328,7 @@ fn test_decompose_scoped_observer_skips_unproved_trusted_lrat_add() {
 
     assert_ne!(added, 0);
     assert_eq!(manager.added_count(), 0);
-    assert!(manager.scoped_decompose_proof_emit_records().is_empty());
+    assert_eq!(manager.scoped_decompose_proof_emit_records().len(), 0);
     assert!(manager.has_lrat_authority_fail_closed());
 }
 
@@ -345,7 +345,7 @@ fn test_decompose_scoped_observer_skips_suppressed_lrat_add() {
 
     assert_eq!(added, 0);
     assert_eq!(manager.added_count(), 0);
-    assert!(manager.scoped_decompose_proof_emit_records().is_empty());
+    assert_eq!(manager.scoped_decompose_proof_emit_records().len(), 0);
 }
 
 #[test]
@@ -1072,7 +1072,7 @@ fn test_fmla_learned_lrat_dry_run_no_records_artifact_round_trips_fail_closed() 
         imported.materialization_status,
         LearnedLratMaterializationStatus::FailClosedNoLearnedLratAuthorityRecords
     );
-    assert!(imported.rows.is_empty());
+    assert_eq!(imported.rows.len(), 0);
     assert_eq!(imported.lrat_fragment, "");
     assert!(!imported.external_checker_required);
     assert!(!imported.external_checker_verified);
@@ -1225,7 +1225,7 @@ fn test_fmla_learned_lrat_dry_run_rejects_malformed_fail_closed_materializer_row
         dry_run.materialization_status,
         LearnedLratMaterializationStatus::FailClosedMalformedReplayRows
     );
-    assert!(dry_run.rows.is_empty());
+    assert_eq!(dry_run.rows.len(), 0);
     assert_eq!(dry_run.lrat_fragment, "");
     assert_eq!(
         dry_run.main_proof_authority_reason,
@@ -1978,9 +1978,9 @@ fn test_lrat_file_hint_filtering_reuses_scratch_for_large_chains() {
         )
         .expect("large file hint chain should be filtered and emitted");
     assert_eq!(clause_id, 10);
-    assert!(manager.file_hints_buf.is_empty());
+    assert_eq!(manager.file_hints_buf.len(), 0);
     assert!(manager.file_hints_buf.capacity() >= initial_hint_capacity);
-    assert!(manager.file_hints_seen.is_empty());
+    assert_eq!(manager.file_hints_seen.len(), 0);
 
     let text =
         String::from_utf8(manager.into_output().into_vec().expect("flush ok")).expect("UTF-8");
@@ -2317,7 +2317,7 @@ fn test_emit_backward_empty_hint_step_is_hidden_and_fails_closed() {
     assert!(manager.backward_reserved_ids.contains(target_id));
     assert!(manager.has_lrat_authority_fail_closed());
     assert!(manager.has_io_error());
-    assert!(manager.into_output().into_vec().unwrap().is_empty());
+    assert_eq!(manager.into_output().into_vec().unwrap().len(), 0);
 }
 
 #[test]

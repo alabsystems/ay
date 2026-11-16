@@ -35,12 +35,9 @@ impl EufSolver<'_> {
         roots: &[TermId],
         work: &mut WorkBudget<'_>,
     ) -> Result<EufModel, QueryError> {
-        work.admit(128, 8 * std::mem::size_of::<EufModel>())?;
+        work.admit(128, 8 * size_of::<EufModel>())?;
         shape::prepared(self, work)?;
-        work.admit(
-            64,
-            16 * std::mem::size_of::<ay_core::term::TermStoreSnapshotStamp>(),
-        )?;
+        work.admit(64, 16 * size_of::<ay_core::term::TermStoreSnapshotStamp>())?;
         let stamp = self.terms.snapshot_stamp();
         let metadata = self.terms.checker_visible_metadata_generation();
         let result = build(self, roots, work);
@@ -90,9 +87,8 @@ fn build(
             .term_values
             .try_reserve(terms.len())
             .map_err(|_| work.refuse_exhaustion())?;
-        for index in 0..terms.len() {
+        for &term in &terms {
             work.charge(32)?;
-            let term = terms[index];
             if let Sort::BitVec(bits) = source.terms.sort(term) {
                 let rep = shape::representative(source, term, work)?;
                 if let Some(value) = classes::value(&rows, bits.width, rep, work)? {

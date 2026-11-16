@@ -46,7 +46,7 @@ impl<'a> Arena<'a> {
         self.nodes.len()
     }
 
-    pub(super) fn boolean(&mut self, value: bool, owner: &mut Owner) -> Result<usize> {
+    pub(super) fn boolean(&mut self, value: bool, owner: &mut Owner<'_>) -> Result<usize> {
         let sort = self.types.intern(Sort::Bool, owner)?;
         self.intern(Key::Bool(value), sort, owner)
     }
@@ -55,7 +55,7 @@ impl<'a> Arena<'a> {
         &mut self,
         value: u128,
         width: u32,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<usize> {
         if width == 0 || width > 128 || (width < 128 && value >> width != 0) {
             return Err(Error::Unsupported);
@@ -72,13 +72,13 @@ impl<'a> Arena<'a> {
         &mut self,
         expr: &'a ChcExpr,
         depth: usize,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<usize> {
         owner.admit(1, 0)?;
         if depth >= MAX_DEPTH {
             return Err(Error::Resource);
         }
-        let address = expr as *const ChcExpr;
+        let address = std::ptr::from_ref::<ChcExpr>(expr);
         if let Some(id) = self.memo.get(&address) {
             return Ok(*id);
         }
@@ -124,7 +124,12 @@ impl<'a> Arena<'a> {
         self.remember(address, id, owner)
     }
 
-    fn remember(&mut self, address: *const ChcExpr, id: usize, owner: &mut Owner) -> Result<usize> {
+    fn remember(
+        &mut self,
+        address: *const ChcExpr,
+        id: usize,
+        owner: &mut Owner<'_>,
+    ) -> Result<usize> {
         owner.admit(1, 64)?;
         self.memo.try_reserve(1).map_err(|_| Error::Resource)?;
         self.memo.insert(address, id);
@@ -136,7 +141,7 @@ impl<'a> Arena<'a> {
         op: ChcOp,
         args: &'a [std::sync::Arc<ChcExpr>],
         depth: usize,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<(Key<'a>, usize)> {
         let bytes = args
             .len()
@@ -160,7 +165,7 @@ impl<'a> Arena<'a> {
         Ok((Key::Op(op, children), sort))
     }
 
-    fn intern(&mut self, key: Key<'a>, sort: usize, owner: &mut Owner) -> Result<usize> {
+    fn intern(&mut self, key: Key<'a>, sort: usize, owner: &mut Owner<'_>) -> Result<usize> {
         let weight = match &key {
             Key::Var(name, _) => name.len(),
             Key::Op(_, args) => args.len(),
@@ -193,12 +198,12 @@ impl<'a> Arena<'a> {
         Ok(id)
     }
 
-    fn reserve_node(&mut self, owner: &mut Owner) -> Result<()> {
+    fn reserve_node(&mut self, owner: &mut Owner<'_>) -> Result<()> {
         owner.admit(1, 2 * std::mem::size_of::<Node<'a>>())?;
         self.nodes.try_reserve(1).map_err(|_| Error::Resource)
     }
 
-    fn variable(&mut self, name: &'a str, sort: usize, owner: &mut Owner) -> Result<usize> {
+    fn variable(&mut self, name: &'a str, sort: usize, owner: &mut Owner<'_>) -> Result<usize> {
         let weight = name.len().checked_add(1).ok_or(Error::Resource)?;
         owner.admit(weight, 0)?;
         let mut hasher = DefaultHasher::new();

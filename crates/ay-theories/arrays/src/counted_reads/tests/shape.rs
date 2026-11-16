@@ -105,7 +105,7 @@ fn constant_array_emits_a_fill_unit_not_a_default_operator() {
     );
     assert_eq!(closure.steps()[0].literals(), &[root]);
     assert_eq!(application(&terms, read, "select"), &[array, index]);
-    assert!(closure.unresolved().is_empty());
+    assert_eq!(closure.unresolved().len(), 0);
     closure.finish().unwrap();
 }
 
@@ -193,7 +193,7 @@ fn shared_ite_dag_expands_each_array_index_pair_once() {
     assert_eq!(closure.reads().len(), 25);
     assert_eq!(closure.steps().len(), 48);
     assert_eq!(closure.unresolved(), &[Unresolved::FreeRead { read: 24 }]);
-    for pair in closure.steps().chunks_exact(2) {
+    for pair in closure.steps().as_chunks::<2>().0 {
         let Derivation::IteThen {
             branch_read: left, ..
         } = pair[0].derivation()

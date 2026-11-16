@@ -100,7 +100,7 @@ fn missing_unit_channel_activation_branch_and_late_entries_cannot_authorize_repl
             0 => f.units.clear(),
             1 => f.roots.retain(|&root| root != f.activation),
             2 => {
-                f.roots.remove(1);
+                let _ = f.roots.remove(1);
             }
             3 => {
                 for (_, _, stamp) in f.entries.values_mut() {

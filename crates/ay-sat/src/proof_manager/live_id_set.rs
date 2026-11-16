@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn test_empty_set_is_empty() {
         let s = LiveIdSet::new();
-        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
         assert_eq!(s.len(), 0);
         assert!(!s.contains(0));
         assert!(!s.contains(42));
@@ -321,7 +321,7 @@ mod tests {
             s.insert(i);
         }
         s.clear_and_shrink();
-        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
         assert_eq!(s.capacity(), 0);
         for i in 1..=50u64 {
             assert!(!s.contains(i));

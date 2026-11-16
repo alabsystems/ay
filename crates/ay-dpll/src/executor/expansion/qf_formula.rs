@@ -74,13 +74,10 @@ pub(in crate::executor) fn binder_chain(
         TermData::Exists(b, body, _) => (false, b.clone(), *body),
         _ => return None,
     };
-    loop {
-        let (next, inner) = match (forall, terms.get(body)) {
-            (true, TermData::Forall(b, inner, _)) | (false, TermData::Exists(b, inner, _)) => {
-                (b, *inner)
-            }
-            _ => break,
-        };
+    while let (true, TermData::Forall(next, inner, _)) | (false, TermData::Exists(next, inner, _)) =
+        (forall, terms.get(body))
+    {
+        let inner = *inner;
         if next
             .iter()
             .any(|(n, _)| binders.iter().any(|(m, _)| m == n))

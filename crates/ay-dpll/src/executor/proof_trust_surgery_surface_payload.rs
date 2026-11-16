@@ -133,64 +133,37 @@ fn atomic_payload_bytes(
 ) -> Option<usize> {
     Some(match terms.get(term) {
         TermData::Const(Constant::Bool(_)) => 5,
-        TermData::Const(Constant::Int(value)) => match decimal_bytes(value) {
-            Some(bytes) => bytes,
-            None => return None,
-        },
+        TermData::Const(Constant::Int(value)) => decimal_bytes(value)?,
         TermData::Const(Constant::Rational(value)) => {
-            let Some(numerator) = decimal_bytes(value.0.numer()) else {
-                return None;
-            };
-            let Some(denominator) = decimal_bytes(value.0.denom()) else {
-                return None;
-            };
-            match numerator
+            let numerator = decimal_bytes(value.0.numer())?;
+            let denominator = decimal_bytes(value.0.denom())?;
+            numerator
                 .checked_add(denominator)
-                .and_then(|n| n.checked_add(16))
-            {
-                Some(bytes) => bytes,
-                None => return None,
-            }
+                .and_then(|n| n.checked_add(16))?
         }
         TermData::Const(Constant::BitVec { value, width }) => {
-            let Some(value_bytes) = decimal_bytes(value) else {
-                return None;
-            };
+            let value_bytes = decimal_bytes(value)?;
             let Ok(width) = usize::try_from(*width) else {
                 return None;
             };
             value_bytes.max(width).saturating_add(2)
         }
         TermData::Const(Constant::String(value)) => {
-            match value.len().checked_mul(6).and_then(|n| n.checked_add(2)) {
-                Some(bytes) => bytes,
-                None => return None,
-            }
+            value.len().checked_mul(6).and_then(|n| n.checked_add(2))?
         }
-        TermData::Var(name, _) => match name.len().checked_mul(2).and_then(|n| n.checked_add(2)) {
-            Some(bytes) => bytes,
-            None => return None,
-        },
-        TermData::App(..) => {
-            match application_bytes(terms, term, remaining_terms, remaining_sort_nodes) {
-                Some(bytes) => bytes,
-                None => return None,
-            }
-        }
+        TermData::Var(name, _) => name.len().checked_mul(2).and_then(|n| n.checked_add(2))?,
+        TermData::App(..) => application_bytes(terms, term, remaining_terms, remaining_sort_nodes)?,
         TermData::Let(bindings, _) => {
             if bindings.len().saturating_add(1) > remaining_terms.saturating_sub(pending_terms) {
                 return None;
             }
             let mut local = 8usize;
             for (name, _) in bindings {
-                let Some(next) = name
+                let next = name
                     .len()
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(3))
-                    .and_then(|n| local.checked_add(n))
-                else {
-                    return None;
-                };
+                    .and_then(|n| local.checked_add(n))?;
                 local = next;
             }
             local
@@ -203,18 +176,13 @@ fn atomic_payload_bytes(
             }
             let mut local = 12usize;
             for (name, sort) in bindings {
-                let Some(sort_bytes) = sort_bytes(sort, remaining_sort_nodes) else {
-                    return None;
-                };
-                let Some(next) = name
+                let sort_bytes = sort_bytes(sort, remaining_sort_nodes)?;
+                let next = name
                     .len()
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(sort_bytes))
                     .and_then(|n| n.checked_add(3))
-                    .and_then(|n| local.checked_add(n))
-                else {
-                    return None;
-                };
+                    .and_then(|n| local.checked_add(n))?;
                 local = next;
             }
             local

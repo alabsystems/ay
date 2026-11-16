@@ -55,8 +55,8 @@ pub(crate) fn problem_contains_recursive_bv_sorts(problem: &ChcProblem) -> bool 
 /// FIX #2b: once-per-solve sharing of the pc-split+condense stage.
 ///
 /// Measured: the same original problem runs the full pc-split+condense
-/// fixpoint up to three times per solve — Lane B (`build_int_only`), Lane C
-/// (`build_bv_native`) and the final portfolio (`build` via
+/// fixpoint up to three times per solve — Lane B (`build_int_only_with_limits`), Lane C
+/// (`build_bv_native_with_limits`) and the final portfolio (`build` via
 /// `enable_preprocessing`) each start from `condense_stage(problem.clone())`.
 /// On SLayerCF copy/destroy and ssh that stage is the dominant preprocessing
 /// cost, so the re-runs alone were a ~2/3-wasted budget window.
@@ -582,6 +582,7 @@ impl PreprocessSummary {
     /// alongside BvToBool: BvToInt produces compact LIA problems solvable by
     /// TPA/PDR/PDKIND, while BvToBool works for problems needing bit-level
     /// reasoning (#5877).
+    #[cfg(test)]
     pub(crate) fn build_int_only(problem: ChcProblem, verbose: bool) -> Self {
         Self::build_int_only_bounded(problem, verbose, None, None)
             .expect("unbounded BvToInt preprocessing cannot be cancelled")
@@ -789,10 +790,11 @@ impl PreprocessSummary {
     /// BV theory. This matches Z3 Spacer's default behavior where
     /// `xform.bit_blast = false` (#5877 Wave 3).
     ///
-    /// Key difference from `build_int_only`: `bv_abstracted` is set to `false`
+    /// Key difference from `build_int_only_with_limits`: `bv_abstracted` is set to `false`
     /// because the problem is NOT abstracted — BV sorts are preserved. Unsafe
     /// results do not require confirmation against the original problem since
     /// the solver operates in the original domain.
+    #[cfg(test)]
     pub(crate) fn build_bv_native(problem: ChcProblem, verbose: bool) -> Self {
         Self::build_bv_native_bounded(problem, verbose, None, None)
             .expect("unbounded BV-native preprocessing cannot be cancelled")

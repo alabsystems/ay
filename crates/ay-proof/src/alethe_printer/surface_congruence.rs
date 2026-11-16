@@ -718,7 +718,7 @@ fn comparison_reversal_pair_steps(
         return None;
     };
     let mut steps = Vec::new();
-    super::authored_assume::comparison_reversal_step(id, surface, canonical, direction, &mut steps)
+    authored_assume::comparison_reversal_step(id, surface, canonical, direction, &mut steps)
         .then_some(steps)
 }
 
@@ -803,7 +803,7 @@ mod tests {
         let mut bytes = 0;
         let steps = vec![String::new(); MAX_SURFACE_CONG_BRIDGE_STEPS + 1];
         assert!(append_generated_steps(&mut output, &mut bytes, steps).is_err());
-        assert!(output.is_empty());
+        assert_eq!(output.as_slice(), &[] as &[String]);
     }
 
     #[test]
@@ -811,7 +811,7 @@ mod tests {
         let mut output = Vec::new();
         let mut bytes = MAX_SURFACE_CONG_BRIDGE_OUTPUT_BYTES;
         assert!(append_generated_steps(&mut output, &mut bytes, vec![String::new()]).is_err());
-        assert!(output.is_empty());
+        assert_eq!(output.as_slice(), &[] as &[String]);
         assert_eq!(bytes, MAX_SURFACE_CONG_BRIDGE_OUTPUT_BYTES);
     }
 }

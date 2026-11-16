@@ -30,8 +30,8 @@ fn generator_respects_the_design_bounds() {
             .filter(|x| matches!(x, Step::Assert(_)))
             .count();
         let checks = s.steps.iter().filter(|x| matches!(x, Step::Check)).count();
-        assert!(asserts <= 40 && asserts >= 1, "asserts={asserts}");
-        assert!(checks <= 30 && checks >= 1, "checks={checks}");
+        assert!((1..=40).contains(&asserts), "asserts={asserts}");
+        assert!((1..=30).contains(&checks), "checks={checks}");
         let mut depth = 0i64;
         for st in &s.steps {
             match st {
@@ -89,14 +89,14 @@ fn pushpop_scripts_agree_with_legacy_and_z3() {
 /// SAT with the documented model) through the session's API path.
 #[test]
 fn backjump_appended_literals_are_fed_after_scope_restore() {
-    use crate::smt::session::{HornCheck, HornSmt, SessionConfig, TheoryKind};
+    use crate::smt::session::{HornCheck, HornSmt, SessionConfig};
     use crate::smt::types::Partition;
     use crate::ChcExpr;
     use std::sync::Arc;
     let cases = backjump_regression_cases();
     for (name, expect_sat, exprs) in cases {
         for cold in [true, false] {
-            let mut cfg = SessionConfig::new(TheoryKind::Lra);
+            let mut cfg = SessionConfig::new();
             cfg.cold_theory_assignment = cold;
             let mut s = HornSmt::new(cfg, None);
             let ids: Vec<_> = exprs

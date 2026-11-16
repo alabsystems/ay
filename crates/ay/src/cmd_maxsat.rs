@@ -819,7 +819,16 @@ impl MaxSatWatchdogServer {
             .and_then(|process| process.as_ref().map(|server| server.child.id()))
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
     fn kill_process_for_test(&self) {
         if let Ok(mut process) = self.process.lock() {
             if let Some(server) = process.as_mut() {
@@ -1397,6 +1406,7 @@ const CERT_PROBE_CAPTURE_BYTES: usize = 64 * 1024;
 pub(crate) struct CertProbeOutput {
     pub(crate) code: Option<i32>,
     pub(crate) stdout: String,
+    #[cfg(test)]
     pub(crate) stderr: String,
 }
 
@@ -1498,7 +1508,10 @@ pub(crate) fn run_cert_probe_bounded(
     let collect =
         |capture: Option<MaxSatCapture>| capture.map(MaxSatCapture::finish).unwrap_or_default().0;
     let captured_stdout = collect(stdout);
+    #[cfg(test)]
     let captured_stderr = collect(stderr);
+    #[cfg(not(test))]
+    let _ = collect(stderr);
 
     if let Some(error) = wait_error {
         return Err(format!("cannot wait for `{}`: {error}", program.display()));
@@ -1513,6 +1526,7 @@ pub(crate) fn run_cert_probe_bounded(
     Ok(CertProbeOutput {
         code: status.code(),
         stdout: captured_stdout,
+        #[cfg(test)]
         stderr: captured_stderr,
     })
 }
@@ -2049,8 +2063,8 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                         race_hard.push(lits.to_vec());
                     } else {
                         race_ok = false;
-                        race_hard = Vec::new();
-                        race_soft = Vec::new();
+                        drop(std::mem::take(&mut race_hard));
+                        drop(std::mem::take(&mut race_soft));
                     }
                 }
                 solver.add_hard_clause(lits.to_vec());
@@ -2064,8 +2078,8 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                         race_soft.push((w, lits.to_vec()));
                     } else {
                         race_ok = false;
-                        race_hard = Vec::new();
-                        race_soft = Vec::new();
+                        drop(std::mem::take(&mut race_hard));
+                        drop(std::mem::take(&mut race_soft));
                     }
                 }
                 solver.add_soft_clause(lits.to_vec(), w);
@@ -2083,8 +2097,8 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
         num_vars <= MILP_RACE_TALL_MAX_VARS && race_hard.len() <= MILP_RACE_TALL_MAX_HARDS;
     if !(standard_ok || tall_ok) {
         race_ok = false;
-        race_hard = Vec::new();
-        race_soft = Vec::new();
+        drop(std::mem::take(&mut race_hard));
+        drop(std::mem::take(&mut race_soft));
     }
     // Weighted instances only: on uniform-weight (unweighted-style) instances
     // the OLL engine's cardinality reasoning dominates any 0/1-LP relaxation

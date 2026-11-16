@@ -26,7 +26,7 @@ fn modulo_exclusions(
     (x, remainder, roots)
 }
 
-fn must_not_authenticate(terms: &ay_core::TermStore, roots: &[TermId]) {
+fn must_not_authenticate(terms: &TermStore, roots: &[TermId]) {
     let error = authenticate_bv_lia_unsat_query(terms, roots, None)
         .expect_err("the explicitly satisfiable source query must never authenticate");
     assert!(
@@ -39,7 +39,7 @@ fn must_not_authenticate(terms: &ay_core::TermStore, roots: &[TermId]) {
 #[test]
 fn complete_small_remainder_domains_authenticate() {
     for divisor in 1..=16 {
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let excluded: Vec<i64> = (0..divisor).collect();
         let (_, _, roots) = modulo_exclusions(&mut terms, divisor, &excluded);
         authenticate_bv_lia_unsat_query(&terms, &roots, None)
@@ -58,7 +58,7 @@ fn every_partial_small_domain_has_a_real_witness() {
                 continue;
             }
             let witness = (0..divisor).find(|value| mask & (1 << value) == 0).unwrap();
-            let mut terms = ay_core::TermStore::new();
+            let mut terms = TermStore::new();
             let (x, _, mut roots) = modulo_exclusions(&mut terms, divisor, &excluded);
             // Pin the actual source dividend to an admitted missing residue.
             let witness = terms.mk_int(witness.into());
@@ -71,7 +71,7 @@ fn every_partial_small_domain_has_a_real_witness() {
 #[test]
 fn upper_endpoint_and_outside_case_cap_are_not_dropped() {
     for divisor in [2, 3, 16, 17] {
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let excluded: Vec<i64> = (0..divisor - 1).collect();
         let (_, _, roots) = modulo_exclusions(&mut terms, divisor, &excluded);
         // x=divisor-1 is a model, including outside the new 16-value cap.
@@ -82,7 +82,7 @@ fn upper_endpoint_and_outside_case_cap_are_not_dropped() {
 #[test]
 fn a_conflicting_first_case_does_not_leak_alias_bounds_into_the_next() {
     for exclude_last in [false, true] {
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let (_, remainder, excluded) = modulo_exclusions(&mut terms, 2, &[0]);
         let out = terms.mk_var("case_out", Sort::Int);
         let zero = terms.mk_int(0.into());
@@ -135,10 +135,10 @@ fn guarded_ite_problem(
 #[test]
 fn both_guarded_ite_arms_require_their_real_guard() {
     for then_branch in [false, true] {
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let roots = guarded_ite_problem(&mut terms, then_branch, true);
         authenticate_bv_lia_unsat_query(&terms, &roots, None).expect("the actual arm is equal");
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let roots = guarded_ite_problem(&mut terms, then_branch, false);
         // In the other arm, 3 differs from every possible mod-2 value.
         must_not_authenticate(&terms, &roots);
@@ -239,7 +239,7 @@ fn smart_expanded_u32_crc_summary_refutes_without_enumerating_u32() {
 #[test]
 fn zero_and_negative_divisors_gain_no_positive_divisor_assumption() {
     for divisor in [0, -3] {
-        let mut terms = ay_core::TermStore::new();
+        let mut terms = TermStore::new();
         let (_, _, roots) = modulo_exclusions(&mut terms, divisor, &[0, 1]);
         // mod(x,-3)=2 is possible; mod(x,0) has no fixed domain theorem.
         must_not_authenticate(&terms, &roots);
@@ -253,7 +253,7 @@ fn residue_case_state(terms: &mut TermStore) -> (TermId, Vec<TermId>) {
 
 #[test]
 fn case_clones_do_not_receive_a_new_work_allowance() {
-    let mut terms = ay_core::TermStore::new();
+    let mut terms = TermStore::new();
     let (_, roots) = residue_case_state(&mut terms);
     let mut checker = QueryChecker::new(&terms, None);
     let mut clauses = Vec::new();
@@ -278,7 +278,7 @@ fn case_clones_do_not_receive_a_new_work_allowance() {
 
 #[test]
 fn an_expired_deadline_cannot_become_a_case_conflict_verdict() {
-    let mut terms = ay_core::TermStore::new();
+    let mut terms = TermStore::new();
     let (_, roots) = residue_case_state(&mut terms);
     let mut checker = QueryChecker::new(&terms, None);
     let mut clauses = Vec::new();
@@ -302,7 +302,7 @@ fn an_expired_deadline_cannot_become_a_case_conflict_verdict() {
 
 #[test]
 fn overflowed_case_copy_accounting_declines_before_allocation() {
-    let terms = ay_core::TermStore::new();
+    let terms = TermStore::new();
     let mut checker = QueryChecker::new(&terms, None);
     let state = IntervalState {
         bound_limbs: u64::MAX,
@@ -316,7 +316,7 @@ fn overflowed_case_copy_accounting_declines_before_allocation() {
 
 #[test]
 fn shared_large_guard_is_kept_exact_without_flattening_payload_copies() {
-    let mut terms = ay_core::TermStore::new();
+    let mut terms = TermStore::new();
     let variables: Vec<_> = (0..128)
         .map(|i| terms.mk_var(format!("wide_guard_{i}"), Sort::Int))
         .collect();

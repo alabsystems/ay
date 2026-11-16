@@ -340,10 +340,7 @@ impl PdrSolver {
             }
         }
 
-        if !checked_any_self_loop {
-            return false;
-        }
-        true
+        checked_any_self_loop
     }
 
     /// Algebraically verify that a signed triple sum is preserved by a transition case.

@@ -41,9 +41,10 @@ impl Policy for Counted<'_> {
                 "counted root materialization requires the trace-only emission route",
             ));
         }
+        let required_vals = s.num_vars.saturating_mul(2);
         if s.num_vars != s.var_data.len()
             || s.trail.len() > s.num_vars
-            || s.vals.len() < s.num_vars.saturating_mul(2)
+            || s.vals.len() < required_vals
             || s.unit_proof_sign.len() < s.unit_proof_id.len()
             || s.cold.level0_proof_sign.len() < s.cold.level0_proof_id.len()
         {

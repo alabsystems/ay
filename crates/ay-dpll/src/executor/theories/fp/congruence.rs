@@ -38,6 +38,7 @@
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
+#[cfg(test)]
 use ay_fp::FpSolver;
 use std::collections::BTreeMap;
 
@@ -260,6 +261,7 @@ mod tests;
 pub(super) use controlled::{plan_congruence_controlled, scan_foreign_controlled};
 
 /// Collect the uninterpreted structure reachable from `roots`.
+#[cfg(test)]
 pub(super) fn scan_foreign(terms: &TermStore, roots: &[TermId]) -> ForeignScan {
     super::bitblast::backend::infallible(controlled::scan(terms, roots, &mut || {
         Ok::<(), std::convert::Infallible>(())
@@ -267,6 +269,7 @@ pub(super) fn scan_foreign(terms: &TermStore, roots: &[TermId]) -> ForeignScan {
 }
 
 /// Build valid Ackermann clauses in the same group and pair order as before.
+#[cfg(test)]
 pub(super) fn plan_congruence(
     terms: &TermStore,
     fp_solver: &mut FpSolver<'_>,

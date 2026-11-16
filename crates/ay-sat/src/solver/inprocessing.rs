@@ -119,7 +119,7 @@ impl BveSkipReason {
 
 /// The scheduler-level gates that keep an otherwise due BVE round from running,
 /// in the order `Solver::bve_gate_skip_counts` counts them.
-pub(super) const BVE_GATE_TAGS: [&'static str; 4] = [
+pub(super) const BVE_GATE_TAGS: [&str; 4] = [
     "gate_dependent_passes",
     "dense_formula",
     "proportional_guard",
@@ -217,8 +217,10 @@ mod backbone;
 mod backbone_stacked;
 mod bce;
 mod bve;
+#[cfg(test)]
+pub(in crate::solver) use bve::kissat_eliminate_interval;
+pub(in crate::solver) use bve::kissat_eliminate_interval_nlog2n;
 pub(crate) use bve::BveBodyScratch;
-pub(in crate::solver) use bve::{kissat_eliminate_interval, kissat_eliminate_interval_nlog2n};
 mod cce;
 mod component;
 mod condition;
@@ -290,8 +292,7 @@ impl Solver {
             // We only care about clauses that *contain a false literal* (the negation
             // of a newly-fixed literal). Satisfied clauses are harmless in lightweight mode.
             let mut affected: Vec<usize> = Vec::new();
-            for trail_pos in self.cold.last_collect_trail_pos..self.trail.len() {
-                let unit_lit = self.trail[trail_pos];
+            for &unit_lit in &self.trail[self.cold.last_collect_trail_pos..] {
                 let neg_lit = unit_lit.negated();
                 for &cidx in gc_occ.get(neg_lit) {
                     if cidx < arena_len {
@@ -517,8 +518,7 @@ impl Solver {
             let mut active: Vec<usize> = Vec::new();
 
             if let Some(ref gc_occ) = self.gc_occ {
-                for trail_pos in trail_start..trail_end {
-                    let unit_lit = self.trail[trail_pos];
+                for &unit_lit in &self.trail[trail_start..trail_end] {
                     // Clauses containing unit_lit are satisfied → delete
                     for &cidx in gc_occ.get(unit_lit) {
                         if cidx < arena_len {
@@ -660,7 +660,7 @@ impl Solver {
                     // LRAT guard (#5028): When LRAT is enabled, reason clauses must
                     // stay alive. ClearLevel0 saves the LRAT clause ID into
                     // level0_proof_id before deletion, but also emits an LRAT 'd'
-                    // (delete) step. Later, append_lrat_unit_chain references
+                    // (delete) step. Later, append_lrat_unit_chain_admitted references
                     // level0_proof_id as a hint — pointing at a clause the checker
                     // considers deleted. Skipping deletion keeps the proof valid.
                     // The clause remains inert (satisfied, won't propagate) but its

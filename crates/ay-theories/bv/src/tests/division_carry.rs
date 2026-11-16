@@ -6,14 +6,12 @@
 //! Concrete CNF propagation, without a SAT solver or production gate evaluator.
 
 use super::*;
+use crate::cnf_test_support::{bit_value, word_value, Circuit};
 
-mod cnf;
 mod oracle;
 mod signed;
 mod wide;
 mod zero_padding;
-
-use cnf::{bit_value, word_value, Circuit};
 
 fn fresh_word(solver: &mut BvSolver<'_>, width: usize) -> BvBits {
     solver.batch_fresh_vars(width).to_vec()
@@ -30,7 +28,7 @@ fn check_subtraction(solver: &mut BvSolver<'_>, inputs: &BvBits, a: &BvBits, b: 
     let width = a.len();
     let mask = (1_u64 << width) - 1;
     let (difference, no_borrow) = solver.bitblast_sub_with_carry(a, b);
-    let circuit = Circuit::new(solver);
+    let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
     for assignment in 0..1_u64 << inputs.len() {
         let model = circuit.propagate(&fix_word(inputs, assignment));
         let av = word_value(&model, a);
@@ -95,22 +93,21 @@ fn restoring_division_exhausts_unsigned_width_one_through_five() {
         let a = fresh_word(&mut solver, width);
         let b = fresh_word(&mut solver, width);
         let (q, r) = solver.bitblast_udiv_urem(&a, &b);
-        let circuit = Circuit::new(&solver);
+        let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
         let mut old = BvSolver::new(&store);
         let old_a = fresh_word(&mut old, width);
         let old_b = fresh_word(&mut old, width);
         let (old_q, old_r) = oracle::divide(&mut old, &old_a, &old_b);
-        let old_circuit = Circuit::new(&old);
+        let old_circuit = Circuit::from_clauses(old.num_vars(), old.clauses());
         let limit = 1_u64 << width;
         for av in 0..limit {
             for bv in 0..limit {
                 let fixes = [fix_word(&a, av), fix_word(&b, bv)].concat();
                 let model = circuit.propagate(&fixes);
                 let old_model = old_circuit.propagate(&fixes);
-                let expected = if bv == 0 {
-                    (limit - 1, av)
-                } else {
-                    (av / bv, av % bv)
+                let expected = match av.checked_div(bv) {
+                    Some(quotient) => (quotient, av % bv),
+                    None => (limit - 1, av),
                 };
                 assert_eq!((word_value(&model, &q), word_value(&model, &r)), expected);
                 assert_eq!(
@@ -134,5 +131,5 @@ fn empty_division_preserves_empty_no_allocation_result() {
         (vec![], vec![])
     );
     assert_eq!(solver.num_vars(), 0);
-    assert!(solver.clauses().is_empty());
+    assert_eq!(solver.clauses(), &[] as &[CnfClause]);
 }

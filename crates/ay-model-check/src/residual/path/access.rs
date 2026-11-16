@@ -32,7 +32,7 @@ impl ReversePath {
     ) -> Option<()> {
         let storage = match self {
             Self::Fields(_) => 1, // preserve the old field-only work schedule
-            Self::Access(_) => std::mem::size_of::<AccessStep>(),
+            Self::Access(_) => size_of::<AccessStep>(),
         };
         if !spend(name.len().checked_add(storage)?) {
             return None;
@@ -57,7 +57,7 @@ impl ReversePath {
     ) -> Option<()> {
         if let Self::Fields(fields) = self {
             let count = fields.len().checked_add(1)?;
-            if !spend(count.checked_mul(std::mem::size_of::<AccessStep>())?) {
+            if !spend(count.checked_mul(size_of::<AccessStep>())?) {
                 return None;
             }
             let mut steps = Vec::new();
@@ -66,7 +66,7 @@ impl ReversePath {
             steps.push(AccessStep::Index(key));
             *self = Self::Access(steps);
         } else if let Self::Access(steps) = self {
-            if !spend(std::mem::size_of::<AccessStep>()) {
+            if !spend(size_of::<AccessStep>()) {
                 return None;
             }
             steps.try_reserve(1).ok()?;

@@ -585,10 +585,13 @@ mod tests {
         assert_eq!(json["detected_xors"].as_array().unwrap().len(), 3);
         assert_eq!(json["final"]["kind"], "contradiction");
         assert_eq!(json["ay_internal_check"]["status"], "passed");
-        assert!(json["search"]["heuristic_decisions"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            json["search"]["heuristic_decisions"]
+                .as_array()
+                .unwrap()
+                .as_slice(),
+            &[] as &[Value]
+        );
         assert!(json["derivation"].as_array().unwrap().iter().any(|step| {
             step["kind"] == "gf2_row_addition" && step["step_class"] == "algebraic"
         }));

@@ -88,7 +88,7 @@ fn datatype_array_field_model_is_valid_witness() {
 
     // Re-feed ay's printed `bx` value (pinned) + the originals to z3: must be
     // CONSISTENT (`sat`).
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let value = pair_value(lines.last().expect("get-value line"));
         let refed = format!(
             "(set-logic ALL)\n\
@@ -100,7 +100,7 @@ fn datatype_array_field_model_is_valid_witness() {
              (check-sat)\n"
         );
         let path = temp_smt("repro2", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -158,7 +158,7 @@ fn unconstrained_datatype_const_has_no_skolem() {
         "expected canonical default `non`, got: {output}"
     );
 
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let refed = format!(
             "(set-logic ALL)\n\
              (declare-datatypes ((O 0)) (((non) (som (g Int)))))\n\
@@ -167,7 +167,7 @@ fn unconstrained_datatype_const_has_no_skolem() {
              (check-sat)\n"
         );
         let path = temp_smt("bugc", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -240,7 +240,7 @@ fn array_of_datatype_model_is_valid_witness() {
         "get-model and get-value disagree on a:\n{output}"
     );
 
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let refed = format!(
             "(set-logic ALL)\n\
              (declare-datatypes ((O 0)) (((non) (som (g Int)))))\n\
@@ -250,7 +250,7 @@ fn array_of_datatype_model_is_valid_witness() {
              (check-sat)\n"
         );
         let path = temp_smt("bugd", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -321,9 +321,9 @@ fn datatype_array_field_congruence_conflict_is_sound() {
         lines[0], "sat",
         "congruence conflict at a common data cell must NOT be reported sat:\n{lines:?}"
     );
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let path = temp_smt("dt_cong_conflict", smt);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -388,9 +388,9 @@ fn nested_array_of_array_const_symbolic_index_congruence_is_refuted() {
         "the nested array-of-array congruence conflict is refutable and now \
          carries a strict-checked certificate:\n{lines:?}"
     );
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let path = temp_smt("dt_nested_const_idx", smt);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,

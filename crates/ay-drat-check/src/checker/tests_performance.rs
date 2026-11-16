@@ -101,7 +101,7 @@ fn test_deleted_clause_slots_are_reused() {
         checker.add_original(&clause);
     }
     assert_eq!(checker.clauses.len(), n, "deleted slots should be reused");
-    assert!(checker.free_clause_slots.is_empty());
+    assert_eq!(checker.free_clause_slots.as_slice(), &[] as &[usize]);
 }
 
 // -- Finding #4: set_core_on_watches should early-exit after finding match --

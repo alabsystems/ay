@@ -708,7 +708,6 @@ fn collect_subterms(terms: &TermStore, term: TermId, out: &mut BTreeSet<TermId>)
 /// closure. This is the ONLY way a new equality between opaque terms is derived,
 /// and it is sound precisely because each argument equality it relies on was
 /// itself established from the conflict's own equality literals (never assumed).
-
 /// Build the congruence closure of a conflict's positive equality literals.
 ///
 /// Returns a union-find that merges (a) the two sides of every asserted positive

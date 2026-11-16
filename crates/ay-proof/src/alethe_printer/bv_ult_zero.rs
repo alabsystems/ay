@@ -276,12 +276,12 @@ impl AlethePrinter<'_> {
             ult,
             eqz,
             oriented_equality,
+            v,
+            z,
             one,
             zero,
             pure_eq,
             eqz_reversed,
-            v,
-            z,
         })
     }
 

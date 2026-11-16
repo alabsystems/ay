@@ -111,7 +111,7 @@ fn work_refusal_keeps_a_completed_prefix_with_an_exact_scoped_proof() {
         "the real default work envelope must be exercised"
     );
     assert!(exec
-        .negated_goal_conflict(&search, super::super::goal::GoalPhase::Final)
+        .negated_goal_conflict(&search, goal::GoalPhase::Final)
         .is_some());
     assert!(matches!(
         exec.ground_search_final_conflict(&search, &[], &work, &|| true),
@@ -195,7 +195,7 @@ fn work_refusal_needs_the_goal_and_cannot_refill_a_zero_allowance() {
             .is_none());
         assert!(work.refused());
         assert!(exec
-            .negated_goal_conflict(&search, super::super::goal::GoalPhase::Final)
+            .negated_goal_conflict(&search, goal::GoalPhase::Final)
             .is_none());
         assert!(exec.last_proof().is_none() && exec.last_proof_raw_original_assertions.is_empty());
         if limit == 0 {
@@ -259,7 +259,7 @@ fn work_prefix_refuses_foreign_or_popped_custody_and_interruption() {
         );
         assert!(work.refused());
         assert!(
-            exec.negated_goal_conflict(&search, super::super::goal::GoalPhase::Final)
+            exec.negated_goal_conflict(&search, goal::GoalPhase::Final)
                 .is_some(),
             "custody, rather than goal absence, must cause refusal"
         );

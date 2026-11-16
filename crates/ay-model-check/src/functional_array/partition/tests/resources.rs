@@ -111,7 +111,9 @@ fn expired_original_end_cannot_be_replaced_by_another_adapter() {
     let end = Instant::now() + Duration::from_secs(20);
     let data = base(7, &[]);
     let expired = owner(
-        Instant::now() - Duration::from_secs(1),
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a current instant has an earlier representable second"),
         1_000_000,
         128 * 1024 * 1024,
     );

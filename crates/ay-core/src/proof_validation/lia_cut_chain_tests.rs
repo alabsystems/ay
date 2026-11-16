@@ -113,7 +113,7 @@ fn certifies_the_cascade_lemma_through_a_cut_chain() {
     assert!(recognize_int_cg_cut_chain(&terms, &clause));
     // Integer rounding is load-bearing: the negation is rationally
     // satisfiable, so no zero-cut (Farkas) combination can exist.
-    assert!(!witness.cuts.is_empty());
+    assert_ne!(witness.cuts.as_slice(), &[]);
     assert!(validate_cut_chain(&witness));
     // The chain rounds the carry total `c1 + c2 + c3 + c4` somewhere.
     let carries: std::collections::BTreeSet<TermId> = ["c1", "c2", "c3", "c4"]
@@ -137,7 +137,7 @@ fn certifies_a_parity_squeeze_with_one_rounding() {
     let high = terms.mk_le(two_x, one);
     let clause = vec![not(&mut terms, low), not(&mut terms, high)];
     let witness = lia_cut_chain_witness(&terms, &clause).expect("cut chain");
-    assert!(!witness.cuts.is_empty());
+    assert_ne!(witness.cuts.as_slice(), &[]);
 }
 
 /// A rationally infeasible clause needs no rounding: the certificate is a
@@ -154,7 +154,7 @@ fn a_rationally_infeasible_clause_needs_no_cut() {
     let high = terms.mk_le(x, zero);
     let clause = vec![not(&mut terms, low), not(&mut terms, high)];
     let witness = lia_cut_chain_witness(&terms, &clause).expect("Farkas chain");
-    assert!(witness.cuts.is_empty());
+    assert_eq!(witness.cuts.as_slice(), &[]);
     assert!(witness.final_row_multipliers.iter().all(|m| !m.is_zero()));
 }
 
@@ -255,7 +255,7 @@ fn declines_a_clause_whose_elimination_exceeds_the_work_budget() {
     let mut terms = TermStore::new();
     let within = chained_equality_clause(&mut terms, 632);
     let witness = lia_cut_chain_witness(&terms, &within).expect("refuted by elimination");
-    assert!(witness.cuts.is_empty());
+    assert_eq!(witness.cuts.as_slice(), &[]);
     let mut terms = TermStore::new();
     let over = chained_equality_clause(&mut terms, 633);
     assert!(lia_cut_chain_witness(&terms, &over).is_none());

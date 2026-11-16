@@ -1166,8 +1166,8 @@ fn test_late_array_structure_replays_active_merge_and_preserves_base_on_pop() {
         !solver.array_vars.contains_key(&c),
         "undoing a merge that created its target must remove the empty target key"
     );
-    assert!(solver.array_var_merge_log.is_empty());
-    assert!(solver.array_var_merge_undo.is_empty());
+    assert_eq!(solver.array_var_merge_log.len(), 0);
+    assert_eq!(solver.array_var_merge_undo.len(), 0);
 }
 
 #[test]

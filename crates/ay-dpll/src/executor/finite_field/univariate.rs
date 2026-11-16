@@ -30,6 +30,7 @@ impl RootSet {
     }
 }
 enum Progress<'a> {
+    #[cfg(test)]
     Cumulative(&'a mut dyn FnMut(usize) -> bool),
     Original(&'a mut dyn FnMut(usize, usize) -> bool),
 }
@@ -46,14 +47,20 @@ impl Search<'_, '_, '_> {
     fn pay(&mut self, work: usize, bytes: usize) -> Option<()> {
         *self.fuel = self.fuel.checked_sub(work)?;
         self.bytes = self.bytes.checked_add(bytes)?;
-        match &mut self.control {
+        #[cfg(test)]
+        let admitted = match &mut self.control {
             Progress::Cumulative(control) => control(self.bytes),
             Progress::Original(control) => control(work, bytes),
-        }
-        .then_some(())
+        };
+        #[cfg(not(test))]
+        let admitted = {
+            let Progress::Original(control) = &mut self.control;
+            control(work, bytes)
+        };
+        admitted.then_some(())
     }
     fn zeros(&mut self, len: usize) -> Option<Poly> {
-        self.pay(len, len.checked_mul(std::mem::size_of::<u32>())?)?;
+        self.pay(len, len.checked_mul(size_of::<u32>())?)?;
         let mut out = Vec::new();
         out.try_reserve_exact(len).ok()?;
         out.resize(len, 0);
@@ -518,7 +525,7 @@ pub(super) fn witness_with_progress(
     let Some(value) = value else {
         return Some(Candidate::Contradiction);
     };
-    search.pay(1, std::mem::size_of::<(TermId, u32, FiniteFieldSort)>())?;
+    search.pay(1, size_of::<(TermId, u32, FiniteFieldSort)>())?;
     Some(Candidate::Model(vec![(variable, value, field)]))
 }
 
@@ -533,6 +540,7 @@ pub(super) struct RootChoice {
 /// `Some(None)` means no F_p root; `None` is terminal original refusal.
 /// The callback reports cumulative storage for THIS call. An outer ledger
 /// must retain prior calls and add only each monotonic delta.
+#[cfg(test)]
 pub(super) fn next_root(
     terms: &TermStore,
     variable: TermId,
@@ -661,6 +669,7 @@ pub(super) enum OutsideRoots {
 /// Domain selection is used only AFTER a rational-family identity is proved.
 /// Every admitted point is valid for the entire family, so this is certified
 /// finite/cofinite avoidance, not speculative model-value trials.
+#[cfg(test)]
 pub(super) fn outside_roots(
     terms: &TermStore,
     variable: TermId,

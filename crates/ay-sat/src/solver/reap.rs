@@ -117,7 +117,7 @@ impl Reap {
             } else {
                 // Bucket 0: exact match — O(1) pop
                 res = self.last_deleted;
-                debug_assert!(!self.buckets[0].is_empty());
+                debug_assert_ne!(self.buckets[0].len(), 0);
                 debug_assert_eq!(self.buckets[0][0], res);
                 self.buckets[0].pop();
             }
@@ -149,6 +149,11 @@ impl Reap {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.num_elements == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.num_elements
     }
 }
 

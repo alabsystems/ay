@@ -40,7 +40,7 @@ fn test_rewrite_produces_unit_from_substitution_and_root_false() {
     arena.add(&[lit(1, true), lit(2, true)], false);
 
     let num_lits = 6; // 3 vars
-    let mut reprs: Vec<_> = (0..num_lits as u32).map(crate::literal::Literal).collect();
+    let mut reprs: Vec<_> = (0..num_lits as u32).map(Literal).collect();
     reprs[lit(1, true).index()] = lit(0, true); // x1 → x0
     reprs[lit(1, false).index()] = lit(0, false); // ¬x1 → ¬x0
 
@@ -88,7 +88,7 @@ fn test_rewrite_produces_empty_derives_unsat() {
     arena.add(&[lit(1, true), lit(2, true)], false);
 
     let num_lits = 6;
-    let mut reprs: Vec<_> = (0..num_lits as u32).map(crate::literal::Literal).collect();
+    let mut reprs: Vec<_> = (0..num_lits as u32).map(Literal).collect();
     reprs[lit(1, true).index()] = lit(0, true);
     reprs[lit(1, false).index()] = lit(0, false);
 
@@ -117,7 +117,7 @@ fn test_rewrite_satisfied_from_root_true_deletes_clause() {
     arena.add(&[lit(1, true), lit(2, true)], false);
 
     let num_lits = 6;
-    let mut reprs: Vec<_> = (0..num_lits as u32).map(crate::literal::Literal).collect();
+    let mut reprs: Vec<_> = (0..num_lits as u32).map(Literal).collect();
     reprs[lit(1, true).index()] = lit(0, true);
     reprs[lit(1, false).index()] = lit(0, false);
 
@@ -151,7 +151,7 @@ fn test_rewrite_tautology_from_negated_equivalence() {
     arena.add(&[lit(0, true), lit(1, true), lit(2, true)], false);
 
     let num_lits = 6;
-    let mut reprs: Vec<_> = (0..num_lits as u32).map(crate::literal::Literal).collect();
+    let mut reprs: Vec<_> = (0..num_lits as u32).map(Literal).collect();
     reprs[lit(1, true).index()] = lit(0, false); // x1 → ¬x0
     reprs[lit(1, false).index()] = lit(0, true); // ¬x1 → x0
 

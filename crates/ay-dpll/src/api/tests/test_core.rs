@@ -1558,7 +1558,7 @@ fn test_forall_construction() {
         TermData::Forall(vars, q_body, triggers) => {
             assert_eq!(vars, &vec![(x_name, Sort::Int)]);
             assert_eq!(*q_body, body.id());
-            assert!(triggers.is_empty());
+            assert_eq!(triggers.as_slice(), &[] as &[Vec<TermId>]);
         }
         other => panic!("expected Forall, got {other:?}"),
     }
@@ -1587,7 +1587,7 @@ fn test_exists_construction() {
         TermData::Exists(vars, q_body, triggers) => {
             assert_eq!(vars, &vec![(x_name, Sort::Int)]);
             assert_eq!(*q_body, body.id());
-            assert!(triggers.is_empty());
+            assert_eq!(triggers.as_slice(), &[] as &[Vec<TermId>]);
         }
         other => panic!("expected Exists, got {other:?}"),
     }
@@ -1648,7 +1648,7 @@ fn test_try_forall_with_triggers_skips_non_function_triggers() {
 
     match solver.terms().get(q.id()) {
         TermData::Forall(_, _, triggers) => {
-            assert!(triggers.is_empty());
+            assert_eq!(triggers.as_slice(), &[] as &[Vec<TermId>]);
         }
         other => panic!("expected Forall, got {other:?}"),
     }

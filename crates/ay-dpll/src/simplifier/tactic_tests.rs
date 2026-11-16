@@ -158,7 +158,7 @@ fn der_tactic_substitutes_under_a_nested_binder_without_capture() {
         panic!("expected the inner existential, got {:?}", t.get(a[0]));
     };
     assert_eq!(vars, vec![("z".to_string(), Sort::Int)]);
-    let free = super::terms::free_names(&t, inner_body).expect("closed walk");
+    let free = terms::free_names(&t, inner_body).expect("closed walk");
     assert!(free.contains("c") && free.contains("z"), "{free:?}");
     assert!(!free.contains("x"), "x := c reached the body: {free:?}");
 }

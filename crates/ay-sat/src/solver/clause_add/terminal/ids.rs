@@ -10,7 +10,7 @@ pub(super) fn new(len: usize, owner: &CountedAdmission) -> AdmissionResult<DetHa
     let buckets = reserved_buckets(len)
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     let bytes = buckets
-        .checked_mul(std::mem::size_of::<u64>() + 1)
+        .checked_mul(size_of::<u64>() + 1)
         .and_then(|n| n.checked_add(31))
         .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
     let work = bytes

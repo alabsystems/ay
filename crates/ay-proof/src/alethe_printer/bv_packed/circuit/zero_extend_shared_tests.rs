@@ -204,7 +204,7 @@ fn closed_constants_use_identity_or_evaluation_without_an_empty_universal() -> T
                 Ok(())
             })?;
         }
-        super::tests::certificate(
+        tests::certificate(
             &format!("checked-constant-zero-extend-8-{extra}"),
             &format!(
                 "(set-logic QF_BV)(assert (not (= ((_ zero_extend {extra}) (_ bv5 8)) (_ bv5 {}))))(check-sat)",
@@ -238,13 +238,13 @@ fn generic_binders_remain_fresh_against_actual_source_names() -> TestResult {
         .lines()
         .filter(|line| line.starts_with("(anchor ") && line.contains(" :args "))
         .collect::<Vec<_>>();
-    assert!(!binders.is_empty());
+    assert_ne!(binders.len(), 0);
     assert!(binders.iter().all(|line| !line.contains(hostile)));
     Ok(())
 }
 
 fn guarded_zero_extend_document(problem: &str) -> TestResult {
-    let (context, root, negative) = super::tests::original(problem)?;
+    let (context, root, negative) = tests::original(problem)?;
     let printer = AlethePrinter::new(&context.terms);
     let (document, report) = crate::capture_alethe_dialect_report(|| {
         printer.format_bv_circuit_refutation(ProofId(7), &[negative])
@@ -274,7 +274,10 @@ fn universal_byte_theorem_passes_the_unchanged_binder_guard() -> TestResult {
     // Preserve the actual exclusion as the opposite control. This scanner
     // check makes no claim that the synthetic fragment is a checked proof.
     let old_shape = "(anchor :step end :args ((generic_bit Bool)))\n(define-fun open_word () (_ BitVec 1) (@bbterm generic_bit))\n(step end (cl (= (forall ((generic_bit Bool)) (= open_word open_word)) (forall ((generic_bit Bool)) true))) :rule hole)\n";
-    assert!(!ay_core::pinned_carcara::binders_pinned_carcara_misreads("", old_shape).is_empty());
+    assert_ne!(
+        ay_core::pinned_carcara::binders_pinned_carcara_misreads("", old_shape).len(),
+        0
+    );
     Ok(())
 }
 

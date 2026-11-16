@@ -1021,11 +1021,15 @@ fn parse_semantic_fields(
     let items = parsed
         .as_list()
         .ok_or_else(|| format!("{} is not one registry list", declaration.path))?;
-    if items.len() < 4
-        || !items[0].is_symbol("logic")
-        || items[1].as_symbol() != Some(catalog.name)
-        || (items.len() - 2) % 2 != 0
+    if items.len() < 4 || !items[0].is_symbol("logic") || items[1].as_symbol() != Some(catalog.name)
     {
+        return Err(format!(
+            "{} has an invalid logic declaration shape",
+            declaration.path
+        ));
+    }
+    let (pairs, remainder) = items[2..].as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(format!(
             "{} has an invalid logic declaration shape",
             declaration.path
@@ -1037,7 +1041,7 @@ fn parse_semantic_fields(
     let mut values = Vec::new();
     let mut note = Vec::new();
     let mut notes = Vec::new();
-    for pair in items[2..].chunks_exact(2) {
+    for pair in pairs {
         let key = match &pair[0] {
             SExpr::Keyword(value) => value.as_str(),
             _ => {
@@ -2072,8 +2076,11 @@ mod tests {
         assert!(fields.extensions[0].contains("(op (to_real t1) t)"));
         assert!(fields.extensions[1].contains("terms of the form c, (* c x), or (* x c)"));
         let parsed = parse_logic_declaration(&declaration.content).unwrap();
-        let history = parsed.as_list().unwrap()[2..]
-            .chunks_exact(2)
+        let items = parsed.as_list().unwrap();
+        let (pairs, remainder) = items[2..].as_chunks::<2>();
+        assert_eq!(remainder, &[] as &[SExpr]);
+        let history = pairs
+            .iter()
             .find(|pair| matches!(&pair[0], SExpr::Keyword(key) if key == ":update-history"))
             .unwrap();
         let SExpr::String(history) = &history[1] else {
@@ -2118,6 +2125,19 @@ mod tests {
     }
 
     #[test]
+    fn dangling_registry_key_is_rejected_as_invalid_shape() {
+        let catalog = CATALOG
+            .iter()
+            .find(|entry| entry.name == "AUFLIRA")
+            .unwrap();
+        let mut declaration = pinned_auflira();
+        let closing = declaration.content.rfind(')').unwrap();
+        declaration.content.insert_str(closing, "\n:dangling");
+        let error = parse_semantic_fields(&declaration, catalog).unwrap_err();
+        assert!(error.contains("invalid logic declaration shape"), "{error}");
+    }
+
+    #[test]
     fn policy_catalog_is_exact_and_source_field_count_is_closed() {
         assert_eq!(CATALOG.len(), SMTLIB_LOGICS.len());
         assert_eq!(
@@ -2152,7 +2172,7 @@ mod tests {
         assert_eq!(fields + semantic + restrictions, DETAILED_CASE_COUNT);
         for entry in CATALOG {
             validate_catalog_theory_projection(&entry).expect("theory projection");
-            assert!(!semantic_kinds(&entry).is_empty());
+            assert_ne!(semantic_kinds(&entry).as_slice(), &[] as &[SemanticKind]);
         }
     }
 

@@ -137,7 +137,7 @@ fn the_first_attempt_does_not_admit_the_negation_schemas() {
     let surface = "(not (not (= x y)))";
     let mut first = Derivation::default();
     assert!(!printer.derive_printed_equivalence("t9.n", surface, node, 0, &mut first));
-    assert!(first.steps.is_empty());
+    assert_eq!(first.steps.as_slice(), &[] as &[String]);
     let mut second = Derivation {
         tier: SchemaTier::Extended,
         ..Derivation::default()

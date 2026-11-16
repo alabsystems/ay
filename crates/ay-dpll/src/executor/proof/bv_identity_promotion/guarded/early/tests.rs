@@ -40,7 +40,10 @@ fn arm(executor: &mut Executor) {
 
 fn declined_without_authority(executor: &mut Executor) {
     assert!(!executor.try_early_ground_memory_refutation());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
     assert!(executor.last_proof.is_none());
     assert!(executor.last_unsat_certificate.is_none());
 }
@@ -170,7 +173,11 @@ fn interrupt_deadline_and_term_memory_limits_prevent_early_authority() {
         arm(&mut executor);
         match control {
             0 => executor.set_interrupt(Arc::new(AtomicBool::new(true))),
-            1 => executor.set_deadline(Some(Instant::now() - Duration::from_secs(1))),
+            1 => executor.set_deadline(Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("the monotonic clock can represent one second ago"),
+            )),
             _ => executor.term_memory_limit = Some(1),
         }
         declined_without_authority(&mut executor);
@@ -202,7 +209,10 @@ fn push_pop_and_reset_retire_the_memory_refutation() {
         .unwrap();
     assert_eq!(outputs, ["unsat", "sat", "sat"]);
     assert!(executor.last_proof().is_none());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
     assert!(executor.last_unsat_certificate.is_none());
 }
 
@@ -222,8 +232,11 @@ fn array_free_frame_source_is_retained_before_preprocessing_without_authority() 
     assert!(!used_definition);
     let negative = executor.ctx.terms.mk_not_raw(root);
     assert!(executor.early_ground_memory_terms_print_faithfully(&[root, negative]));
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
-    assert!(executor.last_proof_rebuild_originals.is_empty());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
+    assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
     assert!(executor.last_proof().is_none());
 }
 

@@ -199,7 +199,7 @@ fn poisoned_bookkeeping_refuses_every_clone_without_running_observer() {
             false
         }),
     );
-    assert!(std::panic::catch_unwind(AssertUnwindSafe(|| owner.inner.test_poison())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.inner.test_poison())).is_err());
     assert_eq!(owner.check(), Err(OriginalAdmissionError::Poisoned));
     assert_eq!(owner.clone().check(), Err(OriginalAdmissionError::Poisoned));
     assert_eq!(calls.load(Ordering::SeqCst), 0);

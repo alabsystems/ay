@@ -434,7 +434,7 @@ impl<'a> Walk<'a> {
             let amo = has_binaries && self.is_amo(c);
             let better = match best {
                 None => true,
-                Some((_, _, bsize, bamo)) => (amo && !bamo) || (!bamo && size < bsize),
+                Some((_, _, bsize, bamo)) => !bamo && (amo || size < bsize),
             };
             if better {
                 best = Some((c, var, size, amo));
@@ -630,7 +630,7 @@ mod tests {
     use super::*;
 
     fn lit(x: i32) -> Literal {
-        let v = Variable((x.unsigned_abs() - 1) as u32);
+        let v = Variable(x.unsigned_abs() - 1);
         if x > 0 {
             Literal::positive(v)
         } else {
@@ -788,7 +788,7 @@ mod tests {
         let (fc, _) = fix_and_cut(&clauses, &gens, 3, 11, 1 << 30);
         assert_eq!(fc.units, vec![lit(1)], "{fc:?}");
         assert_eq!(fc.ops, vec![LevelOp::NegationFix], "{fc:?}");
-        assert!(fc.binaries.is_empty());
+        assert_eq!(fc.binaries.len(), 0);
         assert!(satisfiable(&with_constraints(&clauses, &fc), 3));
         // The step: unit x1 with a witness carrying ¬x1 to x1.
         assert_eq!(fc.steps.len(), 1);

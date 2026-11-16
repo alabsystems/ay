@@ -367,7 +367,13 @@ fn extract_sum_equalities_skips_nonlinear() {
     // x * y = z (nonlinear, should not extract)
     let body = ChcExpr::eq(ChcExpr::mul(var("x"), var("y")), var("z"));
     let result = PdrSolver::extract_sum_equalities_alg(&body);
-    assert!(result.is_empty());
+    assert_eq!(
+        result,
+        [] as [(
+            (FxHashMap<String, i128>, i128),
+            (FxHashMap<String, i128>, i128)
+        ); 0]
+    );
 }
 
 #[test]
@@ -375,7 +381,13 @@ fn extract_sum_equalities_skips_constant_only() {
     // 5 = 5 (both sides constant, no variables)
     let body = ChcExpr::eq(ChcExpr::int(5), ChcExpr::int(5));
     let result = PdrSolver::extract_sum_equalities_alg(&body);
-    assert!(result.is_empty()); // filtered: both sides empty coefficients
+    assert_eq!(
+        result,
+        [] as [(
+            (FxHashMap<String, i128>, i128),
+            (FxHashMap<String, i128>, i128)
+        ); 0]
+    ); // filtered: both sides empty coefficients
 }
 
 // --- verify_equality_by_sub_alg ---

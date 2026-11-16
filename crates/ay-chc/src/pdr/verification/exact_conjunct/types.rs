@@ -23,7 +23,7 @@ impl Types {
         self.0[id]
     }
 
-    pub(super) fn intern(&mut self, sort: Sort, owner: &mut Owner) -> Result<usize> {
+    pub(super) fn intern(&mut self, sort: Sort, owner: &mut Owner<'_>) -> Result<usize> {
         owner.admit(self.0.len().checked_add(1).ok_or(Error::Resource)?, 0)?;
         if let Some(id) = self.0.iter().position(|entry| *entry == sort) {
             return Ok(id);
@@ -38,7 +38,7 @@ impl Types {
         &mut self,
         sort: &ChcSort,
         depth: usize,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<usize> {
         owner.admit(1, 0)?;
         if depth >= MAX_DEPTH {
@@ -66,7 +66,7 @@ impl Types {
         &mut self,
         op: ChcOp,
         args: &[usize],
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<usize> {
         owner.admit(args.len().checked_add(1).ok_or(Error::Resource)?, 0)?;
         // Array signatures compare canonical sort IDs, not recursive clones.

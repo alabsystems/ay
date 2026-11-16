@@ -122,7 +122,7 @@ impl NraSolver<'_> {
         };
         let mut values = Vec::with_capacity(monomial.vars.len());
         for &factor in &monomial.vars {
-            let Some(value) = self.monomial_factor_value_memo(factor, memo) else {
+            let Some(value) = self.monomial_factor_value(factor, memo) else {
                 return false;
             };
             values.push(value);

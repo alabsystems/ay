@@ -232,10 +232,12 @@ fn independently_false_uf_interpretation_withdraws_every_offer() {
                 .bitvec_atom_index(&[apart, root], &mut owner)
                 .unwrap();
             let offered = [b].into_iter().collect();
-            assert!(executor
-                .offers_an_atom_refuses(&model, &index, &offered, &mut owner)
-                .unwrap()
-                .is_empty());
+            assert_eq!(
+                executor
+                    .offers_an_atom_refuses(&model, &index, &offered, &mut owner)
+                    .unwrap(),
+                [] as [TermId; 0]
+            );
         }
         assert_eq!(
             executor

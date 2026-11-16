@@ -35,12 +35,6 @@ pub(crate) struct CoreLemmas {
     pub(crate) root_original: Option<u32>,
 }
 
-impl CoreLemmas {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.lemmas.is_empty()
-    }
-}
-
 impl Kitten {
     /// The core lemmas of the last UNSAT answer — a real inconsistency or an
     /// assumption failure. Empty unless antecedent tracking is on.

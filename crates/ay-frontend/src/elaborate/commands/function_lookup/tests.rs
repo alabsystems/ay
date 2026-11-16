@@ -30,7 +30,7 @@ fn unique_source_function_lookup_borrows_exact_names_and_signature() {
         let (arguments, result) = context.source_function_for_model(name).unwrap();
         let info = context.symbol_info(name).unwrap();
         assert!(std::ptr::eq(arguments, info.arg_sorts.as_slice()));
-        assert!(std::ptr::eq(result, &info.sort));
+        assert!(std::ptr::eq(result, &raw const info.sort));
     }
     let (args, result) = context.source_function_for_model("f with space").unwrap();
     assert_eq!(args, [Sort::Bool, Sort::bitvec(72)]);
@@ -73,7 +73,7 @@ fn overloads_native_aliases_and_datatype_operations_do_not_acquire_uf_ownership(
     );
     let term = context.source_constant_for_value("x").unwrap().0;
     context.register_symbol("alias".into(), term, Sort::bitvec(8));
-    context.register_native_global_constant("native".into(), Sort::bitvec(8));
+    let _ = context.register_native_global_constant("native".into(), Sort::bitvec(8));
     for name in ["alias", "native", "mkR", "field", "is-mkR"] {
         assert!(context.source_function_for_model(name).is_none(), "{name}");
     }

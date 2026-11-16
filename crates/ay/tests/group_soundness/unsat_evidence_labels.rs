@@ -216,7 +216,7 @@ fn evidence_fields(run: &Run) -> Vec<(String, String)> {
     tail.split_whitespace()
         .filter_map(|w| w.split_once('='))
         .map(|(k, v)| {
-            let v = v.trim_end_matches(|c: char| c == ';' || c == ',' || c == ')' || c == '.');
+            let v = v.trim_end_matches([';', ',', ')', '.']);
             (k.to_string(), v.to_string())
         })
         .collect()

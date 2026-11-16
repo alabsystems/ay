@@ -188,7 +188,7 @@ impl Executor {
             .and_then(|n| n.checked_add(self.last_assumptions.as_ref().map_or(0, Vec::len)))
             .and_then(|n| n.checked_add(extra_roots.len()))
             .and_then(|n| n.checked_add(self.lane_model_pin_roots.len()));
-        if !root_count.is_some_and(|n| n <= MAX_SOURCE_TERMS) {
+        if root_count.is_none_or(|n| n > MAX_SOURCE_TERMS) {
             return false;
         }
         let Some(roots) = self.datatype_model_collection_roots(extra_roots) else {
@@ -1727,10 +1727,10 @@ impl AsgBuilder<'_> {
                     let v = render_ctor(self.exec.dt_surface(&ctor), &parts);
                     return Some((ctor, parts, v));
                 }
-                None => match Self::scalar_enumeration_extras(&fsort) {
-                    Some(extras) => j -= extras,
-                    None => return None,
-                },
+                None => {
+                    let extras = Self::scalar_enumeration_extras(&fsort)?;
+                    j -= extras;
+                }
             }
         }
         // First allowed constructor with a datatype-sorted field is the pump.

@@ -102,7 +102,7 @@ fn assert_specialized(terms: &TermStore, clause: TermId, route: SpecializedRoute
 #[test]
 fn outside_frame_prerequisite_route_is_explicitly_unsupported() {
     let (terms, clause) = outside_frame();
-    assert!(super::super::outside_frame::Shape::recognize(&terms, &[clause]).is_some());
+    assert!(outside_frame::Shape::recognize(&terms, &[clause]).is_some());
     assert!(crate::checker::bv_bitblast::disjoint::Shape::recognize(&terms, &[clause]).is_none());
     assert_specialized(&terms, clause, SpecializedRoute::OutsideFrame);
 }
@@ -111,7 +111,7 @@ fn outside_frame_prerequisite_route_is_explicitly_unsupported() {
 fn disjoint_prerequisite_route_is_explicitly_unsupported() {
     let (terms, clause) = disjoint();
     assert!(crate::checker::bv_bitblast::disjoint::Shape::recognize(&terms, &[clause]).is_some());
-    assert!(super::super::outside_frame::Shape::recognize(&terms, &[clause]).is_none());
+    assert!(outside_frame::Shape::recognize(&terms, &[clause]).is_none());
     assert_specialized(&terms, clause, SpecializedRoute::Disjoint);
 }
 

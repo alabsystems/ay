@@ -51,17 +51,18 @@ fn consume(original: &OriginalAdmission, bytes: &[u8]) -> Result<(), OriginalAdm
 }
 fn totals(bytes: &[u8]) -> (u64, usize) {
     let (mut work_total, mut byte_total) = (0u64, 0usize);
-    let mut admission = |work, bytes| {
-        work_total += work as u64;
-        byte_total += bytes;
-        Ok(())
-    };
-    let mut work = WorkBudget::with_admission(u64::MAX, &mut admission);
-    prepare_qf_invariant_envelope_with_work(bytes, &mut work)
-        .unwrap()
-        .with_envelope(|_, _| Ok(()))
-        .unwrap();
-    drop(work);
+    {
+        let mut admission = |work, bytes| {
+            work_total += work as u64;
+            byte_total += bytes;
+            Ok(())
+        };
+        let mut work = WorkBudget::with_admission(u64::MAX, &mut admission);
+        prepare_qf_invariant_envelope_with_work(bytes, &mut work)
+            .unwrap()
+            .with_envelope(|_, _| Ok(()))
+            .unwrap();
+    }
     (work_total, byte_total)
 }
 

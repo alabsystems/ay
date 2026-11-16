@@ -49,7 +49,7 @@ pub(in crate::engines) fn checked_sort_with_bound(
         if !poll() {
             return None;
         }
-        let key = node as *const ChcExpr;
+        let key = std::ptr::from_ref::<ChcExpr>(node);
         if sorts.contains_key(&key) {
             continue;
         }
@@ -81,7 +81,7 @@ pub(in crate::engines) fn checked_sort_with_bound(
         }
         sorts.insert(key, result);
     }
-    let result = sorts.remove(&(root as *const ChcExpr))?;
+    let result = sorts.remove(&std::ptr::from_ref::<ChcExpr>(root))?;
     drop(pending);
     drop(sorts);
     poll().then_some(result)
@@ -107,7 +107,7 @@ fn node_sort(
             if !scalar(key) {
                 return None;
             }
-            let value_sort = sorts.get(&(value.as_ref() as *const ChcExpr))?;
+            let value_sort = sorts.get(&std::ptr::from_ref::<ChcExpr>(value.as_ref()))?;
             scalar(value_sort)
                 .then(|| ChcSort::Array(Box::new(key.clone()), Box::new(value_sort.clone())))
         }
@@ -118,7 +118,11 @@ fn node_sort(
                 if !poll() {
                     return None;
                 }
-                argument_sorts.push(sorts.get(&(argument.as_ref() as *const ChcExpr))?.clone());
+                argument_sorts.push(
+                    sorts
+                        .get(&std::ptr::from_ref::<ChcExpr>(argument.as_ref()))?
+                        .clone(),
+                );
             }
             crate::pdr::validate_qf_operation(*op, &argument_sorts).ok()
         }

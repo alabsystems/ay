@@ -20,6 +20,10 @@ impl Circuit<'_, '_, '_> {
             .equality(&read, &target, "resolution", &[&yes, &no])
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument names one checked read-over-write proof row component"
+    )]
     fn row_case(
         &mut self,
         write: &Write,

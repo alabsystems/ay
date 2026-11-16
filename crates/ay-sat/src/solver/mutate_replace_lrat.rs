@@ -32,7 +32,7 @@ impl Solver {
             return Vec::new();
         }
         let num_vars = self.num_vars;
-        debug_assert!(self.min.lrat_to_clear.is_empty());
+        debug_assert_eq!(self.min.lrat_to_clear.len(), 0);
 
         // Mark excluded variables (in new clause — checker already knows them).
         for &vi in exclude_vars {

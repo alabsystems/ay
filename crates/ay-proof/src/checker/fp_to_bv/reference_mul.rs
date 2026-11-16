@@ -142,7 +142,7 @@ impl Format {
         }
         .ok_or(ReferenceError::Width)?;
         let count = u64::from(p) * 4;
-        let count_bits = u64::BITS - count.leading_zeros();
+        let count_bits = count.bit_width();
         let exponent_width = eb
             .checked_add(4)
             .ok_or(ReferenceError::Width)?
@@ -164,6 +164,7 @@ struct Output {
     // Required for a future fresh BV-carrier clause translation. The current
     // word matcher instead checks ACTUAL RM equalities and the exact five-way
     // source code, never treating this Boolean as a caller-provided premise.
+    #[cfg(test)]
     rm_domain: RefId,
 }
 
@@ -287,7 +288,7 @@ impl<'terms, 'owner> Reference<'terms, 'owner> {
             .and_then(|n| n.checked_add(1024))
             .ok_or(ReferenceError::Width)?;
         let bytes = limit
-            .checked_mul(std::mem::size_of::<Node>())
+            .checked_mul(size_of::<Node>())
             .ok_or(ReferenceError::Width)?;
         self.storage(limit, bytes)?;
         if self.nodes.try_reserve_exact(limit).is_err() {

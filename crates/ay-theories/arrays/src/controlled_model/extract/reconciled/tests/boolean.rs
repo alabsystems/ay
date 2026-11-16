@@ -14,7 +14,7 @@ fn boolean_const_base_literal_fallback_matches_legacy_candidate_only() {
     let true_value = terms.mk_bool(true);
     let constant = terms.mk_const_array(Sort::Bool, false_value);
     let chain = terms.mk_app(Symbol::named("store"), [constant, index, true_value], sort);
-    terms.mk_app(Symbol::named("select"), [alias, index], Sort::Bool);
+    let _alias_read = terms.mk_app(Symbol::named("select"), [alias, index], Sort::Bool);
     let equality = terms.mk_eq(alias, chain);
     let mut solver = ArraySolver::new(&terms);
     solver.populate_caches();

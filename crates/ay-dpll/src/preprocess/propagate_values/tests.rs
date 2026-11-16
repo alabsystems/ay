@@ -296,7 +296,7 @@ fn goal_mode_empty_goal_is_a_no_op() {
     let mut fs: Vec<TermId> = Vec::new();
     let changed = PropagateValues::new().apply_goal(&mut terms, &mut fs);
     assert!(!changed);
-    assert!(fs.is_empty());
+    assert_eq!(fs, [] as [TermId; 0]);
 }
 
 #[test]

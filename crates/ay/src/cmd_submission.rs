@@ -1886,7 +1886,7 @@ fn preflight_chc_late_entry(opts: &ChcLateEntryPreflightOptions) -> Result<()> {
     });
 
     write_json_report(&opts.json, &payload)?;
-    write_chc_late_entry_markdown(&opts.report, &payload, root)?;
+    write_chc_late_entry_markdown(&opts.report, &payload)?;
     println!("wrote {}", display_path_for_report(&opts.json, root));
     println!("wrote {}", display_path_for_report(&opts.report, root));
     print_chc_track_model_summary();
@@ -6364,11 +6364,7 @@ fn write_pb_comp_verify_markdown(
     write_text(path, &lines.join("\n"), false)
 }
 
-fn write_chc_late_entry_markdown(
-    path: &Path,
-    payload: &serde_json::Value,
-    root: &Path,
-) -> Result<()> {
+fn write_chc_late_entry_markdown(path: &Path, payload: &serde_json::Value) -> Result<()> {
     let checks = payload["checks"].as_array().cloned().unwrap_or_default();
     let wrapper_cases = payload["wrapper_cases"]
         .as_array()
@@ -6596,14 +6592,6 @@ fn display_path_for_report(path: &Path, root: &Path) -> String {
         .strip_prefix(&root)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| absolute.display().to_string())
-}
-
-fn repo_relative_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
 }
 
 fn absolute_path_for_report(path: &Path) -> String {

@@ -105,8 +105,14 @@ fn certificate_only_scope_skips_safe_and_unsafe_obligation_trees() {
             panic!("stats-off SAFE generated replay obligations")
         },
     ));
-    assert!(safe_artifacts.replay_obligations.is_empty());
-    assert!(obligation_directories(temp.path()).is_empty());
+    assert_eq!(
+        safe_artifacts.replay_obligations.as_slice(),
+        &[] as &[ChcReplayObligationArtifact]
+    );
+    assert_eq!(
+        obligation_directories(temp.path()).as_slice(),
+        &[] as &[PathBuf]
+    );
     drop(safe_artifacts);
 
     let unsafe_artifacts = available_artifacts(write_chc_unsafe_certificate_artifacts(
@@ -118,8 +124,14 @@ fn certificate_only_scope_skips_safe_and_unsafe_obligation_trees() {
             panic!("stats-off UNSAFE generated replay obligations")
         },
     ));
-    assert!(unsafe_artifacts.replay_obligations.is_empty());
-    assert!(obligation_directories(temp.path()).is_empty());
+    assert_eq!(
+        unsafe_artifacts.replay_obligations.as_slice(),
+        &[] as &[ChcReplayObligationArtifact]
+    );
+    assert_eq!(
+        obligation_directories(temp.path()).as_slice(),
+        &[] as &[PathBuf]
+    );
 }
 
 #[test]

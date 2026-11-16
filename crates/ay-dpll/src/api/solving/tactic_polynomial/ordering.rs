@@ -31,10 +31,7 @@ pub(super) fn sort<T>(
             if compare(&values[root], &values[largest])? != Ordering::Less {
                 return Ok(());
             }
-            pay(
-                owner,
-                std::mem::size_of::<T>().checked_mul(2).ok_or_else(fail)?,
-            )?;
+            pay(owner, size_of::<T>().checked_mul(2).ok_or_else(fail)?)?;
             values.swap(root, largest);
             root = largest;
         }
@@ -43,10 +40,7 @@ pub(super) fn sort<T>(
         sift(values, root, values.len(), owner, compare)?;
     }
     for end in (1..values.len()).rev() {
-        pay(
-            owner,
-            std::mem::size_of::<T>().checked_mul(2).ok_or_else(fail)?,
-        )?;
+        pay(owner, size_of::<T>().checked_mul(2).ok_or_else(fail)?)?;
         values.swap(0, end);
         sift(values, 0, end, owner, compare)?;
     }

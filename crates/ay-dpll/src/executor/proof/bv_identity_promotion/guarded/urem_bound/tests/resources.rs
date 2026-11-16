@@ -78,7 +78,7 @@ fn incomplete_original_root_census_does_not_create_a_bound_candidate() {
         &|| false,
     );
     assert_eq!(result, Some(false));
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn candidate_refusal_is_recorded_at_existing_publication_boundary() {
         ),
         None
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }
 
 #[test]

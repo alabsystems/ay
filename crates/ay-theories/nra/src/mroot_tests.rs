@@ -468,8 +468,8 @@ fn no_roots_means_no_closest_roots() {
     let p = mp(&[(1, &[(X, 2)]), (1, &[])]);
     let (roots, idx) =
         isolate_roots_closest_at(&p, X, &Var2Anum::new(), &int(0)).expect("isolates");
-    assert!(roots.is_empty());
-    assert!(idx.is_empty());
+    assert_eq!(roots.as_slice(), &[] as &[Anum]);
+    assert_eq!(idx.as_slice(), &[] as &[usize]);
 }
 
 // ---------------------------------------------------------------------------

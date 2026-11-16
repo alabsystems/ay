@@ -80,7 +80,7 @@ impl<'a> SosPolynomialBudget<'a> {
     }
 
     pub(crate) fn visit_term(&mut self, depth: usize) -> bool {
-        if !self.charge(1, std::mem::size_of::<(TermId, usize)>())
+        if !self.charge(1, size_of::<(TermId, usize)>())
             || depth > MAX_SOS_TERM_DEPTH
             || self.term_visits >= MAX_SOS_TERM_VISITS
         {

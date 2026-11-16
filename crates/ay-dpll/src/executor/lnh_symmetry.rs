@@ -1564,7 +1564,7 @@ mod tests {
         let mut t = TermStore::new();
         let (s, c) = domain6(&mut t);
         let stale = symmetric_totality(&mut t, &s, &c);
-        assert!(!stale.is_empty());
+        assert_ne!(stale, [] as [TermId; 0]);
         // A unary predicate over the domain exists in the store (lex-leader atoms).
         for &ci in &c {
             let _ = t.mk_app(Symbol::named("p"), [ci], Sort::Bool);

@@ -139,6 +139,6 @@ fn a_true_constant_guard_does_not_exclude_its_satisfying_value() {
         .filter(|(_, term)| **term == false_term)
         .map(|(cnf, _)| Literal::negative(Variable::new(*cnf - 1)))
         .collect();
-    assert!(!false_comparisons.is_empty());
+    assert_ne!(false_comparisons.as_slice(), &[] as &[Literal]);
     assert!(solve_with(&fixture, &false_comparisons).is_sat());
 }

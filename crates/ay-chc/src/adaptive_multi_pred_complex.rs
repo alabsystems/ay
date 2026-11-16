@@ -1790,38 +1790,43 @@ impl AdaptivePortfolio {
     ) -> Vec<LadderMember<'a>> {
         let mut members = vec![
             LadderMember::new("relational_equality_houdini", move || {
-                complex_member(self.try_relational_equality_houdini_lane(deadline))
+                self.try_relational_equality_houdini_lane(deadline)
+                    .map(complex_member)
             }),
             LadderMember::new("data_driven_houdini", move || {
-                complex_member(self.try_data_driven_houdini_lane())
+                self.try_data_driven_houdini_lane().map(complex_member)
             }),
             LadderMember::new("reve_accumulator_houdini", move || {
-                complex_member(self.try_reve_accumulator_invariant_lane())
+                self.try_reve_accumulator_invariant_lane()
+                    .map(complex_member)
             }),
             LadderMember::new("reve_coupling_houdini", move || {
-                complex_member(self.try_reve_coupling_houdini_lane())
+                self.try_reve_coupling_houdini_lane().map(complex_member)
             }),
             LadderMember::new("cyclic_consistency_invariant", move || {
-                complex_member(self.try_cyclic_consistency_invariant_lane())
+                self.try_cyclic_consistency_invariant_lane()
+                    .map(complex_member)
             }),
             LadderMember::new("ball_rajamani_arrays_cex", move || {
-                complex_member(self.try_ball_rajamani_lia_arrays_counterexample_route(deadline))
+                self.try_ball_rajamani_lia_arrays_counterexample_route(deadline)
+                    .map(complex_member)
             }),
             LadderMember::new("acyclic_bmc", move || {
-                complex_member(
-                    self.try_acyclic_bmc_probe(features, deadline)
-                        .map(|(result, _evidence)| result),
-                )
+                self.try_acyclic_bmc_probe(features, deadline)
+                    .map(|(result, _evidence)| result)
+                    .map(complex_member)
             }),
         ];
         if let Some(export) = non_inlined {
             members.push(LadderMember::new("non_inlined_pdr", move || {
-                complex_member(self.multi_pred_complex_non_inlined_pdr(features, deadline, export))
+                self.multi_pred_complex_non_inlined_pdr(features, deadline, export)
+                    .map(complex_member)
             }));
         }
         if self.nonlinear_lane_applies() {
             members.push(LadderMember::new("nonlinear_spacer_pdr", move || {
-                complex_member(self.multi_pred_complex_nonlinear_lane_pdr(features, deadline))
+                self.multi_pred_complex_nonlinear_lane_pdr(features, deadline)
+                    .map(complex_member)
             }));
         }
         members
@@ -2268,8 +2273,8 @@ impl AdaptivePortfolio {
 }
 
 /// Map a Safe/Unsafe-returning complex lane onto a ladder-race member result.
-fn complex_member(result: Option<PortfolioResult>) -> Option<LadderOutcome> {
-    result.map(|result| (result, ValidationEvidence::FullVerification))
+fn complex_member(result: PortfolioResult) -> LadderOutcome {
+    (result, ValidationEvidence::FullVerification)
 }
 
 /// What an Unknown non-inlined PDR stage hands the later stages (#7919 lemma

@@ -76,7 +76,7 @@ fn append_unit_fragment(
     let count = u32::try_from(proof.steps.len()).ok()?;
     offset.checked_add(count)?;
     for (index, step) in proof.steps.iter().enumerate() {
-        spend_payload(cx, 1, std::mem::size_of::<ProofStep>().checked_mul(2)?)?;
+        spend_payload(cx, 1, size_of::<ProofStep>().checked_mul(2)?)?;
         let copied = copy_unit_step(cx, step, index, offset)?;
         cx.chain.add_step(copied);
     }
@@ -124,7 +124,7 @@ fn copy_unit_step(
             spend_payload(
                 cx,
                 premises.len(),
-                premises.len().checked_mul(std::mem::size_of::<ProofId>())?,
+                premises.len().checked_mul(size_of::<ProofId>())?,
             )?;
             let premises = premises
                 .iter()
@@ -156,7 +156,7 @@ fn copy_unit_step(
                 theory: theory.clone(),
                 clause: clause.clone(),
                 farkas: None,
-                kind: kind.clone(),
+                kind: *kind,
                 lia: None,
             })
         }
@@ -165,7 +165,7 @@ fn copy_unit_step(
 }
 
 fn spend_terms(cx: &mut PlanCx<'_>, terms: usize) -> Option<()> {
-    spend_payload(cx, terms, terms.checked_mul(std::mem::size_of::<TermId>())?)
+    spend_payload(cx, terms, terms.checked_mul(size_of::<TermId>())?)
 }
 
 #[cfg(test)]

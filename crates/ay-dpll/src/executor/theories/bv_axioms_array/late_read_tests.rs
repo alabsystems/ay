@@ -174,8 +174,8 @@ fn two_folded_ite_branches_do_not_bypass_the_existing_condition_mapping_gate() {
         &BTreeMap::new(),
     );
     unmapped.check_relation(|_| true);
-    assert!(unmapped.axioms.is_empty());
+    assert_eq!(unmapped.axioms, [] as [ay_core::CnfClause; 0]);
     let omitted = Circuit::new(&executor, &bv, &roots, None, &observed, &mapping);
     omitted.check_relation(|_| true);
-    assert!(omitted.axioms.is_empty());
+    assert_eq!(omitted.axioms, [] as [ay_core::CnfClause; 0]);
 }

@@ -279,7 +279,7 @@ pub(super) fn capture<'a>(
     pay(
         scope
             .len()
-            .checked_mul((usize::BITS - scope.len().leading_zeros()) as usize + 1)
+            .checked_mul(scope.len().bit_width() as usize + 1)
             .ok_or(Refusal::Unsupported)?,
         0,
     )?;

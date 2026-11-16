@@ -7,7 +7,8 @@
 use super::*;
 
 impl Executor {
-    pub(crate) fn native_clause_trace(&self) -> Option<&ay_sat::ClauseTrace> {
+    #[cfg(feature = "z3-compat-internals")]
+    pub(crate) fn native_clause_trace(&self) -> Option<&ClauseTrace> {
         self.last_clause_trace.as_ref()
     }
 

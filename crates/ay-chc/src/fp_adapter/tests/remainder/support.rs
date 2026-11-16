@@ -113,11 +113,12 @@ fn owner_from(
             .ok_or(QueryError::Exhausted)?;
         Ok(())
     };
-    let mut budget = WorkBudget::with_admission(work, &mut admission);
-    budget.charge(0)?;
-    run(&mut budget);
-    budget.charge(0)?;
-    drop(budget);
+    {
+        let mut budget = WorkBudget::with_admission(work, &mut admission);
+        budget.charge(0)?;
+        run(&mut budget);
+        budget.charge(0)?;
+    }
     admission(0, 0)
 }
 

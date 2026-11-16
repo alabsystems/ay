@@ -18,7 +18,7 @@ pub(super) fn refuse(used: &AtomicUsize) {
 }
 
 pub(super) fn debit(used: &AtomicUsize, amount: usize) -> bool {
-    used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prior| {
+    used.try_update(Ordering::AcqRel, Ordering::Acquire, |prior| {
         Some(prior.saturating_add(amount).min(REFUSED))
     })
     .is_ok_and(|prior| {

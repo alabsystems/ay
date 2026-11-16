@@ -1047,37 +1047,36 @@ impl Solver {
             } else if var_level > level {
                 continue;
             }
-            if self.var_data[var_idx].is_lazy_theory_reason() {
-                if self
+            if self.var_data[var_idx].is_lazy_theory_reason()
+                && self
                     .materialize_lazy_reason_with_ext(var_idx, ext, max_reason_level)
                     .is_none()
-                {
-                    // Materialization failed: the theory could not reconstruct
-                    // the reason (e.g., bounds were retracted by backtracking).
-                    // Convert to a decision so conflict analysis handles it
-                    // correctly instead of encountering an unmaterialized lazy
-                    // reason and treating it as a decision WITHOUT clearing the
-                    // lazy flag (#8511).
-                    //
-                    // Soundness: treating a propagated variable as a decision
-                    // adds its negation to the learned clause instead of
-                    // resolving through the (unavailable) reason. This makes
-                    // the learned clause WEAKER (more literals = fewer pruned
-                    // assignments), which is sound. The alternative — leaving
-                    // the lazy flag set — causes conflict analysis to skip
-                    // resolution, producing an overly STRONG clause that can
-                    // prune valid solutions, causing false UNSAT.
-                    //
-                    // A lazy flag whose index names no entry for this variable
-                    // (see `lazy_reason_entry`) takes the same exit: it is not
-                    // a reason and must never be read as one.
-                    let vd = &mut self.var_data[var_idx];
-                    let seen_flag = vd.flags & VarData::FLAG_SEEN_PUB;
-                    vd.reason = NO_REASON;
-                    vd.flags = seen_flag; // Clear lazy flag, preserve seen
-                    if fail_level == Some(var_level) {
-                        failed_at_fail_level = true;
-                    }
+            {
+                // Materialization failed: the theory could not reconstruct
+                // the reason (e.g., bounds were retracted by backtracking).
+                // Convert to a decision so conflict analysis handles it
+                // correctly instead of encountering an unmaterialized lazy
+                // reason and treating it as a decision WITHOUT clearing the
+                // lazy flag (#8511).
+                //
+                // Soundness: treating a propagated variable as a decision
+                // adds its negation to the learned clause instead of
+                // resolving through the (unavailable) reason. This makes
+                // the learned clause WEAKER (more literals = fewer pruned
+                // assignments), which is sound. The alternative — leaving
+                // the lazy flag set — causes conflict analysis to skip
+                // resolution, producing an overly STRONG clause that can
+                // prune valid solutions, causing false UNSAT.
+                //
+                // A lazy flag whose index names no entry for this variable
+                // (see `lazy_reason_entry`) takes the same exit: it is not
+                // a reason and must never be read as one.
+                let vd = &mut self.var_data[var_idx];
+                let seen_flag = vd.flags & VarData::FLAG_SEEN_PUB;
+                vd.reason = NO_REASON;
+                vd.flags = seen_flag; // Clear lazy flag, preserve seen
+                if fail_level == Some(var_level) {
+                    failed_at_fail_level = true;
                 }
             }
         }
@@ -1126,7 +1125,7 @@ mod insertion_origin_tests {
         solver.add_theory_axiom(vec![a, b]);
         let idx = solver.arena.active_indices().next().expect("stored axiom");
         let before = solver.snapshot_clause_trace().expect("enabled");
-        solver.delete_clause_checked(idx, crate::solver::mutate::ReasonPolicy::Skip);
+        solver.delete_clause_checked(idx, mutate::ReasonPolicy::Skip);
         assert!(!solver.arena.is_active(idx));
         let after = solver.snapshot_clause_trace().expect("enabled");
         assert_eq!(after.len(), before.len());

@@ -56,9 +56,7 @@ impl Executor {
             if !attempt.is_same_attempt(&self.evaluation_attempt())
                 || source != self.ctx.source_context_stamp()
             {
-                return Err(self.record_evaluation_stop(
-                    crate::executor_types::UnknownOrigin::IncompleteSolverLane,
-                ));
+                return Err(self.record_evaluation_stop(UnknownOrigin::IncompleteSolverLane));
             }
             Ok(())
         };
@@ -135,7 +133,7 @@ impl Executor {
                             args,
                             self.ctx.terms.sort(term),
                         )
-                        .map_err(|_| "array projection signature mismatch".to_owned())?
+                        .map_err(|()| "array projection signature mismatch".to_owned())?
                     {
                         let selected = *args.get(index).ok_or("invalid array projection")?;
                         reserve_counted(&mut pending, 1, owner).map_err(|e| e.to_string())?;
@@ -151,7 +149,7 @@ impl Executor {
                 reads_function = true;
                 let owned = model
                     .constant_array_value(self, term)
-                    .map_err(|_| "array function DATA is stale")?
+                    .map_err(|()| "array function DATA is stale")?
                     .is_some()
                     || model.functional_array_value(self, term)?.is_some()
                     || self
@@ -332,8 +330,8 @@ impl Executor {
                 || owner
                     .admit(
                         symbol.name().len().saturating_mul(2),
-                        std::mem::size_of::<ay_model_check::ModelValue>()
-                            + 2 * std::mem::size_of::<usize>()
+                        size_of::<ay_model_check::ModelValue>()
+                            + 2 * size_of::<usize>()
                             + symbol.name().len(),
                     )
                     .is_err()
@@ -356,7 +354,7 @@ impl Executor {
         if owner
             .admit(
                 1,
-                std::mem::size_of::<ConstantArrayFunctions>() + 2 * std::mem::size_of::<usize>(),
+                size_of::<ConstantArrayFunctions>() + 2 * size_of::<usize>(),
             )
             .is_err()
         {

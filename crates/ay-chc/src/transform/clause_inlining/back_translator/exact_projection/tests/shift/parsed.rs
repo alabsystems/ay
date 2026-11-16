@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::PredicateId;
 
 #[test]
 fn parsed_division_rules_reach_projection_as_correlated_logical_shifts() {
@@ -19,7 +20,10 @@ fn parsed_division_rules_reach_projection_as_correlated_logical_shifts() {
     "#;
     let problem = crate::ChcParser::parse(input).unwrap();
     let clause = &problem.clauses()[0];
-    assert!(clause.body.predicates.is_empty());
+    assert_eq!(
+        clause.body.predicates,
+        [] as [(PredicateId, Vec<ChcExpr>); 0]
+    );
     let formula = clause.body.constraint.as_ref().unwrap();
     assert_eq!(operation_count(formula, ChcOp::BvUDiv), 0);
     assert_eq!(operation_count(formula, ChcOp::BvLShr), 2);

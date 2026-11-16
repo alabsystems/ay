@@ -79,7 +79,7 @@ fn effective_read_keeps_the_skipped_write_distinctness() {
 
     let outer = (i, two, Vec::new());
     let (base_value, base_reasons) = solver
-        .effective_read_value_at(base, &[outer.clone()], j)
+        .effective_read_value_at(base, std::slice::from_ref(&outer), j)
         .expect("a write at a distinct index lets the read reach the base");
     assert_eq!(base_value, one);
     assert_eq!(base_reasons, vec![TheoryLit::new(eq_i_j, false)]);

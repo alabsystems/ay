@@ -511,10 +511,10 @@ impl ArraySolver<'_> {
                 else {
                     continue;
                 };
-                if !model
+                if model
                     .array_values
                     .get(&base)
-                    .is_some_and(|interp| interp.default.is_none())
+                    .is_none_or(|interp| interp.default.is_some())
                 {
                     continue;
                 }

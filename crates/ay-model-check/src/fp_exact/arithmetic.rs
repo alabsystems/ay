@@ -81,13 +81,13 @@ pub(crate) fn plan<'a>(
                 // four u64 digits per BigUint, not just its occupied limb.
                 // eb<=63 bounds the mask; the fraction is one, not dense.
                 RemainderResult::Nan => {
-                    std::mem::size_of::<ModelValue>()
-                        + 2 * (std::mem::size_of::<BigUint>() + 2 * std::mem::size_of::<usize>())
-                        + 2 * 4 * std::mem::size_of::<u64>()
+                    size_of::<ModelValue>()
+                        + 2 * (size_of::<BigUint>() + 2 * size_of::<usize>())
+                        + 2 * 4 * size_of::<u64>()
                 }
                 // Cloning exact DATA shares its immutable Arc fields. Legacy
                 // native DATA is fixed-size too. No rational or field copy.
-                RemainderResult::Dividend(_) => std::mem::size_of::<ModelValue>(),
+                RemainderResult::Dividend(_) => size_of::<ModelValue>(),
             };
             return Ok(ArithmeticPlan {
                 name,
@@ -152,7 +152,7 @@ pub(crate) fn plan<'a>(
         .and_then(|n| n.checked_add(input_work))
         .ok_or("FP work overflow")?;
     let storage = limbs
-        .checked_mul(32 * std::mem::size_of::<u64>())
+        .checked_mul(32 * size_of::<u64>())
         .and_then(|n| n.checked_mul(phases))
         .and_then(|n| n.checked_add(input_storage))
         .ok_or("FP storage overflow")?;

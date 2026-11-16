@@ -66,6 +66,7 @@ impl PolynomialParameters {
         }
         Ok(())
     }
+    /// Return whether `name` identifies a supported polynomial option.
     pub fn recognizes(name: &str) -> bool {
         matches!(
             name,
@@ -79,6 +80,7 @@ impl PolynomialParameters {
                 | "push_to_real"
         )
     }
+    /// Set a supported option, rejecting unknown names or mismatched value kinds.
     pub fn set(&mut self, name: &str, value: V) -> Result<(), TacticFailure> {
         match (name, value) {
             ("som", V::Bool(v)) => self.som = Some(v),

@@ -157,19 +157,6 @@ fn verification_error(message: impl Into<String>) -> ChcError {
     ChcError::Verification(message.into())
 }
 
-fn dump_failed_obligation(obligation: &ChcReplayObligation) {
-    let Some(dir) = ay_core::misc_cli_flags()
-        .chc_dump_failed_replay_obligation
-        .as_deref()
-    else {
-        return;
-    };
-    let path = format!("{dir}/{}.smt2", obligation.name);
-    if std::fs::write(&path, &obligation.smtlib).is_ok() {
-        eprintln!("[ay-chc] wrote failing replay obligation to {path}");
-    }
-}
-
 /// Expected executor verdict for one replay obligation kind.
 ///
 /// Safe-certificate obligations (initiation/consecution/safety — including
@@ -349,13 +336,12 @@ impl ChcPdrProofRun {
             &mut continuation,
             self.problem().clauses().len(),
         )
-        .map_err(|error| {
+        .inspect_err(|_| {
             // Admission can reject an elapsed limit before its first
             // callback. That refusal still belongs to the witness.
             if let Some(owner) = &mut compact_owner {
                 let _ = owner.refuse::<()>(crate::ground_derivation::compact::Error::Stopped);
             }
-            error
         })?;
         if let Some(owner) = compact_owner {
             progress.retain_compact_owner(owner)?;

@@ -207,7 +207,7 @@ fn the_streamed_verdict_is_its_own_render_and_a_parse_gap_outranks_it() {
     assert!(exec
         .try_export_last_proof_alethe_for_problem_scope_to_with_carcara_surface(&mut bytes)
         .is_none());
-    assert!(bytes.is_empty());
+    assert_eq!(bytes, [] as [u8; 0]);
     assert_eq!(exec.last_unsat_proof_carcara_surface(), None);
 }
 

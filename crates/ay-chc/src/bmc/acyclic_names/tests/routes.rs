@@ -102,8 +102,11 @@ fn repeated_expansions_have_independent_hidden_locals() {
 #[test]
 fn preflight_refusal_does_not_retry_the_level_flat_encoding() {
     let (problem, _) = collision_problem("z");
-    let mut config = BmcConfig::default();
-    config.time_budget = Some(std::time::Duration::ZERO);
+    let base = BmcConfig::default();
+    let config = BmcConfig {
+        time_budget: Some(std::time::Duration::ZERO),
+        ..base
+    };
     let solver = BmcSolver::new(problem, config);
     let queries: Vec<_> = solver.problem.queries().collect();
     assert!(matches!(
@@ -131,12 +134,15 @@ fn live_depth_refusal_is_terminal_before_preferred_exact_concrete_recovery() {
         ClauseBody::empty(),
         ClauseHead::Predicate(pred, vec![expression]),
     ));
-    let mut config = BmcConfig::default();
-    config.acyclic_safe = true;
-    config.prefer_exact_acyclic_first = true;
-    config.enable_adaptive_stepping = false;
-    config.enable_k_induction = false;
-    config.time_budget = Some(std::time::Duration::from_secs(60));
+    let base = BmcConfig::default();
+    let config = BmcConfig {
+        acyclic_safe: true,
+        prefer_exact_acyclic_first: true,
+        enable_adaptive_stepping: false,
+        enable_k_induction: false,
+        time_budget: Some(std::time::Duration::from_secs(60)),
+        ..base
+    };
     let solver = BmcSolver::new(problem, config);
     assert!(solver.prefer_exact_acyclic_executor_first());
     let queries: Vec<_> = solver.problem.queries().collect();

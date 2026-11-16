@@ -16,7 +16,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
 /// Gates between `t` and the stop/cut sets, and the leaf atoms reached.
 pub(crate) fn cone(
-    p: &Proof,
+    p: &Proof<'_>,
     t: T,
     stop: &HashSet<T>,
     cut: &HashSet<T>,
@@ -78,7 +78,7 @@ struct Run {
 }
 
 impl Chain {
-    fn state_atoms(&self, p: &Proof, run: &Run, i: usize) -> Vec<T> {
+    fn state_atoms(&self, p: &Proof<'_>, run: &Run, i: usize) -> Vec<T> {
         let mut out = Vec::new();
         let mut seen = HashSet::default();
         for &t in &self.bounds[i] {
@@ -95,7 +95,7 @@ impl Chain {
     }
 
     /// Boundary 0 also carries the leaf inputs its terms depend on.
-    fn widen_boundary0(&mut self, p: &Proof, run: &Run) {
+    fn widen_boundary0(&mut self, p: &Proof<'_>, run: &Run) {
         let stop: HashSet<T> = run.env.keys().copied().collect();
         let mut seen: HashSet<T> = self.bounds[0].iter().map(|&t| p.t.lit_of(t).0).collect();
         let mut extra = Vec::new();
@@ -118,7 +118,7 @@ impl Chain {
         self.bounds[0].extend(extra);
     }
 
-    fn local_clauses(p: &mut Proof, gates: &[T]) -> Vec<Clause> {
+    fn local_clauses(p: &mut Proof<'_>, gates: &[T]) -> Vec<Clause> {
         let mut out = Vec::new();
         for &g in gates {
             for d in p.gate_defs(g) {
@@ -130,7 +130,7 @@ impl Chain {
 
     /// Projections onto `proj` of the models of `db` that extend `fixed`.
     fn project(
-        db: &mut Vec<Clause>,
+        db: &[Clause],
         fixed: &HashMap<T, bool>,
         proj: &[T],
         budget: &mut u64,
@@ -143,7 +143,7 @@ impl Chain {
         localsat::project(db, fixed, proj, budget, progress)
     }
 
-    pub(crate) fn run(mut self, p: &mut Proof) -> Option<ChainResult> {
+    pub(crate) fn run(mut self, p: &mut Proof<'_>) -> Option<ChainResult> {
         p.observe()?;
         let mut run = Run {
             env: HashMap::default(),
@@ -173,7 +173,7 @@ impl Chain {
         Some(ChainResult { outputs, finals })
     }
 
-    fn boundary0(&self, p: &mut Proof, run: &mut Run) -> Option<(HashSet<Vec<bool>>, Vec<S>)> {
+    fn boundary0(&self, p: &mut Proof<'_>, run: &mut Run) -> Option<(HashSet<Vec<bool>>, Vec<S>)> {
         p.observe()?;
         let s0 = self.state_atoms(p, run, 0);
         let stop: HashSet<T> = run.env.keys().copied().collect();
@@ -181,14 +181,8 @@ impl Chain {
         for &a in &s0 {
             gates.extend(cone(p, a, &stop, &self.cut, &self.leafcut).0);
         }
-        let mut db = Self::local_clauses(p, &gates);
-        let reach = Self::project(
-            &mut db,
-            &run.env.clone(),
-            &s0,
-            &mut run.budget,
-            p.progress(),
-        )?;
+        let db = Self::local_clauses(p, &gates);
+        let reach = Self::project(&db, &run.env.clone(), &s0, &mut run.budget, p.progress())?;
         let mut prem: Vec<Prem> = run.param_steps.iter().map(|&s| Prem::Step(s)).collect();
         for &g in &gates {
             prem.extend(p.gate(g));
@@ -198,7 +192,7 @@ impl Chain {
     }
 }
 
-fn valid_clause(p: &Proof, reach: &[&Vec<bool>], c: &[(usize, bool)]) -> Option<bool> {
+fn valid_clause(p: &Proof<'_>, reach: &[&Vec<bool>], c: &[(usize, bool)]) -> Option<bool> {
     for s in reach {
         p.observe()?;
         if !c.iter().any(|&(j, v)| s[j] == v) {
@@ -209,7 +203,7 @@ fn valid_clause(p: &Proof, reach: &[&Vec<bool>], c: &[(usize, bool)]) -> Option<
 }
 
 fn covered_state(
-    p: &Proof,
+    p: &Proof<'_>,
     reach: &HashSet<Vec<bool>>,
     chosen: &[Vec<(usize, bool)>],
     s: &[bool],
@@ -236,7 +230,7 @@ fn covered_state(
 
 /// Clauses over `atoms` exactly characterizing `reach`, each derived from `prem`.
 fn invariant(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     atoms: &[T],
     reach: &HashSet<Vec<bool>>,
     prem: &[Prem],
@@ -327,7 +321,7 @@ type Advance = (HashSet<Vec<bool>>, Vec<S>, Vec<S>);
 impl Chain {
     fn position(
         &self,
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         run: &mut Run,
         i: usize,
         reach: &HashSet<Vec<bool>>,
@@ -360,7 +354,7 @@ impl Chain {
                 fixed.insert(a, v);
             }
             newreach.extend(Self::project(
-                &mut db,
+                &db,
                 &fixed,
                 &sn,
                 &mut run.budget,
@@ -394,7 +388,7 @@ impl Chain {
         Some((newreach, inv2, out_steps))
     }
 
-    fn position_cone(&self, p: &Proof, targets: &[T], stop: &HashSet<T>) -> (Vec<T>, Vec<T>) {
+    fn position_cone(&self, p: &Proof<'_>, targets: &[T], stop: &HashSet<T>) -> (Vec<T>, Vec<T>) {
         let mut gates = Vec::new();
         let mut gseen = HashSet::default();
         let mut inputs = Vec::new();
@@ -419,7 +413,7 @@ impl Chain {
         (gates, inputs)
     }
 
-    fn finish(&self, p: &mut Proof, run: &Run, len: usize, inv: &[S]) -> Option<Vec<S>> {
+    fn finish(&self, p: &mut Proof<'_>, run: &Run, len: usize, inv: &[S]) -> Option<Vec<S>> {
         p.observe()?;
         let sl = self.state_atoms(p, run, len);
         let mut stop: HashSet<T> = sl.iter().copied().collect();

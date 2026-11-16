@@ -146,7 +146,7 @@ pub(super) fn extract_theory_sat_values(
             .get(qualified_name)
             .map(String::as_str)
             .unwrap_or(qualified_name);
-        if let Some(sort) = chc_scalar_sort(&terms.sort(term_id)) {
+        if let Some(sort) = chc_scalar_sort(terms.sort(term_id)) {
             scalar_sorts_by_name.entry(name).or_default().push(sort);
         }
     }
@@ -171,7 +171,7 @@ pub(super) fn extract_theory_sat_values(
             .unwrap_or(qualified_name);
         let key: String = match (
             plain_name_winner(name),
-            chc_scalar_sort(&terms.sort(term_id)),
+            chc_scalar_sort(terms.sort(term_id)),
         ) {
             (Some(winner), Some(sort)) if winner != sort => {
                 crate::ChcVar::new(name, sort).sort_qualified_name()

@@ -20,7 +20,7 @@ pub(super) fn validate(
             for &arg in args {
                 prior_sort(entries, index, arg, progress)?;
             }
-            super::super::preflight_app::validate_app_signature_with_progress(
+            preflight_app::validate_app_signature_with_progress(
                 entries, index, symbol, args, result, progress,
             )
         }

@@ -2076,7 +2076,7 @@ fn test_cli_chc_stats_json_binds_unsafe_trace_validity_obligation_hash() {
     assert_eq!(trace_obligation["payload_format"], "ground-derivation-v1");
     assert_eq!(trace_obligation["role"], "unsafe-ground-derivation");
     let problem = ay::chc::ChcParser::parse(input).expect("original trace source");
-    ay::chc::validate_chc_ground_derivation_artifact(&problem, &trace_payload)
+    let _validated = ay::chc::validate_chc_ground_derivation_artifact(&problem, &trace_payload)
         .expect("published ground evidence must freshly replay the original clauses");
     assert_eq!(
         trace_obligation["sha256"],

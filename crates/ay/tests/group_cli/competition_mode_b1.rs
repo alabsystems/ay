@@ -10,7 +10,7 @@
 //! (documented precedence, never a clap conflict).
 
 use ntest::timeout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -118,7 +118,7 @@ fn no_proof_and_z3_mode_shed_the_proof_cycle_like_rigor_fast() {
 /// published with a certificate behind it — the tracker recorded steps, the
 /// mint ran and was strict-checked — and the sidecar announced and written.
 /// The exact inverse of [`assert_shed_proof_posture`].
-fn assert_certified_proof_posture(output: &std::process::Output, alethe: &PathBuf, label: &str) {
+fn assert_certified_proof_posture(output: &std::process::Output, alethe: &Path, label: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -183,7 +183,7 @@ fn stat_value(combined: &str, key: &str) -> Option<String> {
 /// through the raw admission lane, every proof-cycle meter at zero (nothing
 /// recorded, minted, re-solved, or strict-checked), no sidecar announced or
 /// written.
-fn assert_shed_proof_posture(output: &std::process::Output, alethe: &PathBuf, label: &str) {
+fn assert_shed_proof_posture(output: &std::process::Output, alethe: &Path, label: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

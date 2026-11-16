@@ -45,6 +45,7 @@ pub struct VivifyStats {
     /// clauses examined and clauses vivified (strengthened, satisfied or
     /// subsumed), Kissat's `tried` / `vivified` per `vivify-tier*` phase.
     pub tier_examined: [u64; 4],
+    /// Vivified clauses per learned/irredundant tier.
     pub tier_vivified: [u64; 4],
     /// Generations: times a tier had no untried clause left and was
     /// re-flagged whole (`--sat-inproc-nlogn-schedule`, `VIVIFY_TRIED_BIT`).

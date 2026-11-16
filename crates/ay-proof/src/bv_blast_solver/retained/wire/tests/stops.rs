@@ -141,14 +141,15 @@ fn usage_survives_refusal_and_caller_grant_does_not_restart_between_operations()
 fn caught_callback_panic_cannot_revive_a_control() {
     let fixture = Fixture::new();
     let mut calls = 0;
-    let mut callback = || {
-        calls += 1;
-        panic!("injected callback panic")
-    };
-    let mut control = Control::new(fixture.wire, &mut callback);
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control.poll()));
-    assert!(panic.is_err());
-    assert_eq!(control.charge(1), Err(WireError::Cancelled));
-    drop(control);
+    {
+        let mut callback = || {
+            calls += 1;
+            panic!("injected callback panic")
+        };
+        let mut control = Control::new(fixture.wire, &mut callback);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control.poll()));
+        assert!(panic.is_err());
+        assert_eq!(control.charge(1), Err(WireError::Cancelled));
+    }
     assert_eq!(calls, 1);
 }

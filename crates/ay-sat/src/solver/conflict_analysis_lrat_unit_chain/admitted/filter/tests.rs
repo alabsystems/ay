@@ -7,7 +7,7 @@ use crate::counted_storage::test_owner;
 const SMALL_BUCKETS: [usize; 16] = [4, 4, 4, 4, 8, 8, 8, 8, 16, 16, 16, 16, 16, 16, 16, 32];
 
 fn bytes(buckets: usize) -> usize {
-    buckets * (std::mem::size_of::<Literal>() + 1) + 31
+    buckets * (size_of::<Literal>() + 1) + 31
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn small_table_one_short_work_refuses_before_reservation_charge() {
 
 #[test]
 fn small_table_bound_covers_pinned_eight_and_sixteen_byte_control_layouts() {
-    let element = std::mem::size_of::<Literal>();
+    let element = size_of::<Literal>();
     assert!(element >= 4);
     for (len, &expected) in SMALL_BUCKETS.iter().enumerate() {
         let buckets = reserved_buckets(len).unwrap();
@@ -74,7 +74,7 @@ fn small_table_bound_covers_pinned_eight_and_sixteen_byte_control_layouts() {
         for group in [8usize, 16] {
             // Pinned TableLayout::calculate_layout_for, excluding the empty
             // set's actual zero allocation: alignment padding plus controls.
-            let alignment = group.max(std::mem::align_of::<Literal>());
+            let alignment = group.max(align_of::<Literal>());
             let controls = (buckets * element + alignment - 1) & !(alignment - 1);
             let actual = controls + buckets + group;
             assert!(bytes(buckets) >= actual, "len={len}, group={group}");

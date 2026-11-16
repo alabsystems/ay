@@ -40,7 +40,7 @@ pub(super) fn accepted(
         .poll()
         .unwrap_or_else(|| panic!("stage {stage}: original parse owner refused"));
     assert!(
-        !memory.is_some_and(|limit| solver.instance_term_bytes() > limit),
+        memory.is_none_or(|limit| solver.instance_term_bytes() <= limit),
         "stage {stage}: original term cap exceeded"
     );
     assert!(
@@ -62,7 +62,7 @@ pub(super) fn accepted(
         "stage {stage}: original deadline spent after solve"
     );
     assert!(
-        !memory.is_some_and(|limit| solver.instance_term_bytes() > limit),
+        memory.is_none_or(|limit| solver.instance_term_bytes() <= limit),
         "stage {stage}: original term cap exceeded after solve"
     );
     assert!(

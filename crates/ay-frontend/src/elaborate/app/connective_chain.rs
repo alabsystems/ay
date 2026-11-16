@@ -187,8 +187,8 @@ mod tests {
         let ParsedTerm::App(_, nested) = &args[0] else {
             panic!("and")
         };
-        assert!(std::ptr::eq(leaves[0], &nested[0]));
-        assert!(std::ptr::eq(leaves[1], &nested[1]));
+        assert!(std::ptr::eq(leaves[0], &raw const nested[0]));
+        assert!(std::ptr::eq(leaves[1], &raw const nested[1]));
     }
 
     #[test]

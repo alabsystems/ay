@@ -174,12 +174,12 @@ fn deadline_and_memory_owners_are_inherited_without_reopening() {
         let _smt = crate::smt::ScopedSmtDeadline::install_until(late);
         let mut owner = Owner::capture(&configured, Some(late));
         assert_eq!(owner.deadline, Some(early));
-        assert!(owner.open_at(early - Duration::from_secs(1)));
+        let before_early = early
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset");
+        assert!(owner.open_at(before_early));
         assert!(!owner.open_at(early));
-        assert!(
-            !owner.open_at(early - Duration::from_secs(1)),
-            "observed expiry is sticky"
-        );
+        assert!(!owner.open_at(before_early), "observed expiry is sticky");
     }
     {
         let _smt = crate::smt::ScopedSmtDeadline::install_until(Instant::now());

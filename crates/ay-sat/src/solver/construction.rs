@@ -18,10 +18,7 @@ pub(super) trait Construction {
     fn boxed<T>(&self, value: T) -> Result<Box<T>, Self::Error>;
 
     fn metadata<T>(&self) -> Result<(), Self::Error> {
-        self.choose(
-            || (),
-            |owner| owner.admit(std::mem::size_of::<T>().max(1), 0),
-        )
+        self.choose(|| (), |owner| owner.admit(size_of::<T>().max(1), 0))
     }
 
     fn unsupported(&self, condition: bool, why: &'static str) -> Result<(), Self::Error> {
@@ -58,7 +55,7 @@ pub(super) trait Construction {
             || Vec::with_capacity(capacity),
             |owner| {
                 let bytes = capacity
-                    .checked_mul(std::mem::size_of::<T>())
+                    .checked_mul(size_of::<T>())
                     .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
                 owner.admit(capacity.max(1), bytes)?;
                 let mut values = Vec::new();
@@ -99,7 +96,7 @@ impl Construction for Counted<'_> {
         counted(self.0)
     }
     fn boxed<T>(&self, value: T) -> Result<Box<T>, Self::Error> {
-        let bytes = std::mem::size_of::<T>();
+        let bytes = size_of::<T>();
         self.0.admit(bytes.max(1), bytes)?;
         Box::try_new(value).map_err(|_| self.0.refuse(CountedAdmissionError::Memory))
     }

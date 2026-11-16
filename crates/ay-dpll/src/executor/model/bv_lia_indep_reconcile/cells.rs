@@ -337,7 +337,7 @@ impl Executor {
                 stack.extend(self.ctx.terms.children(t));
             }
         }
-        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        out.sort_unstable_by_key(|a| a.0);
         out.dedup();
         out
     }

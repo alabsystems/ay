@@ -17,9 +17,9 @@ fn clause_body_empty() {
     let body = ClauseBody::empty();
     assert!(body.is_empty());
     assert!(body.is_fact());
-    assert!(body.predicates.is_empty());
+    assert_eq!(body.predicates, [] as [(PredicateId, Vec<ChcExpr>); 0]);
     assert!(body.constraint.is_none());
-    assert!(body.vars().is_empty());
+    assert_eq!(body.vars(), [] as [ChcVar; 0]);
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn clause_body_constraint_only() {
     let body = ClauseBody::constraint(ChcExpr::ge(ChcExpr::var(x), ChcExpr::int(0)));
     assert!(!body.is_empty());
     assert!(body.is_fact()); // No predicates = is_fact
-    assert!(body.predicates.is_empty());
+    assert_eq!(body.predicates, [] as [(PredicateId, Vec<ChcExpr>); 0]);
     assert!(body.constraint.is_some());
 
     let vars = body.vars();
@@ -101,7 +101,7 @@ fn clause_head_false() {
     let head = ClauseHead::False;
     assert!(head.is_query());
     assert!(head.predicate_id().is_none());
-    assert!(head.vars().is_empty());
+    assert_eq!(head.vars(), [] as [ChcVar; 0]);
 }
 
 #[test]

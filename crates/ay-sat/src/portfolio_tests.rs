@@ -431,7 +431,7 @@ fn assert_lrat_proof_verifies(
 
         // Addition line: "<id> <lit1> ... 0 <hint1> ... 0"
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        assert!(!tokens.is_empty(), "non-empty LRAT line must have tokens");
+        assert_ne!(tokens.len(), 0, "non-empty LRAT line must have tokens");
         let clause_id: u64 = tokens[0].parse().expect("clause ID must parse");
 
         let mut lits = Vec::new();
@@ -498,7 +498,7 @@ fn test_portfolio_proof_verified_by_lrat_checker() {
 
     assert!(result.is_unsat(), "expected UNSAT, got {result:?}");
     let bytes = proof_bytes.expect("proof_mode UNSAT must produce raw LRAT proof bytes");
-    assert!(!bytes.is_empty(), "LRAT proof bytes must be non-empty");
+    assert_ne!(bytes.len(), 0, "LRAT proof bytes must be non-empty");
     assert_lrat_proof_verifies(
         &formula,
         bytes,

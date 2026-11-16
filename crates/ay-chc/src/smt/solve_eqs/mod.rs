@@ -419,7 +419,7 @@ impl State<'_> {
             return Some(false);
         }
         let t = Simplifier::default().simp(&self.defs, &mut self.visits, &t, 0)?;
-        if !is_substitutable(&t, &x.sort) && !(large_ok && is_scalar_term(&t, &x.sort)) {
+        if !(is_substitutable(&t, &x.sort) || large_ok && is_scalar_term(&t, &x.sort)) {
             return Some(false);
         }
         let t_vars = t.vars();

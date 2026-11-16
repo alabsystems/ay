@@ -37,7 +37,9 @@ fn expired_later_deadline_cannot_be_removed_by_original_callback() {
     let _cleanup = ClearScopes;
     DEADLINE.with(|slot| {
         *slot.borrow_mut() = Some(ScopedSmtDeadline::install_until(
-            Instant::now() - Duration::from_millis(1),
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("fixture instant supports a one-millisecond offset"),
         ));
     });
     armed.store(true, Ordering::SeqCst);

@@ -366,7 +366,7 @@ pub(super) fn rational_to_f64(r: &num_rational::BigRational) -> f64 {
     }
 }
 
-// Re-exported here so existing `use to_real::{offset_cnf_lit, ...}` imports continue to work.
+// Re-export the live blocking helpers used by the to-real lane.
 pub(super) use super::blocking::{
-    block_decided_modes, build_fp_target_unit_clauses, choose_blocking_clause, offset_cnf_lit,
+    block_decided_modes, build_fp_target_unit_clauses, choose_blocking_clause,
 };

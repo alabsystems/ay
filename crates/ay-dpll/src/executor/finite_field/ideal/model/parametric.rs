@@ -87,9 +87,9 @@ impl Ring<'_, '_> {
                 continue;
             }
             let mut selected = None;
-            for row in rank..rows.len() {
+            for (row, cells) in rows.iter().enumerate().skip(rank) {
                 self.pay(1, 0)?;
-                if !rows[row][column].is_empty() {
+                if !cells[column].is_empty() {
                     selected = Some(row);
                     break;
                 }

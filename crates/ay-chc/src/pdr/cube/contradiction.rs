@@ -4,8 +4,7 @@
 
 //! Contradiction detection in cube expressions.
 //!
-//! Contains `is_trivial_contradiction` (A AND NOT(A) detection),
-//! `has_relational_contradiction` (contradictory bounds), and
+//! Contains `is_trivial_contradiction` (including contradictory bounds) and
 //! `collect_equalities_for_point_check` (union-find-based point cube analysis).
 
 use super::PointCubeUnionFind;
@@ -194,14 +193,6 @@ fn trivial_contradiction_inner(expr: &ChcExpr, mut stop: &mut dyn FnMut() -> boo
     }
 }
 
-/// Check if a list of conjuncts contains contradictory relational constraints.
-/// Examples:
-/// - (a <= b) and (a > b) → contradiction
-/// - (a <= b) and (a >= b) and (a != b) → contradiction (since a <= b && a >= b implies a = b)
-pub(in crate::pdr) fn has_relational_contradiction(conjuncts: &[ChcExpr]) -> bool {
-    has_relational_contradiction_checked(conjuncts, &mut || false).unwrap_or(false)
-}
-
 pub(in crate::pdr) fn has_relational_contradiction_checked(
     conjuncts: &[ChcExpr],
     stop: &mut dyn FnMut() -> bool,
@@ -247,6 +238,7 @@ pub(in crate::pdr) fn has_relational_contradiction_checked(
 }
 
 /// Extract implied relations from a list of conjuncts.
+#[cfg(test)]
 pub(super) fn extract_implied_relations_from_conjuncts(
     conjuncts: &[ChcExpr],
 ) -> Vec<(String, String, RelationType)> {

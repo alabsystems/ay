@@ -183,7 +183,7 @@ fn phase_oracle_vocabulary(terms: &mut ay_core::term::TermStore) -> (Vec<TermId>
     let cm3 = terms.mk_int((-3).into());
     let half = terms.mk_int(7.into());
     fn app(t: &mut ay_core::term::TermStore, n: &str, a: &[TermId]) -> TermId {
-        t.mk_app(Symbol::named(n), a, ay_core::Sort::Int)
+        t.mk_app(Symbol::named(n), a, Sort::Int)
     }
     let (x, y, z, w, u) = (vars[0], vars[1], vars[2], vars[3], vars[4]);
     let mut operands = vec![x, y, z, w, u, c0, c2, cm3, half];
@@ -378,8 +378,7 @@ fn leaf_sign_memo_matches_direct_reads_across_epochs() {
         s.lia.lra_solver().has_value(t)
             || matches!(
                 s.terms.get(t),
-                ay_core::term::TermData::Const(ay_core::term::Constant::Rational(_))
-                    | ay_core::term::TermData::Const(ay_core::term::Constant::Int(_))
+                TermData::Const(Constant::Rational(_)) | TermData::Const(Constant::Int(_))
             )
     };
     let check_all = |s: &NiaSolver<'_>| {
@@ -397,7 +396,7 @@ fn leaf_sign_memo_matches_direct_reads_across_epochs() {
                     .lra_solver()
                     .value_sign(t)
                     .or_else(|| match s.terms.get(t) {
-                        ay_core::term::TermData::Const(ay_core::term::Constant::Int(n)) => {
+                        TermData::Const(Constant::Int(n)) => {
                             Some(n.sign().cmp(&num_bigint::Sign::NoSign))
                         }
                         _ => None,

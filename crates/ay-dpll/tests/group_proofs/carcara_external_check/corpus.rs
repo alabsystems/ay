@@ -424,8 +424,8 @@ fn test_carcara_checked_divisibility_wire_rows() {
         "{:?}",
         summary.rejected_labels
     );
-    assert!(summary.unsupported_unsat_labels.is_empty());
-    assert!(summary.oracle_sat_labels.is_empty());
+    assert_eq!(summary.unsupported_unsat_labels, [] as [String; 0]);
+    assert_eq!(summary.oracle_sat_labels, [] as [String; 0]);
     assert_eq!(summary.verified, expected_valid.len());
     assert_eq!(
         summary.verified_labels.into_iter().collect::<BTreeSet<_>>(),

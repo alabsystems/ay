@@ -14,6 +14,10 @@ mod array_free;
 mod sparse;
 type Progress<'a> = &'a mut dyn FnMut(usize, usize) -> bool;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "live step, backing capacity, three independent limit owners, and progress stay explicit"
+)]
 pub(crate) fn price_clause(
     terms: &TermStore,
     step_id: ProofId,
@@ -88,6 +92,10 @@ pub(crate) fn price_clause(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "live clause, wire, native price, deadline, limit owners, and progress stay explicit"
+)]
 fn run_price(
     terms: &TermStore,
     clause: &[TermId],

@@ -1181,7 +1181,7 @@ mod tests {
         let mut jit = TheoryPropJit::new();
         let mut results = Vec::new();
         jit.propagate_var(999, Some(make_bound(5, 1, false)), None, &mut results);
-        assert!(results.is_empty());
+        assert_eq!(results.as_slice(), &[] as &[PropagationResult]);
     }
 
     // --- Hotness-deferred native compilation (Fix A1) ---

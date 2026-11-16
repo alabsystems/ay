@@ -4,6 +4,7 @@
 use super::*;
 use crate::smt::executor_adapter::ReplayCancellation;
 use std::cell::Cell;
+use std::time::Duration;
 
 mod diagnostic;
 mod rows;
@@ -129,7 +130,7 @@ fn callback_refusal_and_caught_callback_panic_permanently_poison_owner() {
 }
 
 #[test]
-fn inherited_cancel_expiry_and_retained_legacy_wall_keep_original_owner() {
+fn inherited_cancel_and_expiry_keep_original_owner() {
     let parent = crate::CancellationToken::new();
     let cancellation = ReplayCancellation::new(&parent.child());
     let mut callback = || true;
@@ -149,14 +150,6 @@ fn inherited_cancel_expiry_and_retained_legacy_wall_keep_original_owner() {
     assert!(
         RetainedReplayProgress::new(ReplayLimit::Until(Instant::now()), &mut callback).is_err()
     );
-    let before = Instant::now();
-    let mut callback = || true;
-    let mut legacy = RetainedReplayProgress::new(ReplayLimit::Legacy, &mut callback).unwrap();
-    let original = legacy.deadline();
-    assert!(original >= before + Duration::from_secs(LEGACY_REQUEST_SECONDS));
-    assert!(matches!(legacy.limit(), ReplayLimit::Until(deadline) if deadline == original));
-    assert!(legacy.charge(1, 1));
-    assert_eq!(legacy.deadline(), original);
 }
 
 #[test]

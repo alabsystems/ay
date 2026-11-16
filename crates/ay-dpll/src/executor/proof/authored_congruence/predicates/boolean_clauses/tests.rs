@@ -50,7 +50,7 @@ fn assert_conditional_bundle(source: &str, expected_assumes: usize) {
     assert!(proof.steps.iter().any(|step| matches!(
         step,
         ProofStep::Step {
-            rule: ay_core::AletheRule::Or,
+            rule: AletheRule::Or,
             ..
         }
     )));
@@ -450,7 +450,7 @@ fn conditional_foreign_equality_and_popped_sources_do_not_grant_authority() {
         ),
         Outcome::Declined
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 
     let source = both_branches().replacen("(set-logic ALL)", "(set-logic ALL) (push 1)", 1);
     let mut executor = parsed(&source);
@@ -467,5 +467,5 @@ fn conditional_foreign_equality_and_popped_sources_do_not_grant_authority() {
         ),
         Outcome::Declined
     );
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ProofStep; 0]);
 }

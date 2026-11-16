@@ -170,7 +170,7 @@ fn screen_vec<T>(count: usize, meter: &mut CheckedRefutationMeter) -> ScreenResu
 }
 
 fn search_work(count: usize) -> usize {
-    (usize::BITS - count.leading_zeros()) as usize + 1
+    count.bit_width() as usize + 1
 }
 
 /// The exact trace, variable map and structural unit premises

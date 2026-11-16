@@ -23,13 +23,13 @@ fn table_bound<T>(
     map: &HashMap<TermId, T>,
     work: &mut WorkBudget<'_>,
 ) -> Result<usize, QueryError> {
-    if std::mem::size_of::<usize>() > 8 {
+    if size_of::<usize>() > 8 {
         return Err(work.refuse_exhaustion());
     }
     // Pinned raw layout: allocated size >= buckets * entry size. capacity()
     // is only items+growth_left and can decrease with tombstones. This is
     // backing metadata used to bound visits, NOT an RSS-to-work conversion.
-    let entries = map.allocation_size() / std::mem::size_of::<(TermId, T)>();
+    let entries = map.allocation_size() / size_of::<(TermId, T)>();
     entries
         .checked_add(32)
         .ok_or_else(|| work.refuse_exhaustion())

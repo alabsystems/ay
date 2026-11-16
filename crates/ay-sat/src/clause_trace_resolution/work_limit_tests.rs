@@ -54,8 +54,6 @@ fn conversion_control_and_overflow_failures_keep_their_original_priority() {
     );
     assert_eq!(meter.consumed_work(), 1_024);
     assert_eq!(polls.get(), 2);
-    drop(meter);
-
     stop.set(false);
     let mut meter = ConversionMeter::new(&limits, &mut should_stop).unwrap();
     meter.work = u64::MAX;
@@ -68,8 +66,6 @@ fn conversion_control_and_overflow_failures_keep_their_original_priority() {
     );
     assert_eq!(meter.consumed_work(), u64::MAX);
     assert_eq!(polls.get(), before);
-    drop(meter);
-
     let mut expired = limits;
     expired.deadline = Some(Instant::now());
     assert!(matches!(

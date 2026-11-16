@@ -965,7 +965,10 @@ mod tests {
         assert_eq!(report.event, SolverProgramInvalidationEvent::Pop);
         assert!(!report.key_delta.key_changed());
         assert_eq!(report.deopted_artifacts, 0);
-        assert!(report.deopted.is_empty());
+        assert_eq!(
+            report.deopted.as_slice(),
+            &[] as &[SolverProgramDeoptMetadata]
+        );
         assert_eq!(report.retained_artifacts, 1);
         assert_eq!(
             report.recompile_trigger,

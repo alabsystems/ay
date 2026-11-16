@@ -262,7 +262,7 @@ impl ArithEntail<'_> {
         ys: &mut Vec<TermId>,
         zero_ys: &mut Vec<TermId>,
     ) -> bool {
-        debug_assert!(zero_ys.is_empty());
+        debug_assert_eq!(zero_ys.as_slice(), &[] as &[TermId]);
 
         if !self.sum_geq(ys, x) {
             return false;

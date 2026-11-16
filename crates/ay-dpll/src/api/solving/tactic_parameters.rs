@@ -15,8 +15,11 @@ use std::time::Instant;
 /// symbol's printed spelling (the symbol `true` is not a Boolean parameter).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TacticParameterValue {
+    /// A Boolean parameter value.
     Bool(bool),
+    /// An unsigned-integer parameter value.
     UInt(u32),
+    /// A value kind unsupported by the tactic parameter surface.
     Unsupported,
 }
 
@@ -31,6 +34,7 @@ pub struct TacticParameters {
     pub(crate) max_power_expansion: Option<u32>,
 }
 impl TacticParameters {
+    /// Set a supported tactic option, rejecting unknown names or mismatched value kinds.
     pub fn set(&mut self, name: &str, value: TacticParameterValue) -> Result<(), TacticFailure> {
         if super::polynomial_parameters::PolynomialParameters::recognizes(name) {
             return self.polynomial.set(name, value);
@@ -67,6 +71,7 @@ impl TacticParameters {
         self.max_power_expansion = Some(maximum);
         self
     }
+    /// Merge global polynomial settings beneath explicit tactic settings.
     pub fn with_global_polynomial(mut self, global: super::PolynomialParameters) -> Self {
         self.polynomial = self.polynomial.over(global);
         self
@@ -81,6 +86,7 @@ pub struct TacticInstance {
     configured: Mutex<TacticParameters>,
 }
 impl TacticInstance {
+    /// Create a tactic instance with no configured parameter overrides.
     pub fn new(body: Tactic) -> Self {
         Self {
             body,
@@ -171,14 +177,12 @@ impl<'a> Restricted<'a> {
                 return result;
             }
         }
-        if self.refused.get().is_none() && result.is_ok() {
-            if self.check().is_err() {
-                self.original
-                    .check()
-                    .map_err(|_| TacticFailure::new("original tactic owner stopped"))?;
-                if self.refused.get().is_none() {
-                    return Err(TacticFailure::new("original tactic checkpoint refused"));
-                }
+        if self.refused.get().is_none() && result.is_ok() && self.check().is_err() {
+            self.original
+                .check()
+                .map_err(|_| TacticFailure::new("original tactic owner stopped"))?;
+            if self.refused.get().is_none() {
+                return Err(TacticFailure::new("original tactic checkpoint refused"));
             }
         }
         if let Some(reason) = self.refused.get() {

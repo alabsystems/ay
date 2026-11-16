@@ -55,7 +55,7 @@ impl Executor {
     ///   independently re-derives that `F` is the exact De Morgan dual of `E`
     ///   (identical binder vector; `F`'s body is the single negation of `E`'s
     ///   body), which is what makes `(cl E F)` the tautology `A ∨ ¬A`.
-    /// * `forall_inst` — `validate_forall_inst` re-derives binder/argument arity
+    /// * `forall_inst` — `validate_forall_inst_with_progress` re-derives binder/argument arity
     ///   and sorts, argument groundness, and that `I` is the EXACT simultaneous
     ///   capture-safe substitution of `F`'s body.
     /// * `or` — the clausification validator re-derives the disjunction.
@@ -170,7 +170,7 @@ impl Executor {
         let forall = self.ctx.terms.mk_forall(bindings.to_vec(), neg_body);
         // I = (not R). Because φ[t⃗] is the interned root R, the raw
         // substitution of F's body (not φ) at t⃗ is exactly (not R), so this is
-        // precisely the instance `validate_forall_inst` expects.
+        // precisely the instance `validate_forall_inst_with_progress` expects.
         let instance = self.ctx.terms.mk_not_raw(ground_root);
         let not_forall = self.ctx.terms.mk_not_raw(forall);
         let disjunction =

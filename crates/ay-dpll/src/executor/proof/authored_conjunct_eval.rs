@@ -149,7 +149,7 @@ impl Executor {
             return false;
         };
         if !self.rebuilt_root_prints_as_authored(root, assertion) {
-            super::authored_consequence_replay::replay_note(|| {
+            authored_consequence_replay::replay_note(|| {
                 "[fold-to-false] conjunct-eval: the raw root does not print as authored".into()
             });
             return false;
@@ -182,7 +182,7 @@ impl Executor {
             };
             let Some(closer) = self.conjunct_eval_closer(inner, datatype_decls, selector_decls)
             else {
-                super::authored_consequence_replay::replay_note(|| {
+                authored_consequence_replay::replay_note(|| {
                     format!(
                         "[fold-to-false] conjunct-eval: no closer for leaf {}",
                         ay_proof::format_term_alethe(&self.ctx.terms, *leaf)

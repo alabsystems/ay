@@ -12,7 +12,8 @@
 //!
 //! Part of #6586, #4919.
 
-use crate::common::{check_z3_or_skip, run_z3_file, workspace_path, SolverOutcome};
+use crate::common::z3::{check_z3_or_skip, run_z3_file};
+use crate::common::{workspace_path, SolverOutcome};
 use anyhow::{anyhow, Context, Result};
 use ay_dpll::Executor;
 use ay_frontend::parse;

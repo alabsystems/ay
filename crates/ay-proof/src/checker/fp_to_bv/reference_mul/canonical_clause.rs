@@ -14,7 +14,7 @@ pub(super) fn validate(
     operation: ay_core::FpOp,
     limits: &ay_sat::ResolutionProofLimits,
     work: &mut ay_core::original_query::WorkBudget<'_>,
-) -> std::result::Result<(), ProofCheckError> {
+) -> Result<(), ProofCheckError> {
     let message = "complete live FP clause has no canonical source-bound refutation";
     work.admit(message.len(), message.len())
         .map_err(|_| ProofCheckError::ResourceLimit)?;
@@ -68,7 +68,7 @@ fn canonical_unit_matches_operation(
     clause: &[TermId],
     operation: ay_core::FpOp,
     work: &mut ay_core::original_query::WorkBudget<'_>,
-) -> std::result::Result<bool, canonical::Error> {
+) -> Result<bool, canonical::Error> {
     let name = match operation {
         ay_core::FpOp::Add => "fp.add",
         ay_core::FpOp::Sub => "fp.sub",

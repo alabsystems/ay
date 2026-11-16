@@ -116,8 +116,11 @@ fn original_zero_and_expired_ambient_walls_report_timeout_not_refuted() {
         ExternalInvariantValidation::Timeout
     );
     config.solve_timeout = Some(Duration::from_secs(20));
-    let _ambient =
-        crate::smt::ScopedSmtDeadline::install_until(Instant::now() - Duration::from_secs(1));
+    let _ambient = crate::smt::ScopedSmtDeadline::install_until(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset"),
+    );
     assert_eq!(
         validate_external_invariant_model_typed(&problem, &model, &config).unwrap(),
         ExternalInvariantValidation::Timeout

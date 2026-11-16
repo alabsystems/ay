@@ -2649,6 +2649,10 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
     };
 
     let abi = tree_entry("src/api/z3_api.h")?;
+    #[expect(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "selected authenticated source paths require the exact lowercase .h suffix"
+    )]
     let public_headers = SELECTED_SOURCE_PATHS
         .iter()
         .copied()
@@ -3260,10 +3264,14 @@ else if (strcmp(ext, "smt2") == 0) {}
             "seq",
             "specrels",
         ];
-        let content = families
-            .iter()
-            .map(|name| format!("register_plugin(symbol(\"{name}\"), plugin);\n"))
-            .collect::<String>();
+        let mut content = String::new();
+        {
+            use std::fmt::Write as _;
+            for name in families {
+                writeln!(&mut content, "register_plugin(symbol(\"{name}\"), plugin);")
+                    .expect("writing to a String cannot fail");
+            }
+        }
         for path in [
             "src/ast/reg_decl_plugins.cpp",
             "src/cmd_context/cmd_context.cpp",

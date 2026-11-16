@@ -29,7 +29,6 @@
 
 use super::*;
 
-mod counted;
 mod resolution;
 
 impl Solver {

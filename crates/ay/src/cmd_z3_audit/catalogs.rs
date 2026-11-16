@@ -140,8 +140,8 @@ fn entries(kind: Catalog, text: &str) -> Result<BTreeMap<String, String>> {
                 {
                     anyhow::bail!("unrecognized parameter descriptor");
                 }
-                if !suffix.is_empty()
-                    && !(suffix.starts_with(" (default: ") && suffix.ends_with(')'))
+                if !(suffix.is_empty()
+                    || (suffix.starts_with(" (default: ") && suffix.ends_with(')')))
                 {
                     anyhow::bail!("truncated or unknown parameter descriptor suffix");
                 }
@@ -280,7 +280,7 @@ pub(super) fn measure(root: &Path, ay: &Path, z3: &str) -> Vec<AuditCheck> {
             .open(&path)?;
         let deadline = std::time::Instant::now() + LIMITS.timeout;
         let mut remaining = metadata.len();
-        let mut chunk = [0u8; 64 * 1024];
+        let mut chunk = vec![0u8; 64 * 1024].into_boxed_slice();
         while remaining != 0 {
             if std::time::Instant::now() >= deadline {
                 return Err(io::Error::new(

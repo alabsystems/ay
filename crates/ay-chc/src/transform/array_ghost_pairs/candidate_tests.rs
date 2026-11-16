@@ -49,7 +49,6 @@ fn derives_exact_bv32_bv64_candidate_for_model_checker_consumer_harder() {
         .expect("MODEL_CHECKER_CONSUMER harder query should yield a candidate");
     assert_eq!(candidates.len(), 1);
     let candidate = &candidates[0];
-    assert_eq!(candidate.predicate, candidate.source_query_predicate);
     assert_eq!(candidate.vars.len(), 10);
     assert_scalar_candidate(candidate);
 
@@ -73,10 +72,6 @@ fn derives_exact_bv32_bv64_candidate_for_model_checker_consumer_harder() {
 fn propagates_model_checker_consumer_multi_query_to_all_compatible_predicates() {
     let problem = ChcParser::parse(MODEL_CHECKER_CONSUMER_MULTI)
         .expect("parse MODEL_CHECKER_CONSUMER multi canary");
-    let source = problem
-        .get_predicate_by_name("loop_inv")
-        .expect("loop_inv declaration")
-        .id;
     let spec = GhostPairSpec::analyze(&problem, 1);
     let candidates = query_anchored_ghost_candidates(&problem, &spec)
         .expect("MODEL_CHECKER_CONSUMER multi query should yield propagated candidates");
@@ -90,7 +85,6 @@ fn propagates_model_checker_consumer_multi_query_to_all_compatible_predicates() 
     predicates.dedup();
     assert_eq!(predicates.len(), 3);
     for candidate in &candidates {
-        assert_eq!(candidate.source_query_predicate, source);
         assert_scalar_candidate(candidate);
         let layout = spec.preds.get(&candidate.predicate).expect("ghost layout");
         for array_index in 0..3 {

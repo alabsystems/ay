@@ -27,7 +27,6 @@ pub(super) fn with_owner(run: impl FnOnce(&mut WorkBudget<'_>)) {
     work.charge(0).unwrap();
     run(&mut work);
     work.charge(0).unwrap();
-    drop(work);
     original(0, 0).unwrap();
 }
 
@@ -79,11 +78,8 @@ pub(super) fn case(
         + 1)
     .checked_mul(2)
     .unwrap();
-    work.admit(
-        cells,
-        cells.checked_mul(std::mem::size_of::<i32>()).unwrap(),
-    )
-    .unwrap();
+    work.admit(cells, cells.checked_mul(size_of::<i32>()).unwrap())
+        .unwrap();
     let units = values
         .iter()
         .map(|v| v.exponent.len() + v.significand.len() + 1)
@@ -95,19 +91,13 @@ pub(super) fn case(
         .unwrap()
         .checked_add(units)
         .unwrap();
-    work.admit(
-        moved,
-        moved.checked_mul(std::mem::size_of::<CnfClause>()).unwrap(),
-    )
-    .unwrap();
+    work.admit(moved, moved.checked_mul(size_of::<CnfClause>()).unwrap())
+        .unwrap();
     built.clauses.try_reserve_exact(units).unwrap();
     for (value, bits) in values.iter().zip(inputs) {
         for lit in signed_bits(value, bits) {
-            work.admit(
-                1,
-                std::mem::size_of::<CnfClause>() + std::mem::size_of::<i32>(),
-            )
-            .unwrap();
+            work.admit(1, size_of::<CnfClause>() + size_of::<i32>())
+                .unwrap();
             built.clauses.push(CnfClause::unit(lit));
         }
     }
@@ -136,7 +126,7 @@ fn native(built: &FpBuiltEncoding, output: &[i32], wrong: bool, work: &mut WorkB
             clause
                 .literals()
                 .len()
-                .checked_mul(std::mem::size_of::<Literal>())
+                .checked_mul(size_of::<Literal>())
                 .unwrap(),
         )
         .unwrap();

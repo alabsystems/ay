@@ -184,10 +184,8 @@ fn the_sweep_accepts_every_same_index_overwrite_over_a_bounded_alphabet() {
         }
     }
     let mut accepted = 0usize;
-    for position in 0..shadowed.len() {
-        let term = shadowed[position];
-        for element_position in 0..elements.len() {
-            let value = elements[element_position];
+    for &term in &shadowed {
+        for &value in &elements {
             let _ = accept(&mut terms, term, value);
             accepted += 1;
         }
@@ -282,7 +280,10 @@ fn a_definition_at_a_different_index_mints_nothing() {
     let b_def_rhs = store(&mut terms, a, other, u);
     let b_def = definition(&mut terms, b, b_def_rhs);
     let root = store(&mut terms, b, at, v);
-    assert!(plan_store_overwrite_instances(&mut terms, &[b_def], &[root]).is_empty());
+    assert_eq!(
+        plan_store_overwrite_instances(&mut terms, &[b_def], &[root]),
+        []
+    );
 }
 
 #[test]

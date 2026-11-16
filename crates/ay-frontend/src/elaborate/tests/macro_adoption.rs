@@ -586,7 +586,7 @@ fn the_pass_own_parsed_copy_reaches_it_until_the_budget_is_spent() {
         within.adopted_macro_interp("f").is_some(),
         "within the budget the pass runs exactly as under full retention"
     );
-    assert!(within.assertions_parsed.is_empty());
+    assert_eq!(within.assertions_parsed.len(), 0);
     for (index, &assertion) in within.assertions.iter().enumerate() {
         assert!(
             !within.term_mentions_symbol(assertion, "f"),

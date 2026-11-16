@@ -173,7 +173,15 @@ pub fn compute_cert_opt_budget_split(
 
     let now = Instant::now();
     let remaining = timeout.saturating_sub(start.elapsed());
+    split_from_remaining(instance, remaining, now, policy)
+}
 
+fn split_from_remaining(
+    instance: &PbInstance,
+    remaining: Duration,
+    now: Instant,
+    policy: CertOptBudgetPolicy,
+) -> CertOptBudgetSplit {
     if let Some(cap_ms) = policy.native_cap_ms {
         let cap = Duration::from_millis(cap_ms);
         return CertOptBudgetSplit {
@@ -679,7 +687,7 @@ mod tests {
         );
         // ceiling: R/8 = 375s, clamped to 300s.
         assert_eq!(
-            certify_reserve(Duration::from_secs(3000)),
+            certify_reserve(Duration::from_mins(50)),
             Duration::from_secs(300)
         );
         // degenerate: nothing left to reserve.
@@ -723,7 +731,9 @@ mod tests {
             Instant::now() + Duration::from_secs(60)
         ))));
         assert!(native_cap_expired(&Cell::new(Some(
-            Instant::now() - Duration::from_secs(1)
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports one-second subtraction")
         ))));
     }
 
@@ -745,11 +755,17 @@ mod tests {
     fn proof_slice_cut_note_fires_only_when_the_slice_outran_the_deadline() {
         let prov = default_prov(Duration::from_secs(10));
         let budget = Duration::from_secs(60);
-        let expired = Some(Instant::now() - Duration::from_secs(1));
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports one-second subtraction"),
+        );
         let live = Some(Instant::now() + Duration::from_secs(30));
 
         // THE PATHOLOGY: slice spent 1 s ago, 50 s of the declared budget left.
-        let start = Instant::now() - Duration::from_secs(10);
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("fixture instant supports ten-second subtraction");
         let note = proof_slice_cut_note(prov, expired, Some(budget), start)
             .expect("slice spent with budget remaining must produce the note");
         assert!(note.starts_with("PROOF-SLICE-EXPIRED:"), "{note}");
@@ -771,7 +787,9 @@ mod tests {
         assert!(proof_slice_cut_note(prov, expired, None, start).is_none());
         // NOT the pathology: an HONEST timeout — the declared budget is spent
         // too, so the slice is not what stopped the phase.
-        let long_ago = Instant::now() - Duration::from_secs(90);
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(90))
+            .expect("fixture instant supports ninety-second subtraction");
         assert!(proof_slice_cut_note(prov, expired, Some(budget), long_ago).is_none());
     }
 
@@ -783,8 +801,14 @@ mod tests {
     #[test]
     fn proof_slice_cut_note_reports_the_huge_divisor_not_the_default() {
         let budget = Duration::from_secs(60);
-        let start = Instant::now() - Duration::from_secs(6);
-        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("fixture instant supports six-second subtraction");
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("fixture instant supports one-millisecond subtraction"),
+        );
         let prov = ProofSliceProvenance {
             slice: Duration::from_millis(5_121),
             origin: ProofSliceOrigin::Divisor {
@@ -809,8 +833,14 @@ mod tests {
     #[test]
     fn proof_slice_cut_note_reports_a_pinned_slice_as_pinned() {
         let budget = Duration::from_secs(60);
-        let start = Instant::now() - Duration::from_secs(6);
-        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(6))
+            .expect("fixture instant supports six-second subtraction");
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("fixture instant supports one-millisecond subtraction"),
+        );
         let prov = ProofSliceProvenance {
             slice: Duration::from_millis(5_000),
             origin: ProofSliceOrigin::CapOverride { cap_ms: 5_000 },
@@ -828,7 +858,7 @@ mod tests {
 
         // ...and it must NOT advise a value below the pin already in force.
         let pinned_high = ProofSliceProvenance {
-            slice: Duration::from_millis(58_000),
+            slice: Duration::from_secs(58),
             origin: ProofSliceOrigin::CapOverride { cap_ms: 58_000 },
             grace_extended_from: None,
         };
@@ -845,10 +875,16 @@ mod tests {
     #[test]
     fn proof_slice_cut_note_reports_a_grace_extension() {
         let budget = Duration::from_secs(60);
-        let start = Instant::now() - Duration::from_secs(21);
-        let expired = Some(Instant::now() - Duration::from_millis(1));
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(21))
+            .expect("fixture instant supports twenty-one-second subtraction");
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("fixture instant supports one-millisecond subtraction"),
+        );
         let prov = ProofSliceProvenance {
-            slice: Duration::from_millis(20_000),
+            slice: Duration::from_secs(20),
             origin: ProofSliceOrigin::Divisor {
                 div: OPT_CERT_NATIVE_SLICE_DIV,
                 huge: false,
@@ -871,20 +907,13 @@ mod tests {
     /// to re-derive the rule.
     #[test]
     fn slice_origin_tracks_the_split_it_describes() {
-        let obj = lin_objective(4);
         let now = Instant::now();
         let budget = Duration::from_secs(600);
 
         for (vars, huge) in [(10u32, false), (OPT_CERT_HUGE_MIN_VARS, true)] {
             let inst = instance(vars, 4);
             assert_eq!(instance_is_huge(&inst), huge);
-            let split = compute_cert_opt_budget_split(
-                &inst,
-                &obj,
-                Some(budget),
-                now,
-                CertOptBudgetPolicy::default(),
-            );
+            let split = split_from_remaining(&inst, budget, now, CertOptBudgetPolicy::default());
             let origin = ProofSliceOrigin::from_policy(
                 CertOptBudgetPolicy::default(),
                 instance_is_huge(&inst),
@@ -893,17 +922,10 @@ mod tests {
                 panic!("default policy must be a divisor origin");
             };
             assert_eq!(h, huge);
-            // The reported divisor must reproduce the slice the split handed out.
-            let slice = split.native_deadline.unwrap() - now;
-            let expected = budget / div;
-            let skew = if slice > expected {
-                slice - expected
-            } else {
-                expected - slice
-            };
-            assert!(
-                skew < Duration::from_millis(50),
-                "reported divisor {div} does not reproduce the slice: {slice:?} vs {expected:?}"
+            assert_eq!(
+                split.native_deadline,
+                Some(now + budget / div),
+                "reported divisor {div} must exactly reproduce the native slice"
             );
         }
 

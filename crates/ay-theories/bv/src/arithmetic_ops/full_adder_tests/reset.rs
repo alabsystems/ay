@@ -47,7 +47,7 @@ fn reset_retires_reverse_provenance_before_reusing_output_ids_for_other_gate_kin
 
     solver.reset();
     assert_eq!(solver.num_vars(), 0);
-    assert!(solver.clauses().is_empty());
+    assert_eq!(solver.clauses(), &[] as &[CnfClause]);
     assert!(solver.and_children().is_empty());
     assert!(solver.xor_children().is_empty());
     assert!(solver.mux_children().is_empty());
@@ -68,8 +68,8 @@ fn reset_retires_reverse_provenance_before_reusing_output_ids_for_other_gate_kin
     let rebuilt = rebuild_provenance(&solver, &store);
     assert_eq!(counts(&rebuilt), counts(&solver));
     assert_eq!(canonical_clauses(&rebuilt), canonical_clauses(&solver));
-    let circuit = Circuit::new(&solver);
-    let rebuilt_circuit = Circuit::new(&rebuilt);
+    let circuit = Circuit::from_clauses(solver.num_vars(), solver.clauses());
+    let rebuilt_circuit = Circuit::from_clauses(rebuilt.num_vars(), rebuilt.clauses());
     for assignment in 0..8 {
         let fixes = fix_word(&inputs, assignment);
         let model = circuit.propagate(&fixes);

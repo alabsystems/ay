@@ -490,7 +490,7 @@ impl SpacerCoreStats {
             LemmaSource::LaneSeed
         };
         self.pending_lane_source = Some(source);
-        if full.len() > 0 {
+        if !full.is_empty() {
             let ratio = 1.0 - (cube.len() as f64 / full.len() as f64);
             self.drop_ratio_sum += ratio;
             self.drop_ratio_count += 1;

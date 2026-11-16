@@ -3,16 +3,16 @@
 
 use super::*;
 
-pub(super) struct Fixture {
-    pub(super) exec: Executor,
-    pub(super) roots: Vec<TermId>,
-    pub(super) term: TermId,
-    pub(super) variable: TermId,
-    pub(super) value: TermId,
+pub(in crate::executor::proof_propagated_rewrite::array_units) struct Fixture {
+    pub(in crate::executor::proof_propagated_rewrite::array_units) exec: Executor,
+    pub(in crate::executor::proof_propagated_rewrite::array_units) roots: Vec<TermId>,
+    pub(in crate::executor::proof_propagated_rewrite::array_units) term: TermId,
+    pub(in crate::executor::proof_propagated_rewrite::array_units) variable: TermId,
+    pub(in crate::executor::proof_propagated_rewrite::array_units) value: TermId,
 }
 
 impl Fixture {
-    pub(super) fn new() -> Self {
+    pub(in crate::executor::proof_propagated_rewrite::array_units) fn new() -> Self {
         let mut exec = Executor::new();
         let terms = &mut exec.ctx.terms;
         let guard = terms.mk_var("guard", Sort::Bool);

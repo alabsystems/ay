@@ -88,7 +88,10 @@ fn nra_sos_pop_cannot_reuse_a_retracted_source_certificate() {
 
     solver.pop();
 
-    assert!(solver.asserted.is_empty());
+    assert_eq!(
+        solver.asserted.as_slice(),
+        &[] as &[(ay_core::TermId, bool)]
+    );
     assert!(!solver.took_sos_unsat_certificate());
     assert!(solver.render_sos_unsat_certificate("stale").is_none());
     solver.assert_literal(neighbor, true);

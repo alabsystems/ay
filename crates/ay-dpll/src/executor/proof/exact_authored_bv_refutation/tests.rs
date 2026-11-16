@@ -4,6 +4,7 @@
 //! Deny-only wire scheduling: every successful candidate still replays.
 
 use super::*;
+use ay_frontend::parse;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,8 +25,8 @@ fn fixture_with_retention(script: &str, retain: bool) -> Executor {
     executor.ctx.set_retain_parsed_assertions(retain);
     // Preserve exact authored syntax rather than letting assertion elaboration
     // turn a tautological equality's negation into a bare false constant.
-    for command in ay_frontend::parse(script).expect("typed source") {
-        if let ay_frontend::Command::Assert(surface) = command {
+    for command in parse(script).expect("typed source") {
+        if let Command::Assert(surface) = command {
             let root = executor
                 .raw_intern_ground_bv_surface(&surface)
                 .expect("raw source");
@@ -42,7 +43,7 @@ fn lemma(proof: &Proof) -> (TheoryLemmaKind, &[TermId]) {
         .steps
         .iter()
         .find_map(|step| match step {
-            ProofStep::TheoryLemma { kind, clause, .. } => Some((kind.clone(), clause.as_slice())),
+            ProofStep::TheoryLemma { kind, clause, .. } => Some((*kind, clause.as_slice())),
             _ => None,
         })
         .expect("one proposed lemma")
@@ -144,7 +145,7 @@ fn bv_denial_does_not_hide_same_source_affine_fallback() {
     let proof = executor
         .exact_authored_bv_refutation(|_, candidate| {
             let kind = lemma(candidate).0;
-            offers.borrow_mut().push(kind.clone());
+            offers.borrow_mut().push(kind);
             kind == TheoryLemmaKind::ArithClauseTautology
         })
         .expect("the independently recognized affine theorem remains available");
@@ -339,7 +340,7 @@ fn preexisting_interrupt_and_deadline_prevent_even_presentation_advice() {
 #[test]
 fn parsed_source_keeps_the_existing_exact_refutation_path() {
     let mut executor = fixture(CONTRADICTION);
-    assert!(!executor.ctx.assertions_parsed().is_empty());
+    assert_ne!(executor.ctx.assertions_parsed(), []);
     let mut proof = Proof::new();
     proof.add_rule_step(AletheRule::Trust, vec![], vec![], vec![]);
     assert!(!executor.try_authenticated_native_bv_refutation(&mut proof));
@@ -356,11 +357,11 @@ fn genuine_65_duplicate_rows_preserve_exact_parsed_and_unretained_scope() {
         let mut executor = fixture_with_retention(CONTRADICTION, retain);
         let authored = executor.exact_concrete_authored_scope();
         assert_eq!(authored.len(), 2);
-        let surface = ay_frontend::parse(CONTRADICTION)
+        let surface = parse(CONTRADICTION)
             .expect("source")
             .into_iter()
             .find_map(|command| match command {
-                ay_frontend::Command::Assert(surface) => Some(surface),
+                Command::Assert(surface) => Some(surface),
                 _ => None,
             })
             .expect("first genuine source row");

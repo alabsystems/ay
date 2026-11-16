@@ -57,7 +57,13 @@ impl Reference<'_, '_> {
         self.sum_specials(x, y, finite, rm_domain)
     }
 
-    fn sum_specials(&mut self, x: Bits, y: Bits, finite: Bits, rm_domain: RefId) -> Result<Output> {
+    fn sum_specials(
+        &mut self,
+        x: Bits,
+        y: Bits,
+        finite: Bits,
+        _rm_domain: RefId,
+    ) -> Result<Output> {
         let (xn, xi, _) = self.classifications(x)?;
         let (yn, yi, _) = self.classifications(y)?;
         let both_infinite = self.binary(Binary::And, xi, yi)?;
@@ -78,7 +84,8 @@ impl Reference<'_, '_> {
             sign: self.select(nan, zero_sign, sign)?,
             exponent: self.select(nan, all_exp, exponent)?,
             fraction: self.select(nan, one_fraction, fraction)?,
-            rm_domain,
+            #[cfg(test)]
+            rm_domain: _rm_domain,
         })
     }
 }

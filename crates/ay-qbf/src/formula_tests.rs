@@ -140,7 +140,10 @@ fn test_universal_reduction_of_universal_only_clause_is_empty() {
         Literal::negative(Variable::new(2)),
     ];
 
-    assert!(formula.universal_reduce(&clause).is_empty());
+    assert_eq!(
+        formula.universal_reduce(&clause).as_slice(),
+        &[] as &[Literal]
+    );
 }
 
 #[test]

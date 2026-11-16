@@ -289,30 +289,6 @@ impl ProofOutput {
         }
     }
 
-    /// Emit a bounded-producer prevalidated positive-RUP addition.
-    pub(crate) fn add_bounded_prevalidated_rup(
-        &mut self,
-        clause: &[Literal],
-        hints: &[u64],
-    ) -> io::Result<u64> {
-        self.add_bounded_prevalidated_rup_with_cancellation(clause, hints, &|| true)
-    }
-
-    /// Emit a pre-assigned bounded-producer positive-RUP addition.
-    pub(crate) fn add_with_id_bounded_prevalidated_rup(
-        &mut self,
-        clause_id: u64,
-        clause: &[Literal],
-        hints: &[i64],
-    ) -> io::Result<()> {
-        self.add_with_id_bounded_prevalidated_rup_with_cancellation(
-            clause_id,
-            clause,
-            hints,
-            &|| true,
-        )
-    }
-
     /// Add a clause with a pre-assigned ID using already-validated signed LRAT
     /// hints.
     ///

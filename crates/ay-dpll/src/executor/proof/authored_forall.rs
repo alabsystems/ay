@@ -43,7 +43,7 @@ impl Executor {
     ///
     /// Both `assume`s are drawn from the EXACT authored scope, and the only
     /// non-Boolean step is `forall_inst`, whose strict validator
-    /// (`ay_proof::checker::quantifier::validate_forall_inst`) independently
+    /// (`ay_proof::checker::quantifier::validate_forall_inst_with_progress`) independently
     /// re-derives the whole certificate from the clause and args alone: the
     /// binder/argument arity and sorts, that every argument is GROUND with
     /// respect to the source binders, and that the instance is the EXACT
@@ -181,7 +181,7 @@ impl Executor {
     /// validator's own deliberate restriction.
     ///
     /// This decides NOTHING. Its output is re-derived from scratch by
-    /// `validate_forall_inst`, so an imprecise match can only cost this pass a
+    /// `validate_forall_inst_with_progress`, so an imprecise match can only cost this pass a
     /// candidate, never buy an unsound one.
     pub(super) fn match_forall_body_instance(
         terms: &TermStore,

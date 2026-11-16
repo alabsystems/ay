@@ -637,8 +637,11 @@ fn fragment_step_upper_bound_admission_is_exact() {
 #[test]
 fn standalone_non_tautological_t21_stays_rejected() {
     let (mut executor, output) = execute_authored(STANDALONE_T21, false);
-    assert!(output.is_empty());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(output, [] as [String; 0]);
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
     let packed = *executor
         .ctx
         .assertions
@@ -669,7 +672,7 @@ fn missing_raw_route_declines_before_publication_walk() {
     executor.replace_with_exact_authored_negated_conjunct_bridge(&mut proof);
 
     assert_eq!(executor.strict_check_invocations.get(), checks_before);
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ay_core::ProofStep; 0]);
 }
 
 #[test]

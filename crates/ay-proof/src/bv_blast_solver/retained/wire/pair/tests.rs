@@ -313,7 +313,7 @@ fn cleanup_stop_overrides_invalid_shape_without_reviving_the_operation() {
 fn every_original_deadline_is_a_minimum_and_absence_is_not_renewed() {
     for index in 0..4 {
         let mut fixture = Fixture::new();
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         match index {
             0 => fixture.wire.deadline = expired,
             1 => fixture.proof.resolution.deadline = Some(expired),

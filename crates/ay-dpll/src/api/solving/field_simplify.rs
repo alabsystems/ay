@@ -451,13 +451,13 @@ mod tests {
                 "and" => {
                     let p = store.mk_var("p", Sort::Bool);
                     let no = store.mk_bool(false);
-                    store.mk_app_structural(Symbol::named(spelling), &[p, no], Sort::Bool)
+                    store.mk_app_structural(Symbol::named(spelling), [p, no], Sort::Bool)
                 }
-                "=" => store.mk_app_structural(Symbol::named(spelling), &[x, one], Sort::Bool),
+                "=" => store.mk_app_structural(Symbol::named(spelling), [x, one], Sort::Bool),
                 _ => {
                     let product = store.mk_app_structural(
                         Symbol::named(spelling),
-                        &[zero, zero],
+                        [zero, zero],
                         Sort::FiniteField(f),
                     );
                     store.mk_eq(product, one)
@@ -511,7 +511,7 @@ mod tests {
         let b = store.mk_finite_field(2, f);
         let opaque = store.mk_app_structural(
             Symbol::Indexed("ff.add".into(), vec![9]),
-            &[a, b],
+            [a, b],
             Sort::FiniteField(f),
         );
         let c = store.mk_finite_field(3, f);
@@ -522,7 +522,7 @@ mod tests {
         );
         let foreign = store.mk_finite_field(2, g);
         let bad =
-            store.mk_app_structural(Symbol::named("ff.mul"), &[a, foreign], Sort::FiniteField(f));
+            store.mk_app_structural(Symbol::named("ff.mul"), [a, foreign], Sort::FiniteField(f));
         let root = store.mk_eq(bad, c);
         assert!(apply(&mut store, &[root], &owner(1_000_000, 1 << 20)).is_err());
     }
@@ -533,7 +533,7 @@ mod tests {
         let q = store.mk_var("q", Sort::Bool);
         let mut shared = q;
         for _ in 0..512 {
-            shared = store.mk_app_structural(Symbol::named("and"), &[shared, shared], Sort::Bool);
+            shared = store.mk_app_structural(Symbol::named("and"), [shared, shared], Sort::Bool);
         }
         // This represents 2^512 occurrences of q, but conjunction is
         // idempotent. Real bounded construction must not enumerate that tree.

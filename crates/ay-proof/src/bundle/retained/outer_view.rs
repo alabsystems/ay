@@ -156,7 +156,7 @@ struct Schema(BundleEncoding);
 impl<'de> Deserialize<'de> for Schema {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Name;
-        impl<'input> de::Visitor<'input> for Name {
+        impl de::Visitor<'_> for Name {
             type Value = Schema;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

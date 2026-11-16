@@ -190,7 +190,7 @@ fn typed_sat_resource_handoff_cannot_start_another_real_search() {
 #[test]
 fn checkpoint_detects_live_term_growth_beyond_the_stop_owners_entry_snapshot() {
     let mut executor = Executor::new();
-    executor.ctx.terms.mk_var("seed", Sort::Real);
+    let _ = executor.ctx.terms.mk_var("seed", Sort::Real);
     let cap = executor.ctx.terms.true_memory_bytes();
     executor.set_term_memory_limit(Some(cap));
     assert!(!executor.term_memory_exceeded());
@@ -198,10 +198,7 @@ fn checkpoint_detects_live_term_growth_beyond_the_stop_owners_entry_snapshot() {
     assert_eq!(stop.check(), Ok(()));
     // Exceed the existing census-refresh threshold, rather than claiming an
     // immediate per-allocation check below that threshold or an RSS ceiling.
-    executor
-        .ctx
-        .terms
-        .mk_var(&"g".repeat(64 * 1024), Sort::Real);
+    let _ = executor.ctx.terms.mk_var("g".repeat(64 * 1024), Sort::Real);
     assert!(executor.ctx.terms.true_memory_bytes() > cap);
     assert_eq!(
         stop.check(),

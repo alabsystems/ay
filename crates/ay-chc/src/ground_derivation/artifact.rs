@@ -30,7 +30,7 @@ use super::validate_ground_derivation;
 use super::{
     ground_uf_congruence_key, validate_ground_derivation_with_control, GroundDerivation,
     GroundDerivationError, GroundDerivationStep, GroundSourceSurfaceCache,
-    GroundSourceSurfaceError, GroundUfCongruenceKey, CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH,
+    GroundSourceSurfaceError, GroundUfCongruenceKey,
 };
 #[cfg(test)]
 use crate::normalized_chc_input_sha256;
@@ -2879,6 +2879,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::ground_derivation::CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH;
     use crate::{
         ChcDtConstructor, ChcDtSelector, ChcExpr, ChcVar, ClauseBody, ClauseHead, HornClause,
     };
@@ -3925,7 +3926,6 @@ mod tests {
             ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded
         );
         assert_eq!(source_work.reason_code, "source_work_limit_exceeded");
-        assert!(super::super::CHC_GROUND_DERIVATION_MAX_SOURCE_WORK > 0);
     }
 
     #[test]

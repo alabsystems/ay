@@ -15,9 +15,13 @@ pub(super) fn resolve(
     b: &[Lit],
     pivot: u32,
     capacity: usize,
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<Option<Vec<Lit>>, BvSolvedExportError> {
     reserve_rup_map::<Lit, ()>(state, capacity)?;
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "the charged reservation prices the exact HashMap<Lit, ()> layout"
+    )]
     let mut seen = HashMap::new();
     try_reserve_rup_map(&mut seen, capacity, state)?;
     let mut out = state.resolution_buffer(capacity)?;
@@ -41,7 +45,7 @@ pub(super) fn resolve(
 pub(super) fn equal(
     a: &[Lit],
     b: &[Lit],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<bool, BvSolvedExportError> {
     reserve_rup_map::<Lit, bool>(state, a.len())?;
     let mut seen = HashMap::new();
@@ -69,9 +73,13 @@ pub(super) fn equal(
 pub(super) fn subset(
     a: &[Lit],
     b: &[Lit],
-    state: &mut RupExpansionState,
+    state: &mut RupExpansionState<'_>,
 ) -> Result<bool, BvSolvedExportError> {
     reserve_rup_map::<Lit, ()>(state, b.len())?;
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "the charged reservation prices the exact HashMap<Lit, ()> layout"
+    )]
     let mut members = HashMap::new();
     try_reserve_rup_map(&mut members, b.len(), state)?;
     for &lit in b {

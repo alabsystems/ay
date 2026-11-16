@@ -79,6 +79,9 @@ struct Normalizer<'a> {
     mask: u128,
     nodes: usize,
     work: usize,
+    // Name hashing consumes the already prepaid MAX_WORK envelope without
+    // reinterpreting the existing affine merge counter as a payload limit.
+    metadata_work: usize,
     /// Normalize `bvmul` with a literal-constant operand as that scalar times
     /// the other operand's form, instead of keeping it as an opaque atom.
     scale_constant_products: bool,
@@ -88,6 +91,17 @@ struct Normalizer<'a> {
 }
 
 impl Normalizer<'_> {
+    fn declared_application(&mut self, term: TermId) -> Option<bool> {
+        let TermData::App(Symbol::Named(name), _) = self.terms.get(term) else {
+            return Some(false);
+        };
+        self.metadata_work = self.metadata_work.checked_add(name.len())?;
+        if self.metadata_work > MAX_WORK.checked_sub(MAX_MERGES)? {
+            return None;
+        }
+        Some(self.terms.is_declared_function(name))
+    }
+
     fn visit(&mut self, term: TermId, depth: usize) -> Option<()> {
         self.terms.entry_stamp(term)?;
         self.nodes = self.nodes.checked_add(1)?;
@@ -98,6 +112,9 @@ impl Normalizer<'_> {
         self.visit(term, depth)?;
         if self.terms.sort(term) != &Sort::bitvec(self.width) {
             return None;
+        }
+        if self.declared_application(term)? {
+            return Some(());
         }
         match self.terms.get(term) {
             TermData::Var(_, _) => Some(()),
@@ -140,6 +157,9 @@ impl Normalizer<'_> {
 
     fn normalize(&mut self, term: TermId, depth: usize) -> Option<Affine> {
         self.visit(term, depth)?;
+        if self.declared_application(term)? {
+            return Some(BTreeMap::from([(Some(term), 1)]));
+        }
         match self.terms.get(term) {
             TermData::Const(Constant::BitVec { value, .. }) => {
                 let value = value.to_u128()?;
@@ -249,6 +269,8 @@ impl Normalizer<'_> {
         let [high, low] = parts.as_slice() else {
             return None;
         };
+        self.terms.entry_stamp(*high)?;
+        self.terms.entry_stamp(*low)?;
         let TermData::Const(Constant::BitVec {
             value,
             width: shift,
@@ -263,8 +285,11 @@ impl Normalizer<'_> {
         let ([top, 0], [operand]) = (indices.as_slice(), operands.as_slice()) else {
             return None;
         };
+        self.terms.entry_stamp(*operand)?;
         (op == "concat"
             && extract == "extract"
+            && !self.terms.is_declared_function(op)
+            && !self.terms.is_declared_function(extract)
             && value.to_u128() == Some(0)
             && (1..self.width).contains(shift)
             && *top == self.width - shift - 1
@@ -337,6 +362,10 @@ impl Normalizer<'_> {
         self.work = self.work.checked_add(1)?;
         if self.work > MAX_MERGES || depth > MAX_DEPTH {
             return None;
+        }
+        self.terms.entry_stamp(term)?;
+        if self.declared_application(term)? {
+            return Some(IntegerForm::from([(vec![term], BigInt::from(1u8))]));
         }
         match self.terms.get(term) {
             TermData::Const(Constant::BitVec { value, .. }) => Some(if value.is_zero() {
@@ -464,8 +493,10 @@ fn small_linear_source(terms: &TermStore, term: TermId, width: u32, remaining: &
             if (matches!(op.as_str(), "bvadd" | "bvsub") && args.len() == 2)
                 || (op == "bvneg" && args.len() == 1) =>
         {
-            args.iter()
-                .all(|&arg| small_linear_source(terms, arg, width, remaining))
+            !terms.is_declared_function(op)
+                && args
+                    .iter()
+                    .all(|&arg| small_linear_source(terms, arg, width, remaining))
         }
         _ => false,
     }
@@ -522,6 +553,7 @@ fn check_identity(
         mask,
         nodes: 0,
         work: 0,
+        metadata_work: 0,
         scale_constant_products: true,
         accept_elaborated_shifts,
     };
@@ -559,6 +591,7 @@ fn equality(terms: &TermStore, clause: &[TermId]) -> Option<(TermId, TermId, u32
         return None;
     };
     (op == "="
+        && !terms.is_declared_function(op)
         && terms.sort(*root) == &Sort::Bool
         && terms.sort(*left) == terms.sort(*right)
         && (1..=128).contains(&sort.width))

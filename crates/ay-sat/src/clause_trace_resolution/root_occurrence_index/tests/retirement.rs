@@ -23,7 +23,7 @@ fn retained_cursor_initialization_finishes_before_any_csr_publication() {
         })();
         if result.is_err() {
             assert!(root.index_heads.is_none());
-            assert!(root.index_items.is_empty());
+            assert_eq!(root.index_items.len(), 0);
             assert!(root.index_retired.is_clear());
         }
         (result, calls.get(), root)
@@ -99,6 +99,6 @@ fn retained_cursor_uses_the_existing_peak_even_with_candidate_scheduler() {
         root.index_heads.is_none(),
         "satisfied malformed tails remain rejected"
     );
-    assert!(root.index_items.is_empty());
+    assert_eq!(root.index_items.len(), 0);
     assert!(root.index_retired.is_clear());
 }

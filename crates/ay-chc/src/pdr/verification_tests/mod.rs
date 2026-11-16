@@ -232,7 +232,7 @@ fn test_smt_value_to_chc_expr_for_sort_canonicalizes_recursive_dt_backedge_9692(
     };
     assert_eq!(nil_ctor, "nillistOfInt");
     assert_eq!(nil_sort, &list_sort);
-    assert!(nil_args.is_empty());
+    assert_eq!(nil_args.as_slice(), []);
 }
 
 #[test]

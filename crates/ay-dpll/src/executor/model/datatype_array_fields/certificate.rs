@@ -24,9 +24,7 @@ impl Executor {
         &self,
         model: &Model,
     ) -> Option<Vec<AuthenticatedDatatypeArrayClass>> {
-        if model.euf_model.is_none() {
-            return None;
-        }
+        model.euf_model.as_ref()?;
         if model.dt_array_field_classes.is_empty()
             || model.dt_array_field_classes.len() > MAX_EXACT_ARRAY_FIELD_TERMS
         {
@@ -106,9 +104,7 @@ impl Executor {
         parse_budget: &mut TypedArrayParseBudget,
         semantic_budget: &mut SemanticNormalizationBudget,
     ) -> Option<ModelValue> {
-        let Some(euf) = model.euf_model.as_ref() else {
-            return None;
-        };
+        let euf = model.euf_model.as_ref()?;
         if authority.members.is_empty()
             || authority.members.len() > MAX_EXACT_ARRAY_FIELD_TERMS
             || closed_members.is_empty()
@@ -121,17 +117,12 @@ impl Executor {
         {
             return None;
         }
-        let Some(cell) = authority
+        let cell = authority
             .members
             .keys()
             .min_by_key(|term| term.index())
-            .copied()
-        else {
-            return None;
-        };
-        let Some(reference) = model.dt_ground.get(&cell) else {
-            return None;
-        };
+            .copied()?;
+        let reference = model.dt_ground.get(&cell)?;
         if !parse_budget.charge_value(reference)
             || !typed_datatype_array_value(reference, &authority.cell_sort, guard)
         {
@@ -159,9 +150,7 @@ impl Executor {
         }
         let normalized_reference = normalize_datatype_array_value(reference, semantic_budget)?;
         for member in closed_members.keys() {
-            let Some(value) = model.dt_ground.get(member) else {
-                return None;
-            };
+            let value = model.dt_ground.get(member)?;
             if !parse_budget.charge_value(value)
                 || !typed_datatype_array_value(value, &authority.cell_sort, guard)
                 || normalize_datatype_array_value(value, semantic_budget).as_ref()
@@ -171,9 +160,7 @@ impl Executor {
             }
         }
         for (index, selector, sort) in &class.fields {
-            let Some(value) = args.get(*index) else {
-                return None;
-            };
+            let value = args.get(*index)?;
             if !self.installed_field_matches_reads(
                 model,
                 &class,

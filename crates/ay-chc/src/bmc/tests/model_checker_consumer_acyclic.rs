@@ -23,7 +23,7 @@ fn retained_dyn_struct_keeps_array_and_wide_word_in_the_original_fact() {
     assert_eq!(problem.predicates().len(), 2);
     assert_eq!(problem.clauses().len(), 3);
     let fact = &problem.clauses()[0];
-    assert!(fact.body.predicates.is_empty());
+    assert_eq!(fact.body.predicates, [] as [(PredicateId, Vec<ChcExpr>); 0]);
     assert_eq!(fact.vars().len(), 3);
     let variables = fact.vars();
     let array_sort = ChcSort::Array(Box::new(ChcSort::BitVec(32)), Box::new(ChcSort::Bool));

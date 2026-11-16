@@ -131,7 +131,7 @@ fn binder_count_beyond_the_cap_refuses() {
     let k = int_const(&mut terms, "k");
     let mut sum = k;
     let mut vars = Vec::new();
-    for index in 0..(MAX_BINDERS + 1) {
+    for index in 0..=MAX_BINDERS {
         let name = format!("x{index}");
         let var = terms.mk_var(&name, Sort::Int);
         sum = terms.mk_add(vec![sum, var]);

@@ -1780,10 +1780,9 @@ fn normalize_legacy_log_statistic(line: &str) -> Option<String> {
         .map_or((line, ""), |body| (body, "\n"));
     let (label, rest, unit) = if let Some(rest) = body.strip_prefix("max. heap size:") {
         ("max. heap size:", rest, "Mbytes")
-    } else if let Some(rest) = body.strip_prefix("time:") {
-        ("time:", rest, "")
     } else {
-        return None;
+        let rest = body.strip_prefix("time:")?;
+        ("time:", rest, "")
     };
     let number_and_unit = rest.trim_start_matches([' ', '\t']);
     let leading = &rest[..rest.len() - number_and_unit.len()];
@@ -5102,7 +5101,7 @@ mod tests {
     #[test]
     fn every_current_log_or_statistics_route_has_a_typed_comparator() {
         let cases = case_catalog(&current_observable_fixture()).unwrap();
-        let mut routes = std::collections::BTreeSet::new();
+        let mut routes = BTreeSet::new();
         for case in &cases {
             if produces_known_telemetry(case) {
                 assert!(

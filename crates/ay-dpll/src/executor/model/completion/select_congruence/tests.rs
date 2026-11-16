@@ -116,8 +116,10 @@ fn reads_of_distinct_cells_keep_distinct_carriers() {
 fn undetermined_index_merges_nothing() {
     let fixture = fixture([None, None, Some(0)]);
     let carriers = [fixture.read_i, fixture.read_j, fixture.read_k];
-    assert!(fixture
-        .exec
-        .select_congruent_carrier_pairs(&fixture.model, &carriers)
-        .is_empty());
+    assert_eq!(
+        fixture
+            .exec
+            .select_congruent_carrier_pairs(&fixture.model, &carriers),
+        [] as [(usize, usize); 0]
+    );
 }

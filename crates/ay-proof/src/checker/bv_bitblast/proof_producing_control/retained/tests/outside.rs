@@ -105,6 +105,10 @@ fn capture_bytes(terms: &TermStore, clause: TermId) -> Metered<Vec<u8>> {
     .unwrap()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test drives the complete outside-frame bridge boundary positionally"
+)]
 fn invoke(
     operation: Operation,
     terms: &TermStore,
@@ -178,12 +182,12 @@ fn two_ordered_frames_survive_producer_drop_and_replay_against_fresh_source() {
         .result
         .unwrap();
     for frame in frames {
-        assert!(
-            !wire::decode(frame, &wire_limits(end), &proof, &gates, &mut || true)
+        assert_ne!(
+            wire::decode(frame, &wire_limits(end), &proof, &gates, &mut || true)
                 .result
                 .unwrap()
-                .rows
-                .is_empty()
+                .rows,
+            []
         );
     }
     let (terms, clause) = fixture(Source::Valid);

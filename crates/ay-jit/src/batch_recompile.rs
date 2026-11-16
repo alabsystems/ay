@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn select_candidates_empty_input_returns_empty() {
         let s = RecompileScheduler::default();
-        assert!(s.select_candidates(&[]).is_empty());
+        assert_eq!(s.select_candidates(&[]).as_slice(), &[] as &[ClauseId]);
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
             top_k_clauses: 8,
         });
         let clauses = vec![LearnedClauseMeta::new(1, 1.0, 3)];
-        assert!(s.select_candidates(&clauses).is_empty());
+        assert_eq!(s.select_candidates(&clauses).as_slice(), &[] as &[ClauseId]);
     }
 
     #[test]

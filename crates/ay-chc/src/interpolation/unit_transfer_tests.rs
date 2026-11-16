@@ -84,7 +84,7 @@ fn split_keeps_a_general_part_and_moves_the_units() {
             b: b2,
             units,
         }) => {
-            assert!(!units.is_empty());
+            assert_ne!(units, [] as [ChcExpr; 0]);
             for part in a2.iter().chain(b2.iter()) {
                 assert!(
                     part.vars().iter().all(|v| s.contains(&v.name)),

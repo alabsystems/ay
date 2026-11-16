@@ -635,7 +635,7 @@ impl Solver {
     /// rebuild VMTF from structural clause weights during the hard tail.
     pub(in crate::solver) fn should_reorder(&self) -> bool {
         // `--sat-reorder-kissat` reorders from the search loop instead.
-        if super::reorder::kissat_reorder_enabled() {
+        if reorder::kissat_reorder_enabled() {
             return false;
         }
         if !self.stable_mode && !self.small_dense_learned_reduce_policy() {

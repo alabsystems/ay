@@ -133,7 +133,7 @@ fn congruent_array_literal_original_stop_precedes_candidate_copy() {
     exec.execute_all(&ay_frontend::parse(SOURCE).unwrap())
         .unwrap();
     let mut model = crate::executor::model::tests::empty_model();
-    let _stop = ay_core::resource::enter_check_stop(std::sync::Arc::new(|| true));
+    let _stop = ay_core::resource::enter_check_stop(Arc::new(|| true));
     exec.complete_congruent_array_literals(&mut model);
     assert!(model.array_model.is_none());
     assert!(exec.evaluation_stop_origin().is_some());

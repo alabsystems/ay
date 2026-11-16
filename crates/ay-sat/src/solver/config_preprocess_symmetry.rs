@@ -840,7 +840,7 @@ impl Solver {
     fn preprocess_symmetry_orbitope<F>(
         &mut self,
         should_stop: &F,
-        stopped: &mut Option<crate::SatUnknownReason>,
+        stopped: &mut Option<SatUnknownReason>,
     ) -> (bool, bool)
     where
         F: Fn() -> bool + ?Sized,
@@ -1011,7 +1011,7 @@ impl Solver {
     pub(in crate::solver) fn preprocess_symmetry_ladder_collapse<F>(
         &mut self,
         should_stop: &F,
-        stopped: &mut Option<crate::SatUnknownReason>,
+        stopped: &mut Option<SatUnknownReason>,
     ) -> (bool, bool)
     where
         F: Fn() -> bool + ?Sized,
@@ -1335,12 +1335,12 @@ impl Solver {
     /// The reason a stop sampled inside the symmetry pass fired. A callback
     /// need not repeat its answer, so a fired stop with no reason left to read
     /// is reported as an interrupt.
-    fn stop_reason_or_interrupted<F>(&self, should_stop: &F) -> crate::SatUnknownReason
+    fn stop_reason_or_interrupted<F>(&self, should_stop: &F) -> SatUnknownReason
     where
         F: Fn() -> bool + ?Sized,
     {
         self.solve_stop_reason(should_stop)
-            .unwrap_or(crate::SatUnknownReason::Interrupted)
+            .unwrap_or(SatUnknownReason::Interrupted)
     }
 
     #[inline]

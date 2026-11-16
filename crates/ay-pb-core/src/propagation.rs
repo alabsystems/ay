@@ -982,7 +982,7 @@ impl PbPropagator {
         debug_assert!(!self.constraints[cid].counting);
         // Weighted rows carry no native-helper literal mirror (only
         // UnitCardinality does), so sorting terms alone is safe.
-        debug_assert!(self.constraints[cid].native_lits.is_empty());
+        debug_assert_eq!(self.constraints[cid].native_lits.as_slice(), &[] as &[i64]);
 
         // (1) Restore the descending order used at construction.
         self.constraints[cid].terms.sort_by(|lhs, rhs| {

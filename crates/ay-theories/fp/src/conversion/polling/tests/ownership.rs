@@ -58,7 +58,7 @@ fn both_barrel_directions_refuse_after_real_owned_stages() {
         assert_eq!(result, Err(Refusal));
         assert_eq!(control.advances, 2);
         assert!(solver.num_vars() > 128);
-        assert!(!solver.clauses().is_empty());
+        assert_ne!(solver.clauses().len(), 0);
     }
 }
 
@@ -75,7 +75,7 @@ fn typed_row_refusal_precedes_any_helper_allocation() {
         };
         assert_eq!(result, Err(Refusal));
         assert_eq!(solver.num_vars(), 0);
-        assert!(solver.clauses().is_empty());
+        assert_eq!(solver.clauses().len(), 0);
     }
 }
 
@@ -120,9 +120,10 @@ fn conversion_callback_panic_cannot_publish_or_retry() {
     let (terms, _, _, result) = fixture(true, FpPrecision::Float64, 64, Some(RoundingMode::RNE));
     let armed = Cell::new(true);
     let mut stop = |p: FpBuildProgress| {
-        if armed.get() && p.stage == FpBuildStage::Operation && p.variables > 64 {
-            panic!("original callback");
-        }
+        assert!(
+            !(armed.get() && p.stage == FpBuildStage::Operation && p.variables > 64),
+            "original callback"
+        );
         stopped(end, &enclosing)
     };
     let mut attempt = FpConstruction::new(FpSolver::new(&terms), &mut stop).unwrap();

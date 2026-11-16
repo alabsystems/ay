@@ -40,7 +40,7 @@ impl Check<'_, '_> {
         (self.progress)(work, bytes).then_some(())
     }
     fn buffer(&mut self, count: usize) -> Option<Poly> {
-        self.pay(count, count.checked_mul(std::mem::size_of::<u32>())?)?;
+        self.pay(count, count.checked_mul(size_of::<u32>())?)?;
         let mut out = Vec::new();
         out.try_reserve_exact(count).ok()?;
         out.resize(count, 0);
@@ -507,7 +507,7 @@ mod tests {
         let truth = terms.mk_bool(true);
         let nested = terms.mk_app(
             Symbol::Named("and".into()),
-            &[truth, truth, equation],
+            [truth, truth, equation],
             Sort::Bool,
         );
         let clause = [
@@ -528,7 +528,7 @@ mod tests {
             terms.mk_not_raw(equation),
         ];
         assert!(validate(&terms, ProofId(0), &false_clause, &mut |_, _| true).is_ok());
-        let wrong = terms.mk_app(Symbol::Named("=".into()), &[truth, x], Sort::Bool);
+        let wrong = terms.mk_app(Symbol::Named("=".into()), [truth, x], Sort::Bool);
         let malformed = [terms.mk_not_raw(falsehood), terms.mk_not_raw(wrong)];
         assert!(
             validate(&terms, ProofId(0), &malformed, &mut |_, _| true).is_err(),
@@ -556,11 +556,8 @@ mod tests {
                             if negate_b {
                                 right = terms.mk_not_raw(right);
                             }
-                            let formula = terms.mk_app(
-                                Symbol::Named(name.into()),
-                                &[left, right],
-                                Sort::Bool,
-                            );
+                            let formula =
+                                terms.mk_app(Symbol::Named(name.into()), [left, right], Sort::Bool);
                             let clause = [terms.mk_not_raw(formula)];
                             let satisfiable = (0..7).any(|v| {
                                 let l = (v == a) != negate_a;

@@ -64,7 +64,7 @@ fn capture(
         &control,
     )
     .expect("one real accepted native model, with complete typed definition");
-    assert!(locals.is_empty());
+    assert_eq!(locals, [] as [ay_dpll::ModelValue; 0]);
     assert_eq!(functions.len(), 1);
     functions.remove(0)
 }
@@ -89,7 +89,7 @@ fn wide_global_nullary_and_unused_functions_are_retained_once_in_source_order() 
         .map(ScalarFunctionModel::name)
         .collect();
     assert_eq!(names, ["uf_call_0_summary", "nullary", "unused"]);
-    assert!(trace.function_models()[1].arg_sorts().is_empty());
+    assert_eq!(trace.function_models()[1].arg_sorts(), []);
     assert_eq!(
         trace.function_models()[0].arg_sorts(),
         &[ay_core::Sort::Bool, ay_core::Sort::bitvec(136)]

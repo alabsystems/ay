@@ -91,7 +91,7 @@ fn actual_eager_window_preserves_long_garbage_dirty_watches_and_duplicate_binari
         if duplicate {
             assert!(s.cold.num_eager_subsumed_duplicate_binaries > 0);
         } else {
-            assert!(!s.dirty_watch_list.is_empty());
+            assert_ne!(s.dirty_watch_list.len(), 0);
         }
         parity(&s, &expected);
         clean(&s);

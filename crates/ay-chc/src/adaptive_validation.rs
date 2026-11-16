@@ -452,6 +452,7 @@ impl AdaptivePortfolio {
     /// demoting. Returns `true` only when the re-proof on the original problem
     /// returns Safe; an Unsafe/Unknown/NotApplicable BMC outcome (or a cyclic /
     /// non-scalar problem) yields `false`, so the caller demotes as before.
+    #[cfg(test)]
     pub(crate) fn final_safe_verdict_reproved_on_original(
         &self,
         remaining_budget: Option<Duration>,

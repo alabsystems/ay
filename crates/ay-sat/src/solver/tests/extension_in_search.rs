@@ -337,7 +337,7 @@ fn on_learned_sees_learned_clauses_when_asked() {
     };
     let result = pigeonhole(5).solve_with_extension(&mut ext).into_inner();
     assert!(matches!(result, SatResult::Unsat(_)), "{result:?}");
-    assert!(!ext.learned.is_empty(), "pigeonhole needs learned clauses");
+    assert_ne!(ext.learned.len(), 0, "pigeonhole needs learned clauses");
     assert!(ext.learned.iter().all(|&len| len > 0));
 
     let mut quiet = CountLearned {
@@ -346,7 +346,7 @@ fn on_learned_sees_learned_clauses_when_asked() {
     };
     let result = pigeonhole(5).solve_with_extension(&mut quiet).into_inner();
     assert!(matches!(result, SatResult::Unsat(_)));
-    assert!(quiet.learned.is_empty());
+    assert_eq!(quiet.learned.len(), 0);
 }
 
 /// Reads `search_ticks` at every callback.

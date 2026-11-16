@@ -730,8 +730,11 @@ fn retain_new_axioms_skips_duplicate_axioms_across_extension_instances_issue_658
         None,
     );
     second.retain_new_axioms(&mut seen_axioms);
-    assert!(second.pending_axiom_terms.is_empty());
-    assert!(second.pending_axiom_clauses.is_empty());
+    assert_eq!(
+        second.pending_axiom_terms,
+        [] as [(TermId, bool, TermId, bool); 0]
+    );
+    assert_eq!(second.pending_axiom_clauses, [] as [Vec<Literal>; 0]);
     assert_eq!(seen_axioms.len(), 1);
 }
 
@@ -976,7 +979,7 @@ fn propagate_returns_none_when_no_propagations() {
     let result = ext.propagate(&ctx);
 
     // ExtPropagateResult is a struct, not an enum
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
     assert!(result.conflict.is_none());
 }
 
@@ -1008,7 +1011,7 @@ fn propagate_returns_conflict_on_theory_unsat() {
     ]);
     let result = ext.propagate(&ctx);
     assert!(ext.take_pending_split().is_none());
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
     assert_eq!(
         result.conflict,
         Some(vec![
@@ -1359,8 +1362,8 @@ fn propagate_checks_level0_after_zero_propagation_streak() {
     let ctx = MockContext::new().with_trail(vec![Literal::positive(Variable::new(1))]);
     let result = ext.propagate(&ctx);
 
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
+    assert_eq!(result.propagations, [] as [(Vec<Literal>, Literal); 0]);
     assert!(result.conflict.is_none());
     assert_eq!(ext.theory.check_calls, 1);
     assert_eq!(ext.deferred_atom_count, 0);
@@ -1395,8 +1398,8 @@ fn propagate_checks_level0_when_deferred_atoms_are_near_batch_target() {
     let ctx = MockContext::new().with_trail(vec![Literal::positive(Variable::new(1))]);
     let result = ext.propagate(&ctx);
 
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
+    assert_eq!(result.propagations, [] as [(Vec<Literal>, Literal); 0]);
     assert!(result.conflict.is_none());
     assert_eq!(ext.theory.check_calls, 1);
     assert_eq!(ext.deferred_atom_count, 0);
@@ -1440,8 +1443,8 @@ fn propagate_does_not_batch_when_split_is_pending() {
         .with_trail(vec![Literal::positive(Variable::new(1))]);
     let result = ext.propagate(&ctx);
 
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
+    assert_eq!(result.propagations, [] as [(Vec<Literal>, Literal); 0]);
     assert!(result.conflict.is_none());
     assert_eq!(ext.theory.check_calls, 1);
     assert_eq!(ext.deferred_atom_count, 0);
@@ -1474,7 +1477,7 @@ fn propagate_stores_split_request_in_pending() {
     let ctx = MockContext::new();
     let result = ext.propagate(&ctx);
     assert!(result.conflict.is_none());
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
     let pending = ext.take_pending_split();
     assert!(pending.is_some(), "split should be stored as pending");
     match pending.unwrap() {
@@ -1628,7 +1631,7 @@ fn propagate_euf_semantic_check_accepts_valid_conflict() {
         Literal::positive(Variable::new(2)),
         Literal::negative(Variable::new(3)),
     ]));
-    assert!(assigned.clauses.is_empty());
+    assert_eq!(assigned.clauses, [] as [Vec<Literal>; 0]);
     assert_eq!(assigned.conflict, Some(expected));
 }
 
@@ -2065,7 +2068,10 @@ fn check_stores_pending_bound_refinements_on_sat() {
 
     let pending = ext.take_pending_bound_refinements();
     assert_eq!(pending, vec![refinement]);
-    assert!(ext.take_pending_bound_refinements().is_empty());
+    assert_eq!(
+        ext.take_pending_bound_refinements(),
+        [] as [BoundRefinementRequest; 0]
+    );
 }
 
 #[test]
@@ -2095,8 +2101,8 @@ fn propagate_preserves_pending_bound_refinements_until_final_check() {
 
     let ctx = MockContext::new().with_trail(vec![Literal::positive(Variable::new(1))]);
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
+    assert_eq!(result.propagations, [] as [(Vec<Literal>, Literal); 0]);
     assert!(result.conflict.is_none());
 
     let final_result = ext.check(&ctx);
@@ -2137,8 +2143,8 @@ fn propagate_inline_bound_refinement_replay_stops_with_pending_requests_issue_65
 
     let ctx = MockContext::new().with_trail(vec![Literal::positive(Variable::new(1))]);
     let result = ext.propagate(&ctx);
-    assert!(result.clauses.is_empty());
-    assert!(result.propagations.is_empty());
+    assert_eq!(result.clauses, [] as [Vec<Literal>; 0]);
+    assert_eq!(result.propagations, [] as [(Vec<Literal>, Literal); 0]);
     assert!(result.conflict.is_none());
     assert!(
         result.stop,
@@ -2217,7 +2223,10 @@ fn backtrack_clears_pending_bound_refinements_from_current_branch() {
     assert_eq!(ext.pending_bound_refinements, vec![refinement]);
 
     ext.backtrack(0);
-    assert!(ext.pending_bound_refinements.is_empty());
+    assert_eq!(
+        ext.pending_bound_refinements,
+        [] as [BoundRefinementRequest; 0]
+    );
 }
 
 // =========================================================================

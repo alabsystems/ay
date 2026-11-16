@@ -508,7 +508,9 @@ pub enum ApplyTactic {
     FieldUnique,
     /// Owned prime-field conjunction decision with checked model reconstruction.
     FieldSolve,
+    /// Owned lazy Boolean SAT/field algebra with native resolution checking.
     FieldSat,
+    /// Exact prime-field residue encoding into bit-vectors with model reconstruction.
     FieldToBv,
     /// `skip` — the identity tactic. Leaves the goal unchanged (depth 0).
     Skip,

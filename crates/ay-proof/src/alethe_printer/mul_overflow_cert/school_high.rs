@@ -15,7 +15,7 @@ use crate::alethe_printer::mul_overflow_cert::term::T;
 impl Ctx {
     /// `(= (bvmul 2^n ZH) (bvmul 2^n (bvadd ZXH ZPHH (bvmul 2^m Zc))))`: `H` agrees with the
     /// wide sum on its low `2m` bits.
-    pub(super) fn s7(&self, p: &mut Proof, q: &Parts) -> Option<(S, T)> {
+    pub(super) fn s7(&self, p: &mut Proof<'_>, q: &Parts) -> Option<(S, T)> {
         let r = &self.row;
         let (m, n, nn) = (r.m, r.n(), 4 * r.m);
         let cbs = self.cb_fact(p)?;
@@ -66,7 +66,7 @@ impl Ctx {
 
     /// `(= ZP (bvadd (bvmul 2^m ZML) ZL0))`: the wrapped product is the low limb of `PLL`
     /// below the low limb of `MID`, by ring steps at `2m` bits.
-    pub(super) fn s8(&self, p: &mut Proof, q: &Parts) -> Option<(S, T)> {
+    pub(super) fn s8(&self, p: &mut Proof<'_>, q: &Parts) -> Option<(S, T)> {
         let r = &self.row;
         let (m, n) = (r.m, r.n());
         let mut bn = Blaster::new(&[r.a_lo, r.a_hi, r.b_lo, r.b_hi], &[]);
@@ -99,7 +99,7 @@ impl Ctx {
         let abx = p.t.mul(aex, bex);
         let p2 = eq_step(p, ab, abx, "cong", &[ea, eb]);
         let swap = r.order.swap;
-        let spelled = |p: &mut Proof, k: usize, x: T, y: T| {
+        let spelled = |p: &mut Proof<'_>, k: usize, x: T, y: T| {
             if swap[k] {
                 p.t.mul(y, x)
             } else {
@@ -165,7 +165,7 @@ impl Ctx {
 
     /// The tail of [`Self::s8`]: from `W(P) = 2^m W(ML) + W(L0)` at `2m`
     /// bits to the zero-extended statement.
-    fn s8_close(&self, p: &mut Proof, q: &Parts, rq: S, w: [T; 4], tb: &[T]) -> Option<(S, T)> {
+    fn s8_close(&self, p: &mut Proof<'_>, q: &Parts, rq: S, w: [T; 4], tb: &[T]) -> Option<(S, T)> {
         let [wp, tgtw, mlw, l0w] = w;
         let r = &self.row;
         let (m, nn) = (r.m, 4 * r.m);
@@ -193,13 +193,13 @@ impl Ctx {
         Some((trans(p, &[l8b, c8]), zp))
     }
 
-    fn word(&self, p: &mut Proof, t: T) -> T {
+    fn word(&self, p: &mut Proof<'_>, t: T) -> T {
         let b = p.t.bits(t);
         p.t.bb(&b)
     }
 
     /// `(= (bvmul X Y) W(prod))` for `prod = (bvmul (zext x) (zext y))` re-spelled over its operand words.
-    fn product_word(&self, p: &mut Proof, xy: T, prod: T, wprod: T, sx: S, sy: S) -> Option<S> {
+    fn product_word(&self, p: &mut Proof<'_>, xy: T, prod: T, wprod: T, sx: S, sy: S) -> Option<S> {
         let (sxs, sys) = (symm(p, sx), symm(p, sy));
         let c = eq_step(p, xy, prod, "cong", &[sxs, sys]);
         let v = eq_step(p, prod, wprod, "bitblast_var", &[]);
@@ -207,7 +207,7 @@ impl Ctx {
     }
 
     /// `(= W(MID) (bvadd (bvadd XT W(S1)) W(S2)))`: `MID` re-spelled over canonical words.
-    fn mid_def(&self, p: &mut Proof, q: &Parts, xtw: T, whl: T, wlh: T) -> Option<S> {
+    fn mid_def(&self, p: &mut Proof<'_>, q: &Parts, xtw: T, whl: T, wlh: T) -> Option<S> {
         let r = &self.row;
         let mut bm = Blaster::new(&[r.pll, r.phl, r.plh], &[]);
         let (xtb, sxt) = bm.blast(p, r.xt)?;

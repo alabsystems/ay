@@ -60,6 +60,10 @@ fn bytes(terms: &TermStore, clause: TermId) -> Vec<u8> {
     .value
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test drives the complete retained bridge boundary positionally"
+)]
 fn invoke(
     operation: Operation,
     terms: &TermStore,

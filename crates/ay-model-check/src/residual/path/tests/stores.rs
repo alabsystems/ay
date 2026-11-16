@@ -267,7 +267,7 @@ fn parser_and_edge_union_have_exact_shared_work_boundaries_and_no_global_node_bl
             assert!(limited.parse_free_read(flag).is_none());
         }
     }
-    let union_cost = parsed.store_edges.len() * std::mem::size_of::<(TermId, TermId)>() * 2;
+    let union_cost = parsed.store_edges.len() * size_of::<(TermId, TermId)>() * 2;
     let mut exact = classifier(&terms, &model, &evaluator, &resolve);
     exact.classify_work = MAX_CLASSIFY_WORK - union_cost;
     let mut edges = StoreEdges::default();

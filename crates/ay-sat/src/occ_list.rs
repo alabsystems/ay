@@ -193,7 +193,7 @@ impl OccList {
                             map.insert(clause_idx, pos);
                         }
                         None if pos >= POS_MAP_MIN_LEN => {
-                            self.pos_map[idx] = Some(Self::build_pos_map(&self.occ[idx]));
+                            self.pos_map[idx] = Some(Box::new(Self::build_pos_map(&self.occ[idx])));
                         }
                         None => {}
                     }
@@ -278,12 +278,12 @@ impl OccList {
     }
 
     /// Position index of `list`, built when it outgrows [`POS_MAP_MIN_LEN`].
-    fn build_pos_map(list: &[usize]) -> Box<PosMap> {
+    fn build_pos_map(list: &[usize]) -> PosMap {
         let mut map = PosMap::with_capacity_and_hasher(list.len() * 2, Default::default());
         for (pos, &clause_idx) in list.iter().enumerate() {
             map.insert(clause_idx, pos);
         }
-        Box::new(map)
+        map
     }
 
     /// Get number of clauses containing a literal.
@@ -338,7 +338,7 @@ impl OccList {
                 list.sort_unstable_by_key(|&clause_idx| key_fn(clause_idx));
                 // Rebuild position map for this literal after sorting.
                 if self.pos_map[lit_idx].is_some() {
-                    self.pos_map[lit_idx] = Some(Self::build_pos_map(list));
+                    self.pos_map[lit_idx] = Some(Box::new(Self::build_pos_map(list)));
                 }
             }
         }
@@ -371,7 +371,7 @@ impl OccList {
             dst.extend_from_slice(src);
             // Rebuild the position map of a long copied list.
             if dst.len() > POS_MAP_MIN_LEN {
-                self.pos_map[lit_idx] = Some(Self::build_pos_map(dst));
+                self.pos_map[lit_idx] = Some(Box::new(Self::build_pos_map(dst)));
             }
         }
     }

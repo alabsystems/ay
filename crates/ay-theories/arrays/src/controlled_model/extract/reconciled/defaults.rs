@@ -110,7 +110,7 @@ fn assign(
     value: &str,
     work: &mut WorkBudget<'_>,
 ) -> Result<bool, QueryError> {
-    if !scan::lookup(&model.array_values, term, work)?.is_some_and(|v| v.default.is_none()) {
+    if scan::lookup(&model.array_values, term, work)?.is_none_or(|v| v.default.is_some()) {
         return Ok(false);
     }
     let value = owned::text(value, work)?;

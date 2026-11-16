@@ -332,7 +332,7 @@ fn circuit_gates(
         });
     }
     // `(cl (not t) x)` and `(cl t (not x))`: `t` is `x`.
-    for gate in 0..variables as usize {
+    for (gate, node) in nodes.iter_mut().enumerate() {
         if !matches!(circuit.kind(gate as u32), GateKind::Theory(_)) {
             continue;
         }
@@ -350,7 +350,7 @@ fn circuit_gates(
             .filter(|other| other.variable().index() != gate)
             .find(|other| converse.contains(&other.negated().index()));
         if let Some(partner) = partner {
-            nodes[gate] = Gate::Alias(partner);
+            *node = Gate::Alias(partner);
         }
     }
     Some(nodes)

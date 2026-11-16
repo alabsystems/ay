@@ -65,7 +65,10 @@ fn is_nullary_constructor(exec: &Executor, term: TermId) -> bool {
 fn constructor_equality_bridge_skips_an_equality_across_sorts() {
     let commands = parse(LIST_CELLS).expect("parse");
     let mut exec = Executor::new();
-    assert!(exec.execute_all(&commands).expect("execute").is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("execute"),
+        [] as [String; 0]
+    );
     let &[a_is_nil, u_is_w] = exec.ctx.assertions.as_slice() else {
         panic!("expected the two authored assertions");
     };
@@ -139,7 +142,10 @@ fn frontier_terms_get_no_tester_clauses_until_they_receive_constructor_axioms() 
     let run = |depth: usize| -> (Vec<TermId>, TermId, TermId, Executor) {
         let commands = parse(LIST_CELLS).expect("parse");
         let mut exec = Executor::new();
-        assert!(exec.execute_all(&commands).expect("execute").is_empty());
+        assert_eq!(
+            exec.execute_all(&commands).expect("execute"),
+            [] as [String; 0]
+        );
         let &[a_is_nil, _] = exec.ctx.assertions.as_slice() else {
             panic!("expected the two authored assertions");
         };

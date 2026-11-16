@@ -51,7 +51,10 @@ fn scan_body(exec: &Executor, root: TermId, vars: &[(String, Sort)]) -> Option<O
 fn real_zero_instance_completes_without_ground_probe() {
     let mut exec = fixture("", FALSE_REAL);
     let authored = exec.exact_concrete_authored_scope();
-    assert!(exec.ematching_proof_records.is_empty());
+    assert_eq!(
+        exec.ematching_proof_records,
+        [] as [crate::executor::query_state::EmatchingProofRecord; 0]
+    );
     assert!(exec.last_model.is_none());
     assert!(exec.try_translate_closed_fp_forall_zero_unsat());
     assert_checked(&exec, &authored);

@@ -39,9 +39,7 @@ fn evaluate(
             BitLemmaKind::And2 => args[0] && args[1],
             BitLemmaKind::Or2 => args[0] || args[1],
             BitLemmaKind::Xor3 => args[0] ^ args[1] ^ args[2],
-            BitLemmaKind::FullAdderCarry => {
-                (args[0] && args[1]) || (args[0] && args[2]) || (args[1] && args[2])
-            }
+            BitLemmaKind::FullAdderCarry => args.iter().filter(|&&arg| arg).count() >= 2,
             _ => panic!("unexpected divider gate"),
         };
     }
@@ -110,11 +108,10 @@ fn mixed_zero_padded_division_and_remainder_match_math_including_original_width_
                                 b
                             };
                             let values = evaluate(&vars, &gates, &clauses, input_a, input_b);
-                            let expected = if b == 0 {
-                                (mask(outer), a)
-                            } else {
-                                (a / b, a % b)
-                            };
+                            let expected = (
+                                a.checked_div(b).unwrap_or_else(|| mask(outer)),
+                                a.checked_rem(b).unwrap_or(a),
+                            );
                             assert_eq!((word(&quotient, &values), word(&remainder, &values)), expected,
                                 "outer{outer}, payload{left_width}/{right_width}, masked{masked}, {a}/{b}");
                         }
@@ -153,10 +150,10 @@ fn the_low_quotient_is_the_same_literal_vector_in_both_construction_orders() {
         assert!(q32[8..].iter().all(|bit| *bit == q32[8]));
         for (a, b) in [(0, 0), (1, 0), (255, 0), (255, 3), (17, 7)] {
             let values = evaluate(&vars, &gates, &clauses, a, b);
-            assert_eq!(word(&q8, &values), if b == 0 { 255 } else { a / b });
+            assert_eq!(word(&q8, &values), a.checked_div(b).unwrap_or(255));
             assert_eq!(
                 word(&q32, &values),
-                if b == 0 { u128::from(u32::MAX) } else { a / b }
+                a.checked_div(b).unwrap_or_else(|| u128::from(u32::MAX))
             );
         }
     }

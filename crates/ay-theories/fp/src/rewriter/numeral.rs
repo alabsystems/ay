@@ -77,10 +77,11 @@ pub fn rounding_mode_literal(terms: &TermStore, term: TermId) -> Option<Rounding
         return None;
     }
     match terms.get(term) {
-        TermData::App(Symbol::Named(name), args)
-            if args.is_empty() && !terms.is_declared_function(name) =>
-        {
-            RoundingMode::from_name(name)
+        TermData::App(Symbol::Named(name), args) if args.is_empty() => {
+            // Reject unknown spellings before hashing a potentially long user
+            // declaration name. Only the ten native literals need the guard.
+            let mode = RoundingMode::from_name(name)?;
+            (!terms.is_declared_function(name)).then_some(mode)
         }
         _ => None,
     }

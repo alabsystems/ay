@@ -34,7 +34,7 @@ fn check(name: &str, mode: &str, values: &[ModelValue], expected: &ModelValue) {
         panic!("{name} {mode}: {result:?}");
     };
     assert!(
-        crate::fp::same_element(&actual, expected),
+        fp::same_element(&actual, expected),
         "{name} {mode}: {actual:?} != {expected:?}"
     );
     let output = terms.mk_var("expected", sort);

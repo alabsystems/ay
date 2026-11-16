@@ -7,9 +7,7 @@
 
 use super::*;
 use crate::z3_abi_500::{LibraryObservation, StockCProbe};
-use sha2::Digest as _;
 use std::ffi::OsString;
-use std::io::Read as _;
 
 mod registered;
 mod semantic_contracts;
@@ -681,6 +679,10 @@ fn header_tree(text: &str) -> Result<BTreeMap<String, String>, String> {
         let Some(name) = path.strip_prefix("crates/ay-ffi/include/") else {
             return Err("header source tree escaped requested prefix".to_string());
         };
+        #[expect(
+            clippy::case_sensitive_file_extension_comparisons,
+            reason = "authenticated Git paths require the exact lowercase .h suffix"
+        )]
         if !name.ends_with(".h") {
             continue;
         }
@@ -1166,6 +1168,10 @@ mod tests {
         let tree = header_tree(&row).unwrap();
         assert_eq!(tree.len(), 1);
         assert!(tree.contains_key("z3.h"));
+        assert_eq!(
+            header_tree(&row.replace("z3.h", "z3.H")).unwrap_err(),
+            "source commit has no AY headers"
+        );
         assert!(header_tree(&format!("{row}{row}")).is_err());
         assert!(header_tree(&row.replace("100644", "120000")).is_err());
         assert!(header_tree(&row.replace("include/z3.h", "include/../z3.h")).is_err());

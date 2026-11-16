@@ -197,7 +197,7 @@ fn checked_ground_offsets_share_only_the_unconditional_boolean_unit() {
     assert!(exec
         .emit_ground_offset_intrinsic(&mut stopped, equalities[0], false)
         .is_none());
-    assert!(stopped.proof.steps.is_empty());
+    assert_eq!(stopped.proof.steps, [] as [ProofStep; 0]);
     assert_eq!(exec.ctx.terms.len(), arena);
 }
 
@@ -208,7 +208,7 @@ fn checked_ground_long_spines_retain_the_general_fallback_and_pinned_path() {
         left = format!("(bvadd {left} (_ bv1 8))");
     }
     let input=format!("(set-option :produce-proofs true)(set-logic QF_BV)(declare-const x (_ BitVec 8))(assert (not (= {left} (bvadd x (_ bv17 8)))))(check-sat)");
-    let (mut exec, root) = super::packing::prepared(&input);
+    let (mut exec, root) = packing::prepared(&input);
     let proof = exec.early_ground_closure_memory_candidate(root).unwrap();
     assert!(
         lemma_count(&proof, |kind, _| matches!(
@@ -223,7 +223,7 @@ fn checked_ground_long_spines_retain_the_general_fallback_and_pinned_path() {
     ay_proof::check_proof_strict_with_context(&proof, &exec.ctx.terms, None, None, Some(&[root]))
         .unwrap();
     let pure="(set-option :produce-proofs true)(set-logic QF_BV)(declare-const x (_ BitVec 8))(assert (not (= (bvor ((_ zero_extend 4) ((_ extract 3 0) x)) (bvshl ((_ zero_extend 4) ((_ extract 7 4) x)) (_ bv4 8))) x)))(check-sat)";
-    let (mut exec, root) = super::packing::prepared(pure);
+    let (mut exec, root) = packing::prepared(pure);
     exec.set_alethe_dialect(ay_proof::AletheDialect::PinnedCarcara);
     let proof = exec.early_ground_closure_memory_candidate(root).unwrap();
     assert_eq!(intrinsic_count(&proof, AletheRule::BvReconstructV1), 0);

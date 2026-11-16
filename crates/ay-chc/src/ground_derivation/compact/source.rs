@@ -34,7 +34,7 @@ pub(super) struct Expressions<'a> {
 }
 
 impl<'a> Expressions<'a> {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             vars: DetHashMap::default(),
             cache: DetHashMap::default(),
@@ -43,7 +43,7 @@ impl<'a> Expressions<'a> {
 }
 
 impl<'a> Source<'a> {
-    pub fn new(problem: &'a ChcProblem, owner: &mut Owner) -> Result<Self> {
+    pub(super) fn new(problem: &'a ChcProblem, owner: &mut Owner<'_>) -> Result<Self> {
         owner.poll()?;
         if problem.has_stripped_body_forall() {
             return Err(Error::InvalidSource);
@@ -82,7 +82,7 @@ impl<'a> Source<'a> {
         &mut self,
         name: &'a str,
         function: Function<'a>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<()> {
         owner.admit(name.len().saturating_add(1), 128)?;
         if name.contains('\0') {
@@ -123,7 +123,7 @@ impl<'a> Source<'a> {
         &self,
         name: &str,
         domain: Option<&str>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<Function<'a>> {
         let first = *self.functions.get(name).ok_or(Error::Unsupported)?;
         if first.field.is_none() || domain == Some(first.sort) {
@@ -144,7 +144,7 @@ impl<'a> Source<'a> {
     pub(super) fn datatype_domain(
         &mut self,
         expr: &'a ChcExpr,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
         depth: usize,
     ) -> Result<Option<&'a str>> {
         owner.admit(1, 0)?;
@@ -169,7 +169,12 @@ impl<'a> Source<'a> {
         })
     }
 
-    pub fn sort(&mut self, sort: &'a ChcSort, owner: &mut Owner, depth: usize) -> Result<Type<'a>> {
+    pub(super) fn sort(
+        &mut self,
+        sort: &'a ChcSort,
+        owner: &mut Owner<'_>,
+        depth: usize,
+    ) -> Result<Type<'a>> {
         owner.admit(1, 0)?;
         if depth > 512 {
             return Err(Error::Unsupported);
@@ -231,7 +236,7 @@ impl<'a> Source<'a> {
         }
     }
 
-    pub fn validate(&mut self, owner: &mut Owner) -> Result<()> {
+    pub(super) fn validate(&mut self, owner: &mut Owner<'_>) -> Result<()> {
         let mut predicate_names = DetHashSet::default();
         for constructors in self.problem.datatype_defs().values() {
             for (_, fields) in constructors {
@@ -263,7 +268,11 @@ impl<'a> Source<'a> {
         owner.poll()
     }
 
-    pub fn clause(&mut self, clause: &'a HornClause, owner: &mut Owner) -> Result<Expressions<'a>> {
+    pub(super) fn clause(
+        &mut self,
+        clause: &'a HornClause,
+        owner: &mut Owner<'_>,
+    ) -> Result<Expressions<'a>> {
         owner.poll()?;
         if clause
             .action_id
@@ -291,7 +300,7 @@ impl<'a> Source<'a> {
         id: PredicateId,
         args: &'a [ChcExpr],
         expressions: &mut Expressions<'a>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<()> {
         let predicate = self
             .problem
@@ -309,7 +318,11 @@ impl<'a> Source<'a> {
         Ok(())
     }
 
-    pub fn value_type(&mut self, node: &super::ValueNode, owner: &mut Owner) -> Result<Type<'a>> {
+    pub(super) fn value_type(
+        &mut self,
+        node: &super::ValueNode,
+        owner: &mut Owner<'_>,
+    ) -> Result<Type<'a>> {
         match node {
             super::ValueNode::Bool(_) => Ok(Type::Bool),
             super::ValueNode::BitVec { width, .. } => Ok(Type::BitVec(*width)),
@@ -328,7 +341,7 @@ impl<'a> Source<'a> {
 pub(super) fn operation_type<'a>(
     op: ChcOp,
     args: &[Type<'a>],
-    owner: &mut Owner,
+    owner: &mut Owner<'_>,
 ) -> Result<Type<'a>> {
     for arg in args {
         if let Type::Datatype(name) = arg {

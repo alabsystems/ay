@@ -655,7 +655,7 @@ impl<'a> Evaluator<'a> {
             array
                 .store
                 .len()
-                .checked_mul(std::mem::size_of::<(ModelValue, ModelValue)>())
+                .checked_mul(size_of::<(ModelValue, ModelValue)>())
                 .ok_or_else(|| self.admission_error("array copy accounting overflow"))?,
         )?;
         for (index, value) in &array.store {
@@ -726,7 +726,7 @@ impl<'a> Evaluator<'a> {
             if self.admission_enabled()? {
                 let bytes = args
                     .len()
-                    .checked_mul(std::mem::size_of::<ModelValue>())
+                    .checked_mul(size_of::<ModelValue>())
                     .ok_or_else(|| self.admission_error("application edge accounting overflow"))?;
                 self.admit_evaluation(args.len(), bytes)?;
             }
@@ -1107,7 +1107,7 @@ impl<'a> Evaluator<'a> {
             Constant::Rational(r) => Ok(ModelValue::Real(r.0.clone())),
             Constant::BitVec { value, width } => Ok(ModelValue::BitVec {
                 width: *width,
-                value: crate::bitvec::normalize(value, *width),
+                value: bitvec::normalize(value, *width),
             }),
             Constant::String(s) => Ok(ModelValue::Str(s.clone())),
             _ => Err("unsupported constant kind".into()),
@@ -2725,7 +2725,7 @@ impl<'a> Evaluator<'a> {
                 .constructors
                 .iter()
                 .all(|constructor| constructor.fields.is_empty())
-                .then(|| distinct_keys >= datatype.constructors.len());
+                .then_some(distinct_keys >= datatype.constructors.len());
         }
         match sort {
             Sort::Bool => Some(distinct_keys >= 2),

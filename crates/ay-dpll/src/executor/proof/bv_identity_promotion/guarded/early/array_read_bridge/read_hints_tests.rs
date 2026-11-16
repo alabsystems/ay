@@ -58,8 +58,11 @@ fn unresolved_store_reads_decline_before_any_arena_or_authority_mutation() {
         assert_eq!(executor.ctx.source_context_stamp(), scope);
         assert!(executor.last_proof().is_none());
         assert!(executor.last_unsat_certificate.is_none());
-        assert!(executor.last_proof_raw_original_assertions.is_empty());
-        assert!(executor.last_proof_rebuild_originals.is_empty());
+        assert_eq!(
+            executor.last_proof_raw_original_assertions,
+            [] as [TermId; 0]
+        );
+        assert_eq!(executor.last_proof_rebuild_originals, [] as [TermId; 0]);
     }
 }
 
@@ -76,7 +79,7 @@ fn exact_original_read_hints_survive_only_append_only_live_epochs() {
             .read(&executor.ctx, read, &mut visits, &running)
             .is_some());
         // Appending a nonsemantic constant preserves the original entries.
-        executor.ctx.terms.mk_bitvec(999.into(), 64);
+        let _ = executor.ctx.terms.mk_bitvec(999.into(), 64);
         assert!(hints
             .read(&executor.ctx, read, &mut visits, &running)
             .is_some());
@@ -90,7 +93,7 @@ fn exact_original_read_hints_survive_only_append_only_live_epochs() {
             2 => executor.ctx.terms.mark_skolem_symbol("hint_metadata"),
             _ => {
                 let checkpoint = executor.ctx.terms.rollback_checkpoint();
-                executor.ctx.terms.mk_bitvec(1000.into(), 64);
+                let _ = executor.ctx.terms.mk_bitvec(1000.into(), 64);
                 // No hint references this discarded suffix; the existing API
                 // still retires the structural snapshot of the original cone.
                 executor.ctx.terms.rollback_to(checkpoint);

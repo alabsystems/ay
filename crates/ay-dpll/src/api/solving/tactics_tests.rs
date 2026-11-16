@@ -29,9 +29,9 @@ fn owned_boolean_structure_preserves_declared_function_identities() {
     let p = store.mk_var("p", ay_core::Sort::Bool);
     let q = store.mk_var("q", ay_core::Sort::Bool);
     let conjunction =
-        store.mk_app_structural(ay_core::Symbol::named("and"), &[p, q], ay_core::Sort::Bool);
+        store.mk_app_structural(ay_core::Symbol::named("and"), [p, q], ay_core::Sort::Bool);
     let disjunction =
-        store.mk_app_structural(ay_core::Symbol::named("or"), &[p, q], ay_core::Sort::Bool);
+        store.mk_app_structural(ay_core::Symbol::named("or"), [p, q], ay_core::Sort::Bool);
     assert_eq!(
         flatten_owned(&store, &[conjunction], &owner).unwrap(),
         [p, q]
@@ -45,13 +45,13 @@ fn owned_boolean_structure_preserves_declared_function_identities() {
     store.register_declared_function("and");
     store.register_declared_function("or");
     let conjunction =
-        store.mk_app_structural(ay_core::Symbol::named("and"), &[p, q], ay_core::Sort::Bool);
+        store.mk_app_structural(ay_core::Symbol::named("and"), [p, q], ay_core::Sort::Bool);
     assert_eq!(
         flatten_owned(&store, &[conjunction], &owner).unwrap(),
         [conjunction]
     );
     let disjunction =
-        store.mk_app_structural(ay_core::Symbol::named("or"), &[p, q], ay_core::Sort::Bool);
+        store.mk_app_structural(ay_core::Symbol::named("or"), [p, q], ay_core::Sort::Bool);
     assert!(Tactic::SplitClause
         .apply_goals_admitted(&mut store, Goal::root(vec![disjunction]), &owner)
         .is_err());
@@ -766,7 +766,7 @@ fn fail_if_not_decided_is_identity_only_on_a_decided_goal() {
         .apply_goals(&mut terms, root(vec![]))
         .expect("empty goal is decided-sat");
     assert_eq!(goals.len(), 1);
-    assert!(goals[0].formulas.is_empty());
+    assert_eq!(goals[0].formulas, [] as [ay_core::TermId; 0]);
     assert_eq!(goals[0].depth, 0);
 
     // Goal containing `false` ⇒ decided UNSAT ⇒ identity.

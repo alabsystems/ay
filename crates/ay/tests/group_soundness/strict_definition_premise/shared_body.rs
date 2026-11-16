@@ -27,6 +27,7 @@ use super::ite_guard::{
     default_certificate_is_honest, has_field, strict_routes_assume_only_problem_premises,
 };
 use super::*;
+use std::fmt::Write as _;
 
 const FRAME_FIXTURE: &str =
     "crates/ay-dpll/tests/fixtures/source_bound_stack_frame/positive-registers.smt2";
@@ -59,11 +60,17 @@ fn frame_load(bytes: usize) -> String {
     for offset in (0..bytes - 1).rev() {
         load = format!("(concat {load} (select saved (bvadd frame (_ bv{offset} 64))))");
     }
-    let mut script: String = frame_fixture()
-        .lines()
-        .filter(|line| !line.starts_with("(assert (or ") && *line != "(check-sat)")
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let mut script = {
+        let fixture = frame_fixture();
+        let mut script = String::new();
+        for line in fixture
+            .lines()
+            .filter(|line| !line.starts_with("(assert (or ") && *line != "(check-sat)")
+        {
+            writeln!(&mut script, "{line}").expect("writing to a String cannot fail");
+        }
+        script
+    };
     script.push_str(&format!(
         "(assert (distinct {load} ((_ extract {} 0) entry_fp)))\n(check-sat)\n",
         8 * bytes - 1

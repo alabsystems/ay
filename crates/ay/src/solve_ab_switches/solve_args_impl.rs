@@ -106,10 +106,6 @@ impl SolveArgs {
             chc_cata_dump_abstract: self.ab_switches.chc_cata_dump_abstract.clone(),
             chc_cata_dump_obligations: self.ab_switches.chc_cata_dump_obligations.clone(),
             chc_dump_scalarized: self.ab_switches.chc_dump_scalarized.clone(),
-            chc_dump_failed_replay_obligation: self
-                .ab_switches
-                .chc_dump_failed_replay_obligation
-                .clone(),
             chc_checksat_dump: self.ab_switches.chc_checksat_dump.clone(),
             chc_pdr_dump: self.ab_switches.chc_pdr_dump.clone(),
             chc_proof_itp_dump: self.ab_switches.chc_proof_itp_dump.clone(),

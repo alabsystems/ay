@@ -306,10 +306,10 @@ impl Context {
                                 "finite-field literal outside field logic".into(),
                             ));
                         }
-                        let n: num_bigint::BigInt = value
+                        let n: BigInt = value
                             .parse()
                             .map_err(|_| ElaborateError::InvalidConstant(name.clone()))?;
-                        let p = num_bigint::BigInt::from(field.modulus());
+                        let p = BigInt::from(field.modulus());
                         use num_traits::ToPrimitive;
                         let residue = ((n % &p + &p) % &p)
                             .to_u32()
@@ -1546,9 +1546,8 @@ const MAX_ALPHA_COMMUTATIVE_ARITY: usize = 8;
 /// symbol here after checking the store canonicalizes its argument order.
 const ID_SORTED_COMMUTATIVE_SYMBOLS: &[&str] = &["=", "and", "or", "xor", "*", "+"];
 
-fn is_id_sorted_commutative(symbol: &ay_core::Symbol) -> bool {
-    matches!(symbol, ay_core::Symbol::Named(_))
-        && ID_SORTED_COMMUTATIVE_SYMBOLS.contains(&symbol.name())
+fn is_id_sorted_commutative(symbol: &Symbol) -> bool {
+    matches!(symbol, Symbol::Named(_)) && ID_SORTED_COMMUTATIVE_SYMBOLS.contains(&symbol.name())
 }
 
 /// Hash a term's structure with every VARIABLE IDENTITY erased.
@@ -1586,7 +1585,12 @@ fn alpha_shape_of(terms: &ay_core::TermStore, id: TermId, depth: u32) -> u64 {
     }
     let mut hasher = DefaultHasher::new();
     terms.sort(id).hash(&mut hasher);
-    let mut children_in_order: Vec<u64> = Vec::new();
+    let mut ordered_children = DefaultHasher::new();
+    let mut ordered_child_count = 0usize;
+    let mut hash_ordered_child = |child| {
+        ordered_child_count += 1;
+        alpha_shape_of(terms, child, depth - 1).hash(&mut ordered_children);
+    };
     let mut children_commutative: u64 = 0;
     match terms.get(id) {
         TermData::Const(constant) => {
@@ -1609,18 +1613,18 @@ fn alpha_shape_of(terms: &ay_core::TermStore, id: TermId, depth: u32) -> u64 {
                 }
             } else {
                 for &arg in considered {
-                    children_in_order.push(alpha_shape_of(terms, arg, depth - 1));
+                    hash_ordered_child(arg);
                 }
             }
         }
         TermData::Not(inner) => {
             3u8.hash(&mut hasher);
-            children_in_order.push(alpha_shape_of(terms, *inner, depth - 1));
+            hash_ordered_child(*inner);
         }
         TermData::Ite(condition, then_branch, else_branch) => {
             4u8.hash(&mut hasher);
             for branch in [*condition, *then_branch, *else_branch] {
-                children_in_order.push(alpha_shape_of(terms, branch, depth - 1));
+                hash_ordered_child(branch);
             }
         }
         TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
@@ -1632,12 +1636,12 @@ fn alpha_shape_of(terms: &ay_core::TermStore, id: TermId, depth: u32) -> u64 {
             for (_, sort) in vars {
                 sort.hash(&mut hasher);
             }
-            children_in_order.push(alpha_shape_of(terms, *body, depth - 1));
+            hash_ordered_child(*body);
             triggers.len().hash(&mut hasher);
             for multi in triggers.iter().take(MAX_ALPHA_SHAPE_FANOUT) {
                 multi.len().hash(&mut hasher);
                 for &trigger in multi.iter().take(MAX_ALPHA_SHAPE_FANOUT) {
-                    children_in_order.push(alpha_shape_of(terms, trigger, depth - 1));
+                    hash_ordered_child(trigger);
                 }
             }
         }
@@ -1648,7 +1652,8 @@ fn alpha_shape_of(terms: &ay_core::TermStore, id: TermId, depth: u32) -> u64 {
             std::mem::discriminant(other).hash(&mut hasher);
         }
     }
-    children_in_order.hash(&mut hasher);
+    ordered_child_count.hash(&mut hasher);
+    ordered_children.finish().hash(&mut hasher);
     children_commutative.hash(&mut hasher);
     hasher.finish()
 }

@@ -5,8 +5,8 @@ use super::*;
 
 struct NoTheory;
 impl Extension for NoTheory {
-    fn propagate(&mut self, _: &dyn SolverContext) -> crate::ExtPropagateResult {
-        crate::ExtPropagateResult::default()
+    fn propagate(&mut self, _: &dyn SolverContext) -> ExtPropagateResult {
+        ExtPropagateResult::default()
     }
 }
 

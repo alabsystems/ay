@@ -79,7 +79,7 @@ fn an_interrupt_observed_before_blast_keeps_its_cause_after_flag_reset() {
     let mut solver = BvSolver::new(&store);
     solver.set_interrupt(Arc::clone(&flag));
     flag.store(false, Ordering::Relaxed);
-    assert!(solver.bitblast_all(&[]).is_empty());
+    assert_eq!(solver.bitblast_all(&[]).as_slice(), &[] as &[CnfClause]);
     assert_eq!(solver.blast_cut(), Some(BlastCut::Interrupt));
     assert!(!solver.encoding_complete());
     solver.reset();
@@ -114,7 +114,10 @@ fn a_memory_cut_inside_a_predicate_is_not_reclassified_as_interrupt() {
     assert!(!ay_sys::process_memory_exceeded());
     assert_eq!(solver.blast_cut(), Some(BlastCut::MemoryCeiling));
     assert!(!solver.encoding_complete());
-    assert!(solver.bitblast_all(&[predicate]).is_empty());
+    assert_eq!(
+        solver.bitblast_all(&[predicate]).as_slice(),
+        &[] as &[CnfClause]
+    );
     assert_eq!(solver.blast_cut(), Some(BlastCut::MemoryCeiling));
 }
 
@@ -125,13 +128,13 @@ fn an_opaque_refusal_never_invents_a_typed_cut_from_later_readings() {
     let store = setup_store();
     let scope = enter_check_stop(Arc::new(|| true));
     let mut solver = BvSolver::new(&store);
-    assert!(solver.bitblast_all(&[]).is_empty());
+    assert_eq!(solver.bitblast_all(&[]).as_slice(), &[] as &[CnfClause]);
     assert!(!solver.encoding_complete());
     assert_eq!(solver.blast_cut(), None);
     drop(scope);
     let _memory = ForcedMemory::exceeded();
     solver.set_interrupt(Arc::new(AtomicBool::new(true)));
-    assert!(solver.bitblast_all(&[]).is_empty());
+    assert_eq!(solver.bitblast_all(&[]).as_slice(), &[] as &[CnfClause]);
     assert!(!solver.encoding_complete());
     assert_eq!(solver.blast_cut(), None, "the first cause was opaque");
 }
@@ -170,6 +173,6 @@ fn typed_refusal_before_root_handoff_is_preserved() {
     later.inherit_encoding_guard(&root);
     assert!(!later.encoding_complete());
     assert_eq!(later.blast_cut(), Some(BlastCut::MemoryCeiling));
-    assert!(child.bitblast_all(&[]).is_empty());
+    assert_eq!(child.bitblast_all(&[]).as_slice(), &[] as &[CnfClause]);
     assert_eq!(child.blast_cut(), Some(BlastCut::MemoryCeiling));
 }

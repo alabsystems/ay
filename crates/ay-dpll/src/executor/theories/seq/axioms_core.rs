@@ -2341,11 +2341,10 @@ impl Executor {
             let Some(h_elems) = resolve_ground(self, scan.contains_terms[i].1) else {
                 continue;
             };
-            for j in 0..scan.contains_terms.len() {
+            for (j, &(c2, mid2, m)) in scan.contains_terms.iter().enumerate() {
                 if j == i {
                     continue;
                 }
-                let (c2, mid2, m) = scan.contains_terms[j];
                 // The inner haystack `mid2` must be the SAME canonical seq as
                 // the outer needle `mid1`.
                 if self.seq_canon_leaves(mid2, &aliases) != mid1_leaves {

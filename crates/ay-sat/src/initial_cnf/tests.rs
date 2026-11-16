@@ -46,7 +46,7 @@ fn exact_rows_namespace_empty_clause_and_tautology_are_preserved() {
     let prepared = prepare(&clauses, owner(10000, 10000)).unwrap();
     assert_eq!(prepared.num_vars(), 3);
     assert_eq!(prepared.len(), 3);
-    assert!(!prepared.is_empty());
+    assert_ne!(prepared.len(), 0);
     for (index, expected) in clauses.iter().enumerate() {
         assert_eq!(
             prepared.clause(index).unwrap().unwrap().original(),

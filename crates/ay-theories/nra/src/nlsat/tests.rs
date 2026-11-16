@@ -299,7 +299,7 @@ fn phase_oracle_vocabulary(terms: &mut ay_core::term::TermStore) -> (Vec<TermId>
     let cm3 = terms.mk_rational(rat(-3));
     let half = terms.mk_rational(BigRational::new(1.into(), 2.into()));
     fn app(t: &mut ay_core::term::TermStore, n: &str, a: &[TermId]) -> TermId {
-        t.mk_app(Symbol::named(n), a, ay_core::Sort::Real)
+        t.mk_app(Symbol::named(n), a, Sort::Real)
     }
     let (x, y, z, w, u) = (vars[0], vars[1], vars[2], vars[3], vars[4]);
     let mut operands = vec![x, y, z, w, u, c0, c2, cm3, half];
@@ -472,5 +472,49 @@ fn feasible_set_recompute_shares_one_materialization_delta() {
     assert!(
         spent <= 2,
         "one check must share its materialisation delta, spent {spent}"
+    );
+}
+
+/// The tangent scan evaluates every monomial's factors and aux var
+/// against one unchanged LRA model (the scan is read-only; cuts are
+/// added afterwards). It must share one materialisation delta across
+/// the whole scan instead of recomputing the O(#vars) delta per
+/// epsilon-carrying leaf (sampled under `generate_refinement_lemmas`
+/// on QF_UFNRA `cas/40f50`).
+#[test]
+fn tangent_scan_shares_one_materialization_delta() {
+    use ay_core::Sort;
+    let mut terms = ay_core::term::TermStore::new();
+    let c0 = terms.mk_rational(rat(0));
+    let c1 = terms.mk_rational(rat(1));
+    let c3 = terms.mk_rational(rat(3));
+    fn app(t: &mut ay_core::term::TermStore, n: &str, a: &[TermId], sort: Sort) -> TermId {
+        t.mk_app(Symbol::named(n), a, sort)
+    }
+    let mut atoms = Vec::new();
+    for i in 0..6 {
+        let x = terms.mk_var(format!("x{i}"), Sort::Real);
+        let y = terms.mk_var(format!("y{i}"), Sort::Real);
+        let prod = app(&mut terms, "*", &[x, y], Sort::Real);
+        for (v, cmp, c) in [(x, ">", c0), (x, "<", c1), (y, ">", c0), (y, "<", c1)] {
+            atoms.push(app(&mut terms, cmp, &[v, c], Sort::Bool));
+        }
+        atoms.push(app(&mut terms, ">", &[prod, c0], Sort::Bool));
+        atoms.push(app(&mut terms, "<", &[prod, c3], Sort::Bool));
+    }
+    let mut solver = NraSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+    assert!(
+        matches!(solver.check(), ay_core::TheoryResult::Sat),
+        "unit-box products must be SAT"
+    );
+    let before = solver.lra.materialization_delta_computations();
+    let _ = solver.add_tangent_constraints_for_incorrect_monomials();
+    let spent = solver.lra.materialization_delta_computations() - before;
+    assert!(
+        spent <= 4,
+        "one tangent scan must share its materialisation delta, spent {spent}"
     );
 }

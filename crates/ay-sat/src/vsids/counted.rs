@@ -8,7 +8,7 @@ use ay_core::original_query::CountedAdmission;
 impl VSIDS {
     /// Preserve the normal heap, VMTF order and lazy CHB/bucket state.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         let bump_order = try_vec_with(owner, num_vars, |i| (num_vars - i) as u64)?;
         let heap = try_vec_with(owner, num_vars, |i| i as u32)?;
         let heap_pos = try_vec_with(owner, num_vars, |i| i as u32)?;

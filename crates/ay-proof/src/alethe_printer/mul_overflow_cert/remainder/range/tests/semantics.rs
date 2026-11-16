@@ -63,10 +63,10 @@ fn actual_range_invariant_holds_for_every_small_incoming_state() {
             free_bits(&mut p, "y", n),
         );
         let q = vec![p.t.ff; n as usize];
-        let stage = clean::udiv_stage(&mut p.t, &x, &y, &q, &r);
-        let shifted = super::super::shifted_x(&p, &x);
-        let before = super::super::invariant(&mut p, &r, &shifted, &y);
-        let after = super::super::invariant(&mut p, &stage.rem, &x, &y);
+        let stage = udiv_stage(&mut p.t, &x, &y, &q, &r);
+        let shifted = shifted_x(&p, &x);
+        let before = invariant(&mut p, &r, &shifted, &y);
+        let after = invariant(&mut p, &stage.rem, &x, &y);
         for rv in 0..1u128 << n {
             for xv in 0..1u128 << n {
                 for yv in 0..1u128 << n {
@@ -94,7 +94,7 @@ fn projected_actual_divider_matches_total_smt_remainder_exhaustively() {
     for n in 1..=4 {
         let mut p = proof();
         let (x, y) = (free_bits(&mut p, "x", n), free_bits(&mut p, "y", n));
-        let stages = super::super::specification::remainder_stages(&mut p, &x, &y).unwrap();
+        let stages = specification::remainder_stages(&mut p, &x, &y).unwrap();
         let is_zero = {
             let equalities: Vec<_> = y.iter().map(|&bit| p.t.eq(bit, p.t.ff)).collect();
             p.t.and(&equalities)

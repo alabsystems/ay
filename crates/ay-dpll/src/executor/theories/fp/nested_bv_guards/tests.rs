@@ -86,7 +86,7 @@ fn seeding_is_definition_only_and_sharing_does_not_mint_new_names() {
     );
     seed(&terms, [root], &mut tseitin, &stop, &|| {}).unwrap();
     assert_eq!(tseitin.num_vars(), variables);
-    assert!(tseitin.take_new_clauses().is_empty());
+    assert_eq!(tseitin.take_new_clauses(), [] as [ay_core::CnfClause; 0]);
     let result = tseitin.into_assertion_result();
     let mut sat = ay_sat::Solver::new(result.num_vars as usize);
     let guard = result.term_to_var[&condition] as i32;

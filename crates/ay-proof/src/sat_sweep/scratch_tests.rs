@@ -32,7 +32,7 @@ fn a_generation_wrap_forgets_every_mark() {
 fn local_indices_follow_first_appearance_and_reset() {
     let mut local = LocalIndex::new(2);
     let mut next = 0;
-    let mut fresh = |next: &mut usize| {
+    let fresh = |next: &mut usize| {
         *next += 1;
         *next - 1
     };

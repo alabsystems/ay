@@ -158,7 +158,7 @@ mod tests {
         let mut terms = TermStore::new();
         let t = terms.mk_var("t", Sort::bitvec(width));
         for shift in 1..=3 {
-            let x = terms.mk_var(&format!("x{shift}"), Sort::bitvec(width - shift));
+            let x = terms.mk_var(format!("x{shift}"), Sort::bitvec(width - shift));
             let zero = terms.mk_bitvec(0u8.into(), shift);
             let padded = app(&mut terms, "concat", [x, zero], width);
             let scale = terms.mk_bitvec((1u16 << shift).into(), width);

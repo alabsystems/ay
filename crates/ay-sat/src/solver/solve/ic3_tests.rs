@@ -2841,7 +2841,7 @@ mod tests {
 
         let deleted = s.cleanup_constrained_clauses();
         assert_eq!(deleted, 1, "should delete the one new constrained clause");
-        assert!(s.cold.ic3_constrained_offsets.is_empty());
+        assert_eq!(s.cold.ic3_constrained_offsets.len(), 0);
     }
 
     /// Verify that constrained clauses work correctly across multiple
@@ -2884,7 +2884,7 @@ mod tests {
 
         // Final cleanup should remove any remaining.
         let _remaining = s.cleanup_constrained_clauses();
-        assert!(s.cold.ic3_constrained_offsets.is_empty());
+        assert_eq!(s.cold.ic3_constrained_offsets.len(), 0);
 
         // Solver should still be functional after all cycles.
         let r = s.solve_incremental_ic3(&[pos(0)]);

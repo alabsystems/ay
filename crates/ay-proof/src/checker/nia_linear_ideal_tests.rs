@@ -21,6 +21,138 @@ fn equality_literal(terms: &mut TermStore, name: &str) -> TermId {
     terms.mk_eq(variable, zero)
 }
 
+#[test]
+fn arithmetic_custody_refuses_declared_boolean_heads_and_nonboolean_descendants() {
+    for head in ["<", "<=", ">", ">=", "="] {
+        let mut terms = TermStore::new();
+        let x = int_var(&mut terms, "x");
+        let relation = terms.mk_app_structural(Symbol::named(head), [x, x], Sort::Bool);
+        let literal = if matches!(head, "<" | ">") {
+            terms.mk_not_raw(relation)
+        } else {
+            relation
+        };
+        assert!(recognize_arith_clause_tautology(&terms, &[literal]));
+        terms.register_declared_function(head);
+        assert!(
+            !recognize_arith_clause_tautology(&terms, &[literal]),
+            "{head}"
+        );
+        assert!(validate_generic_arithmetic_refutation_with_progress(
+            &terms,
+            ProofId(0),
+            &[literal],
+            &mut |_, _| true,
+        )
+        .is_err());
+    }
+    for head in ["and", "or"] {
+        let mut terms = TermStore::new();
+        let equality = equality_literal(&mut terms, "x");
+        let opposite = terms.mk_not_raw(equality);
+        let packed = terms.mk_app_structural(Symbol::named(head), [equality, opposite], Sort::Bool);
+        let literal = if head == "and" {
+            terms.mk_not_raw(packed)
+        } else {
+            packed
+        };
+        assert!(recognize_arith_clause_tautology(&terms, &[literal]));
+        terms.register_declared_function(head);
+        assert!(
+            !recognize_arith_clause_tautology(&terms, &[literal]),
+            "{head}"
+        );
+    }
+    let mut terms = TermStore::new();
+    let x = int_var(&mut terms, "x");
+    let relation = terms.mk_app_structural(Symbol::named("<"), [x, x], Sort::Bool);
+    let negated = terms.mk_not_raw(relation);
+    // The ordinary producer correctly refuses Not(Int). Preserve that native
+    // contract and exercise malformed input through the checker snapshot owner.
+    let mut entries = terms.entries_snapshot();
+    entries[relation.index()].1 = Sort::Int;
+    let malformed = TermStore::from_entries(entries, None, None, 0);
+    assert!(!recognize_arith_clause_tautology(&malformed, &[negated]));
+    assert!(validate_generic_arithmetic_refutation_with_progress(
+        &malformed,
+        ProofId(0),
+        &[negated],
+        &mut |_, _| true,
+    )
+    .is_err());
+}
+
+#[test]
+fn arithmetic_custody_keeps_declared_numeric_applications_opaque() {
+    for (head, real, expected) in [
+        ("+", false, 3),
+        ("-", false, 1),
+        ("*", false, 2),
+        ("/", true, 2),
+        ("to_real", true, 2),
+        ("bv2nat", false, 2),
+    ] {
+        let mut terms = TermStore::new();
+        let sort = if real { Sort::Real } else { Sort::Int };
+        let mut number = |n: i64| {
+            if real {
+                terms.mk_rational(BigRational::from_integer(n.into()))
+            } else {
+                terms.mk_int(n.into())
+            }
+        };
+        let two = number(2);
+        let one = number(1);
+        let expected = number(expected);
+        let args = if head == "to_real" {
+            vec![terms.mk_int(2.into())]
+        } else if head == "bv2nat" {
+            vec![terms.mk_bitvec(2.into(), 8)]
+        } else {
+            vec![two, one]
+        };
+        let app = terms.mk_app_structural(Symbol::named(head), args, sort);
+        let identity = terms.mk_app_structural(Symbol::named("="), [app, expected], Sort::Bool);
+        assert!(
+            recognize_arith_clause_tautology(&terms, &[identity]),
+            "{head}"
+        );
+        terms.register_declared_function(head);
+        assert!(
+            !recognize_arith_clause_tautology(&terms, &[identity]),
+            "{head}"
+        );
+        let opaque_reflexivity =
+            terms.mk_app_structural(Symbol::named("<="), [app, app], Sort::Bool);
+        assert!(
+            recognize_arith_clause_tautology(&terms, &[opaque_reflexivity]),
+            "{head}"
+        );
+    }
+}
+
+#[test]
+fn arithmetic_custody_refuses_declared_bv2nat_ranges_and_false_constant_denominators() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::bitvec(8));
+    let conversion = terms.mk_app_structural(Symbol::named("bv2nat"), [x], Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let bound = terms.mk_app_structural(Symbol::named("<="), [zero, conversion], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[bound]));
+    terms.register_declared_function("bv2nat");
+    assert!(!recognize_arith_clause_tautology(&terms, &[bound]));
+
+    let mut terms = TermStore::new();
+    let one = terms.mk_rational(BigRational::from_integer(1.into()));
+    let two = terms.mk_rational(BigRational::from_integer(2.into()));
+    let denominator = terms.mk_app_structural(Symbol::named("+"), [one, one], Sort::Real);
+    let quotient = terms.mk_app_structural(Symbol::named("/"), [two, denominator], Sort::Real);
+    let identity = terms.mk_app_structural(Symbol::named("="), [quotient, one], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[identity]));
+    terms.register_declared_function("+");
+    assert!(!recognize_arith_clause_tautology(&terms, &[identity]));
+}
+
 fn refuse_exact_charge(
     terms: &TermStore,
     clause: &[TermId],

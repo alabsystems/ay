@@ -12,13 +12,11 @@ pub(super) struct IndexBits(Vec<u64>);
 impl IndexBits {
     pub(super) fn empty(n: usize) -> Self {
         // One zeroed word per 64 indices. The reservation is a capacity hint
-        // only: if it fails, the pushes grow the vector as they go.
+        // only: if it fails, resize allocates the words as the old pushes did.
         let words = n.div_ceil(64);
         let mut bits = Vec::new();
         let _ = bits.try_reserve_exact(words);
-        for _ in 0..words {
-            bits.push(0);
-        }
+        bits.resize_with(words, u64::default);
         Self(bits)
     }
     pub(super) fn set(&mut self, pos: usize) {

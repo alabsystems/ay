@@ -6,6 +6,7 @@
 
 use num_rational::{BigRational, Rational64};
 use num_traits::{One, Zero};
+use std::mem::size_of;
 
 use super::{FarkasValidationError, ProgressMeter};
 use crate::{Constant, Sort, Symbol, TermData, TermId, TermStore};

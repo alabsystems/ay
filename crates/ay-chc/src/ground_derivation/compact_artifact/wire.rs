@@ -56,7 +56,7 @@ pub(super) struct Binding {
 }
 
 impl Envelope {
-    pub(super) fn check_header(&self, owner: &mut Owner) -> Result<()> {
+    pub(super) fn check_header(&self, owner: &mut Owner<'_>) -> Result<()> {
         owner.poll().map_err(native_error)?;
         if self.schema != CHC_COMPACT_GROUND_DERIVATION_SCHEMA || self.schema_version != 1 {
             return Err(error(
@@ -98,7 +98,7 @@ impl Envelope {
     pub(super) fn from_derivation(
         derivation: &CompactDerivation,
         identity: (&'static str, String, String),
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
     ) -> Result<Self> {
         let Some(storage) = derivation
             .arena
@@ -154,7 +154,7 @@ impl Envelope {
     }
 }
 
-fn counts(steps: &[Step], owner: &mut Owner) -> Result<(usize, usize)> {
+fn counts(steps: &[Step], owner: &mut Owner<'_>) -> Result<(usize, usize)> {
     let (mut bindings, mut edges) = (0usize, 0usize);
     for step in steps {
         admit(owner, 1, 0)?;
@@ -170,7 +170,7 @@ fn counts(steps: &[Step], owner: &mut Owner) -> Result<(usize, usize)> {
     Ok((bindings, edges))
 }
 
-fn encode_node(node: &ValueNode, owner: &mut Owner) -> Result<Node> {
+fn encode_node(node: &ValueNode, owner: &mut Owner<'_>) -> Result<Node> {
     Ok(match node {
         ValueNode::Bool(value) => {
             admit(owner, 1, 128)?;
@@ -213,7 +213,7 @@ fn encode_node(node: &ValueNode, owner: &mut Owner) -> Result<Node> {
     })
 }
 
-fn encode_step(step: &compact::CompactStep, owner: &mut Owner) -> Result<Step> {
+fn encode_step(step: &compact::CompactStep, owner: &mut Owner<'_>) -> Result<Step> {
     let Some(storage) = step.env.len().checked_mul(512).and_then(|n| {
         step.premises
             .len()

@@ -65,8 +65,7 @@ impl Model {
         let store = exec.ctx.terms.snapshot_stamp();
         let scope = evaluation_copies::EvaluationCopyScope::enter(exec).ok()?;
         let admission = scope.read_admission(exec);
-        let metadata =
-            std::mem::size_of::<Payload>().checked_add(2 * std::mem::size_of::<usize>())?;
+        let metadata = size_of::<Payload>().checked_add(2 * size_of::<usize>())?;
         if !progress(0, 0) {
             return None;
         }
@@ -84,7 +83,7 @@ impl Model {
             copied.push((term, value));
         }
         // Fixed-width keys/values: unstable sort needs no auxiliary buffer.
-        let levels = (usize::BITS - copied.len().leading_zeros()) as usize + 1;
+        let levels = copied.len().bit_width() as usize + 1;
         if !progress(copied.len().checked_mul(levels)?, 0) || admission.check().is_err() {
             return None;
         }
@@ -207,7 +206,11 @@ impl Model {
                 .unwrap_or(UnknownOrigin::IncompleteSolverLane));
         }
         exec.poll_evaluation_stop()?;
-        let work = (usize::BITS - payload.rows.len().leading_zeros()) as u64 + 1;
+        let work = payload.rows.len().bit_width() as u64 + 1;
+        #[expect(
+            clippy::collection_is_never_read,
+            reason = "owning the fallback evaluation scope keeps the current read admission live through the final source check and scalar lookup"
+        )]
         let _fallback_scope;
         if let Some(guard) = ay_core::resource::current_guard() {
             _fallback_scope = None;
@@ -356,7 +359,7 @@ mod tests {
             let y = exec
                 .ctx
                 .terms
-                .mk_var(&format!("y{i}"), Sort::FiniteField(field));
+                .mk_var(format!("y{i}"), Sort::FiniteField(field));
             let value = i % 7;
             rows.push((y, FieldScalar::Field { value, field }));
             term = exec

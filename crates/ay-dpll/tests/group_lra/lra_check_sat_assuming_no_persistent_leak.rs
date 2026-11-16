@@ -16,7 +16,7 @@
 //! `ctx.assertions` afterwards did not retract the unit, so the assumption
 //! stayed a hard constraint until the enclosing scope was popped, and at
 //! depth 0 for the rest of the session. The scoped sub-solve now runs on
-//! fresh incremental state (`solve_without_persistent_encoding`).
+//! an isolated incremental-state window (`solve_scoped_window`).
 //!
 //! Each test pins z3's exact verdicts in both the proof-shedding posture
 //! (`--competition` / `--z3-mode`, where the wrong `unsat` shipped) and the

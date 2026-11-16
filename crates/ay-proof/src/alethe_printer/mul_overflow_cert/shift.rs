@@ -18,13 +18,13 @@ pub(crate) struct ShiftLemma {
     fact: S,
 }
 
-fn vars(p: &mut Proof, prefix: &str, w: u32) -> Vec<T> {
+fn vars(p: &mut Proof<'_>, prefix: &str, w: u32) -> Vec<T> {
     (0..w)
         .map(|i| p.t.var(&format!("{prefix}{i}"), Sort::Bool))
         .collect()
 }
 
-fn shifted(p: &Proof, bits: &[T], k: u32) -> Vec<T> {
+fn shifted(p: &Proof<'_>, bits: &[T], k: u32) -> Vec<T> {
     let mut out = vec![p.t.ff; k as usize];
     out.extend(&bits[..bits.len() - k as usize]);
     out
@@ -32,7 +32,7 @@ fn shifted(p: &Proof, bits: &[T], k: u32) -> Vec<T> {
 
 impl ShiftLemma {
     /// `(forall w (= (bvadd W W) (W << 1)))`.
-    pub(crate) fn doubling(p: &mut Proof, w: u32, prefix: &str) -> Option<Self> {
+    pub(crate) fn doubling(p: &mut Proof<'_>, w: u32, prefix: &str) -> Option<Self> {
         let v = vars(p, prefix, w);
         let ww = p.t.bb(&v);
         let sh = shifted(p, &v, 1);
@@ -47,7 +47,7 @@ impl ShiftLemma {
 
     /// `(forall w (= (bvmul 2^(k*steps) W) (W << k*steps)))` from a proved `base` shift by `k`.
     pub(crate) fn power(
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         base: &ShiftLemma,
         steps: u32,
         prefix: &str,
@@ -65,12 +65,12 @@ impl ShiftLemma {
     }
 
     /// One instance: `(cl (= (bvmul 2^k bb(bits)) bb(bits << k)))` (or the doubling `bvadd` form).
-    pub(crate) fn inst(&self, p: &mut Proof, b: &[T]) -> Option<S> {
+    pub(crate) fn inst(&self, p: &mut Proof<'_>, b: &[T]) -> Option<S> {
         instantiate(p, self.fact, b)
     }
 
     /// `(= (bvmul 2^(k*steps) bb(b)) bb(b << k*steps))` by `steps` chained instances.
-    pub(crate) fn chain(&self, p: &mut Proof, b: &[T], steps: u32) -> Option<S> {
+    pub(crate) fn chain(&self, p: &mut Proof<'_>, b: &[T], steps: u32) -> Option<S> {
         let w = self.w;
         let wb = p.t.bb(b);
         let mut cur = b.to_vec();
@@ -91,9 +91,13 @@ impl ShiftLemma {
         prev
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the bit-shift recurrence terms and proof premises are positional by construction"
+    )]
     fn doubling_step(
         &self,
-        p: &mut Proof,
+        p: &mut Proof<'_>,
         wb: T,
         wj: T,
         wn: T,
@@ -126,7 +130,20 @@ impl ShiftLemma {
         }
     }
 
-    fn power_step(&self, p: &mut Proof, wb: T, wj: T, wn: T, j: u32, prev: Option<S>, d: S) -> S {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the bit-shift recurrence terms and proof premises are positional by construction"
+    )]
+    fn power_step(
+        &self,
+        p: &mut Proof<'_>,
+        wb: T,
+        wj: T,
+        wn: T,
+        j: u32,
+        prev: Option<S>,
+        d: S,
+    ) -> S {
         let (w, s) = (self.w, self.k);
         let _ = wn;
         match prev {
@@ -148,7 +165,7 @@ impl ShiftLemma {
 }
 
 /// A shift by `2*k` as two chained instances of a shift by `k`.
-pub(crate) fn double_shift(p: &mut Proof, sh: &ShiftLemma, b: &[T]) -> Option<S> {
+pub(crate) fn double_shift(p: &mut Proof<'_>, sh: &ShiftLemma, b: &[T]) -> Option<S> {
     let (k, w) = (sh.k, sh.w);
     let s1 = sh.inst(p, b)?;
     let wb = p.t.bb(b);

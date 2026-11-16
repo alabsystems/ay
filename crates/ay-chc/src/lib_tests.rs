@@ -416,7 +416,7 @@ fn test_deep_expr_traversals_do_not_overflow() {
     // Exercise multiple traversals that historically used direct recursion.
     assert_eq!(expr.simplify_constants(), ChcExpr::Bool(true));
     assert_eq!(expr.normalize_negations(), ChcExpr::Bool(true));
-    assert!(expr.vars().is_empty());
+    assert_eq!(expr.vars(), [] as [ChcVar; 0]);
     assert_eq!(expr.substitute(&[]), expr);
 
     let eliminated = expr.eliminate_mod().eliminate_ite();
@@ -683,8 +683,8 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
         artifacts.replay_transcript().role(),
         CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE
     );
-    assert!(!artifacts.model().sha256().is_empty());
-    assert!(!artifacts.replay_transcript().sha256().is_empty());
+    assert_ne!(artifacts.model().sha256(), "");
+    assert_ne!(artifacts.replay_transcript().sha256(), "");
 
     let model_json: serde_json::Value =
         serde_json::from_slice(artifacts.model().bytes()).expect("model artifact JSON envelope");

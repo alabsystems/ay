@@ -27,10 +27,13 @@ impl std::fmt::Display for DisplaySorts<'_> {
 /// Negative local tactic limit, not a new budget or a model/proof permit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TacticLimitKind {
+    /// The local tactic deadline was exhausted.
     #[error("local tactic deadline exceeded")]
     Deadline,
+    /// The local tactic work allowance was exhausted.
     #[error("local tactic rewrite work exceeded")]
     Work,
+    /// The local tactic memory allowance was exhausted.
     #[error("local tactic memory checkpoint exceeded")]
     Memory,
 }

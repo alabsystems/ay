@@ -16,7 +16,7 @@ fn test_as_datatype_some_nullary() {
     };
     let (ctor, args) = v.as_datatype().unwrap();
     assert_eq!(ctor, "Nil");
-    assert!(args.is_empty());
+    assert_eq!(args, []);
 }
 
 #[test]

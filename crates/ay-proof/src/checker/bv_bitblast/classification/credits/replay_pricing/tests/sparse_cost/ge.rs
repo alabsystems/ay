@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn app(terms: &mut TermStore, head: &str, args: &[ay_core::TermId], sort: Sort) -> ay_core::TermId {
+fn app(terms: &mut TermStore, head: &str, args: &[TermId], sort: Sort) -> TermId {
     terms.mk_app(Symbol::named(head), args, sort)
 }
 
@@ -41,12 +41,13 @@ fn ge_ordinary_original_route_is_authenticated_without_search_or_native_credit_l
     let expression = price.expression_work().unwrap();
     assert!(price.work > expression);
     let mut credits = refined.prepay(end(), &mut |_, _| true).unwrap();
-    let allowance = credits
-        .take(ProofId(0), &mut |_, _| true)
-        .unwrap()
-        .into_allowance();
-    assert_eq!(allowance.work_limit(), expression as u64);
-    drop(allowance);
+    {
+        let allowance = credits
+            .take(ProofId(0), &mut |_, _| true)
+            .unwrap()
+            .into_allowance();
+        assert_eq!(allowance.work_limit(), expression as u64);
+    }
     credits.finish().unwrap();
     assert_eq!(terms.entries_snapshot(), snapshot);
     assert_eq!(producer_test_counter::count(), before);
@@ -81,7 +82,7 @@ fn ge_original_route_stops_deadlines_and_malformed_wire_keep_legacy_strict_bound
         .unwrap();
     assert_eq!(invalid_step_and_reason(old), invalid_step_and_reason(new));
     let mut wire = transport_wire_limits(end());
-    wire.deadline = Instant::now() - Duration::from_secs(1);
+    wire.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
     let mut calls = 0;
     assert!(plan(&terms, &proof)
         .refine_replay(&payloads, end(), Some(wire), &mut |_, _| {
@@ -230,7 +231,7 @@ fn wrapping_disjoint_candidate_cannot_capture_or_publish_without_prerequisite() 
         .unwrap()
         .ordinary_clause()
         .unwrap();
-    let shape = crate::checker::bv_bitblast::disjoint::Shape::recognize(&terms, clause).unwrap();
+    let shape = disjoint::Shape::recognize(&terms, clause).unwrap();
     assert_eq!(shape.width, 9);
     assert!(shape.spans.iter().all(|span| span.length == 1));
     let before = original_plan.aggregate_charge();

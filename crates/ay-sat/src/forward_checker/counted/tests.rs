@@ -23,7 +23,7 @@ fn measured_bootstrap_has_exact_work_and_storage_controls() {
         drop(ForwardChecker::try_new_counted(num_vars, 0, &baseline).unwrap());
         let used = baseline.usage().unwrap();
         assert!(used.work_admitted > 0);
-        assert!(used.storage_admitted >= 1024 * std::mem::size_of::<Vec<usize>>());
+        assert!(used.storage_admitted >= 1024 * size_of::<Vec<usize>>());
         let exact = owner(used.work_admitted, used.storage_admitted);
         drop(ForwardChecker::try_new_counted(num_vars, 0, &exact).unwrap());
         assert_eq!(exact.usage().unwrap().work_remaining, 0);

@@ -168,7 +168,7 @@ impl<'a> BackwardProofMeter<'a> {
             },
         )?;
         if actual > self.limits.max_bytes {
-            *vec = Vec::new();
+            drop(std::mem::take(vec));
             return Err(BackwardProofFailure::Limit {
                 resource: BackwardProofResource::Bytes,
                 limit: self.limits.max_bytes,
@@ -256,7 +256,7 @@ impl<'a> BackwardProofMeter<'a> {
                 },
             )?;
             if actual > self.limits.max_bytes {
-                *seen = HashSet::new();
+                drop(std::mem::take(seen));
                 return Err(BackwardProofFailure::Limit {
                     resource: BackwardProofResource::Bytes,
                     limit: self.limits.max_bytes,

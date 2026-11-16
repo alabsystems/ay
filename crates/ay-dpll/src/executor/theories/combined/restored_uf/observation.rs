@@ -111,7 +111,7 @@ impl Probe {
         // tags. Formatting is after BOTH the existing flag and shared cap.
         ay_core::safe_eprintln!(
             "[ay-uf-recovery] seq={} executor={:p} epoch=0x{:x} phase={} check={} term={:?} peer={:?} nodes={:?} apps={:?} completed_bool_outputs={:?} capture_complete={} closure_complete={} changed={:?} committed={} outcome={} stop={:?}",
-            ticket, exec as *const Executor, epoch, record.phase, record.check,
+            ticket, std::ptr::from_ref(exec), epoch, record.phase, record.check,
             record.term, record.peer, record.nodes, record.apps, record.completed_outputs, record.captured,
             record.closed, record.changed, record.committed, outcome, stop,
         );

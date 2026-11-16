@@ -630,9 +630,6 @@ impl PdrSolver {
         }
 
         // If zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        true // Preserved in all self-loops
+        checked_any_self_loop // Preserved in all self-loops
     }
 }

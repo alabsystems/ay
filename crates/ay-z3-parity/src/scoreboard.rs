@@ -2504,7 +2504,7 @@ mod tests {
         let mut stats = DivStats::default();
         stats.add(&record);
         assert_eq!(stats.both_decided, 1);
-        assert!(stats.ratios.is_empty());
+        assert_eq!(stats.ratios.as_slice(), &[] as &[f64]);
         let mut divisions = BTreeMap::new();
         divisions.insert("D".to_string(), stats.clone());
         let cert = certificate_of(&[record], &divisions, &stats);

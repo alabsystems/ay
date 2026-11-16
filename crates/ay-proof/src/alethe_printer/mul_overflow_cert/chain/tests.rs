@@ -78,7 +78,7 @@ fn exact_membership_preserves_every_small_chosen_clause_combination() {
     }
 }
 
-fn premise_fixture(p: &mut Proof, k: usize, reach: &HashSet<Vec<bool>>) -> (Vec<T>, Vec<Prem>) {
+fn premise_fixture(p: &mut Proof<'_>, k: usize, reach: &HashSet<Vec<bool>>) -> (Vec<T>, Vec<Prem>) {
     let atoms: Vec<_> = (0..k)
         .map(|j| p.t.var(&format!("s{j}"), Sort::Bool))
         .collect();

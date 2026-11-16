@@ -120,7 +120,10 @@ fn parse(terms: &TermStore, atom: TermId, value: bool) -> Option<Lit> {
                 continue;
             }
             let d = int_numeral(terms, margs[1])?.abs();
-            if d.is_zero() || k.is_negative() || k >= d {
+            if d.is_zero() {
+                return None;
+            }
+            if k.is_negative() || k >= d {
                 return None;
             }
             let mut e = lin_of(terms, margs[0])?;
@@ -467,3 +470,7 @@ pub(crate) fn canonical_atoms(
     memo.insert(t, r);
     r
 }
+
+#[cfg(test)]
+#[path = "mbp_tests.rs"]
+mod tests;

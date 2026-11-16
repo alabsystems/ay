@@ -127,8 +127,8 @@ pub(super) struct GroundSearch {
     /// Recognizer calls left for proposing `Evaluated` edges and `Closed`
     /// facts; the recognizer is the only non-linear work a round can buy.
     pub(super) probes: usize,
-    pub(super) read_chains: super::read_chain::ReadChainState,
-    pub(super) packings: super::packing::PackingState,
+    pub(super) read_chains: read_chain::ReadChainState,
+    pub(super) packings: packing::PackingState,
 }
 
 impl Default for GroundSearch {
@@ -137,8 +137,8 @@ impl Default for GroundSearch {
             closure: GroundClosure::default(),
             facts: FactBase::default(),
             probes: MAX_RECOGNIZER_PROBES,
-            read_chains: super::read_chain::ReadChainState::default(),
-            packings: super::packing::PackingState::default(),
+            read_chains: read_chain::ReadChainState::default(),
+            packings: packing::PackingState::default(),
         }
     }
 }

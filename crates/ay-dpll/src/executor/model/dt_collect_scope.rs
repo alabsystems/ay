@@ -80,7 +80,7 @@ impl Executor {
                 .len()
                 .checked_add(extra_roots.len())
                 .and_then(|n| n.checked_add(self.lane_model_pin_roots.len()));
-            let bytes = amount.and_then(|n| n.checked_mul(std::mem::size_of::<TermId>()));
+            let bytes = amount.and_then(|n| n.checked_mul(size_of::<TermId>()));
             if !amount
                 .zip(bytes)
                 .is_some_and(|(work, bytes)| super::recovery_admission::pay_for(self, work, bytes))

@@ -58,6 +58,7 @@ use ay_lra::GomoryCut;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 
+use crate::check_loop::ValueMemo;
 use crate::monomial::Monomial;
 use crate::NraSolver;
 
@@ -336,6 +337,12 @@ impl NraSolver<'_> {
         let mut sorted_mons: Vec<_> = self.products().collect();
         sorted_mons.sort_unstable_by(|a, b| (&a.vars, a.aux_var.0).cmp(&(&b.vars, b.aux_var.0)));
 
+        // The scan below is read-only over one unchanged LRA model (cuts
+        // are added only after it), so resolve values through a per-pass
+        // memo: identical values, one shared materialisation delta, and
+        // repeated factors answered from the memo instead of recomputing
+        // the O(#vars) delta per epsilon-carrying leaf.
+        let memo = std::cell::RefCell::new(ValueMemo::default());
         for mon in sorted_mons {
             // Collect factor values for all monomials
             let mut factor_values = Vec::with_capacity(mon.vars.len());
@@ -351,7 +358,7 @@ impl NraSolver<'_> {
                 // factor without a tableau column is skipped here: this path
                 // may only refine monomials it can express, and the published
                 // model's correctness is the executor strict oracle's job.
-                if let Some(val) = self.var_value(var) {
+                if let Some(val) = self.memo_var_value(var, &memo) {
                     factor_values.push(val);
                 } else {
                     all_known = false;
@@ -362,7 +369,7 @@ impl NraSolver<'_> {
                 continue;
             }
 
-            let Some(v) = self.var_value(mon.aux_var) else {
+            let Some(v) = self.memo_var_value(mon.aux_var, &memo) else {
                 continue;
             };
 

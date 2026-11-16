@@ -160,7 +160,7 @@ fn check_read(case: &Prefix<'_>, key: u64, expected: ModelValue) {
         .unwrap();
     case.model.owner.left.set(work);
     case.model.owner.charge(0).unwrap();
-    assert!(crate::value_eq(&actual, &expected).unwrap());
+    assert!(value_eq(&actual, &expected).unwrap());
 }
 
 fn confirms(case: &Prefix<'_>) -> bool {
@@ -373,7 +373,9 @@ fn original_raw_callback_and_absolute_end_refusals_survive_reset() {
         // Independent negative fixture owners share one live absolute end.
         // The deadline-negative fixture is deliberately already expired.
         owner.end = if cause == 2 {
-            original_start - Duration::from_secs(1)
+            original_start
+                .checked_sub(Duration::from_secs(1))
+                .expect("a current instant has an earlier representable second")
         } else {
             common_end
         };

@@ -589,10 +589,13 @@ mod tests {
         let permit = detached_test_permit(&executor, &[]).expect("plain hard query is eligible");
 
         assert_eq!(permit.roots(), executor.ctx.assertions);
-        assert!(permit.inventory().assumptions.is_empty());
-        assert!(permit.inventory().objectives.is_empty());
-        assert!(permit.inventory().parsed_softs.is_empty());
-        assert!(permit.inventory().native_softs.is_empty());
+        assert_eq!(permit.inventory().assumptions, [] as [TermId; 0]);
+        assert_eq!(permit.inventory().objectives, [] as [Objective; 0]);
+        assert_eq!(permit.inventory().parsed_softs, [] as [SoftAssertion; 0]);
+        assert_eq!(
+            permit.inventory().native_softs,
+            [] as [NativeSoftQueryBinding; 0]
+        );
         assert!(permit.is_current(&executor));
 
         executor.ctx.assertions.swap(0, 1);

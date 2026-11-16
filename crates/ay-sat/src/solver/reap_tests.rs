@@ -15,7 +15,7 @@ fn test_reap_push_pop_ordered() {
     assert_eq!(r.pop(), 3);
     assert_eq!(r.pop(), 5);
     assert_eq!(r.pop(), 7);
-    assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn test_reap_duplicates() {
     assert_eq!(r.pop(), 4);
     assert_eq!(r.pop(), 4);
     assert_eq!(r.pop(), 4);
-    assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn test_reap_single_element() {
     let mut r = Reap::new();
     r.push(42);
     assert_eq!(r.pop(), 42);
-    assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn test_reap_clear() {
     r.push(1);
     r.push(2);
     r.clear();
-    assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
     r.push(10);
     assert_eq!(r.pop(), 10);
 }

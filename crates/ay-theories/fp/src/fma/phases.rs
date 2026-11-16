@@ -171,7 +171,7 @@ impl FpSolver<'_> {
             let sig_lz = self.bv_leading_zeros(&sig_abs, ew);
             let two_exp = self.const_bv(2, ew);
             let sig_lz_adj = self.bv_sub(&sig_lz, &two_exp);
-            let bias = u64::from(precision.bias());
+            let bias = precision.bias();
             let e_min_val = 1i64 - bias as i64;
             let e_min_bv = self.const_bv_signed(e_min_val, ew);
             let max_exp_delta_renorm = self.bv_sub(&res_exp_pre, &e_min_bv);

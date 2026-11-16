@@ -19,7 +19,7 @@ fn actual_standard_bcp_matches_clause_order_lbd_backtrack_activity_and_trace() {
                 assert!(result.chain.len() >= 3);
                 assert!(result.chain.iter().all(|id| *id > 0));
             } else {
-                assert!(result.chain.is_empty());
+                assert_eq!(result.chain.len(), 0);
             }
             let (mut s, conflict, _) = fixture(length, reasons);
             let trace = format!("{:?}", s.clause_trace());
@@ -86,7 +86,7 @@ fn complete_learned_clause_is_entailed_by_nonempty_original_model_sets() {
                 }
             }
             assert!(models > 0, "SAT antecedents: no vacuous UNSAT entailment");
-            assert!(!learned.clause.is_empty());
+            assert_ne!(learned.clause.len(), 0);
         }
     }
 }
@@ -98,13 +98,13 @@ fn real_binary_and_arena_reason_routes_are_nonvacuous() {
         let count = s
             .trail
             .iter()
-            .filter(
-                |lit| match (reasons, s.var_reason_kind(lit.variable().index())) {
-                    (Reasons::Binary, ReasonKind::BinaryLiteral(_)) => true,
-                    (Reasons::Long, ReasonKind::Clause(_)) => true,
-                    _ => false,
-                },
-            )
+            .filter(|lit| {
+                matches!(
+                    (reasons, s.var_reason_kind(lit.variable().index())),
+                    (Reasons::Binary, ReasonKind::BinaryLiteral(_))
+                        | (Reasons::Long, ReasonKind::Clause(_))
+                )
+            })
             .count();
         assert!(count >= 4);
         attach(&mut s, &test_owner(100_000_000, 100_000_000));

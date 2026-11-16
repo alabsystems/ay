@@ -11,7 +11,7 @@
 //! Extracted from lib.rs as part of #5970 code-health splits.
 
 use ay_core::term::{Constant, TermData, TermId};
-use ay_core::{TheoryLit, TheoryResult, TheorySolver};
+use ay_core::{TheoryResult, TheorySolver};
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 
@@ -353,42 +353,6 @@ impl NraSolver<'_> {
         added
     }
 
-    /// Exact value of a monomial FACTOR under the current linear model.
-    ///
-    /// A factor is NOT always a simplex-rowed term. `lra.get_value` answers only
-    /// for terms the tableau actually carries — the declared variables and the
-    /// opaque aux terms that stand for whole nonlinear products. MetiTarski-style
-    /// Taylor polynomials are emitted in HORNER form, so every product nests a
-    /// compound `+` term as its last factor:
-    ///
-    /// ```text
-    /// (* skoX skoX (+ (* skoX skoX (+ (* skoX skoX 1/720) -1/24)) 1/2))
-    /// ```
-    ///
-    /// That inner `(+ ...)` is a linear combination, not a tableau column, so
-    /// `lra.get_value` returns `None` for it — and the caller used to read that
-    /// `None` as "consistent" (see [`Self::check_monomial_consistency`]).
-    ///
-    /// Resolution order matters and is deliberate:
-    ///
-    /// 1. `lra.get_value` FIRST, so a nested product aux term contributes the
-    ///    OPAQUE value the linear abstraction assigned it. That keeps the check
-    ///    local — each monomial is verified against its immediate factors, and
-    ///    global consistency follows by induction over the monomial set. It is
-    ///    also what makes the check able to FAIL: recomputing a nested product
-    ///    structurally would make every monomial trivially agree with itself.
-    /// 2. Structural evaluation only for terms the tableau does not carry:
-    ///    constants and `+`/`-`/`*`/`/` nodes over factors that resolve.
-    ///
-    /// Returns `None` when the value genuinely cannot be determined. See
-    /// [`Self::check_monomial_consistency`] for what the caller does with that.
-    ///
-    /// Call through [`Self::monomial_factor_value`] rather than passing a depth
-    /// by hand.
-    fn factor_value(&self, term: TermId, depth: u32) -> Option<BigRational> {
-        self.factor_value_memo(term, depth, None)
-    }
-
     /// Tableau value of `term` through a per-pass memo: repeated queries
     /// answer from the memo (including a recorded `None`), and the first
     /// ε-carrying query fills the shared materialisation δ that every
@@ -409,18 +373,29 @@ impl NraSolver<'_> {
         value
     }
 
-    /// [`Self::factor_value`] resolving tableau leaves through `memo`
-    /// when one is supplied; identical results either way.
-    fn factor_value_memo(
+    /// Exact value of a monomial factor under the current linear model.
+    ///
+    /// A factor is not always a simplex-rowed term. The tableau carries
+    /// declared variables and opaque auxiliary terms for whole nonlinear
+    /// products, but not compound Horner-form arithmetic such as an inner
+    /// linear combination.
+    ///
+    /// Resolution order matters: [`Self::memo_var_value`] is queried first so
+    /// a nonlinear auxiliary contributes the opaque value assigned by the
+    /// linear abstraction. Structural evaluation is used only for constants
+    /// and `+`/`-`/`*`/`/` terms absent from the tableau. Recomputing opaque
+    /// products structurally would make every monomial agree with itself and
+    /// destroy the consistency check.
+    ///
+    /// Returns `None` when the value cannot be determined within `depth`, or
+    /// when structural division would divide by zero.
+    fn factor_value(
         &self,
         term: TermId,
         depth: u32,
-        memo: Option<&std::cell::RefCell<ValueMemo>>,
+        memo: &std::cell::RefCell<ValueMemo>,
     ) -> Option<BigRational> {
-        let direct = match memo {
-            Some(memo) => self.memo_var_value(term, memo),
-            None => self.lra.get_value(term),
-        };
+        let direct = self.memo_var_value(term, memo);
         if let Some(v) = direct {
             return Some(v);
         }
@@ -437,30 +412,28 @@ impl NraSolver<'_> {
                 "+" if !args.is_empty() => {
                     let mut acc = BigRational::zero();
                     for &a in args {
-                        acc += self.factor_value_memo(a, depth - 1, memo)?;
+                        acc += self.factor_value(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
                 "*" if !args.is_empty() => {
                     let mut acc = BigRational::one();
                     for &a in args {
-                        acc *= self.factor_value_memo(a, depth - 1, memo)?;
+                        acc *= self.factor_value(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
-                "-" if args.len() == 1 => {
-                    Some(-self.factor_value_memo(args[0], depth - 1, memo)?)
-                }
+                "-" if args.len() == 1 => Some(-self.factor_value(args[0], depth - 1, memo)?),
                 "-" if args.len() >= 2 => {
-                    let mut acc = self.factor_value_memo(args[0], depth - 1, memo)?;
+                    let mut acc = self.factor_value(args[0], depth - 1, memo)?;
                     for &a in &args[1..] {
-                        acc -= self.factor_value_memo(a, depth - 1, memo)?;
+                        acc -= self.factor_value(a, depth - 1, memo)?;
                     }
                     Some(acc)
                 }
                 "/" if args.len() == 2 => {
-                    let num = self.factor_value_memo(args[0], depth - 1, memo)?;
-                    let den = self.factor_value_memo(args[1], depth - 1, memo)?;
+                    let num = self.factor_value(args[0], depth - 1, memo)?;
+                    let den = self.factor_value(args[1], depth - 1, memo)?;
                     // Division by zero is left to the dedicated zero-divisor
                     // machinery (`zero_divisor_model_is_unsound`); do not
                     // invent a quotient here.
@@ -476,28 +449,17 @@ impl NraSolver<'_> {
         }
     }
 
-    /// Value of a monomial factor at the standard evaluation depth. Single
-    /// entry point so every consumer of a monomial (consistency check, model
-    /// patcher, tangent refinement) resolves factors identically — they used to
-    /// disagree only by each having its own copy of the same blind spot.
-    pub(crate) fn monomial_factor_value(&self, term: TermId) -> Option<BigRational> {
-        // Depth guard: term graphs are DAGs and can nest arbitrarily. Horner
-        // chains in this corpus reach ~12; 64 leaves headroom while keeping a
-        // hostile input from exhausting the stack.
-        const FACTOR_EVAL_MAX_DEPTH: u32 = 64;
-        self.factor_value(term, FACTOR_EVAL_MAX_DEPTH)
-    }
-
-    /// Depth bound shared by the memoised and live factor resolvers.
+    /// Depth bound for recursive factor resolution.
     pub(crate) const FACTOR_EVAL_MAX_DEPTH: u32 = 64;
 
-    /// [`Self::monomial_factor_value`] resolving leaves through `memo`.
-    pub(crate) fn monomial_factor_value_memo(
+    /// Value of a monomial factor at the standard evaluation depth, resolving
+    /// tableau leaves through the per-pass `memo`.
+    pub(crate) fn monomial_factor_value(
         &self,
         term: TermId,
         memo: &std::cell::RefCell<ValueMemo>,
     ) -> Option<BigRational> {
-        self.factor_value_memo(term, Self::FACTOR_EVAL_MAX_DEPTH, Some(memo))
+        self.factor_value(term, Self::FACTOR_EVAL_MAX_DEPTH, memo)
     }
 
     /// [`Self::term_value`] resolving the tableau query through `memo`.
@@ -625,7 +587,7 @@ impl NraSolver<'_> {
     /// only `self.asserted`, so it works uniformly for every UNSAT surface
     /// (interval exhaustion, ICP branch-and-prune, linear substitution, the
     /// univariate decider). The returned certificate is guaranteed to pass the
-    /// independent checker ([`crate::sos::SosCertificate::verify`]).
+    /// independent checker ([`crate::sos::SosCertificate::verify_with_progress`]).
     fn try_build_unsat_sos_certificate(&self) -> Option<crate::sos::SosCertificate> {
         let constraints = self.sos_source_constraints()?;
         if constraints.is_empty() {

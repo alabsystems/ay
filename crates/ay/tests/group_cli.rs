@@ -225,8 +225,6 @@ mod solution_visualization_8702;
 
 #[path = "group_cli/memout_status_lock.rs"]
 mod memout_status_lock;
-#[path = "common/random_3sat.rs"]
-mod random_3sat;
 #[path = "group_cli/sat_primary_path_8884.rs"]
 mod sat_primary_path_8884;
 #[path = "group_cli/seal_latency_fast_publication.rs"]
@@ -328,3 +326,6 @@ mod z3_audit_public_snapshot;
 
 #[path = "group_cli/exact_division_admission.rs"]
 mod exact_division_admission;
+
+#[path = "group_cli/empty_datatype_identity.rs"]
+mod empty_datatype_identity;

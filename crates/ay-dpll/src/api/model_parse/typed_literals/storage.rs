@@ -43,14 +43,14 @@ pub(super) fn allowance(text: &str) -> Option<(usize, usize)> {
     }
     // Multiple geometrically grown AST/parse/drop vectors, per-node slack,
     // decoded spelling copies, and the parser's error-only line-offset table.
-    let node_bytes = std::mem::size_of::<SExpr>()
+    let node_bytes = size_of::<SExpr>()
         .checked_mul(4)?
-        .checked_add(std::mem::size_of::<Vec<SExpr>>().checked_mul(4)?)?
+        .checked_add(size_of::<Vec<SExpr>>().checked_mul(4)?)?
         .checked_add(64)?;
     let copy = nodes
         .checked_mul(node_bytes)?
         .checked_add(text.len().checked_mul(2)?)?
-        .checked_add(lines.checked_mul(std::mem::size_of::<usize>().checked_mul(2)?)?)?;
+        .checked_add(lines.checked_mul(size_of::<usize>().checked_mul(2)?)?)?;
     let work = text.len().checked_mul(3)?.checked_add(nodes)?;
     Some((work, copy))
 }

@@ -30,7 +30,7 @@ fn test_parse_empty_clause() {
     let input = b"p cnf 2 3\n1 0\n-1 0\n0\n";
     let cnf = parse_cnf(&input[..]).unwrap();
     assert_eq!(cnf.clauses.len(), 3);
-    assert!(cnf.clauses[2].is_empty());
+    assert_eq!(cnf.clauses[2].as_slice(), &[]);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_parse_with_ids_empty_clause() {
     assert_eq!(cnf.clauses.len(), 3);
     assert_eq!(cnf.clauses[0].0, 1);
     assert_eq!(cnf.clauses[1].0, 2);
-    assert!(cnf.clauses[1].1.is_empty()); // empty clause
+    assert_eq!(cnf.clauses[1].1.as_slice(), &[]); // empty clause
     assert_eq!(cnf.clauses[2].0, 3);
 }
 

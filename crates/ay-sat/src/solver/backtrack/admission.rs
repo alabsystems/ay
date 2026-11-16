@@ -126,10 +126,8 @@ impl Solver {
             }
         };
         // Planning buffers have been dropped before the publication fence.
-        owner
-            .check()
-            .map_err(crate::solver::counted_admission::reason)?;
-        result.map_err(crate::solver::counted_admission::reason)
+        owner.check().map_err(counted_admission::reason)?;
+        result.map_err(counted_admission::reason)
     }
 }
 

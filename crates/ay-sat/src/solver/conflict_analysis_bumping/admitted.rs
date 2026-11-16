@@ -66,7 +66,7 @@ impl Solver {
             self.add_reason_literals_admitted(lit.negated(), depth, &mut added, limit, p)?;
         }
         if added >= limit {
-            p.counter(self.cold.bumpreason_delay_interval[mode] as u64, 1)?;
+            p.counter(self.cold.bumpreason_delay_interval[mode], 1)?;
             p.work(self.conflict.analyzed_vars().len() - saved)?;
             self.conflict.rollback_analyzed(saved, &mut self.var_data);
             self.cold.bumpreason_delay_interval[mode] += 1;

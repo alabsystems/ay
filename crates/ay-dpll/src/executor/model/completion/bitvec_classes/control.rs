@@ -133,7 +133,7 @@ impl CandidateOwner {
 
     pub(in crate::executor) fn sort(&mut self, count: usize) -> Result<(), UnknownOrigin> {
         let work = count
-            .checked_mul((usize::BITS - count.leading_zeros()) as usize + 1)
+            .checked_mul(count.bit_width() as usize + 1)
             .ok_or_else(|| self.refuse(UnknownOrigin::DeterministicResourceBudget))?;
         self.pay(work, 0)
     }

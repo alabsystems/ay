@@ -16,7 +16,7 @@ pub(super) fn wide(choices: &[&str]) -> Executor {
     assert!(found_query);
     for choice in choices {
         let command = ay_frontend::parse(&format!("(assert {choice})")).unwrap();
-        assert!(executor.execute_all(&command).unwrap().is_empty());
+        assert_eq!(executor.execute_all(&command).unwrap(), [] as [String; 0]);
     }
     executor
 }

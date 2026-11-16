@@ -226,7 +226,6 @@ impl Drop for Suspended {
 /// No original deadline is reset. Restoration queues for real capacity and may
 /// outlast a wait timeout; this is cooperative accounting, not a hard deadline.
 /// A thread without a scope simply waits. Suspended computation cannot reenter.
-#[must_use]
 pub fn with_suspended_current<R>(wait: impl FnOnce() -> R) -> io::Result<R> {
     let mut suspended = ENTERED.with(|entered| -> io::Result<Option<Suspended>> {
         let mut entered = entered.borrow_mut();

@@ -340,7 +340,7 @@ fn test_discover_model_equality_two_terms_same_value_not_euf_equal() {
         Some(TheoryResult::NeedModelEquality(req)) => {
             assert_eq!(req.lhs, ids[0]);
             assert_eq!(req.rhs, ids[1]);
-            assert!(req.reason.is_empty());
+            assert_eq!(req.reason, [] as [ay_core::TheoryLit; 0]);
         }
         other => panic!("expected NeedModelEquality, got {other:?}"),
     }

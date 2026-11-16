@@ -51,7 +51,7 @@ fn rejects_different_assertions_without_changing_the_query() {
             solver.try_assert_term_with_source(native, source).is_err(),
             "{source}"
         );
-        assert!(solver.assertions().is_empty());
+        assert_eq!(solver.assertions(), [] as [Term; 0]);
     }
     solver
         .try_assert_term_with_source(native, "(assert (> x 4))")
@@ -76,7 +76,7 @@ fn rejects_extra_commands_before_execution() {
             solver.try_assert_term_with_source(native, source).is_err(),
             "{source}"
         );
-        assert!(solver.assertions().is_empty());
+        assert_eq!(solver.assertions(), [] as [Term; 0]);
         assert_eq!(solver.num_scopes(), 0);
     }
     assert!(solver.check_sat().is_sat());
@@ -94,7 +94,7 @@ fn rejects_foreign_terms_and_nonboolean_sources() {
     assert!(solver
         .try_assert_term_with_source(number, "(assert 42)")
         .is_err());
-    assert!(solver.assertions().is_empty());
+    assert_eq!(solver.assertions(), [] as [Term; 0]);
 }
 
 #[test]
@@ -117,8 +117,8 @@ fn source_retention_follows_push_pop_and_reset() {
     assert_eq!(solver.executor.context().assertions_parsed().len(), 1);
     assert!(solver.check_sat().is_sat());
     solver.try_reset_assertions().unwrap();
-    assert!(solver.assertions().is_empty());
-    assert!(solver.executor.context().assertions_parsed().is_empty());
+    assert_eq!(solver.assertions(), [] as [Term; 0]);
+    assert_eq!(solver.executor.context().assertions_parsed(), []);
 }
 
 #[test]
@@ -127,8 +127,8 @@ fn oversized_source_cannot_enter_assertion_history() {
     let native = solver.bool_const(true);
     let source = format!("(assert true){}", " ".repeat(8 * 1024 * 1024));
     assert!(solver.try_assert_term_with_source(native, &source).is_err());
-    assert!(solver.assertions().is_empty());
-    assert!(solver.executor.context().assertions_parsed().is_empty());
+    assert_eq!(solver.assertions(), [] as [Term; 0]);
+    assert_eq!(solver.executor.context().assertions_parsed(), []);
 }
 
 /// `Level = zero | succ(pred: Level)`, declared natively.
@@ -241,7 +241,7 @@ fn different_datatype_sources_are_still_refused() {
             solver.try_assert_term_with_source(native, source).is_err(),
             "{source}"
         );
-        assert!(solver.assertions().is_empty());
+        assert_eq!(solver.assertions(), [] as [Term; 0]);
     }
 }
 

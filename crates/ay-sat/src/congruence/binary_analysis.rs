@@ -226,8 +226,7 @@ impl CongruenceClosure {
             // Mark all partners of `lit` (binary clauses containing `lit`).
             // Each `(lit, other)` clause encodes implication `¬lit → other`.
             let mut analyzed: Vec<usize> = Vec::new();
-            for i in 0..self.cached_binary_adj[lit].len() {
-                let other = self.cached_binary_adj[lit][i];
+            for &other in &self.cached_binary_adj[lit] {
                 // CaDiCaL ordering filter: skip if lit has higher variable
                 // index than other. This avoids double-processing symmetric
                 // pairs and ensures the lower-index variable is the "source".

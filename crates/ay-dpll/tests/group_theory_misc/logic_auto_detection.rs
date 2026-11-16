@@ -478,18 +478,17 @@ fn array_bearing_dt_nonlinear_int_stays_fail_closed() {
     "#;
     let commands = ay_frontend::parse(smt).expect("parse");
     let mut exec = ay_dpll::Executor::new();
-    match exec.execute_all(&commands) {
+    if let Ok(lines) = exec.execute_all(&commands) {
         // Fail-closed: either a hard `UnsupportedLogic` refusal (today) or a
         // sound `unknown`. A definitive verdict from a lane with no array
         // theory is what this test forbids.
-        Ok(lines) => assert!(
+        assert!(
             lines
                 .iter()
                 .all(|l| l.trim() != "sat" && l.trim() != "unsat"),
             "array-bearing DT+NIA must not publish a verdict from an \
              array-blind lane, got: {lines:?}"
-        ),
-        Err(_) => {}
+        );
     }
 }
 

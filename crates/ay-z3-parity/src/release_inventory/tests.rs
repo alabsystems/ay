@@ -3,6 +3,15 @@
 use super::*;
 
 #[test]
+fn dangling_inventory_option_is_rejected() {
+    let error = execute(&["--repo-root".to_string()]).unwrap_err();
+    assert_eq!(
+        error,
+        "requires --repo-root PATH --release PATH --output PATH"
+    );
+}
+
+#[test]
 fn multiline_catalog_escapes_and_refusals() {
     let source = r#"const TEST: &[(&str,&str)] = &[
         ("one", "first"),

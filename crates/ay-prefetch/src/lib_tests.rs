@@ -162,7 +162,6 @@ fn vec_set_len_zero() {
     let mut v: Vec<u64> = vec![1, 2, 3];
     unsafe { vec_set_len(&mut v, 0) };
     assert_eq!(v.len(), 0);
-    assert!(v.is_empty());
 }
 
 // --- Tests for SoA watch helpers (#8243, #8548) ---

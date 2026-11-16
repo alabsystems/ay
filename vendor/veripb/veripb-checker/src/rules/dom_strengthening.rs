@@ -99,7 +99,7 @@ impl Checkable for DominanceBasedStrengtheningRule {
         // unconditionally, so derived slots never raise an obligation here.
         let derived_slots = crate::kernel_bridge::derived_slot_ids(database, false);
         let mut goal_slots: Vec<(usize, veripb_formula::prelude::PBConstraintEnum)> = Vec::new();
-        let mut note =
+        let note =
             |source: &Rc<DBConstraint>,
              image: &Rc<DBConstraint>,
              out: &mut Vec<(usize, veripb_formula::prelude::PBConstraintEnum)>| {

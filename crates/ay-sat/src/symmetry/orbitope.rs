@@ -262,7 +262,7 @@ impl RowAmoMatrix {
     }
 }
 
-/// Budgets for [`detect_row_amo_matrices`].
+/// Budgets for [`detect_row_amo_matrices_until`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OrbitopeLimits {
     /// Maximum clauses to scan. Detection is linear, so this is generous.
@@ -424,6 +424,7 @@ fn greedy_order(
 /// Returns at most one matrix today (the largest width class); the signature is
 /// a vector so a later pass can peel off independent matrices without changing
 /// callers.
+#[cfg(test)]
 pub(crate) fn detect_row_amo_matrices(
     clauses: &[Vec<Literal>],
     limits: OrbitopeLimits,
@@ -431,11 +432,11 @@ pub(crate) fn detect_row_amo_matrices(
     detect_row_amo_matrices_until(clauses, limits, &|| false)
 }
 
-/// [`detect_row_amo_matrices`] that samples `should_stop` throughout, so the
+/// Bounded detector that samples `should_stop` throughout, so the
 /// solve's deadline or interrupt ends detection within milliseconds. A stopped
 /// run returns no matrix and sets [`OrbitopeStats::interrupted`]; detection
 /// only reads `clauses`, so nothing partial is left behind. Unstopped, its
-/// result is the same as [`detect_row_amo_matrices`].
+/// result is the same as an unbounded [`detect_row_amo_matrices_until`] call.
 pub(crate) fn detect_row_amo_matrices_until(
     clauses: &[Vec<Literal>],
     limits: OrbitopeLimits,
@@ -1184,8 +1185,8 @@ mod tests {
         // The pivot's own column must never appear in the substitution: the
         // swap is restricted to columns > j, which is what keeps the already
         // fixed columns untouched.
-        for row in 0..m.row_count() {
-            let v = Literal::positive(m.entries[row][0][0]);
+        for row in &m.entries[..m.row_count()] {
+            let v = Literal::positive(row[0][0]);
             assert!(
                 !pairs.contains(&v),
                 "column 0 must not be permuted by its own step"
@@ -1242,7 +1243,7 @@ mod tests {
     fn ignores_formulas_without_at_most_one_structure() {
         let clauses = vec![vec![lit(1), lit(2), lit(3)], vec![lit(-1), lit(2)]];
         let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
-        assert!(matrices.is_empty());
+        assert_eq!(matrices.len(), 0);
         assert_eq!(stats.eo_groups, 0);
     }
 
@@ -1397,7 +1398,7 @@ mod tests {
             };
             let (matrices, stats) =
                 detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &stop);
-            assert!(matrices.is_empty(), "stopped at sample {fire_at}");
+            assert_eq!(matrices.len(), 0, "stopped at sample {fire_at}");
             assert!(stats.interrupted, "stopped at sample {fire_at}");
             assert_eq!(samples.get(), fire_at, "no sample after the stop fired");
         }

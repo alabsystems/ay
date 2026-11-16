@@ -33,7 +33,7 @@ impl Circuit<'_, '_, '_> {
     // sign contribution. Keep that exact syntax; the subsequent la_generic
     // steps independently check the strict/non-strict integer duality.
     fn signed_order(&mut self, op: &str, x: &str, y: &str, width: usize) -> Option<Equality> {
-        if width < 2 || width > MAX_WIDTH {
+        if !(2..=MAX_WIDTH).contains(&width) {
             return None;
         }
         let msb = width - 1;

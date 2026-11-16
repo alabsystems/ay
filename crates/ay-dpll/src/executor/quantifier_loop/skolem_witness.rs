@@ -402,7 +402,7 @@ mod tests {
         let (mut exec, outputs) = solved(UF_EXISTS);
         assert_eq!(outputs, vec!["sat"]);
         let records = exec.skolem_witness_records.clone();
-        assert!(!records.is_empty());
+        assert_ne!(records, [] as [SkolemWitnessRecord; 0]);
         let quantifier = records[0].quantified;
         let mut replaced = 0usize;
         let rewritten = exec.skolem_witness_rewrite(&records, quantifier, true, &mut replaced, 0);
@@ -423,7 +423,7 @@ mod tests {
     fn tampered_instance_is_ignored_by_replay() {
         let (mut exec, _) = solved(UF_EXISTS);
         let mut records = exec.skolem_witness_records.clone();
-        assert!(!records.is_empty());
+        assert_ne!(records, [] as [SkolemWitnessRecord; 0]);
         // Replace the instance with `true` — a formula every model
         // trivially satisfies.
         let tampered = exec.ctx.terms.true_term();
@@ -445,7 +445,7 @@ mod tests {
     fn foreign_witness_is_rejected_by_replay() {
         let (mut exec, _) = solved(UF_EXISTS);
         let mut records = exec.skolem_witness_records.clone();
-        assert!(!records.is_empty());
+        assert_ne!(records, [] as [SkolemWitnessRecord; 0]);
         // A fresh plain variable: right sort, but not in the Skolem registry.
         let foreign = exec
             .ctx

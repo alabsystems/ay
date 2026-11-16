@@ -59,7 +59,7 @@ impl Blaster<'_, '_> {
         } else {
             (quot, "bvudiv", "bitblast_udiv")
         };
-        Some((bits, self.blasted_application(head, &[x, y], rule)))
+        Some((bits, self.blasted_application(head, &[x, y], rule)?))
     }
 }
 

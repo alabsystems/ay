@@ -1264,7 +1264,7 @@ mod tests {
         );
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bve.next_conflict,
             solver.num_conflicts + BVE_INTERVAL_BASE
@@ -1289,7 +1289,7 @@ mod tests {
             solver.run_elimination_passes(&mut passes_run, false, false, false, round_start, 0);
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bve.next_conflict,
             solver.num_conflicts + BVE_INTERVAL_BASE
@@ -1357,7 +1357,7 @@ mod tests {
         );
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bce.next_conflict,
             solver.num_conflicts + BCE_INTERVAL
@@ -1384,7 +1384,7 @@ mod tests {
         );
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bce.next_conflict,
             solver.num_conflicts + BCE_INTERVAL
@@ -1410,7 +1410,7 @@ mod tests {
         );
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bce.next_conflict,
             solver.num_conflicts + BCE_INTERVAL
@@ -1437,7 +1437,7 @@ mod tests {
         );
 
         assert!(!unsat);
-        assert!(passes_run.is_empty());
+        assert_eq!(passes_run.len(), 0);
         assert_eq!(
             solver.inproc_ctrl.bce.next_conflict,
             solver.num_conflicts + BCE_INTERVAL

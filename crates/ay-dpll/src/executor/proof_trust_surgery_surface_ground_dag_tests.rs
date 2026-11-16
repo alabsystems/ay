@@ -14,7 +14,7 @@ fn term(text: &str) -> Term {
 #[test]
 fn sharing_is_exact_closed_source_syntax_not_canonical_equality() {
     let source = term("(and (= (select a (bvadd x #x00)) (select a x)) (= (select a (bvadd x #x00)) (select a x)))");
-    let mut context = ay_frontend::Context::new();
+    let mut context = Context::new();
     for command in ay_frontend::parse(
         "(declare-const x (_ BitVec 8))
          (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))",
@@ -49,7 +49,7 @@ fn sharing_is_exact_closed_source_syntax_not_canonical_equality() {
 
 #[test]
 fn shared_source_keeps_existing_depth_token_and_macro_refusals() {
-    let mut context = ay_frontend::Context::new();
+    let mut context = Context::new();
     for command in ay_frontend::parse("(define-fun alias () (_ BitVec 8) #x00)").unwrap() {
         context.process_command(&command).unwrap();
     }
@@ -77,7 +77,7 @@ fn shared_source_does_not_raise_the_distinct_node_limit() {
         .map(|chunk| Term::App("and".into(), chunk.to_vec()))
         .collect();
     let source = Term::App("and".into(), children);
-    assert!(Plan::new(&source, &mut ay_frontend::Context::new(), |_| false).is_none());
+    assert!(Plan::new(&source, &mut Context::new(), |_| false).is_none());
 }
 
 #[test]
@@ -180,8 +180,11 @@ fn no_select_decline_leaves_live_arrays_unchanged_across_ordinary_solve_and_pop(
         ),
         "a no-select decline must not elaborate its untaken store in the live arena"
     );
-    assert!(source_context == executor.ctx.source_context_stamp());
-    assert!(executor.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(source_context, executor.ctx.source_context_stamp());
+    assert_eq!(
+        executor.last_proof_raw_original_assertions,
+        [] as [TermId; 0]
+    );
     assert!(executor.last_proof().is_none());
     assert_eq!(
         executor

@@ -13,7 +13,7 @@
 //! The goal is to catch regressions in strings behavior on real-world
 //! benchmark inputs, not only hand-written formulas.
 
-use crate::common::{check_z3_or_skip as z3_available, solve_with_z3_file};
+use crate::common::z3::{check_z3_or_skip as z3_available, solve_with_z3_file};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;

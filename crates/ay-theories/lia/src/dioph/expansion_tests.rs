@@ -334,6 +334,12 @@ fn d3_cyclic_substitutions_yield_no_expansion() {
         ([(1, BigInt::from(2))].into_iter().collect(), BigInt::one()),
     );
     solver.substitutions = subs;
-    assert!(solver.get_modular_constraints(1).is_empty());
-    assert!(solver.get_expanded_substitutions(1, true).is_empty());
+    assert_eq!(
+        solver.get_modular_constraints(1).as_slice(),
+        &[] as &[(usize, BigInt, BigInt)]
+    );
+    assert_eq!(
+        solver.get_expanded_substitutions(1, true).as_slice(),
+        &[] as &[(usize, Vec<(usize, BigInt)>, BigInt)]
+    );
 }

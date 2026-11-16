@@ -140,7 +140,7 @@ pub(super) fn source(
     }
     let storage = active
         .len()
-        .checked_mul(std::mem::size_of::<TermId>())
+        .checked_mul(size_of::<TermId>())
         .and_then(|n| n.checked_mul(8))
         .and_then(|n| n.checked_add(4096))
         .ok_or_else(failed)?;
@@ -198,18 +198,18 @@ pub(super) fn independent_refutation(
     for &root in roots {
         owner.admit(remaining.len(), 0).map_err(|_| failed())?;
         let assume = proof.add_assume(root, None);
-        remaining.remove(0);
+        let _ = remaining.remove(0);
         prior = proof.add_resolution(copy(&remaining, owner)?, root, assume, prior);
     }
     // Price the bounded checker's outer clause/step carriers before its first
     // allocation; its independent algebra/evaluation then pays actual progress.
     let bytes = steps
-        .checked_mul(std::mem::size_of::<Option<Vec<TermId>>>())
+        .checked_mul(size_of::<Option<Vec<TermId>>>())
         .and_then(|n| {
             roots
                 .len()
                 .checked_mul(roots.len())
-                .and_then(|pairs| pairs.checked_mul(2 * std::mem::size_of::<TermId>()))
+                .and_then(|pairs| pairs.checked_mul(2 * size_of::<TermId>()))
                 .and_then(|b| n.checked_add(b))
         })
         .ok_or_else(failed)?;
@@ -318,7 +318,7 @@ mod tests {
             .apply_tactic_subgoals_converted(&tactic, &roots, 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
         let model = solver
             .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
             .unwrap();
@@ -350,7 +350,7 @@ mod tests {
                     "ordinary native engine remains usable"
                 );
             } else {
-                assert!(goal.formulas.is_empty());
+                assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
                 let converter = goal.model_converter.unwrap();
                 let model = solver
                     .convert_tactic_model(&converter, &Model::empty())
@@ -418,7 +418,7 @@ mod tests {
             .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
         let model = solver
             .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
             .unwrap();
@@ -437,7 +437,7 @@ mod tests {
             .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
         let model = solver
             .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
             .unwrap();
@@ -455,7 +455,7 @@ mod tests {
             .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
         let converter = goal.model_converter.unwrap();
         let copied = converter.clone();
         let model = solver
@@ -493,7 +493,7 @@ mod tests {
             .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &[], 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[Term]);
         assert!(empty
             .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
             .is_ok());
@@ -536,11 +536,14 @@ mod tests {
         );
         drop(request);
         assert_eq!(solver.terms().snapshot_stamp(), before);
-        assert!(solver
-            .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
-            .unwrap()[0]
-            .formulas
-            .is_empty());
+        assert_eq!(
+            solver
+                .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
+                .unwrap()[0]
+                .formulas
+                .as_slice(),
+            &[] as &[Term]
+        );
         solver.set_term_memory_limit(Some(0));
         let request = solver.begin_model_evaluation_read();
         assert!(solver
@@ -555,10 +558,13 @@ mod tests {
             Some(crate::UnknownOrigin::MemoryBudget)
         );
         drop(request);
-        assert!(solver
-            .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
-            .unwrap()[0]
-            .formulas
-            .is_empty());
+        assert_eq!(
+            solver
+                .apply_tactic_subgoals_converted(&Tactic::FieldSolve, &roots, 0, None)
+                .unwrap()[0]
+                .formulas
+                .as_slice(),
+            &[] as &[Term]
+        );
     }
 }

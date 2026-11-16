@@ -20,7 +20,7 @@ fn metadata_duplicates_unknown_fields_and_wrong_payload_types_refuse() {
         br#"[{"step":0,"payload":{}}}"#,
         br#"[] trailing"#,
     ] {
-        assert!(decoded(bytes).result.is_err(), "{:?}", bytes);
+        assert!(decoded(bytes).result.is_err(), "{bytes:?}");
     }
     for json in [
         br#"{"schema":"ay.proofbundle/v6","retained":[],"retained":[]}"#.as_slice(),
@@ -47,7 +47,7 @@ fn oversized_tokens_and_depth_fail_before_any_parser_or_owner_reservation() {
 #[test]
 fn ninth_entry_refuses_before_any_new_inventory_owner() {
     let entry = r#"{"step":0,"payload":{}}"#;
-    let json = format!("[{}]", vec![entry; 9].join(","));
+    let json = format!("[{}]", [entry; 9].join(","));
     let outcome = decoded(json.as_bytes());
     assert_eq!(outcome.result, Err(TransportError::InvalidJson));
     assert_eq!(outcome.usage.charged_bytes, lexical::OPAQUE_BYTES);

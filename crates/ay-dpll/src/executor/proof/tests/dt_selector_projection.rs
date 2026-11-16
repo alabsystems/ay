@@ -151,7 +151,7 @@ fn test_qf_dt_nested_selector_transport_is_strict_checkable() {
         "#,
     )
     .unwrap();
-    assert!(exec.execute_all(&declarations).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&declarations).unwrap(), [] as [String; 0]);
 
     let d_sort = Sort::Uninterpreted("D".to_string());
     let f_sort = Sort::Uninterpreted("F".to_string());
@@ -231,7 +231,7 @@ fn test_qf_dt_negated_conjunction_transport_is_strict_checkable() {
         "#,
     )
     .unwrap();
-    assert!(exec.execute_all(&declarations).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&declarations).unwrap(), [] as [String; 0]);
 
     let d_sort = Sort::Uninterpreted("D".to_string());
     let f_sort = Sort::Uninterpreted("F".to_string());
@@ -303,7 +303,7 @@ fn test_qf_dt_negated_conjunction_bv_sibling_transport_is_strict_checkable() {
         "#,
     )
     .unwrap();
-    assert!(exec.execute_all(&declarations).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&declarations).unwrap(), [] as [String; 0]);
 
     let d_sort = Sort::Uninterpreted("D".to_string());
     let f_sort = Sort::Uninterpreted("F".to_string());
@@ -388,7 +388,7 @@ fn test_qf_dt_negated_conjunction_leaf_sibling_transport_is_strict_checkable() {
         "#,
     )
     .unwrap();
-    assert!(exec.execute_all(&declarations).unwrap().is_empty());
+    assert_eq!(exec.execute_all(&declarations).unwrap(), [] as [String; 0]);
 
     let d_sort = Sort::Uninterpreted("D".to_string());
     let f_sort = Sort::Uninterpreted("F".to_string());

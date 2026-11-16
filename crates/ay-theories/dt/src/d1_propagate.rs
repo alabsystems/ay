@@ -933,7 +933,7 @@ mod tests {
         let _ = euf.check();
         let mut verifier = EufSolver::new(&terms).verify_only();
         let first = prop.propagate_lemmas(&terms, &mut euf, &mut verifier, None);
-        assert!(!first.is_empty());
+        assert_ne!(first.as_slice(), &[] as &[TheoryLemma]);
         let second = prop.propagate_lemmas(&terms, &mut euf, &mut verifier, None);
         assert!(second.is_empty(), "dedup failed: {second:?}");
     }

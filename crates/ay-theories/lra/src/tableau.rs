@@ -1062,8 +1062,8 @@ impl TableauRow {
             let old_count = self.coeffs.len();
             let mut new_coeffs: Vec<(u32, Rational)> = Vec::with_capacity(old_count + add_count);
             let mut ai = 0usize;
-            for i in 0..old_count {
-                let var = self.coeffs[i].0;
+            for (var, coefficient) in &self.coeffs[..old_count] {
+                let var = *var;
                 let vi = var as usize;
                 if vi < work_vec.len() && work_vec[vi] == CANCELLED {
                     continue;
@@ -1083,7 +1083,7 @@ impl TableauRow {
                 if vi < work_vec.len() {
                     work_vec[vi] = new_coeffs.len() as i32;
                 }
-                new_coeffs.push((var, self.coeffs[i].1.clone()));
+                new_coeffs.push((var, coefficient.clone()));
             }
             while ai < add_count {
                 let av = additions[ai].0;

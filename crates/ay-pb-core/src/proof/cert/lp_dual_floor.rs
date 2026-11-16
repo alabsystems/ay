@@ -351,129 +351,6 @@ fn dual_floor_verdict(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::arithmetic::MAX_DUAL_SCALE;
-    use super::dual_floor_verdict;
-    use super::MAX_DUAL_SOLVE_POLLS;
-    use crate::optimize::lp_bound::DUAL_DENOMINATOR_LADDER;
-    use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
-
-    /// End-to-end over the EQUALITY-SPAN lane: a mixed-sign objective pinned
-    /// to a constant by one `=` row (the `mult_diagcomm` shape in miniature)
-    /// must certify `BOUNDS 0 <= obj <= 0` with the objective expressed as an
-    /// exact combination of the equality's two split halves — no simplex tier
-    /// in the loop.
-    #[test]
-    fn equality_span_instance_certifies_end_to_end() {
-        let term = |coeff: i128, var: u32| PbTerm {
-            coeff,
-            lits: vec![PbLit {
-                var,
-                negated: false,
-            }],
-        };
-        let instance = PbInstance {
-            num_vars: 2,
-            num_constraints: 1,
-            constraints: vec![PbConstraint {
-                terms: vec![term(1, 1), term(-1, 2)],
-                rel: PbRel::Eq,
-                rhs: 0,
-            }],
-            objective: Some(PbObjective {
-                terms: vec![term(1, 1), term(-1, 2)],
-            }),
-        };
-        let proof = super::certify_opt_lin_lp_dual_floor(&instance, &[false, false], 0)
-            .expect("the equality-span certificate must emit");
-        assert!(
-            proof.contains("conclusion BOUNDS 0 :"),
-            "equal bounds at the optimum, got:\n{proof}"
-        );
-    }
-
-    /// The poll cap was sized from a measured gap, and this pins BOTH edges so
-    /// a blind resize cannot silently cross either. Probe sweep 2026-08-30
-    /// (PB25 OPT-LIN REACHABLE + the three census pathologies): the heaviest
-    /// instance the rung CERTIFIES spends 2,061 polls (`lo_14x14_007`); the
-    /// cheapest instance that used to burn the old one-minute wall deadline
-    /// WITHOUT certifying spends 7,047 (`aim-200-2_0-yes1-2`). Below the lower
-    /// edge the cap costs measured certificates; at or above the upper edge it
-    /// readmits the 12x `--timeout` overshoot the count exists to close. A
-    /// legitimate move of either edge is a NEW measurement, and the A/B gate
-    /// for it is proof-sha equality on the certifying corpus.
-    #[test]
-    fn dual_solve_poll_cap_sits_inside_the_measured_gap() {
-        assert!(
-            MAX_DUAL_SOLVE_POLLS > 2_061,
-            "cap {MAX_DUAL_SOLVE_POLLS} would decline the heaviest measured certifying member"
-        );
-        assert!(
-            MAX_DUAL_SOLVE_POLLS < 7_047,
-            "cap {MAX_DUAL_SOLVE_POLLS} readmits the cheapest measured pathology"
-        );
-    }
-
-    /// The reduction ladder lives in the LP module and the cap that refuses its
-    /// output lives here. A rung past the cap would build a plan this emitter is
-    /// guaranteed to refuse — wasted work that looks like an unreachable model.
-    #[test]
-    fn every_denominator_rung_is_within_the_emitters_cap() {
-        assert!(
-            DUAL_DENOMINATOR_LADDER
-                .iter()
-                .all(|&rung| rung <= MAX_DUAL_SCALE),
-            "a ladder rung exceeds MAX_DUAL_SCALE={MAX_DUAL_SCALE}: {DUAL_DENOMINATOR_LADDER:?}"
-        );
-    }
-
-    /// The shortfall verdict must be decided by CONVERGENCE, not by the shortfall
-    /// alone. Before this split, both rows below printed the same definitive
-    /// `UNREACHABLE ... (integrality gap)`, so a dual solve that merely ran out of
-    /// wall clock was recorded as a mathematical obstruction.
-    #[test]
-    fn shortfall_is_only_an_integrality_gap_when_the_solve_converged() {
-        assert_eq!(
-            dual_floor_verdict(5785, true, 5867, false),
-            "UNREACHABLE:lp-floor-below-optimum(integrality gap)"
-        );
-        assert!(dual_floor_verdict(5785, false, 5867, false).starts_with("INCONCLUSIVE:"));
-    }
-
-    /// A floor ABOVE the claimed optimum impeaches the incumbent at any dual
-    /// point, converged or not: weak duality bounds every dual-feasible floor by
-    /// the true optimum.
-    #[test]
-    fn floor_above_optimum_is_conclusive_either_way() {
-        for converged in [true, false] {
-            assert_eq!(
-                dual_floor_verdict(9, converged, 8, false),
-                "UNREACHABLE:lp-floor-above-optimum(bad incumbent?)"
-            );
-        }
-    }
-
-    /// Tight floors keep their existing two verdicts, and reaching the optimum
-    /// with an unconverged dual is still REACHABLE — the emitter's self-check,
-    /// not convergence, is what licenses the certificate.
-    #[test]
-    fn tight_floor_verdicts_are_unchanged() {
-        assert_eq!(
-            dual_floor_verdict(-2, true, -2, false),
-            "REACHABLE:lp-tight"
-        );
-        assert_eq!(
-            dual_floor_verdict(-2, false, -2, false),
-            "REACHABLE:lp-tight"
-        );
-        assert_eq!(
-            dual_floor_verdict(-2, true, -2, true),
-            "LOST:denominator-exceeds-MAX_DUAL_SCALE"
-        );
-    }
-}
-
 /// Names the first arithmetic guard that would decline the LP-dual emitter.
 fn certify_opt_lin_lp_dual_floor_declined_reason(
     instance: &PbInstance,
@@ -494,3 +371,7 @@ fn certify_opt_lin_lp_dual_floor_declined_reason(
     .err()?
     .diagnosis(optimum)
 }
+
+#[cfg(test)]
+#[path = "lp_dual_floor_tests.rs"]
+mod tests;

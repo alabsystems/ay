@@ -262,7 +262,7 @@ impl Executor {
                 vec![transport.step],
                 vec![],
             );
-            transport = DerivedUnit { literal, step };
+            transport = DerivedUnit { step, literal };
         }
         emitter.admit_steps(4)?;
         let equality = self

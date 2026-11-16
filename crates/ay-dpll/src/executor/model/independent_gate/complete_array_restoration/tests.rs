@@ -22,10 +22,10 @@ fn loaded(source: &str, end: Instant) -> Executor {
     exec.set_term_memory_limit(Some(128 * 1024 * 1024));
     exec.set_deadline(Some(end));
     let commands = parse(source).expect("complete original source");
-    assert!(exec
-        .execute_all(&commands)
-        .expect("elaboration only")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&commands).expect("elaboration only"),
+        [] as [String; 0]
+    );
     exec.begin_external_decision_query(false);
     exec.set_deadline(Some(end));
     let mut model = Model::empty();

@@ -2398,7 +2398,7 @@ fn bitvec_var_with_no_bv_value_stays_unknown_and_ignores_euf_literal() {
     // Nor does an eliminated one: the definition is the authority and
     // completion, not the evaluator, installs it.
     executor.recorded_var_substitutions.insert(x, two);
-    super::eval_memo_clear();
+    eval_memo_clear();
     assert_eq!(executor.evaluate_term(&model, x), EvalValue::Unknown);
 
     // And when the BV model DOES carry a value, that value wins — the lane
@@ -2411,7 +2411,7 @@ fn bitvec_var_with_no_bv_value_stays_unknown_and_ignores_euf_literal() {
         term_to_bits: HashMap::default(),
         bool_overrides: HashMap::default(),
     });
-    super::eval_memo_clear();
+    eval_memo_clear();
     assert_eq!(
         executor.evaluate_term(&model, x),
         EvalValue::BitVec {

@@ -292,7 +292,7 @@ fn test_walk_trail_overflow_invalidates_when_no_best() {
     walker.push_flipped(3);
 
     assert_eq!(walker.best_trail_pos, -1, "trail should be invalidated");
-    assert!(walker.flips_trail.is_empty(), "trail should be cleared");
+    assert_eq!(walker.flips_trail.len(), 0, "trail should be cleared");
 
     // Subsequent pushes are no-ops (best_trail_pos < 0 guard)
     walker.push_flipped(4);

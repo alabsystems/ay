@@ -250,7 +250,7 @@ fn clean_width8_fused_mul_readout_fits_4096_producer_steps() {
         .expect("Clean's producer budget is public and finite");
     let proof = export_bv_blast_proof_expr_bounded(&lhs, &rhs, &budget)
         .expect("the exact fused width-8 Clean multiply readout fits 4096 steps");
-    assert!(!proof.refutation.steps.is_empty());
+    assert_ne!(proof.refutation.steps, []);
     assert!(proof.refutation.steps.len() <= 4096);
     proof
         .validate_with_limits(&finite_replay_limits(&proof))
@@ -267,7 +267,7 @@ fn clean_width8_mul_by_zero_fits_4096_producer_steps() {
         .expect("Clean's producer budget is public and finite");
     let proof = export_bv_blast_proof_expr_bounded(&lhs, &zero, &budget)
         .expect("the exact width-8 Clean multiply-by-zero proof fits 4096 steps");
-    assert!(!proof.refutation.steps.is_empty());
+    assert_ne!(proof.refutation.steps, []);
     assert!(proof.refutation.steps.len() <= 4096);
     proof
         .validate_with_limits(&finite_replay_limits(&proof))

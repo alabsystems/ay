@@ -46,7 +46,7 @@ fn real_select_iteration_conflict_is_partial_poison_not_a_fabricated_winner() {
         .unwrap();
     let legacy = solver.extract_model(&values);
     same(&output, &legacy);
-    assert!(output.array_values[&fixture.base].stores.is_empty());
+    assert_eq!(output.array_values[&fixture.base].stores.len(), 0);
     assert!(output.read_conflicted.contains(&fixture.base));
     drop(output);
     owner.check().unwrap();

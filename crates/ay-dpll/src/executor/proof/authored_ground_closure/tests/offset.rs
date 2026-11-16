@@ -37,7 +37,7 @@ fn checked_candidate(exec: &mut Executor, root: TermId) -> Proof {
         .check_proof_strict_derivation_with_datatypes(&candidate)
         .unwrap()
         .is_complete());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof.is_none());
     candidate
 }
@@ -131,7 +131,7 @@ fn modular_offsets_keep_wrong_bases_offsets_widths_and_heads_separate() {
         )
         .unwrap();
         assert!(!closure.same_class(term, x));
-        assert!(closure.edges().is_empty());
+        assert_eq!(closure.edges(), []);
     }
     let malformed = raw(&mut exec, "bvsub", wide, zero, 8);
     let term = raw(&mut exec, "bvadd", malformed, zero, 8);
@@ -164,12 +164,12 @@ fn modular_offset_search_preserves_shared_work_and_proposal_limits() {
             &mut SharedGroundWork::new(0)
         )
         .is_none());
-    assert!(closure.edges().is_empty());
+    assert_eq!(closure.edges(), []);
     let mut work = SharedGroundWork::new(MAX_NODES * MAX_ROUNDS);
     exec.add_ground_modular_offset_identity_edges(&mut closure, &mut 0, &mut work)
         .unwrap();
     assert_eq!(work.remaining(), MAX_NODES * MAX_ROUNDS);
-    assert!(closure.edges().is_empty());
+    assert_eq!(closure.edges(), []);
     let mut proposals = 1;
     exec.add_ground_modular_offset_identity_edges(&mut closure, &mut proposals, &mut work)
         .unwrap();
@@ -199,8 +199,8 @@ fn modular_offset_spine_refuses_before_constructor_allocation_when_work_runs_out
     assert_eq!(work.remaining(), 0);
     assert_eq!(proposals, 1);
     assert_eq!(exec.ctx.terms.len(), arena_len);
-    assert!(closure.edges().is_empty());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(closure.edges(), []);
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
 }
 
 #[test]
@@ -221,8 +221,8 @@ fn modular_offset_stop_prevents_identity_merges() {
             &mut SharedGroundWork::new(MAX_NODES * MAX_ROUNDS),
         )
         .is_none());
-    assert!(closure.edges().is_empty());
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(closure.edges(), []);
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof().is_none());
 }
 
@@ -371,7 +371,7 @@ fn original_memory_offset_stage_retains_the_actual_connected_frontier() {
                 ..
             } = step
             {
-                assert!(args.is_empty());
+                assert_eq!(args.as_slice(), []);
                 args.push(clause[0]);
             }
         }
@@ -410,7 +410,7 @@ fn original_memory_offset_stage_retains_the_actual_connected_frontier() {
                     )
                 })
                 .expect("diagnostic export retains any real wire loss");
-            super::packing::retain("original-e1-native", ORIGINAL, Some(&text));
+            packing::retain("original-e1-native", ORIGINAL, Some(&text));
             let report = serde_json::json!({"steps":candidate.steps.len(),"strict_native":true,"exact_source":true,"work":work,"admission_bytes":bytes,"reconstruct_units":intrinsic_count(&candidate,AletheRule::BvReconstructV1),"offset_units":intrinsic_count(&candidate,AletheRule::BvOffsetSpinesV1),"wire_holes":text.matches(":rule hole").count(),"no_public_full_proof_claim":true});
             std::fs::write(
                 std::path::Path::new(&directory).join("original-native.json"),
@@ -447,7 +447,7 @@ fn original_memory_offset_stage_retains_the_actual_connected_frontier() {
         .to_string()
         .contains("sparse array store-chain budget exceeded"));
     println!("original memory direct strict refusal: {refusal}");
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof().is_none());
 }
 

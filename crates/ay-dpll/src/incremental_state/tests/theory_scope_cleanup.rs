@@ -67,7 +67,7 @@ fn incremental_theory_state_reset_clears_all_state() {
     assert_eq!(st.tseitin_state.next_var, 1);
     assert_eq!(st.scope_depth, 0);
     assert_eq!(st.pending_push, 0);
-    assert!(st.theory_atoms.is_empty());
+    assert_eq!(st.theory_atoms, [] as [TermId; 0]);
     assert!(st.pre_push_assertions.is_empty());
     assert!(!st.needs_activation_reassert);
     assert_eq!(st.theory_conflicts, 0);
@@ -141,5 +141,5 @@ fn incremental_theory_state_reset_clears_proof_scope_starts() {
     assert_eq!(st.proof_scope_starts.len(), 2);
 
     st.reset();
-    assert!(st.proof_scope_starts.is_empty());
+    assert_eq!(st.proof_scope_starts, [] as [(usize, usize); 0]);
 }

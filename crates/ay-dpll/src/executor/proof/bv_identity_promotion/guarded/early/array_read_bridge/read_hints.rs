@@ -15,6 +15,10 @@ pub(super) struct ReadHints {
     metadata: u64,
     original_end: usize,
     entries: HashMap<TermId, (TermEntryStamp, Option<ReadHint>)>,
+    #[expect(
+        clippy::rc_buffer,
+        reason = "preserves the bounded constructed proof hot-path Vec buffer without reallocating or copying it"
+    )]
     store_chains: HashMap<TermId, Rc<Vec<(TermId, TermId)>>>,
 }
 

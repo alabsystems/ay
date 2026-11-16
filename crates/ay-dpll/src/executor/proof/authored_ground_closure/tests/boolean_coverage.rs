@@ -9,7 +9,7 @@ fn proposed(input: &str) -> (Executor, Option<Proof>) {
     let source = exec.ctx.assertions_parsed()[0].clone();
     let root = exec.raw_intern_surface(&source).unwrap();
     let candidate = exec.early_ground_closure_memory_candidate(root);
-    assert!(exec.last_proof_raw_original_assertions.is_empty());
+    assert_eq!(exec.last_proof_raw_original_assertions, [] as [TermId; 0]);
     assert!(exec.last_proof.is_none());
     (exec, candidate)
 }
@@ -344,7 +344,7 @@ fn denied_or_cancelled_range_emission_does_not_grow_the_term_arena() {
     let mut search = GroundSearch::default();
     exec.register_ground_subterms(&mut search.closure, root)
         .unwrap();
-    let mut work = super::super::goal::MAX_GOAL_WORK;
+    let mut work = goal::MAX_GOAL_WORK;
     let plan = exec
         .ground_read_range_plan(&search.closure, goal, &mut work)
         .unwrap()
@@ -359,7 +359,7 @@ fn denied_or_cancelled_range_emission_does_not_grow_the_term_arena() {
     assert_eq!(exec.ctx.terms.len(), arena);
     assert_eq!(full.proof.steps.len(), steps);
 
-    let mut work = super::super::goal::MAX_GOAL_WORK;
+    let mut work = goal::MAX_GOAL_WORK;
     let plan = exec
         .ground_read_range_plan(&search.closure, goal, &mut work)
         .unwrap()
@@ -369,6 +369,6 @@ fn denied_or_cancelled_range_emission_does_not_grow_the_term_arena() {
     )));
     let mut stopped = ClosureEmitter::new(&search);
     assert!(exec.emit_ground_read_range(&mut stopped, plan).is_none());
-    assert!(stopped.proof.steps.is_empty());
+    assert_eq!(stopped.proof.steps, [] as [ProofStep; 0]);
     assert_eq!(exec.ctx.terms.len(), arena);
 }

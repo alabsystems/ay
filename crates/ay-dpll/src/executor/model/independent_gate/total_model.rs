@@ -56,7 +56,6 @@ impl Executor {
     ) -> Result<SolveResult> {
         if result != SolveResult::Sat
             || self.quantified_model_confirmation.is_none()
-            || !self.independent_model_gate_enabled()
             || self.in_quantified_model_gate
         {
             return Ok(result);
@@ -160,10 +159,9 @@ impl Executor {
     ) -> SolveResult {
         let every_constant = self.quantified_model_confirmation.is_some();
         // The same scope as the quantified gate itself: never inside its own
-        // nested confirmation solves, never with the gate disabled.
+        // nested confirmation solves.
         if result != SolveResult::Sat
             || (!every_constant && self.preprocess_eliminated_constants.is_empty())
-            || !self.independent_model_gate_enabled()
             || self.in_quantified_model_gate
         {
             return result;

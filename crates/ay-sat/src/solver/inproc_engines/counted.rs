@@ -8,7 +8,7 @@ use ay_core::original_query::{CountedAdmission, CountedAdmissionError, QueryErro
 impl InprocessingEngines {
     /// Construct every ordinary engine under the same original admission owner.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(1, std::mem::size_of::<Self>())?;
+        owner.admit(1, size_of::<Self>())?;
         if ay_core::misc_cli_flags().sat_mem_probe {
             // The diagnostic branch constructs a second engine set and prints
             // per-engine measurements. Its extra work is not covered here.

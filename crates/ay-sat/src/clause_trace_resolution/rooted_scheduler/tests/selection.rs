@@ -6,12 +6,12 @@ use super::*;
 #[test]
 fn rooted_selection_bound_includes_escalation_census_equality_and_overflow() {
     assert!(size_of::<CandidateSchedule>() <= size_of::<Scheduler>() + size_of::<Vec<usize>>());
-    let choose = super::super::selection::legacy_is_cheaper;
+    let choose = selection::legacy_is_cheaper;
     // C=3, M=2, L=5, S=C+M+1: (M+2)*(C+M+L)+2M+1+S = 51.
     assert!(choose(3, 2, 5, 8, 6)); // Three dense head passes also cost 51.
     assert!(!choose(3, 2, 5, 8, 7));
     assert!(!choose(3, 2, 5, 7, 6));
-    assert!(crate::clause_trace_resolution::ordinary_compaction::legacy_is_cheaper(3, 2, 5, 7, 6));
+    assert!(ordinary_compaction::legacy_is_cheaper(3, 2, 5, 7, 6));
     for (c, m, l, v, s) in [
         (u128::MAX, 2, 5, 8, 6),
         (3, u128::MAX, 5, 8, 6),
@@ -109,8 +109,8 @@ fn exhausted_candidates_still_escalate_originals_after_root_filtering() {
         .unwrap();
         assert_eq!(chain, expected);
         assert_eq!(root.assign, vec![None, None, None, None, Some(true)]);
-        assert!(root.row_trail.is_empty());
-        assert!(root.cand_order.is_empty());
+        assert_eq!(root.row_trail.len(), 0);
+        assert_eq!(root.cand_order.len(), 0);
         derived.push(RupStep {
             id: 8 + derived.len() as u64,
             clause: vec![target],

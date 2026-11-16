@@ -68,7 +68,7 @@ impl Executor {
             return None;
         }
         let source = self.ctx.source_context_stamp();
-        let mut admission = PinAdmission::capture(self, model).ok()?;
+        let admission = PinAdmission::capture(self, model).ok()?;
         drop(current);
         let result = construct(&mut self.ctx.terms, leaf, &captured, &mut |work, bytes| {
             admission.pay(work, bytes).is_ok()

@@ -248,11 +248,11 @@ fn successful_memory_counters_match_actual_owned_entry_and_bucket_growth() {
         .expect("interned bucket")
         .capacity()
         - old_capacity)
-        * std::mem::size_of::<TermId>();
+        * size_of::<TermId>();
     assert_eq!(store.heap_data_bytes - before_heap, heap);
     assert_eq!(store.bucket_capacity_bytes - before_buckets, growth);
     assert_eq!(
         store.instance_term_bytes - before_instance,
-        std::mem::size_of::<TermEntry>() + heap + growth
+        size_of::<TermEntry>() + heap + growth
     );
 }

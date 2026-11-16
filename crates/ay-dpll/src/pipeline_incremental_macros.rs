@@ -47,7 +47,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             verify_theory_conflict_with_farkas_full,
         };
         use $crate::executor::theories::freeze_var_if_needed;
-        use $crate::executor::theories::solve_harness::TheoryModels;
 
         let proof_enabled = $self.produce_proofs_enabled();
         // #dt-ground-conflict: datatype registries for the conflict-path
@@ -849,7 +848,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             verify_theory_conflict_with_farkas_full,
         };
         use $crate::executor::theories::freeze_var_if_needed;
-        use $crate::executor::theories::solve_harness::TheoryModels;
 
         let proof_enabled = $self.produce_proofs_enabled();
         // #dt-ground-conflict: datatype registries for the conflict-path

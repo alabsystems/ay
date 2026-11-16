@@ -303,14 +303,16 @@ fn guarded_quantifier_counters_render_zero_by_default() {
 /// same field, and each must survive a write.
 #[test]
 fn guarded_quantifier_counters_read_back_under_both_spellings() {
-    let mut stats = Statistics::default();
-    stats.quantifier_proxies_minted = 3;
-    stats.quantifier_guarded_instances_created = 5;
-    stats.quantifier_guarded_instances_asserted = 4;
-    stats.quantifier_mbqi_rounds = 2;
-    stats.quantifier_mbqi_candidates_probed = 91;
-    stats.quantifier_cegqi_rounds = 6;
-    stats.quantifier_cegqi_ce_lemmas = 7;
+    let stats = Statistics {
+        quantifier_proxies_minted: 3,
+        quantifier_guarded_instances_created: 5,
+        quantifier_guarded_instances_asserted: 4,
+        quantifier_mbqi_rounds: 2,
+        quantifier_mbqi_candidates_probed: 91,
+        quantifier_cegqi_rounds: 6,
+        quantifier_cegqi_ce_lemmas: 7,
+        ..Statistics::default()
+    };
 
     for (dotted, snake, expected) in [
         ("quantifier.proxies_minted", "quantifier_proxies_minted", 3),

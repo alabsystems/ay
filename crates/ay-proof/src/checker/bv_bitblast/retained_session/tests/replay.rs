@@ -107,7 +107,7 @@ fn non_boolean_live_source_and_sat_capture_refuse_without_retained_output() {
     )
     .unwrap();
     assert!(session.validate_step(ProofId(0), &mut |_, _| true).is_err());
-    assert!(session.output.is_empty());
+    assert_eq!(session.output, []);
     assert!(session.finish(&mut |_, _| true).is_err());
 
     let mut terms = TermStore::new();

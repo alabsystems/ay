@@ -26,10 +26,11 @@ fn fixture() -> (Executor, TermId, ModelValue) {
     let source = "(declare-const x (_ FloatingPoint 8 200))
         (declare-fun f (Int) (_ FloatingPoint 8 200))
         (assert (forall ((n Int)) (fp.leq (f n) x)))";
-    assert!(exec
-        .execute_all(&parse(source).expect("original source"))
-        .expect("elaborate without solving")
-        .is_empty());
+    assert_eq!(
+        exec.execute_all(&parse(source).expect("original source"))
+            .expect("elaborate without solving"),
+        [] as [String; 0]
+    );
     exec.begin_external_decision_query(false);
     let x = exec
         .ctx

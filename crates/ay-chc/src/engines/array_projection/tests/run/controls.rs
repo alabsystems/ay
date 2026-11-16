@@ -129,7 +129,9 @@ fn expired_original_clock_precancellation_and_zero_memory_refuse_before_search()
         let mut config = configured();
         let parent = CancellationToken::new();
         let until = if case == 0 {
-            Instant::now() - Duration::from_secs(1)
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture instant supports a one-second offset")
         } else {
             deadline()
         };

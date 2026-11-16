@@ -253,7 +253,7 @@ mod tests {
         executor.replace_with_exact_authored_poly_refutation(&mut proof, RepairEntry::Check);
 
         assert_eq!(executor.strict_check_invocations.get(), checks_before);
-        assert!(proof.steps.is_empty());
+        assert_eq!(proof.steps, [] as [ProofStep; 0]);
     }
 
     #[test]

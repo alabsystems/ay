@@ -869,8 +869,8 @@ impl<'s> TheoryBridge<'s> {
                 self.answer_mint(ctx, outcome)
             }
             TheoryResult::NeedSplit(_) => {
-                // Rung 2 (LIA branch-and-bound): `Minter::integer_split`. The
-                // LRA arm never raises it from `check()`.
+                // Persistent sessions are LRA-only. They do not mint integer
+                // branch-and-bound splits.
                 self.exit = BridgeExit::Unsupported(UnsupportedKind::Shape);
                 ExtCheckResult::Unknown
             }

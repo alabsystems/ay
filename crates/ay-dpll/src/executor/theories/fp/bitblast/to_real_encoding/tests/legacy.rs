@@ -47,7 +47,7 @@ pub(super) fn encode(
     let congruences = congruence_clauses.len();
     let total_vars = (tseitin_result.num_vars + fp.num_vars()) as usize;
     let var_offset = tseitin_result.num_vars as i32;
-    let shift = |lit| super::super::super::super::to_real::offset_cnf_lit(lit, var_offset);
+    let shift = |lit| super::super::super::super::blocking::offset_cnf_lit(lit, var_offset);
     let mut base_clauses = tseitin_result.clauses.clone();
     for clause in fp_clauses {
         base_clauses.push(CnfClause::new(

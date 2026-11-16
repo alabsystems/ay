@@ -61,7 +61,7 @@ fn fixed_int_subst_wide_bounds_no_subst() {
         ChcExpr::ge(var("x"), ChcExpr::int(0)),
     );
     let subst = PdrSolver::fixed_int_subst_from_conjuncts(&expr);
-    assert!(subst.is_empty());
+    assert_eq!(subst, [] as [(ChcVar, ChcExpr); 0]);
 }
 
 #[test]
@@ -130,14 +130,14 @@ fn fixed_int_subst_multiple_vars() {
 #[test]
 fn fixed_int_subst_empty_for_bool_true() {
     let subst = PdrSolver::fixed_int_subst_from_conjuncts(&ChcExpr::Bool(true));
-    assert!(subst.is_empty());
+    assert_eq!(subst, [] as [(ChcVar, ChcExpr); 0]);
 }
 
 #[test]
 fn fixed_int_subst_var_eq_var_no_subst() {
     let expr = ChcExpr::eq(var("x"), var("y"));
     let subst = PdrSolver::fixed_int_subst_from_conjuncts(&expr);
-    assert!(subst.is_empty());
+    assert_eq!(subst, [] as [(ChcVar, ChcExpr); 0]);
 }
 
 #[test]

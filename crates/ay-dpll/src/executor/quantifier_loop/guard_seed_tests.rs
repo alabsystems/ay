@@ -49,7 +49,10 @@ fn binder_dependent_and_binder_free_comparisons_are_not_seeds() {
         &[self_bound, ground, nonlinear],
         Sort::Bool,
     );
-    assert!(guard_bound_seeds(&terms, body, "s", &Sort::Real).is_empty());
+    assert_eq!(
+        guard_bound_seeds(&terms, body, "s", &Sort::Real),
+        [] as [TermId; 0]
+    );
 }
 
 /// The scan reads the Boolean skeleton under `not` and `or` and never enters
@@ -85,13 +88,13 @@ fn only_nonlinear_single_real_binder_bodies_are_seedable() {
     let sum = app(&mut terms, "+", &[s, v], Sort::Real);
     let linear_goal = app(&mut terms, "<=", &[sum, t], Sort::Bool);
     let linear = app(&mut terms, "=>", &[guard, linear_goal], Sort::Bool);
-    assert!(seedable(&terms, &vars, linear).is_empty());
+    assert_eq!(seedable(&terms, &vars, linear), [] as [TermId; 0]);
 
     let two = terms.mk_rational(num_rational::BigRational::from_integer(2.into()));
     let scaled = app(&mut terms, "*", &[two, s], Sort::Real);
     let scaled_goal = app(&mut terms, "<=", &[scaled, t], Sort::Bool);
     let scaled_body = app(&mut terms, "=>", &[guard, scaled_goal], Sort::Bool);
-    assert!(seedable(&terms, &vars, scaled_body).is_empty());
+    assert_eq!(seedable(&terms, &vars, scaled_body), [] as [TermId; 0]);
 
     let product = app(&mut terms, "*", &[s, v], Sort::Real);
     let nonlinear_goal = app(&mut terms, "<=", &[product, t], Sort::Bool);
@@ -99,7 +102,7 @@ fn only_nonlinear_single_real_binder_bodies_are_seedable() {
     assert_eq!(seedable(&terms, &vars, nonlinear), vec![zero, t]);
 
     let int_vars = vec![("s".to_string(), Sort::Int)];
-    assert!(seedable(&terms, &int_vars, nonlinear).is_empty());
+    assert_eq!(seedable(&terms, &int_vars, nonlinear), [] as [TermId; 0]);
     let two_vars = vec![("s".to_string(), Sort::Real), ("r".to_string(), Sort::Real)];
-    assert!(seedable(&terms, &two_vars, nonlinear).is_empty());
+    assert_eq!(seedable(&terms, &two_vars, nonlinear), [] as [TermId; 0]);
 }

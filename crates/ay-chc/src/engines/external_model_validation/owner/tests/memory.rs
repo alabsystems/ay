@@ -102,8 +102,11 @@ fn phase_resource_refusal_survives_internal_error_without_reclassifying_the_erro
 #[test]
 fn shorter_caller_ambient_wall_is_retained_after_scope_drop_on_worker() {
     let original = guard();
-    let scope =
-        crate::smt::ScopedSmtDeadline::install_until(Instant::now() - Duration::from_secs(1));
+    let scope = crate::smt::ScopedSmtDeadline::install_until(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fixture instant supports a one-second offset"),
+    );
     let owner = ExternalInvariantValidationOwner::capture(&original, &configured());
     drop(scope);
     assert_eq!(

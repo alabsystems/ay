@@ -5,7 +5,7 @@
 
 use super::super::super::{Admission, TermStore};
 use super::*;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 
 fn collision_store() -> (TermStore, Vec<u64>) {
     let mut store = TermStore::new();
@@ -15,9 +15,8 @@ fn collision_store() -> (TermStore, Vec<u64>) {
     // Pigeonhole, not assumed hash distribution: at least one h1 class has
     // 113 members. Low eight equal bits collide at BOTH B=128 and F=256.
     for key in 0..(256 * 113u64) {
-        let mut hash = store.hash_cons.hasher().build_hasher();
-        key.hash(&mut hash);
-        candidates[(hash.finish() & 255) as usize].push(key);
+        let hash = store.hash_cons.hasher().hash_one(key);
+        candidates[(hash & 255) as usize].push(key);
     }
     let keys = candidates
         .into_iter()
@@ -105,7 +104,6 @@ fn real_full_collision_resize_prepays_and_preserves_every_owned_row() {
         refused: false,
     };
     assert_eq!(store.controlled_map_reserve(&mut admission), Ok(()));
-    drop(admission);
     drop(sink);
     assert_eq!(observed, vec![expected]);
     assert!(store.hash_cons.allocation_size() > old);
@@ -144,7 +142,6 @@ fn real_collision_tombstones_keep_allocation_and_rehash_in_place() {
         refused: false,
     };
     assert_eq!(store.controlled_map_reserve(&mut admission), Ok(()));
-    drop(admission);
     drop(sink);
     assert_eq!(observed, vec![expected]);
     assert_eq!(store.hash_cons.allocation_size(), old);
@@ -172,7 +169,6 @@ fn original_one_short_sticky_refusal_happens_before_real_growth() {
     for _ in 0..2 {
         assert_eq!(store.controlled_map_reserve(&mut admission), Err(limit()));
     }
-    drop(admission);
     drop(sink);
     assert_eq!(owner.charge(0), Err(QueryError::Exhausted));
     assert_eq!(store.hash_cons.allocation_size(), old);
@@ -195,7 +191,6 @@ fn nonfull_table_preserves_the_old_unit_charge_and_zero_storage() {
         refused: false,
     };
     assert_eq!(store.controlled_map_reserve(&mut admission), Ok(()));
-    drop(admission);
     drop(sink);
     assert_eq!(observed, vec![(1, 0)]);
     assert_eq!(store.hash_cons.allocation_size(), old);

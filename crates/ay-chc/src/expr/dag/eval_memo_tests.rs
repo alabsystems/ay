@@ -43,7 +43,7 @@ fn distinct_inner_nodes(root: &ChcExpr) -> Vec<&ChcExpr> {
     let mut out = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if !has_children(node) || !seen.insert(node as *const ChcExpr) {
+        if !has_children(node) || !seen.insert(std::ptr::from_ref(node)) {
             continue;
         }
         out.push(node);

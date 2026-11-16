@@ -45,7 +45,7 @@ fn bitvector_array_lambda_keeps_only_outer_free_variables() {
 #[test]
 fn nested_array_lambda_shadowing_restores_outer_scope() {
     let value = expression("(lambda ((x Int)) (+ x (select (lambda ((x Int)) (+ x 2)) 3)))");
-    assert!(value.vars().is_empty());
+    assert_eq!(value.vars(), [] as [ChcVar; 0]);
 }
 
 #[test]
@@ -99,7 +99,10 @@ fn array_lambda_quantifiers_fail_without_hoisting() {
             parser.variables.is_empty(),
             "lambda scope must be restored on error"
         );
-        assert!(parser.active_renames.is_empty());
+        assert_eq!(
+            parser.active_renames,
+            [] as [(std::string::String, std::string::String); 0]
+        );
         assert_eq!(parser.lambda_depth, 0);
     }
 }
@@ -112,5 +115,5 @@ fn array_lambda_serialization_roundtrips_lexical_scopes() {
     let rendered = crate::InvariantModel::expr_to_smtlib(&original);
     let restored = expression(&rendered);
     assert_eq!(original, restored, "{rendered}");
-    assert!(restored.vars().is_empty());
+    assert_eq!(restored.vars(), [] as [ChcVar; 0]);
 }

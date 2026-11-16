@@ -13,13 +13,13 @@ struct Class {
 pub(super) struct Classes(Vec<Class>);
 
 impl Classes {
-    pub(super) fn new(arena: &Arena, owner: &mut Owner) -> Result<Self> {
+    pub(super) fn new(arena: &Arena<'_>, owner: &mut Owner<'_>) -> Result<Self> {
         let mut result = Self(Vec::new());
         result.extend(arena, owner)?;
         Ok(result)
     }
 
-    pub(super) fn extend(&mut self, arena: &Arena, owner: &mut Owner) -> Result<()> {
+    pub(super) fn extend(&mut self, arena: &Arena<'_>, owner: &mut Owner<'_>) -> Result<()> {
         let extra = arena
             .len()
             .checked_sub(self.0.len())
@@ -43,7 +43,7 @@ impl Classes {
         Ok(())
     }
 
-    pub(super) fn root(&mut self, mut id: usize, owner: &mut Owner) -> Result<usize> {
+    pub(super) fn root(&mut self, mut id: usize, owner: &mut Owner<'_>) -> Result<usize> {
         loop {
             // Path halving is charged before reads and parent mutation, not
             // only at successful unions. Even adversarial chains are bounded.
@@ -57,16 +57,16 @@ impl Classes {
         }
     }
 
-    pub(super) fn same(&mut self, a: usize, b: usize, owner: &mut Owner) -> Result<bool> {
+    pub(super) fn same(&mut self, a: usize, b: usize, owner: &mut Owner<'_>) -> Result<bool> {
         Ok(self.root(a, owner)? == self.root(b, owner)?)
     }
 
-    pub(super) fn literal(&mut self, id: usize, owner: &mut Owner) -> Result<Option<usize>> {
+    pub(super) fn literal(&mut self, id: usize, owner: &mut Owner<'_>) -> Result<Option<usize>> {
         let root = self.root(id, owner)?;
         Ok(self.0[root].literal)
     }
 
-    pub(super) fn array(&mut self, id: usize, owner: &mut Owner) -> Result<Option<usize>> {
+    pub(super) fn array(&mut self, id: usize, owner: &mut Owner<'_>) -> Result<Option<usize>> {
         let root = self.root(id, owner)?;
         Ok(self.0[root].array)
     }
@@ -75,8 +75,8 @@ impl Classes {
         &mut self,
         a: usize,
         b: usize,
-        arena: &Arena,
-        owner: &mut Owner,
+        arena: &Arena<'_>,
+        owner: &mut Owner<'_>,
     ) -> Result<bool> {
         owner.admit(1, 0)?;
         if arena.node(a).sort != arena.node(b).sort {

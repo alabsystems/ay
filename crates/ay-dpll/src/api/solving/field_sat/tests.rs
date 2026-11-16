@@ -20,7 +20,7 @@ fn decided(body: &str, sat: bool) -> Option<Model> {
         "tactics must not assert a different source problem"
     );
     if sat {
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[crate::api::Term]);
         Some(
             solver
                 .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
@@ -212,7 +212,7 @@ fn field_sat_rejects_malformed_field_atoms_before_boolean_refutation() {
         "y",
         Sort::FiniteField(ay_core::FiniteFieldSort::new(11).unwrap()),
     );
-    let bad = terms.mk_app(Symbol::Named("=".into()), &[x, y], Sort::Bool);
+    let bad = terms.mk_app(Symbol::Named("=".into()), [x, y], Sort::Bool);
     let not_bad = terms.mk_not_raw(bad);
     let operation = solver.begin_tactic_operation().unwrap();
     assert!(source(
@@ -238,7 +238,7 @@ fn field_sat_inverse_names_preserve_unrelated_original_assignments() {
         .apply_tactic_subgoals_converted(&Tactic::FieldSat, &roots, 0, None)
         .unwrap()
         .remove(0);
-    assert!(goal.formulas.is_empty());
+    assert_eq!(goal.formulas.as_slice(), &[] as &[crate::api::Term]);
     let mut input = Model::empty();
     input.field_values.insert(
         collision.clone(),
@@ -274,7 +274,7 @@ fn field_sat_composed_and_repeated_solved_goals_keep_the_original_typed_witness(
             .apply_tactic_subgoals_converted(&tactic, &roots, 0, None)
             .unwrap()
             .remove(0);
-        assert!(goal.formulas.is_empty());
+        assert_eq!(goal.formulas.as_slice(), &[] as &[crate::api::Term]);
         let model = solver
             .convert_tactic_model(goal.model_converter.as_ref().unwrap(), &Model::empty())
             .unwrap();

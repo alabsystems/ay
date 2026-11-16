@@ -144,7 +144,7 @@ fn each_lowering_and_continuation_poll_stops_the_same_chain() {
 fn expired_source_deadline_never_invokes_prerequisite_or_splits_limits() {
     for route in [Route::Disjoint, Route::Outside, Route::Combined] {
         let fixture = fixture(route, Value::Valid);
-        let deadline = Instant::now() - Duration::from_secs(1);
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         let mut actual = limits(deadline);
         let expected = format!("{actual:?}");
         let mut calls = 0;
@@ -173,11 +173,11 @@ fn returned_expression_still_contains_an_unproved_sibling() {
     let conjunction =
         fixture
             .terms
-            .mk_app(Symbol::named("and"), &[shape.property, sibling], Sort::Bool);
+            .mk_app(Symbol::named("and"), [shape.property, sibling], Sort::Bool);
     let negative = fixture.terms.mk_not_raw(conjunction);
     let root = fixture
         .terms
-        .mk_app(Symbol::named("and"), &[shape.guard, negative], Sort::Bool);
+        .mk_app(Symbol::named("and"), [shape.guard, negative], Sort::Bool);
     fixture.clause = fixture.terms.mk_not_raw(root);
     let deadline = deadline();
     let mut calls = 0;

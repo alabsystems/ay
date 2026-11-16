@@ -60,7 +60,7 @@ pub(crate) fn replay(
             }),
             progress,
         )?;
-        debug_assert!(output.is_empty());
+        debug_assert_eq!(output, []);
         Ok(checked)
     })
 }

@@ -29,7 +29,7 @@ struct W {
     zero: T,
 }
 
-fn words(p: &mut Proof, n: u32, x: &[T], e: &[T]) -> W {
+fn words(p: &mut Proof<'_>, n: u32, x: &[T], e: &[T]) -> W {
     let ff = p.t.ff;
     let mut xb = x.to_vec();
     xb.resize(2 * n as usize, ff);
@@ -45,7 +45,7 @@ fn words(p: &mut Proof, n: u32, x: &[T], e: &[T]) -> W {
 }
 
 /// `(and (not (bvult C U)) (or (= Zd ZERO) (not (bvult U ZX))))`.
-fn inv(p: &mut Proof, w: &W, zd: T, c: T) -> T {
+fn inv(p: &mut Proof<'_>, w: &W, zd: T, c: T) -> T {
     let u = p.t.mul(w.zx, zd);
     let b = p.t.ult(c, u);
     let nb = p.t.not(b);
@@ -56,7 +56,7 @@ fn inv(p: &mut Proof, w: &W, zd: T, c: T) -> T {
     p.t.and(&[nb, o])
 }
 
-fn shape(p: &mut Proof, n: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
+fn shape(p: &mut Proof<'_>, n: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
     let nn = 2 * n;
     let w = words(p, n, x, e);
     let maxl = p.t.lit(bits::mask(n, nn));
@@ -73,7 +73,7 @@ fn shape(p: &mut Proof, n: u32, x: &[T], e: &[T], c: T, cp: T) -> (T, T, T) {
 }
 
 impl Mono {
-    pub(crate) fn new(p: &mut Proof, n: u32, prefix: &str) -> Option<Self> {
+    pub(crate) fn new(p: &mut Proof<'_>, n: u32, prefix: &str) -> Option<Self> {
         let nn = 2 * n;
         let x: Vec<T> = (0..n)
             .map(|i| p.t.var(&format!("{prefix}x{i}"), Sort::Bool))
@@ -103,7 +103,7 @@ impl Mono {
         Some(mono)
     }
 
-    fn prove(&self, p: &mut Proof, k: T, prev: T, cur: T) -> Option<S> {
+    fn prove(&self, p: &mut Proof<'_>, k: T, prev: T, cur: T) -> Option<S> {
         let nn = 2 * self.n;
         let w = words(p, self.n, &self.x, &self.e);
         let (u, up) = (p.t.mul(w.zx, w.zd), p.t.mul(w.zx, w.zdp));
@@ -169,7 +169,7 @@ impl Mono {
         body_from_clause(p, self.body, spc)
     }
 
-    fn case(&self, p: &mut Proof, c: &Ctx<'_>, positive: bool) -> Option<S> {
+    fn case(&self, p: &mut Proof<'_>, c: &Ctx<'_>, positive: bool) -> Option<S> {
         let bnd_t = {
             let b = p.t.ult(self.c, c.u);
             p.t.not(b)
@@ -193,7 +193,7 @@ impl Mono {
     }
 
     /// The even case: `Zd' = 0` makes `Zd = 0`; otherwise `U' >= ZX` and `U = 2U'`.
-    fn mono_even(&self, p: &mut Proof, c: &Ctx<'_>, mon_t: T, mono_or: T) -> Option<S> {
+    fn mono_even(&self, p: &mut Proof<'_>, c: &Ctx<'_>, mon_t: T, mono_or: T) -> Option<S> {
         let zc = p.t.eq(c.w.zdp, c.w.zero);
         let s1 = p.anchor(&[]);
         let az = p.assume(zc);
@@ -224,7 +224,7 @@ impl Mono {
 
     /// Instances for multiplicand bits `xb` and multiplier bits `db`; returns the step
     /// for the final invariant over `U_0 = ZX * (concat 0 bb(db))`.
-    pub(crate) fn run(&self, p: &mut Proof, xb: &[T], db: &[T]) -> Option<S> {
+    pub(crate) fn run(&self, p: &mut Proof<'_>, xb: &[T], db: &[T]) -> Option<S> {
         let (n, ff) = (self.n, p.t.ff);
         let cs = consts(n);
         let mut ebase = vec![db[n as usize - 1]];
@@ -256,7 +256,7 @@ impl Mono {
         Some(fact)
     }
 
-    fn base(&self, p: &mut Proof, xb: &[T], ebase: &[T], prev: T) -> Option<S> {
+    fn base(&self, p: &mut Proof<'_>, xb: &[T], ebase: &[T], prev: T) -> Option<S> {
         let nn = 2 * self.n;
         let w = words(p, self.n, xb, ebase);
         let up = p.t.mul(w.zx, w.zdp);

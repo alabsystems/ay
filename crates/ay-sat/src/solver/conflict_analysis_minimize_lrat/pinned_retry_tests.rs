@@ -227,7 +227,7 @@ fn a_solver_with_a_proof_output_keeps_the_full_retry() {
     let support_id = solver.clause_id(ClauseRef(support_idx as u32));
     solver.record_unit_proof_id_for_lit(lit(SUPPORT), support_id);
     solver.materialize_level0_unit_proofs();
-    assert!(solver.cold.lrat_level0_unit_materialize_pinned.is_empty());
+    assert_eq!(solver.cold.lrat_level0_unit_materialize_pinned.len(), 0);
     for &t in &TARGETS {
         let id = solver.level0_var_proof_id(t).expect("materialized");
         assert!(solver.lrat_hint_id_visible(id));

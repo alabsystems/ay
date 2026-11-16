@@ -18,10 +18,10 @@ fn exact_199_bit_public_fields_roundtrip_without_native_truncation() {
     let value = decode(&literal, 8, 200).unwrap();
     let fields = value.as_fp_exact().unwrap();
     assert!(fields.sign());
-    assert_eq!(fields.exponent(), &num_bigint::BigUint::from(127u32));
+    assert_eq!(fields.exponent(), &BigUint::from(127u32));
     assert_eq!(
         fields.significand(),
-        &((num_bigint::BigUint::from(1u32) << 198usize) | num_bigint::BigUint::from(1u32))
+        &((BigUint::from(1u32) << 198usize) | BigUint::from(1u32))
     );
     assert!(value.as_fp_wide().is_none());
     assert!(value.as_fp().is_none());

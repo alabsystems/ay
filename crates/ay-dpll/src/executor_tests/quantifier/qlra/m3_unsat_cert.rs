@@ -364,7 +364,8 @@ fn p2_and_rnd_3_5_publish_under_competition_shedding() {
 /// count is 1.
 #[test]
 fn a_parked_certificate_is_installed_before_the_deep_qe_retry_runs() {
-    for (name, smt) in [("mjollnir3_177", fixture!("mjollnir3_formula_177.smt2"))] {
+    {
+        let (name, smt) = ("mjollnir3_177", fixture!("mjollnir3_formula_177.smt2"));
         let run = run_cert_with(smt, ExpansionCertMutation::None, true, true);
         assert_eq!(run.verdict, "unsat", "{name}");
         assert_eq!(

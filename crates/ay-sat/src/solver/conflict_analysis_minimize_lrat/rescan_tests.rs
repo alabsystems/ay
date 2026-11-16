@@ -111,7 +111,7 @@ fn fresh_entries_are_charged_even_when_the_pass_does_not_leave_a_pin() {
         pass.run(&mut solver);
         assert_eq!(pass.visited(&solver), 8);
         assert_eq!(solver.cold.proof_bookkeeping_budget, Some(1));
-        assert!(solver.cold.lrat_level0_unit_materialize_pinned.is_empty());
+        assert_eq!(solver.cold.lrat_level0_unit_materialize_pinned.len(), 0);
         pass.run(&mut solver);
         assert_eq!(pass.visited(&solver), 8, "empty retry does no work");
         assert_eq!(solver.cold.proof_bookkeeping_budget, Some(1));
@@ -151,7 +151,7 @@ fn actual_visit_exhaustion_restores_scratch_and_cannot_revive_the_trace() {
         assert!(!solver.has_live_clause_trace());
         assert_eq!(solver.cold.lrat_level0_unit_materialize_pinned, [1]);
         assert_eq!(solver.cold.lrat_level0_unit_materialize_cursor, 8);
-        assert!(solver.cold.lrat_materialize_hints_buf.is_empty());
+        assert_eq!(solver.cold.lrat_materialize_hints_buf.len(), 0);
         assert_eq!(solver.cold.lrat_materialize_hints_buf.capacity(), capacity);
         pass.run(&mut solver);
         assert_eq!(pass.visited(&solver), 1);
@@ -180,7 +180,7 @@ fn assert_stopped_prefix_preserved(mut solver: Solver) {
         assert_eq!(solver.cold.lrat_level0_unit_materialize_pinned, [1]);
         assert_eq!(solver.cold.lrat_level0_unit_materialize_cursor, 8);
         assert_eq!(entries(&solver), before);
-        assert!(solver.cold.lrat_materialize_hints_buf.is_empty());
+        assert_eq!(solver.cold.lrat_materialize_hints_buf.len(), 0);
         assert_eq!(solver.cold.lrat_materialize_hints_buf.capacity(), capacity);
     }
 }

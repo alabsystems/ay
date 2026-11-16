@@ -149,7 +149,7 @@ pub(super) fn observe(executor: &Executor, model: &Model, leaf: TermId) {
     if !ay_core::misc_cli_flags().debug_strict_oracle {
         return;
     }
-    let ticket = match LEAF_RECORDS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+    let ticket = match LEAF_RECORDS.try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
         if count <= LEAF_LIMIT {
             Some(count + 1)
         } else {
@@ -169,7 +169,7 @@ pub(super) fn observe(executor: &Executor, model: &Model, leaf: TermId) {
     ay_core::safe_eprintln!(
         "[ite-uf-provenance] seq={} executor={:p} epoch=0x{:x} leaf={:?}",
         ticket,
-        executor as *const Executor,
+        std::ptr::from_ref(executor),
         executor.query_authority_epoch.diagnostic_address(),
         Point {
             executor,

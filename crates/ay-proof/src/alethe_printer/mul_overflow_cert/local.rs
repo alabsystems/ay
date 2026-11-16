@@ -15,10 +15,10 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 /// `(cl (not h_1) .. (not h_k) c)` from `body`, run under the assumptions
 /// `hyps` (their steps in order), whose last step must conclude `(cl c)`.
 pub(crate) fn under(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     hyps: &[T],
     c: T,
-    body: impl FnOnce(&mut Proof, &[S]) -> Option<S>,
+    body: impl FnOnce(&mut Proof<'_>, &[S]) -> Option<S>,
 ) -> Option<S> {
     let a = p.anchor(&[]);
     let hs: Vec<S> = hyps.iter().map(|&h| p.assume(h)).collect();
@@ -31,7 +31,7 @@ pub(crate) fn under(
     Some(p.close(a, &cl, "subproof", &hs))
 }
 
-fn word_atom(p: &Proof, a: T) -> bool {
+fn word_atom(p: &Proof<'_>, a: T) -> bool {
     matches!(p.t.op(a), Op::Eq | Op::Ult) && p.t.width(p.t.args(a)[0]) > 0
 }
 
@@ -40,13 +40,13 @@ fn word_atom(p: &Proof, a: T) -> bool {
 /// way the checker does it, words the blaster does not open standing for
 /// their own `@bit_of` projections, and the local refuter derives the clause
 /// from the circuits' defining clauses.
-pub(crate) fn bitfact(p: &mut Proof, hyps: &[S], target: &[T]) -> Option<S> {
+pub(crate) fn bitfact(p: &mut Proof<'_>, hyps: &[S], target: &[T]) -> Option<S> {
     bitfact_with(p, hyps, target, &[])
 }
 
 /// [`bitfact`] with the words `opaque` kept closed (standing for their own
 /// `@bit_of` projections), as the schoolbook sees its limbs.
-pub(crate) fn bitfact_with(p: &mut Proof, hyps: &[S], target: &[T], opaque: &[T]) -> Option<S> {
+pub(crate) fn bitfact_with(p: &mut Proof<'_>, hyps: &[S], target: &[T], opaque: &[T]) -> Option<S> {
     let mut b = Blaster::new(opaque, &[]);
     let mut prem: Vec<Prem> = hyps.iter().map(|&s| Prem::Step(s)).collect();
     let mut atoms = Vec::new();
@@ -86,7 +86,7 @@ pub(crate) fn bitfact_with(p: &mut Proof, hyps: &[S], target: &[T], opaque: &[T]
 
 /// `(= c v)` for the Boolean value `v` of the condition `c` (an atom or a
 /// negation of one) given the literal step `lit` of the same atom.
-pub(crate) fn truth(p: &mut Proof, c: T, lit: S) -> Option<(S, bool)> {
+pub(crate) fn truth(p: &mut Proof<'_>, c: T, lit: S) -> Option<(S, bool)> {
     let (atom, pol) = p.t.lit_of(p.unit(lit));
     let (catom, cpol) = p.t.lit_of(c);
     if atom != catom {
@@ -102,7 +102,7 @@ pub(crate) fn truth(p: &mut Proof, c: T, lit: S) -> Option<(S, bool)> {
 }
 
 /// `(= (ite c x y) x)` or `(= (ite c x y) y)` from the literal step of `c`.
-pub(crate) fn branch(p: &mut Proof, ite: T, lit: S) -> Option<S> {
+pub(crate) fn branch(p: &mut Proof<'_>, ite: T, lit: S) -> Option<S> {
     let [c, x, y] = p.t.args(ite).to_vec()[..] else {
         return None;
     };

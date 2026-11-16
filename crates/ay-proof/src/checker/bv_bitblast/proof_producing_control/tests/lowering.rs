@@ -73,9 +73,7 @@ fn lowerer_refusal_and_caught_callback_panic_cannot_resurrect_the_attempt() {
         let mut calls = 0;
         let mut callback = || {
             calls += 1;
-            if panics {
-                panic!("injected lowering callback panic");
-            }
+            assert!(!panics, "injected lowering callback panic");
             false
         };
         let mut lowerer = ProofProducingLowerer::new(&terms, deadline());

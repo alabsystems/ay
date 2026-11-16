@@ -270,6 +270,7 @@ pub(super) fn scalar_candidate_node_count(
     Some(crate::expr::MAX_PREPROCESSING_NODES - remaining)
 }
 
+#[cfg(test)]
 pub(super) fn exact_scalar_walk(
     expr: &ChcExpr,
     allowed: &FxHashSet<ChcVar>,

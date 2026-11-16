@@ -469,19 +469,24 @@ impl CheckedExactRmDomainExpansionUnsat {
             return false;
         }
         for (index, branch) in self.branches.iter().enumerate() {
-            if branch.modes.len() != self.rm_vars.len()
-                || branch.roots.len() != self.roots.len()
-                || !CheckedExactClosedForallUnsat::entries_are_current(
-                    &executor.ctx.terms,
-                    &branch.modes,
-                    &branch.mode_entries,
-                )
-                || !CheckedExactClosedForallUnsat::entries_are_current(
-                    &executor.ctx.terms,
-                    &branch.roots,
-                    &branch.root_entries,
-                )
-            {
+            if branch.modes.len() != self.rm_vars.len() {
+                return false;
+            }
+            if branch.roots.len() != self.roots.len() {
+                return false;
+            }
+            if !CheckedExactClosedForallUnsat::entries_are_current(
+                &executor.ctx.terms,
+                &branch.modes,
+                &branch.mode_entries,
+            ) {
+                return false;
+            }
+            if !CheckedExactClosedForallUnsat::entries_are_current(
+                &executor.ctx.terms,
+                &branch.roots,
+                &branch.root_entries,
+            ) {
                 return false;
             }
             let mut digits = index;
@@ -962,5 +967,35 @@ mod tests {
             !evidence.is_current(&executor),
             "branch i must carry the canonical decoding of i"
         );
+    }
+
+    /// MUTATION: enlarge either branch dimension while keeping its term-entry
+    /// stamps current. The checker must reject the carrier before matching its
+    /// contents against the sealed cross product.
+    #[test]
+    fn rm_domain_expansion_token_rejects_extra_branch_dimensions() {
+        let (executor, mut evidence) = rm_domain_expansion_evidence(RM_WRONG_PIN_UNSAT_SCRIPT);
+        assert!(evidence.is_current(&executor));
+        let mut branches = evidence.branches.into_vec();
+        let mut modes = branches[0].modes.to_vec();
+        let mut mode_entries = branches[0].mode_entries.to_vec();
+        modes.push(modes[0]);
+        mode_entries.push(mode_entries[0]);
+        branches[0].modes = modes.into_boxed_slice();
+        branches[0].mode_entries = mode_entries.into_boxed_slice();
+        evidence.branches = branches.into_boxed_slice();
+        assert!(!evidence.is_current(&executor));
+
+        let (executor, mut evidence) = rm_domain_expansion_evidence(RM_WRONG_PIN_UNSAT_SCRIPT);
+        assert!(evidence.is_current(&executor));
+        let mut branches = evidence.branches.into_vec();
+        let mut roots = branches[0].roots.to_vec();
+        let mut root_entries = branches[0].root_entries.to_vec();
+        roots.push(roots[0]);
+        root_entries.push(root_entries[0]);
+        branches[0].roots = roots.into_boxed_slice();
+        branches[0].root_entries = root_entries.into_boxed_slice();
+        evidence.branches = branches.into_boxed_slice();
+        assert!(!evidence.is_current(&executor));
     }
 }

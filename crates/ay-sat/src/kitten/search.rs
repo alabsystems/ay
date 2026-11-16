@@ -164,9 +164,9 @@ impl Kitten {
     fn analyze(&mut self, conflict_ref: u32) {
         debug_assert!(self.level > 0);
         debug_assert_eq!(self.inconsistent, INVALID);
-        debug_assert!(self.analyzed.is_empty());
-        debug_assert!(self.resolved.is_empty());
-        debug_assert!(self.clause_buf.is_empty());
+        debug_assert_eq!(self.analyzed.len(), 0);
+        debug_assert_eq!(self.resolved.len(), 0);
+        debug_assert_eq!(self.clause_buf.len(), 0);
 
         self.clause_buf.push(INVALID);
 
@@ -274,8 +274,8 @@ impl Kitten {
     /// 3. `first_failed`: assumption falsified by propagation, walk implication graph
     fn failing_analysis(&mut self) {
         debug_assert_eq!(self.inconsistent, INVALID);
-        debug_assert!(!self.assumptions.is_empty());
-        debug_assert!(self.analyzed.is_empty());
+        debug_assert_ne!(self.assumptions.len(), 0);
+        debug_assert_eq!(self.analyzed.len(), 0);
 
         let assumptions = self.assumptions.clone();
 

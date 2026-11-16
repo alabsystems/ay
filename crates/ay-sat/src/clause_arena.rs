@@ -337,7 +337,7 @@ impl ClauseArena {
         owner: &ay_core::original_query::CountedAdmission,
     ) -> Result<Self, ay_core::original_query::CountedAdmissionError> {
         use ay_core::original_query::CountedAdmissionError;
-        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        owner.admit(size_of::<Self>(), 0)?;
         let words = clauses
             .checked_mul(HEADER_WORDS)
             .and_then(|n| n.checked_add(literals))
@@ -377,7 +377,7 @@ impl ClauseArena {
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             let target = end.max(grown).max(VEC_MIN_NON_ZERO_CAP);
             let bytes = target
-                .checked_mul(std::mem::size_of::<u32>())
+                .checked_mul(size_of::<u32>())
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             let work = target
                 .checked_add(self.words.len())
@@ -421,7 +421,7 @@ impl ClauseArena {
                 .checked_mul(4)
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             let bytes = buckets
-                .checked_mul(std::mem::size_of::<(usize, usize)>() + 32)
+                .checked_mul(size_of::<(usize, usize)>() + 32)
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
             // Bound real rehash/probe walks too, not only element hashing.
             // Fixed hashing is deterministic but not a collision-freedom proof.

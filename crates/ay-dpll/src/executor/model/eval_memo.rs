@@ -181,7 +181,7 @@ pub(super) fn put(term_id: TermId, value: &EvalValue) {
     let Some(original) = currency() else {
         return;
     };
-    if !super::evaluation_copies::pay(1, std::mem::size_of::<(TermId, EvalValue)>() * 4) {
+    if !super::evaluation_copies::pay(1, size_of::<(TermId, EvalValue)>() * 4) {
         return;
     }
     let value = super::evaluation_copies::copy(value);
@@ -234,7 +234,7 @@ pub(super) fn residual_dep_put(terms: impl IntoIterator<Item = TermId>, value: b
         return;
     };
     for term in terms {
-        if !super::evaluation_copies::pay(1, 4 * std::mem::size_of::<(TermId, bool)>()) {
+        if !super::evaluation_copies::pay(1, 4 * size_of::<(TermId, bool)>()) {
             return;
         }
         EVAL_MEMO.with(|c| {

@@ -8,16 +8,16 @@ use crate::solver::FreshInputTraceEvent;
 
 impl ClauseTrace {
     pub(crate) fn with_capacity_counted(capacity: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(std::mem::size_of::<Self>().saturating_add(32), 0)?;
+        owner.admit(size_of::<Self>().saturating_add(32), 0)?;
         let mut trace = Self::new();
         let bytes = capacity
-            .checked_mul(std::mem::size_of::<EntryMeta>())
+            .checked_mul(size_of::<EntryMeta>())
             .filter(|bytes| *bytes <= trace.budget_bytes)
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         let meta = try_reserved_exact(owner, capacity)?;
         let actual = meta
             .capacity()
-            .checked_mul(std::mem::size_of::<EntryMeta>())
+            .checked_mul(size_of::<EntryMeta>())
             .filter(|actual| *actual <= trace.budget_bytes)
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         owner.admit(

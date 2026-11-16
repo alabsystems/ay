@@ -1010,8 +1010,8 @@ fn a_stopped_check_leaves_the_rest_of_an_equality_batch_unrecorded() {
     let pairs: Vec<(TermId, TermId)> = (0..200)
         .map(|i| {
             (
-                terms.mk_var(&format!("sl{i}"), Sort::Int),
-                terms.mk_var(&format!("sr{i}"), Sort::Int),
+                terms.mk_var(format!("sl{i}"), Sort::Int),
+                terms.mk_var(format!("sr{i}"), Sort::Int),
             )
         })
         .collect();
@@ -1080,7 +1080,10 @@ fn stable_array_replay_union_preserves_prefix_order_and_full_reason_identity() {
         vec![a, a_other_reason, b],
         "an empty imported prefix does not license cloning persistent duplicates unchanged",
     );
-    assert!(TheoryCombiner::stable_array_replay_union(&[], &[]).is_empty());
+    assert_eq!(
+        TheoryCombiner::stable_array_replay_union(&[], &[]),
+        [] as [ArrayPropagatedEqualityReplay; 0]
+    );
 }
 
 #[test]

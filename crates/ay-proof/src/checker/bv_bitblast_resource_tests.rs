@@ -6,7 +6,9 @@
 
 use std::time::Duration;
 
+use super::producer_limits::strict_producer_limits;
 use super::*;
+use crate::bv_blast_solver::export_bv_blast_proof_expr_with_limits;
 
 fn expression_shape(root: &BvExpr) -> (usize, usize) {
     let mut stack = vec![(root, 1_usize)];

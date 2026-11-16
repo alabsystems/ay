@@ -2215,7 +2215,7 @@ mod tests {
     fn retained_affine_case(
         annotation: Option<ay_core::FarkasAnnotation>,
     ) -> (Solver, Proof, HashSet<TermId>, HashSet<TermId>) {
-        let mut solver = Solver::try_new(crate::api::types::Logic::QfLia).unwrap();
+        let mut solver = Solver::try_new(Logic::QfLia).unwrap();
         let terms = solver.terms_mut();
         let a = terms.mk_var("retained_a", Sort::Int);
         let b = terms.mk_var("retained_b", Sort::Int);

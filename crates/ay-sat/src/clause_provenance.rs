@@ -222,7 +222,7 @@ mod tests {
         tracker.tag(0, ClauseProvenance::ProblemEncoding);
         assert_eq!(tracker.get(0), None);
         assert_eq!(tracker.tracked_count(), 0);
-        assert!(tracker.summary().is_empty());
+        assert_eq!(tracker.summary().len(), 0);
     }
 
     #[test]
@@ -333,7 +333,7 @@ mod tests {
             tags: Vec::new(),
         };
         let breakdown = tracker.breakdown_for_indices(&[0, 1, 2]);
-        assert!(breakdown.is_empty());
+        assert_eq!(breakdown.len(), 0);
     }
 
     #[test]

@@ -264,8 +264,7 @@ fn opaque_completion_retains_structured_datatype_for_gate_projection() {
                 if ctor == &objective_ctor
                     && matches!(args.as_slice(), [ModelValue::Array(_)])
         ),
-        "objective must retain its exact constructor/array value: {:?}",
-        objective_value
+        "objective must retain its exact constructor/array value: {objective_value:?}"
     );
     assert!(
         !model
@@ -326,7 +325,7 @@ fn structured_ground_finalization_exhaustion_is_atomic() {
         let mut builder = exec
             .dt_collect(&model, &[])
             .expect("bounded opaque fixture must enter construction");
-        assert!(!builder.terms.is_empty());
+        assert_ne!(builder.terms, [] as [TermId; 0]);
         assert!(builder.force_constructors());
         builder.add_observation_disequalities();
         assert!(builder.construct_all());

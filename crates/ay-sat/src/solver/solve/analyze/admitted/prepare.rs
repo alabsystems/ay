@@ -44,11 +44,7 @@ impl Solver {
                 .lbd_sum
                 .checked_add(u64::from(result.lbd))
                 .is_none()
-            || self
-                .stats
-                .lbd_buckets
-                .iter()
-                .any(|count| *count == u64::MAX)
+            || self.stats.lbd_buckets.contains(&u64::MAX)
         {
             return Err(invalid(owner, "learning statistics overflow"));
         }

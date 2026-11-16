@@ -120,7 +120,7 @@ fn array_select_constrained_model_is_valid_store_chain() {
     // Re-feed ay's printed array value (pinned) + the originals to z3: the
     // witness must be CONSISTENT (`sat`), proving it does not violate the
     // assertions.
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let value = pair_value(lines.last().expect("get-value line"));
         let refed = format!(
             "(set-logic ALL)\n\
@@ -131,7 +131,7 @@ fn array_select_constrained_model_is_valid_store_chain() {
              (check-sat)\n"
         );
         let path = temp_smt("repro1", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -175,7 +175,7 @@ fn nested_array_of_arrays_model_is_valid_witness() {
         "get-model and get-value disagree on a:\n{output}"
     );
 
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let refed = format!(
             "(set-logic ALL)\n\
              (declare-const a (Array Int (Array Int Int)))\n\
@@ -184,7 +184,7 @@ fn nested_array_of_arrays_model_is_valid_witness() {
              (check-sat)\n"
         );
         let path = temp_smt("repro_nested", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -258,7 +258,7 @@ fn store_equality_array_inherits_base_default() {
         "get-model and get-value disagree on b:\n{output}"
     );
 
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let refed = format!(
             "(set-logic ALL)\n\
              (declare-const a (Array Int Int))\n\
@@ -270,7 +270,7 @@ fn store_equality_array_inherits_base_default() {
              (check-sat)\n"
         );
         let path = temp_smt("repro_storeeq", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,
@@ -336,7 +336,7 @@ fn datatype_keyed_array_index_has_no_skolem() {
         "get-model and get-value disagree on a:\n{output}"
     );
 
-    if crate::common::check_z3_or_skip() {
+    if crate::common::z3::check_z3_or_skip() {
         let refed = format!(
             "(set-logic ALL)\n\
              (declare-datatypes ((Color 0)) (((red) (green) (blue))))\n\
@@ -347,7 +347,7 @@ fn datatype_keyed_array_index_has_no_skolem() {
              (check-sat)\n"
         );
         let path = temp_smt("buge", &refed);
-        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let outcome = crate::common::z3::run_z3_file(&path, 10).expect("run z3");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             outcome,

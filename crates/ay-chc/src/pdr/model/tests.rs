@@ -191,9 +191,9 @@ fn constant_false_replay_uses_strict_certifiable_guard_contradiction() {
         !obligation.smtlib.contains("(define-fun error"),
         "an unused false-bodied definition must not enter the guarded contradiction"
     );
-    let cert = crate::smt::executor_adapter::smtlib_strict_unsat_cert_via_executor(
+    let cert = crate::smt::executor_adapter::smtlib_strict_unsat_cert_via_executor_until(
         &obligation.smtlib,
-        None,
+        ay_core::time::Instant::now() + std::time::Duration::from_mins(1),
     )
     .expect("the guarded constant-false replay query must retain a native strict certificate");
     assert_eq!(
@@ -203,7 +203,7 @@ fn constant_false_replay_uses_strict_certifiable_guard_contradiction() {
     );
     let checked = ay_dpll::api::re_check_bundle_strict(&cert.bundle)
         .expect("the guarded contradiction bundle must independently recheck");
-    assert!(!checked.assume_terms.is_empty());
+    assert_ne!(checked.assume_terms, [] as [ay_core::TermId; 0]);
     assert_eq!(checked.assume_terms, cert.bundle.obligation_assertions);
 }
 

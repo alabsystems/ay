@@ -336,7 +336,7 @@ impl AlethePrinter<'_> {
             self.terms.entry_stamp(term)?;
             if matches!(self.terms.get(term), TermData::App(Symbol::Named(op), _) if op == "store")
             {
-                self.row_store_parts(term)?;
+                let _ = self.row_store_parts(term)?;
             }
             if !row_sort(self.terms.sort(term))
                 || self.term_overrides.is_some_and(|m| m.contains_key(&term))
@@ -348,7 +348,7 @@ impl AlethePrinter<'_> {
             let (own, children): (usize, &[TermId]) = match self.terms.get(term) {
                 TermData::Const(Constant::Bool(_)) => (5, &[]),
                 TermData::Const(Constant::BitVec { width, value }) => {
-                    if value.sign() == num_bigint::Sign::Minus || value.bits() > u64::from(*width) {
+                    if value.sign() == Sign::Minus || value.bits() > u64::from(*width) {
                         return None;
                     }
                     (*width as usize + 32, &[])

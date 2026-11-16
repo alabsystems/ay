@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn ext_propagate_result_none_is_empty() {
     let result = ExtPropagateResult::none();
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses.len(), 0);
     assert!(result.conflict.is_none());
 }
 
@@ -48,7 +48,7 @@ fn ext_propagate_result_conflict_sets_conflict_clause() {
     let conflict_clause = vec![lit_a, lit_b];
 
     let result = ExtPropagateResult::conflict(conflict_clause.clone());
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses.len(), 0);
     assert_eq!(result.conflict, Some(conflict_clause));
 }
 

@@ -105,7 +105,7 @@ impl<'a> ProofMeter<'a> {
         seen: &mut BTreeSet<TermId>,
         term: TermId,
     ) -> Result<bool, ProofCheckError> {
-        let levels = add((usize::BITS - seen.len().leading_zeros()) as usize, 1)?;
+        let levels = add(seen.len().bit_width() as usize, 1)?;
         let comparisons = add(seen.len(), 1)?.min(mul(levels, 12)?);
         let lookup = add(comparisons, levels)?;
         self.charge(lookup, 0)?;

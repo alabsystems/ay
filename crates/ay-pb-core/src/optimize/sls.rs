@@ -3429,7 +3429,7 @@ mod tests {
             with.objective <= planted_obj,
             "incumbent must be at least as good as the planted seed"
         );
-        assert!(!reported.is_empty());
+        assert_ne!(reported.as_slice(), &[] as &[i128]);
     }
 
     #[test]
@@ -4302,7 +4302,7 @@ mod tests {
             &ddfw.assignment
         ));
         assert_eq!(eval_objective(&objective, &ddfw.assignment), ddfw.objective);
-        assert!(!ddfw_reported.is_empty());
+        assert_ne!(ddfw_reported.as_slice(), &[] as &[i128]);
     }
 
     // ---- Unified (NuPBO-class) search tests ----

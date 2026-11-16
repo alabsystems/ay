@@ -71,7 +71,8 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
     // probe -- not this comment -- is what re-proves that every run.
     //
     // `alethe_printer/complete_blast.rs` prints `Blasted::rule`, chosen by
-    // `blast_operation`'s operator tables. It is a BOUNDED EMITTER (below).
+    // `blast_operation`'s operator tables. `Blasted` stores the private
+    // `CheckableRule` type, so an unchecked spelling cannot reach its writer.
     //
     // ## The `rule` sites
     //
@@ -85,41 +86,41 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
     // the probe, saying there what that proves and what it does not. The
     // duality site selects its two rules from the fixed decoder table too.
     //
-    // The other six are BOUNDED EMITTERS: `bv_packed.rs` (`named_step`),
+    // The other six are typed emitters: `bv_packed.rs` (`named_step`),
     // `complete_blast.rs` (`theory_atom`), `complete_blast/transport.rs`
-    // (`ClauseEmit::Rule`, planned through `Blaster::plan`), `closed_guard/emit.rs` (`command`),
+    // (`ClauseEmit::Rule`, planned through `Blaster::plan`),
+    // `closed_guard/emit.rs` (`command`),
     // `ground_substitution/derivation.rs` (`step`) and `shadowed_stores.rs`
-    // (`step`). These five lowerings landed after `5d837561c` and were never
-    // connected; their rule names are `&str` arguments spelled at call sites
-    // across the whole subtree -- ~40 files for `bv_packed` alone -- and
-    // several of those call sites SPLICE the name (`bitblast_{gate}`,
-    // `pbblast_{op}`, `{op}_simplify`), which no static scan can read back.
+    // (`step`). Their raw entry points convert to `CheckableRule` before a
+    // separate writer can format bytes. Complete blast carries the typed value
+    // in both `Blasted` and `ClauseEmit`, so later layers cannot reintroduce an
+    // unchecked string.
     //
     // The tenth is `complete_blast/order.rs` `equate` (see the count below).
-    // The eleventh and twelfth are two more BOUNDED EMITTERS:
+    // The eleventh and twelfth are two more typed emitters:
     //
     // * `alethe_printer/mul_overflow_cert/proof.rs` (`write_step`,
     //   `519f0611d`), the one writer of the u128/i128 multiplication-overflow
     //   certificate. Its names are `&'static str` literals spread across that
     //   subtree (`GateDef::rule`, `emit`, `emit_named`, `close`, `drup`); it
-    //   landed unconnected, and the bound in `write_step` (the hole for any
-    //   name outside `CHECKABLE_ALETHE_RULES`) is what connects it.
+    //   `write_step` converts every name to `CheckableRule`, using the typed
+    //   `hole` value for an unknown name.
     // * `alethe_printer/constant_skolem_bridge.rs` (`bridge_command`), the one
     //   writer of the anchored bridge that derives `(= BODY b)` for a Skolem
     //   instance the store folded to `true` / `false`, and of the
     //   `sko_forall` / `sko_ex` that closes it. Its rules come from
     //   `ConstantBridgeStep::rule` (`eq_simplify`, `comp_simplify`, `cong`,
     //   `not_simplify`, `trans`) and from the judged Skolem step
-    //   (`sko_forall`, `sko_ex`); `bridge_command` refuses any name outside
-    //   `CHECKABLE_ALETHE_RULES` and the step is then the hole.
+    //   (`sko_forall`, `sko_ex`); `bridge_command` refuses any name that cannot
+    //   become a `CheckableRule` and the step is then the hole.
     //
     // The probe of that array covers both.
     //
-    // So the bound is enforced where the bytes are written: each emitter
-    // refuses any name outside `CHECKABLE_ALETHE_RULES` and leaves the honest
-    // hole, `RULE_BOUNDED_EMITTERS` asserts that each guard is still there,
-    // and the probe now covers every member of that array. See
-    // `assert_emitters_are_rule_bounded`.
+    // `CheckableRule` has a private field and canonicalizes through
+    // `CHECKABLE_ALETHE_RULES`, so the typed writers cannot represent any
+    // other spelling. Its unit tests cover every member, reject invented and
+    // trust-only names, and pin the hole fallback. The external probe covers
+    // every member of that same array.
     //
     // ## `blast_rule` and `simplify_rule`
     //
@@ -165,11 +166,10 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
         ("blast_rule", 2),
         ("non_strict_rule", 1),
         // 10: complete_blast/order.rs `equate` prints `pbblast_{op}` for a
-        // derived comparison (73810d00d); it emits only a name
-        // `is_checkable_alethe_rule` accepts.
+        // derived comparison (73810d00d); its raw entry point must first
+        // construct a `CheckableRule`.
         // 11: mul_overflow_cert/proof.rs `write_step`, and 12:
-        // constant_skolem_bridge.rs `bridge_command` (bounded emitters,
-        // above).
+        // constant_skolem_bridge.rs `bridge_command` (typed emitters, above).
         ("rule", 12),
         ("rule_name", 2),
         ("simplify_rule", 2),

@@ -81,7 +81,7 @@ fn exhaustive_tiny_arrays_preserve_overlapping_guards_and_unwritten_cells() {
 fn missing_original_support_or_activation_cannot_license_a_definition() {
     for omitted in 0..4 {
         let mut f = Fixture::new(2, [1, 2]);
-        f.roots.remove(omitted);
+        let _ = f.roots.remove(omitted);
         assert!(f.derive().is_none(), "missing original root {omitted}");
     }
     let mut f = Fixture::new(2, [1, 2]);

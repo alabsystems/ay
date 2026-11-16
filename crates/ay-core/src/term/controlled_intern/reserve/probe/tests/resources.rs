@@ -19,7 +19,6 @@ fn exact_original_work_offer_covers_one_complete_lookup_without_renewal() {
         refused: false,
     };
     assert_eq!(store.controlled_probe_fee(&mut admission), Ok(()));
-    drop(admission);
     drop(sink);
     assert_eq!(owner.charge(0), Ok(()));
     assert_eq!(owner.charge(1), Err(QueryError::Exhausted));
@@ -40,7 +39,6 @@ fn one_short_and_zero_original_owners_refuse_before_lookup_and_stay_refused() {
         for _ in 0..2 {
             assert_eq!(store.controlled_probe_fee(&mut admission), Err(limit()));
         }
-        drop(admission);
         drop(sink);
         assert_eq!(owner.charge(0), Err(QueryError::Exhausted));
     }
@@ -70,7 +68,6 @@ fn original_late_stop_is_sticky_after_flag_reset_without_lookup_or_new_owner() {
     assert_eq!(store.controlled_probe_fee(&mut admission), Err(limit()));
     raw.store(false, Ordering::Release);
     assert_eq!(store.controlled_probe_fee(&mut admission), Err(limit()));
-    drop(admission);
     drop(sink);
     assert_eq!(
         owner.charge(0),

@@ -50,28 +50,28 @@ fn bounded_authored_canonical_render_projects_and_instantiates_quantifiers() {
         let negated_source = executor.ctx.terms.mk_not_raw(roots[0]);
         let not_forall = executor.ctx.terms.mk_not_raw(quantifier);
         let implication = executor.ctx.terms.mk_app(
-            ay_core::Symbol::named("or"),
+            Symbol::named("or"),
             [not_forall, instance],
-            ay_core::Sort::Bool,
+            Sort::Bool,
         );
         let mut proof = Proof::new();
         let source = proof.add_assume(roots[0], None);
         let negative = proof.add_assume(roots[1], None);
         let projection = proof.add_rule_step(
-            ay_core::AletheRule::AndPos(u32::try_from(index).unwrap()),
+            AletheRule::AndPos(u32::try_from(index).unwrap()),
             vec![negated_source, quantifier],
             vec![],
             vec![],
         );
         let universal = proof.add_resolution(vec![quantifier], roots[0], source, projection);
         let instantiated = proof.add_rule_step(
-            ay_core::AletheRule::ForallInst,
+            AletheRule::ForallInst,
             vec![implication],
             vec![],
             vec![witness],
         );
         let disjunction = proof.add_rule_step(
-            ay_core::AletheRule::Or,
+            AletheRule::Or,
             vec![not_forall, instance],
             vec![instantiated],
             vec![],
@@ -143,7 +143,7 @@ fn bounded_authored_canonical_render_exports_quantified_conjunctions() {
         let source = proof.add_assume(roots[0], None);
         let negative = proof.add_assume(roots[1], None);
         let projection = proof.add_rule_step(
-            ay_core::AletheRule::AndPos(0),
+            AletheRule::AndPos(0),
             vec![negated_source, pivot],
             vec![],
             vec![],
@@ -214,7 +214,7 @@ fn replacement_preflight_preserves_state_with_available_or_missing_source() {
             let pivot = operands[0];
             let negated_source = executor.ctx.terms.mk_not_raw(roots[0]);
             let projection = proof.add_rule_step(
-                ay_core::AletheRule::AndPos(0),
+                AletheRule::AndPos(0),
                 vec![negated_source, pivot],
                 vec![],
                 vec![],

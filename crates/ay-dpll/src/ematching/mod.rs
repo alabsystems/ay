@@ -491,12 +491,6 @@ pub(crate) struct ParkedInstance {
     /// Shadow-staged (M2+M3): consumed once the demand lane goes live.
     #[allow(dead_code)]
     pub head: String,
-    /// Whether the source forall is unconditionally asserted (the exact
-    /// `quant_is_unconditional_forall` predicate the eager path tags
-    /// support axioms with), captured at park time — by flush time the
-    /// ground lane has stripped the foralls from `ctx.assertions`, so
-    /// the predicate cannot be recomputed there (#demand-flush-provenance).
-    pub unconditional: bool,
 }
 
 /// One round's demand-lane gate (SHADOW-ONLY; M2+M3). Passed into
@@ -1136,7 +1130,6 @@ pub(crate) fn perform_ematching_with_generations(
                                 var_names: vars.clone(),
                                 generation: would_be_gen,
                                 head: head_sym.to_string(),
-                                unconditional: quant_is_unconditional_forall,
                             });
                             gate.frontier_parked += 1;
                             demand.record_parked(quant, head_sym);

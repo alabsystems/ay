@@ -147,5 +147,5 @@ fn a_non_unit_farkas_clause_reaches_the_cut_chain_arm() {
     assert_eq!(ordered.as_ref(), clause.as_slice());
     let witness = ay_core::proof_validation::lia_cut_chain_witness(&terms, &clause)
         .expect("the strict checker's witness");
-    assert!(witness.cuts.is_empty());
+    assert_eq!(witness.cuts, [] as [ay_core::proof_validation::ChainCut; 0]);
 }

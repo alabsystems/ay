@@ -69,9 +69,8 @@ fn one(
 ) -> Result<(Vec<Row>, Vec<TermId>), QueryError> {
     let mut rows = owned::reserve_vec::<Row>(terms.len(), work)?;
     let mut origins = owned::reserve_vec::<TermId>(terms.len(), work)?;
-    for index in 0..terms.len() {
+    for &term in terms {
         work.charge(64)?;
-        let term = terms[index];
         let TermData::App(Symbol::Named(symbol), args) = source.terms.get(term) else {
             continue;
         };
@@ -81,9 +80,9 @@ fn one(
             continue;
         }
         let mut values = owned::reserve_vec::<String>(args.len(), work)?;
-        for position in 0..args.len() {
+        for &arg in args.iter() {
             work.charge(32)?;
-            values.push(argument(source, model, buckets, args[position], work)?);
+            values.push(argument(source, model, buckets, arg, work)?);
         }
         let result = if kind.is_predicate() {
             let assigned = owned::lookup(&source.assigns, term, work)?.copied();
@@ -154,24 +153,24 @@ fn duplicate(
     values: &[String],
     work: &mut WorkBudget<'_>,
 ) -> Result<bool, QueryError> {
-    for index in 0..rows.len() {
+    for row in rows {
         work.charge(64)?;
-        let old = &rows[index].0;
+        let old = &row.0;
         if old.len() != values.len() {
             continue;
         }
         let mut same = true;
-        for arg in 0..old.len() {
+        for (old_value, value) in old.iter().zip(values) {
             work.charge(32)?;
             let visits = owned::checked(
-                old[arg]
+                old_value
                     .len()
-                    .checked_add(values[arg].len())
+                    .checked_add(value.len())
                     .and_then(|n| n.checked_add(16)),
                 work,
             )?;
             work.charge(visits)?;
-            if old[arg] != values[arg] {
+            if old_value != value {
                 same = false;
                 break;
             }

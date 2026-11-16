@@ -230,7 +230,7 @@ mod tests {
     fn the_seam_sleeps_inside_a_round_trip_and_switches_off() {
         delay_each_round_trip(Duration::from_millis(5));
         assert_eq!(round_trip_delay(), Duration::from_millis(5));
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         crate::resource::work().note_round_trip();
         assert!(started.elapsed() >= Duration::from_millis(5));
         delay_each_round_trip(Duration::ZERO);
@@ -242,7 +242,7 @@ mod tests {
         delay_each_stop_poll(Duration::from_millis(5));
         assert_eq!(stop_poll_delay(), Duration::from_millis(5));
         let before = stop_polls();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let _ = crate::resource::work_grant_spent();
         assert!(started.elapsed() >= Duration::from_millis(5));
         assert!(stop_polls() > before);

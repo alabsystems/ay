@@ -89,7 +89,7 @@ impl Circuit {
         divider: Divider,
     ) -> Option<(Vec<SRef>, Vec<SRef>)> {
         let size = x.len();
-        if size < 2 || size > MAX_CIRCUIT_BITS || y.len() != size {
+        if !(2..=MAX_CIRCUIT_BITS).contains(&size) || y.len() != size {
             return None;
         }
         let (quot, rem) = self.udiv_urem_rec(x, y, size, divider)?;

@@ -10,7 +10,7 @@ type Result<T> = std::result::Result<T, CountedAdmissionError>;
 
 impl ExactWatchPlan {
     pub(crate) fn try_new_counted(num_lits: usize, owner: &CountedAdmission) -> Result<Self> {
-        owner.admit(std::mem::size_of::<Self>(), 0)?;
+        owner.admit(size_of::<Self>(), 0)?;
         Ok(Self {
             counts: crate::counted_storage::try_vec_with(owner, num_lits, |_| 0)?,
         })
@@ -58,7 +58,7 @@ impl WatchedLists {
             };
             total = total
                 .checked_add(capacity as usize)
-                .filter(|n| *n <= u32::MAX as usize)
+                .filter(|n| u32::try_from(*n).is_ok())
                 .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
         }
         let reserved = if total >= WATCH_BUF_LARGE_ENTRIES {

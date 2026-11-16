@@ -87,6 +87,7 @@ impl LraSolver {
     ///     through its own explanation, once per `(var, side)` on this walk;
     ///   * else the antecedent cannot be grounded and the whole reason is
     ///     rejected.
+    ///
     /// Because rows are equations valid in every model, "each antecedent is
     /// entailed by the cited literals" gives "the derived bound is entailed
     /// by the cited literals" by induction over the chain — the caller may

@@ -127,7 +127,7 @@ pub(crate) fn check(
             Some(request),
             progress,
         )?;
-        debug_assert!(deferred.is_empty());
+        debug_assert_eq!(deferred, []);
         // Bookkeeping over steps already validated (#completed-check-accepted);
         // this lane's final control is `with_control`'s, around the whole pass.
         ensure_terminal_empty_clause(&clauses)?;

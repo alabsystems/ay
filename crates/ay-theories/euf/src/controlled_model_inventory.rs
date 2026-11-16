@@ -19,9 +19,9 @@ struct InventoryScratch {
 
 fn priced_vec<T>(entries: usize, work: &mut WorkBudget<'_>) -> Result<Vec<T>, QueryError> {
     let bytes = entries
-        .checked_mul(std::mem::size_of::<T>())
+        .checked_mul(size_of::<T>())
         .and_then(|bytes| bytes.checked_mul(8))
-        .and_then(|bytes| bytes.checked_add(4 * std::mem::size_of::<Vec<T>>()))
+        .and_then(|bytes| bytes.checked_add(4 * size_of::<Vec<T>>()))
         .ok_or_else(|| work.refuse_exhaustion())?;
     let units = entries
         .checked_mul(8)

@@ -12,16 +12,14 @@ const DATATYPE_SAT: &str = "(declare-datatype D ((a) (b))) (declare-const x D) \
 
 #[derive(Clone, Copy)]
 enum AdapterMode {
-    Legacy,
     Deadline,
     Cancellable,
 }
 
 fn certificate(source: &str, mode: AdapterMode) -> Option<StrictUnsatCert> {
     match mode {
-        AdapterMode::Legacy => smtlib_strict_unsat_cert_via_executor(source, None),
         AdapterMode::Deadline => {
-            smtlib_strict_unsat_cert_via_executor_until(source, live_deadline())
+            smtlib_strict_unsat_cert_via_executor_until(source, hang_deadline())
         }
         AdapterMode::Cancellable => {
             let parent = crate::CancellationToken::new();
@@ -29,7 +27,7 @@ fn certificate(source: &str, mode: AdapterMode) -> Option<StrictUnsatCert> {
             let cert = smtlib_strict_unsat_cert_via_executor_with_limit(
                 source,
                 ReplayLimit::Cancellable {
-                    deadline: live_deadline(),
+                    deadline: hang_deadline(),
                     cancellation: &cancellation,
                 },
             );
@@ -57,9 +55,9 @@ fn assert_native_bundle(bundle: &SerializableProofBundle) {
     )));
 }
 
-fn solver_and_bundle() -> (Solver, SerializableProofBundle) {
-    let query = parse_plain_query(DATATYPE, ReplayLimit::Legacy).unwrap();
-    let mut solver = Solver::try_new_with_config(query.logic, solver_config(None)).unwrap();
+fn native_bundle() -> SerializableProofBundle {
+    let query = parse_plain_query(DATATYPE, ReplayLimit::Until(hang_deadline())).unwrap();
+    let mut solver = Solver::try_new_with_config(query.logic, solver_config()).unwrap();
     solver.set_produce_proofs(true);
     let binding = solver
         .parse_smtlib2_with_exact_query_binding(&query.body)
@@ -69,24 +67,20 @@ fn solver_and_bundle() -> (Solver, SerializableProofBundle) {
         .export_last_unsat_bundle_for_exact_query_with_resource_control(&binding, &mut |_, _| true)
         .unwrap()
         .unwrap();
-    (solver, bundle)
+    bundle
 }
 
 #[test]
 fn native_datatype_authority_and_retained_bundle_replay_work_in_all_adapter_modes() {
-    for mode in [
-        AdapterMode::Legacy,
-        AdapterMode::Deadline,
-        AdapterMode::Cancellable,
-    ] {
+    for mode in [AdapterMode::Deadline, AdapterMode::Cancellable] {
         let cert = certificate(DATATYPE, mode).expect("native datatype proof must be available");
         assert!(matches!(
             cert.strict_verdict,
             ay_dpll::api::StrictProofVerdict::Verified(ref quality) if quality.is_complete()
         ));
         assert_native_bundle(&cert.bundle);
-        // Use the actual offline native bundle reader. Optional Alethe text
-        // neither licenses the proof nor must provide an external wire rule.
+        // Use the actual offline native bundle reader; no external wire rule
+        // licenses this proof.
         let bytes = serde_json::to_vec(&cert.bundle).unwrap();
         let retained: SerializableProofBundle = serde_json::from_slice(&bytes).unwrap();
         assert_native_bundle(&retained);
@@ -97,11 +91,7 @@ fn native_datatype_authority_and_retained_bundle_replay_work_in_all_adapter_mode
 #[test]
 fn explicit_datatype_wire_request_and_satisfiable_neighbor_still_refuse() {
     let wire = format!("(set-option :check-proofs-strict true) {DATATYPE}");
-    for mode in [
-        AdapterMode::Legacy,
-        AdapterMode::Deadline,
-        AdapterMode::Cancellable,
-    ] {
+    for mode in [AdapterMode::Deadline, AdapterMode::Cancellable] {
         assert!(certificate(&wire, mode).is_none());
         assert!(certificate(DATATYPE_SAT, mode).is_none());
     }
@@ -109,7 +99,7 @@ fn explicit_datatype_wire_request_and_satisfiable_neighbor_still_refuse() {
 
 #[test]
 fn consumer_replay_rejects_datatype_registry_signature_source_and_proof_mutations() {
-    let (solver, bundle) = solver_and_bundle();
+    let bundle = native_bundle();
     assert_native_bundle(&bundle);
     let mut registry = bundle.clone();
     registry.datatype_declarations.clear();
@@ -121,38 +111,34 @@ fn consumer_replay_rejects_datatype_registry_signature_source_and_proof_mutation
     proof.steps.pop().expect("the original proof is nonempty");
     for altered in [registry, signature, source, proof] {
         assert!(ay_dpll::api::re_check_bundle_strict(&altered).is_err());
-        let mut progress = ProofProgress::new(ReplayLimit::Legacy, ReplayMemory::capture(None));
-        assert!(
-            checked_certificate(&solver, altered, ReplayLimit::Legacy, &mut progress).is_none()
-        );
+        let limit = ReplayLimit::Until(hang_deadline());
+        let mut progress = ProofProgress::new(limit, ReplayMemory::capture(None));
+        assert!(checked_certificate(altered, limit, &mut progress).is_none());
     }
-    let mut progress = ProofProgress::new(ReplayLimit::Legacy, ReplayMemory::capture(None));
-    assert!(checked_certificate(&solver, bundle, ReplayLimit::Legacy, &mut progress).is_some());
+    let limit = ReplayLimit::Until(hang_deadline());
+    let mut progress = ProofProgress::new(limit, ReplayMemory::capture(None));
+    assert!(checked_certificate(bundle, limit, &mut progress).is_some());
 }
 
 #[test]
 fn native_datatype_cancellation_zero_memory_and_expiry_never_admit_a_certificate() {
-    let (solver, bundle) = solver_and_bundle();
+    let bundle = native_bundle();
     let parent = crate::CancellationToken::new();
     let cancellation = ReplayCancellation::new(&parent.child());
     let limit = ReplayLimit::Cancellable {
-        deadline: live_deadline(),
+        deadline: hang_deadline(),
         cancellation: &cancellation,
     };
     let mut progress = ProofProgress::new(limit, ReplayMemory::capture(None));
     parent.cancel();
-    assert!(checked_certificate(&solver, bundle.clone(), limit, &mut progress).is_none());
+    assert!(checked_certificate(bundle.clone(), limit, &mut progress).is_none());
     parent.reset();
-    assert!(checked_certificate(&solver, bundle, limit, &mut progress).is_none());
+    assert!(checked_certificate(bundle, limit, &mut progress).is_none());
     assert!(cancellation.is_cancelled());
     assert!(smtlib_strict_unsat_cert_via_executor_until(DATATYPE, Instant::now()).is_none());
     {
         let _scope = crate::smt::SmtContext::scoped_thread_term_memory_budget(Some(0));
-        for mode in [
-            AdapterMode::Legacy,
-            AdapterMode::Deadline,
-            AdapterMode::Cancellable,
-        ] {
+        for mode in [AdapterMode::Deadline, AdapterMode::Cancellable] {
             assert!(certificate(DATATYPE, mode).is_none());
         }
     }

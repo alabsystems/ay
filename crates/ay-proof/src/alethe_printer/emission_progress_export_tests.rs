@@ -35,7 +35,7 @@ fn initial_caller_refusal_returns_a_typed_error_before_any_output() {
             AlethePrintError::EmissionStopped { steps_rendered: 0 }
         ))
     ));
-    assert!(output.is_empty());
+    assert_eq!(output.as_slice(), &[] as &[u8]);
 }
 
 #[test]

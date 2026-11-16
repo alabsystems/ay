@@ -5,6 +5,7 @@ use ay_core::TermStore;
 use ay_frontend::parse;
 use ay_model_check::{confirm_completed_model, GateVerdict};
 
+use super::work_counter::REFUSED;
 use super::*;
 use crate::executor::model::independent_gate::IndependentModelView;
 use crate::executor::model::EvalValue;
@@ -339,16 +340,10 @@ fn failed_constructor_retries_debit_the_same_original_attempt_until_exhausted() 
     counter.store(MAX_FUNCTIONAL_WORK - 1, Ordering::Release);
     exec.install_functional_array_candidate(&mut model);
     assert!(model.functional_arrays.is_none());
-    assert_eq!(
-        counter.load(Ordering::Acquire),
-        super::work_counter::REFUSED
-    );
+    assert_eq!(counter.load(Ordering::Acquire), REFUSED);
     exec.install_functional_array_candidate(&mut model);
     assert!(model.functional_arrays.is_none());
-    assert_eq!(
-        counter.load(Ordering::Acquire),
-        super::work_counter::REFUSED
-    );
+    assert_eq!(counter.load(Ordering::Acquire), REFUSED);
 }
 
 #[test]

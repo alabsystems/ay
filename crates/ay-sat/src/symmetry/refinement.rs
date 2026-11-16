@@ -297,6 +297,6 @@ mod tests {
     fn test_refinement_empty_formula() {
         let refined = iterative_color_refinement(&[]);
         assert_eq!(refined.rounds, 0);
-        assert!(refined.var_colors.is_empty());
+        assert_eq!(refined.var_colors.len(), 0);
     }
 }

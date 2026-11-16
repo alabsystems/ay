@@ -21,11 +21,7 @@ fn empty_and_unary_connectives_replay_native_rules_from_original_roots() {
                 } else {
                     "or"
                 };
-                let gate = terms.mk_app(
-                    ay_core::Symbol::named(name),
-                    args[..arity].to_vec(),
-                    Sort::Bool,
-                );
+                let gate = terms.mk_app(ay_core::Symbol::named(name), &args[..arity], Sort::Bool);
                 let mut builder = CountedTermBuilder::new(&mut terms, &original).unwrap();
                 let value = if arity == 0 {
                     op == CountedBuiltin::And

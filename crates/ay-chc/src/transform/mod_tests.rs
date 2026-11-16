@@ -91,7 +91,7 @@ fn test_transform_result_reports_reversible_identity_memory() {
     assert!(report.validates_original());
     assert!(!report.safe_requires_original_validation());
     assert!(report.unsafe_backtranslation_complete());
-    assert!(report.obligations().is_empty());
+    assert_eq!(report.obligations(), []);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn test_transform_memory_can_report_original_validation() {
     assert!(report.validates_original());
     assert!(report.safe_requires_original_validation());
     assert!(report.unsafe_backtranslation_complete());
-    assert!(report.obligations().is_empty());
+    assert_eq!(report.obligations(), []);
 }
 
 #[test]

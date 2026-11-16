@@ -19,7 +19,7 @@ use super::term::{Op, T};
 
 /// `(cl (not amin) (not bneg1) ovl)`: `MIN * -1` overflows, by evaluation
 /// once both operands and the limit are known.
-pub(super) fn spec_overflows(p: &mut Proof, s: &Signed) -> Option<S> {
+pub(super) fn spec_overflows(p: &mut Proof<'_>, s: &Signed) -> Option<S> {
     under(p, &[s.amin, s.bneg1], s.ovl, |p, h| {
         let sa = bitfact(p, &[h[0]], &[s.sa])?;
         let sb = bitfact(p, &[h[1]], &[s.sb])?;
@@ -56,7 +56,7 @@ pub(super) fn spec_overflows(p: &mut Proof, s: &Signed) -> Option<S> {
 /// Each case's quotient is the core's quotient when its dividend is the
 /// wrapped magnitude product and its divisor `|B|`; and against `|A|`.
 pub(super) fn quotients(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     s: &Signed,
     row: &Row,
     at: &Atoms,
@@ -155,7 +155,7 @@ struct Tops {
 }
 
 impl Tops {
-    fn new(p: &mut Proof, s: &Signed, at: &Atoms, dl: &DivLemma) -> Option<Self> {
+    fn new(p: &mut Proof<'_>, s: &Signed, at: &Atoms, dl: &DivLemma) -> Option<Self> {
         let pairs = [(s.pp, s.d), (s.np, s.d), (s.pp, s.nd), (s.np, s.nd)];
         let mut split = Vec::new();
         let mut both = Vec::new();
@@ -185,7 +185,7 @@ impl Tops {
 
     /// `(cl BOTH_k)` from the top bit of `q_k` (the step `top`) and the
     /// divisor's word disequality (the step `nz`).
-    fn both_from(&self, p: &mut Proof, k: usize, top: S, nz: S) -> Option<S> {
+    fn both_from(&self, p: &mut Proof<'_>, k: usize, top: S, nz: S) -> Option<S> {
         let y = self.pairs[k].1;
         let yz = zero_test(p, y);
         let nyz = p.t.not(yz);
@@ -202,7 +202,7 @@ impl Tops {
 /// The cases whose quotient cannot be `A` (the product's top bit disagrees
 /// with the operands' signs), through the division lemma's top-bit conjunct.
 pub(super) fn contradictions(
-    p: &mut Proof,
+    p: &mut Proof<'_>,
     s: &Signed,
     at: &Atoms,
     dl: &DivLemma,
@@ -245,7 +245,13 @@ pub(super) fn contradictions(
 /// a divisor of one and a dividend of `MIN`, so the case gives back `MIN`.
 /// For k = 1 that sets `A`'s clear sign bit; for k = 3 it makes `A = MIN`
 /// and, through `-D = 1`, `B = D = -1`, the excluded case.
-fn min_cases(p: &mut Proof, s: &Signed, at: &Atoms, tp: &Tops, facts: &mut Vec<S>) -> Option<()> {
+fn min_cases(
+    p: &mut Proof<'_>,
+    s: &Signed,
+    at: &Atoms,
+    tp: &Tops,
+    facts: &mut Vec<S>,
+) -> Option<()> {
     let nmin = p.t.neg(s.minw);
     let ppmin = p.t.eq(s.pp, s.minw);
     let qmin = p.t.mk(Op::Udiv, &[nmin, s.one]);

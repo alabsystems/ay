@@ -427,10 +427,10 @@ fn the_ledger_charges_distinct_literal_text_once() {
         .expect("a 40-literal clause fits");
     let one_atom = super::OwnedText::cost(atom.len()).unwrap()
         + printer.printed_clause_atom_texts.borrow().capacity()
-            * std::mem::size_of::<super::PrintedAtomSlot>()
+            * size_of::<super::PrintedAtomSlot>()
         + printer.printed_clause_atom_index.borrow().allocation_size()
         + printer.printed_clause_bodies.borrow().allocation_size();
-    let per_occurrence = 40 * std::mem::size_of::<super::PrintedAtomId>();
+    let per_occurrence = 40 * size_of::<super::PrintedAtomId>();
     assert_eq!(
         printer.printed_clause_bytes.get() - before,
         one_atom + per_occurrence
@@ -452,7 +452,7 @@ fn the_ledger_charges_distinct_literal_text_once() {
         .expect("fits");
     assert_eq!(
         printer.printed_clause_bytes.get() - before,
-        2 * std::mem::size_of::<super::PrintedAtomId>()
+        2 * size_of::<super::PrintedAtomId>()
     );
     assert_eq!(printer.printed_clause_atom_texts.borrow().len(), 1);
 

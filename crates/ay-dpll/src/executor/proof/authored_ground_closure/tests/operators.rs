@@ -123,7 +123,7 @@ fn closed_value_hints_do_not_create_constants_or_bypass_zero_probes() {
         exec.add_ground_evaluation_edges(&mut closure, &[term], &mut remaining);
         assert!(!closure.same_class(term, one));
         assert!(!closure.same_class(term, two));
-        assert!(closure.edges().is_empty());
+        assert_eq!(closure.edges(), []);
         assert_eq!(closure.nodes().len(), nodes);
         assert_eq!(remaining, budget);
     }

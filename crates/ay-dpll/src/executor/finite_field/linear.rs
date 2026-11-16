@@ -94,7 +94,7 @@ pub(super) fn witness_with_progress(
     let base = seen
         .len()
         .checked_mul(256)?
-        .checked_add(stack_capacity.checked_mul(std::mem::size_of::<TermId>())?)?;
+        .checked_add(stack_capacity.checked_mul(size_of::<TermId>())?)?;
     pay(work, edges, control, base)?;
     let mut variables = Vec::new();
     let mut field = None;
@@ -114,7 +114,7 @@ pub(super) fn witness_with_progress(
     }
     let field = field?;
     let p = field.modulus();
-    let levels = (usize::BITS - variables.len().leading_zeros()) as usize + 1;
+    let levels = variables.len().bit_width() as usize + 1;
     pay(work, variables.len().checked_mul(levels)?, control, base)?;
     variables.sort_unstable();
     let n = variables.len();
@@ -165,7 +165,7 @@ pub(super) fn witness_with_progress(
     }
     let bytes = base
         .checked_add(cells.checked_mul(8)?)?
-        .checked_add(rows.checked_mul(std::mem::size_of::<Vec<u32>>())?)?;
+        .checked_add(rows.checked_mul(size_of::<Vec<u32>>())?)?;
     pay(work, cells, control, bytes)?;
     let mut memo = HashMap::default();
     let mut matrix = Vec::with_capacity(rows);
@@ -206,7 +206,7 @@ pub(super) fn witness_with_progress(
         matrix.swap(rank, pivot);
         // At most two modular multiplications per exponent bit. Charge before
         // work, preserving the caller's cumulative budget and cancellation.
-        let inverse_work = 2 * (u32::BITS - (p - 2).leading_zeros()) as usize;
+        let inverse_work = 2 * (p - 2).bit_width() as usize;
         pay(work, inverse_work.checked_add(columns)?, control, bytes)?;
         let inverse = inverse(matrix[rank][column], field)?;
         for entry in &mut matrix[rank][column..] {
@@ -240,7 +240,7 @@ pub(super) fn witness_with_progress(
         // Pull a unit covector for the contradictory row back through the
         // elementary row operations. Undo later swaps on the stored rows so
         // every factor is read in the position it had at this pivot.
-        let witness_bytes = bytes.checked_add(rows.checked_mul(std::mem::size_of::<u32>())?)?;
+        let witness_bytes = bytes.checked_add(rows.checked_mul(size_of::<u32>())?)?;
         pay(work, rows, control, witness_bytes)?;
         let mut multipliers = vec![0; rows];
         multipliers[conflict] = 1;

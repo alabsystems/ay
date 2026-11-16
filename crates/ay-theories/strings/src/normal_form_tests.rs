@@ -10,7 +10,7 @@ fn empty_normal_form() {
     assert!(nf.is_empty());
     assert_eq!(nf.len(), 0);
     assert!(nf.rep.is_none());
-    assert!(nf.deps.is_empty());
+    assert_eq!(nf.deps.as_slice(), &[] as &[ExplainEntry]);
 }
 
 #[test]

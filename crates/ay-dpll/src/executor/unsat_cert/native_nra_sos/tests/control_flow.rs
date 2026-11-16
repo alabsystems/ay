@@ -6,6 +6,7 @@
 
 #![cfg(test)]
 
+use super::super::build::BuildError;
 use super::*;
 use ay_core::{time::Instant, Symbol, TermStore};
 use std::cell::{Cell, RefCell};
@@ -37,16 +38,16 @@ fn through_phases(
     root: TermId,
     control: &mut Control<'_>,
     phase: &Cell<Phase>,
-) -> Result<build::BuiltSosProof, build::BuildError> {
+) -> Result<BuiltSosProof, BuildError> {
     phase.set(Phase::Entry);
     if !control.poll_terms(terms, 0, 0) {
-        return Err(build::BuildError::ResourceLimit);
+        return Err(BuildError::ResourceLimit);
     }
     phase.set(Phase::Build);
     let built = build::build(terms, &[root], &[], &mut |work, bytes| {
         control.poll(work, bytes)
     })?
-    .ok_or(build::BuildError::InvalidProof)?;
+    .ok_or(BuildError::InvalidProof)?;
     phase.set(Phase::Evidence);
     if !built
         .evidence
@@ -54,11 +55,11 @@ fn through_phases(
             control.poll(work, bytes)
         })?
     {
-        return Err(build::BuildError::InvalidProof);
+        return Err(BuildError::InvalidProof);
     }
     phase.set(Phase::Final);
     if !control.poll_terms(terms, 0, 0) {
-        return Err(build::BuildError::ResourceLimit);
+        return Err(BuildError::ResourceLimit);
     }
     Ok(built)
 }
@@ -100,7 +101,7 @@ fn every_cross_phase_refusal_is_terminal_and_a_fresh_control_can_succeed() {
         assert!(
             matches!(
                 through_phases(&mut terms, root, &mut control, &phase),
-                Err(build::BuildError::ResourceLimit)
+                Err(BuildError::ResourceLimit)
             ),
             "refusal {stop}"
         );
@@ -108,7 +109,7 @@ fn every_cross_phase_refusal_is_terminal_and_a_fresh_control_can_succeed() {
         assert_eq!(calls.get(), stop);
         assert!(matches!(
             through_phases(&mut terms, root, &mut control, &phase),
-            Err(build::BuildError::ResourceLimit)
+            Err(BuildError::ResourceLimit)
         ));
         assert_eq!(
             calls.get(),
@@ -155,7 +156,7 @@ fn a_true_final_callback_cannot_publish_past_memory_or_deadline_refusal() {
         let mut control = Control::with_progress(&executor, &mut callback);
         assert!(matches!(
             through_phases(&mut terms, root, &mut control, &phase),
-            Err(build::BuildError::ResourceLimit)
+            Err(BuildError::ResourceLimit)
         ));
         assert_eq!(final_callbacks.get(), 1);
         assert!(control.stopped());
@@ -199,7 +200,7 @@ fn a_spent_search_allowance_yields_to_the_existing_presentation_but_a_terminal_s
         build::build(&mut executor.ctx.terms, &roots, &[], &mut |work, bytes| {
             control.poll(work, bytes)
         }),
-        Err(build::BuildError::ResourceLimit)
+        Err(BuildError::ResourceLimit)
     ));
     assert_eq!(control.stop(), Some(Stop::Allowance));
     assert!(!control.poll_terms(&executor.ctx.terms, 0, 0), "sticky");

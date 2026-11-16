@@ -33,7 +33,7 @@ impl Solver {
             let result = solve(self);
             #[cfg(test)]
             PANIC_AFTER_SOLVE.with(|armed| {
-                if armed.get() == Some(self as *const Self as usize) {
+                if armed.get() == Some(std::ptr::from_ref(self) as usize) {
                     armed.set(None);
                     panic!("injected panic after solve result");
                 }

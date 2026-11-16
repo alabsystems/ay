@@ -3,9 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::super::{ChcReplayObligationKind, InvariantModel, PredicateInterpretation};
-use crate::smt::executor_adapter::smtlib_first_verdict_via_executor;
+use crate::smt::executor_adapter::smtlib_first_verdict_via_executor_until;
 use crate::{ChcExpr, ChcParser, ChcProblem};
-use std::time::Duration;
 
 /// A MODEL_CHECKER_CONSUMER-shaped datatype whose sort name needs SMT-LIB quoting.
 fn datatype_problem() -> ChcProblem {
@@ -38,7 +37,11 @@ fn model(problem: &ChcProblem, exact: bool) -> InvariantModel {
 }
 
 fn verdict(smt: &str) -> Option<String> {
-    smtlib_first_verdict_via_executor(smt, Some(Duration::from_secs(10)))
+    smtlib_first_verdict_via_executor_until(
+        smt,
+        ay_core::time::Instant::now() + std::time::Duration::from_mins(1),
+        None,
+    )
 }
 
 #[test]

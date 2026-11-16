@@ -6,13 +6,19 @@ use super::{NativeProofApplication as App, NativeProofDag, Solver, Term};
 use ay_frontend::DeclarationId;
 use std::collections::HashMap;
 
+/// How one authored assertion was tracked when the native proof was built.
 #[derive(Clone, Debug)]
 pub enum NativeProofInputBinding {
+    /// The assertion was not named or guarded.
     Untracked,
+    /// The assertion was guarded by an exact declaration identity.
     Tracked {
+        /// Authored tracking-label name.
         name: String,
+        /// Source declaration identity of the tracking label.
         identity: DeclarationId,
     },
+    /// The source used a tracking form this projection cannot preserve.
     Unsupported,
 }
 

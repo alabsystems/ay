@@ -40,9 +40,9 @@ fn compare(
         &built.cache.term_to_fp[&result],
         &legacy.term_to_fp[&result],
     );
-    assert!(built.pending_condition_links.is_empty());
-    assert!(built.cache.to_bv_unspec_sites.is_empty());
-    assert!(built.cache.ieee_nan_encodings.is_empty());
+    assert_eq!(built.pending_condition_links.len(), 0);
+    assert_eq!(built.cache.to_bv_unspec_sites.len(), 0);
+    assert_eq!(built.cache.ieee_nan_encodings.len(), 0);
     assert!(!built.has_encoding_gap);
     drop(built);
     drop(legacy);

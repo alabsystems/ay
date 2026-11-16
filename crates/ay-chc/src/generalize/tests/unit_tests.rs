@@ -215,7 +215,7 @@ fn test_literal_weakening_no_weakening_for_bool() {
     let eq = ChcExpr::eq(b, t);
 
     let weakenings = g.generate_weakenings(&eq);
-    assert!(weakenings.is_empty());
+    assert_eq!(weakenings, [] as [ChcExpr; 0]);
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn test_literal_weakening_no_weakening_for_inequality() {
     let lt = ChcExpr::lt(x, five);
 
     let weakenings = g.generate_weakenings(&lt);
-    assert!(weakenings.is_empty());
+    assert_eq!(weakenings, [] as [ChcExpr; 0]);
 }
 
 #[test]

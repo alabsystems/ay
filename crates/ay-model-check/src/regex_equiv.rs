@@ -319,16 +319,12 @@ impl Lang {
     }
 
     fn copy_box(&self, work: &mut Work<'_>) -> EvalResult<Box<Self>> {
-        work.owner
-            .admit(0, std::mem::size_of::<Self>())
-            .map_err(stopped)?;
+        work.owner.admit(0, size_of::<Self>()).map_err(stopped)?;
         Ok(Box::new(self.clone_counted(work)?))
     }
 
     fn into_box(self, work: &mut Work<'_>) -> EvalResult<Box<Self>> {
-        work.owner
-            .admit(0, std::mem::size_of::<Self>())
-            .map_err(stopped)?;
+        work.owner.admit(0, size_of::<Self>()).map_err(stopped)?;
         Ok(Box::new(self))
     }
 
@@ -723,9 +719,9 @@ fn insert_alphabet_point(points: &mut Vec<u32>, point: u32, work: &mut Work<'_>)
         work.charge(1)?;
         let mid = lo + (hi - lo) / 2;
         match points[mid].cmp(&point) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => return Ok(()),
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => return Ok(()),
         }
     }
     work.charge(points.len() - lo)?;

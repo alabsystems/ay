@@ -107,7 +107,7 @@ fn a_skip_is_dropped_so_more_routines_run_never_fewer() {
 fn quiet_short_spelling_is_rewritten() {
     let normalized = normalize(&["-q", "routine"]);
     assert_eq!(normalized.forwarded, os(&["--quiet", "routine"]));
-    assert!(normalized.dropped.is_empty());
+    assert_eq!(normalized.dropped.as_slice(), &[] as &[OsString]);
     assert_eq!(
         normalized.rewritten,
         vec![(OsString::from("-q"), OsString::from("--quiet"))]

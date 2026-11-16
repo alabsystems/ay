@@ -198,9 +198,9 @@ fn original_check_stop_refuses_between_bounded_replay_chunks() {
     }
     let input = originals(&s);
     assert_eq!(input.len(), 130);
-    let polls = std::sync::Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
     let original = polls.clone();
-    let scope = ay_core::resource::enter_check_stop(std::sync::Arc::new(move || {
+    let scope = ay_core::resource::enter_check_stop(Arc::new(move || {
         original.fetch_add(1, Ordering::SeqCst) >= 2
     }));
     assert!(!s.preflight_original_ledger_replay(0));
@@ -221,7 +221,7 @@ fn raw_interrupt_refuses_ledger_replay_without_resetting_the_original_flag() {
     let mut s = solver(Format::Text, 1);
     assert!(s.add_clause(vec![p(0), p(1)]));
     let input = originals(&s);
-    let flag = std::sync::Arc::new(AtomicBool::new(true));
+    let flag = Arc::new(AtomicBool::new(true));
     s.set_interrupt_handle(Some(flag.clone()));
     assert!(!s.preflight_original_ledger_replay(0));
     assert!(flag.load(Ordering::SeqCst));

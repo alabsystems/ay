@@ -173,9 +173,16 @@ impl Blaster<'_, '_> {
     /// `pbblast_{op}` proves `(= atom constraint)`; plan its two halves.
     fn equate(&mut self, atom: SRef, constraint: SRef, op: &str) -> Option<()> {
         let rule = format!("pbblast_{op}");
-        if !ay_core::is_checkable_alethe_rule(&rule) {
-            return None;
-        }
+        let rule = CheckableRule::new(&rule)?;
+        self.equate_with_rule(atom, constraint, rule)
+    }
+
+    fn equate_with_rule(
+        &mut self,
+        atom: SRef,
+        constraint: SRef,
+        rule: CheckableRule,
+    ) -> Option<()> {
         let equality = self.step_name(".oq");
         self.push_step(&format!(
             "(step {equality} (cl (= {} {})) :rule {rule})",

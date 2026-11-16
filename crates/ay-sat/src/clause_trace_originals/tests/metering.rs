@@ -26,7 +26,7 @@ fn wide(originals: u64, derived: u64, hints: u64) -> (OriginalArena, ClauseTrace
     (arena, trace)
 }
 
-/// The units the transfer of [`wide`]`(64, 2000, 8)` charges.
+/// The units the transfer of [`wide`] with `(64, 2000, 8)` charges.
 fn wide_units() -> u64 {
     let (originals, mut trace) = wide(64, 2_000, 8);
     let mut used = 0;
@@ -38,7 +38,7 @@ fn wide_units() -> u64 {
 }
 
 /// What the validation of fd4e00f75, which asked the caller once per unit,
-/// charged for [`wide`]`(64, 2000, 8)`: counted on that build's callback,
+/// charged for [`wide`] with `(64, 2000, 8)`: counted on that build's callback,
 /// and by a model of its walk (128 for the originals, 4,063 for the derived
 /// rows, the rest for the events and their hint lookups).
 const WIDE_UNITS_ONE_CALL_EACH: u64 = 288_068;

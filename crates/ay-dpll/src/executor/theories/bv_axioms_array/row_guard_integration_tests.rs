@@ -218,7 +218,7 @@ fn full_producer_unavailable_or_incompatible_base_preserves_wide_row1_only() {
 fn full_producer_syntactically_identical_indices_keep_rewriter_fast_path() {
     let fixture = Fixture::with_indices(BaseRead::Exact, Indices::Identical);
     let (result, _, _, _) = fixture.generate();
-    assert!(result.clauses.is_empty());
+    assert_eq!(result.clauses, [] as [ay_core::CnfClause; 0]);
     assert_eq!(result.num_vars, 0);
 }
 

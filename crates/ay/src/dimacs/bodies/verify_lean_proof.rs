@@ -2,6 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#[cfg(target_os = "linux")]
 fn run_authenticated_lean_verifier(
     snapshot: &AuthenticatedLeanSnapshot,
 ) -> super::lean_verify::LeanVerificationOutcome {
@@ -9,12 +10,7 @@ fn run_authenticated_lean_verifier(
     if let Some(path) = super::LEAN_BINARY_PATH.get() {
         verifier = verifier.with_path(path);
     }
-    #[cfg(target_os = "linux")]
-    return verifier.verify_descriptor(&snapshot.descriptor);
-    #[cfg(not(target_os = "linux"))]
-    super::lean_verify::LeanVerificationOutcome::Unavailable {
-        reason: "Lean verification requires a re-openable authenticated anonymous descriptor path, which is unavailable on this platform".to_string(),
-    }
+    verifier.verify_descriptor(&snapshot.descriptor)
 }
 
 fn verify_lean_proof_body(proof_config: Option<&ProofConfig>) -> bool {
@@ -63,52 +59,63 @@ fn verify_lean_proof_body(proof_config: Option<&ProofConfig>) -> bool {
         return false;
     }
 
-    // Lean sees only the anonymous digest-bound snapshot. The inherited
-    // descriptor pins the exact inode across exec; the public proof path
-    // remains useful as a retained artifact, but it is never a verifier input.
-    let outcome = run_authenticated_lean_verifier(&snapshot);
-    if let Err(error) = snapshot.validate() {
+    #[cfg(not(target_os = "linux"))]
+    {
         safe_eprintln!(
-            "c Error: authenticated Lean snapshot for {} changed during kernel verification: {error}",
-            proof.path
+            "c Error: Lean verification unavailable: Lean verification requires a re-openable authenticated anonymous descriptor path, which is unavailable on this platform (the requested kernel check did not run)"
         );
-        return false;
+        false
     }
-    match outcome {
-        super::lean_verify::LeanVerificationOutcome::Accepted => {
-            if let Err(error) = validate_published_dimacs_proof(&proof.path) {
-                safe_eprintln!(
-                    "c Error: Lean proof {} changed during kernel verification: {error}",
-                    proof.path
-                );
-                return false;
-            }
-            safe_eprintln!("c Lean verification: OK ({})", proof.path);
-            true
-        }
-        super::lean_verify::LeanVerificationOutcome::Rejected {
-            diagnostic,
-            exit_code,
-        } => {
+
+    #[cfg(target_os = "linux")]
+    {
+        // Lean sees only the anonymous digest-bound snapshot. The inherited
+        // descriptor pins the exact inode across exec; the public proof path
+        // remains useful as a retained artifact, but it is never a verifier input.
+        let outcome = run_authenticated_lean_verifier(&snapshot);
+        if let Err(error) = snapshot.validate() {
             safe_eprintln!(
-                "c Error: Lean kernel REJECTED proof {} (exit {exit_code})",
+                "c Error: authenticated Lean snapshot for {} changed during kernel verification: {error}",
                 proof.path
             );
-            if !diagnostic.trim().is_empty() {
-                safe_eprintln!("c Lean diagnostics:\n{diagnostic}");
-            }
-            safe_eprintln!(
-                "c Error: SOUNDNESS FAILURE — solver reported UNSAT but emitted proof was rejected by Lean kernel"
-            );
-            let _ = io::stdout().flush();
-            let _ = io::stderr().flush();
-            false
+            return false;
         }
-        super::lean_verify::LeanVerificationOutcome::Unavailable { reason } => {
-            safe_eprintln!(
-                "c Error: Lean verification unavailable: {reason} (the requested kernel check did not run)"
-            );
-            false
+        match outcome {
+            super::lean_verify::LeanVerificationOutcome::Accepted => {
+                if let Err(error) = validate_published_dimacs_proof(&proof.path) {
+                    safe_eprintln!(
+                        "c Error: Lean proof {} changed during kernel verification: {error}",
+                        proof.path
+                    );
+                    return false;
+                }
+                safe_eprintln!("c Lean verification: OK ({})", proof.path);
+                true
+            }
+            super::lean_verify::LeanVerificationOutcome::Rejected {
+                diagnostic,
+                exit_code,
+            } => {
+                safe_eprintln!(
+                    "c Error: Lean kernel REJECTED proof {} (exit {exit_code})",
+                    proof.path
+                );
+                if !diagnostic.trim().is_empty() {
+                    safe_eprintln!("c Lean diagnostics:\n{diagnostic}");
+                }
+                safe_eprintln!(
+                    "c Error: SOUNDNESS FAILURE — solver reported UNSAT but emitted proof was rejected by Lean kernel"
+                );
+                let _ = io::stdout().flush();
+                let _ = io::stderr().flush();
+                false
+            }
+            super::lean_verify::LeanVerificationOutcome::Unavailable { reason } => {
+                safe_eprintln!(
+                    "c Error: Lean verification unavailable: {reason} (the requested kernel check did not run)"
+                );
+                false
+            }
         }
     }
 }

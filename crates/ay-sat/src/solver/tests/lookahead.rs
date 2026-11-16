@@ -140,7 +140,7 @@ fn test_generate_cubes_depth_0() {
 
     let cubes = solver.generate_cubes(0);
     assert_eq!(cubes.len(), 1);
-    assert!(cubes[0].is_empty());
+    assert_eq!(cubes[0].len(), 0);
 }
 
 /// generate_cubes(1) produces exactly 2 cubes with 1 literal each,
@@ -274,7 +274,7 @@ fn test_generate_cubes_coverage() {
     assert!(solver.process_initial_clauses().is_none());
 
     let cubes = solver.generate_cubes(2);
-    assert!(!cubes.is_empty());
+    assert_ne!(cubes.len(), 0);
 
     // Verify that at least one cube is satisfiable.
     let mut found_sat = false;

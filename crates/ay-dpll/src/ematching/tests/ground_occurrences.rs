@@ -32,7 +32,7 @@ fn ground_occurrences_agree_full_incremental_in_both_orders() {
         );
     }
     let binder_only = TermIndex::new(&terms, &[quantified]);
-    assert!(binder_only.get_by_symbol("f").is_empty());
+    assert_eq!(binder_only.get_by_symbol("f"), []);
     assert!(!collect_ground_terms_by_sort(&terms, &[quantified])
         .get(&Sort::Int)
         .is_some_and(|values| values.contains(&f_x)));
@@ -51,7 +51,7 @@ fn ground_occurrences_drop_retracted_free_candidate_at_epoch_reset() {
     assert_eq!(state.index().get_by_symbol("f"), &[f_x]);
     state.begin_epoch(0);
     state.refresh_index(&terms, &[quantified]);
-    assert!(state.index().get_by_symbol("f").is_empty());
+    assert_eq!(state.index().get_by_symbol("f"), []);
     assert_eq!(
         state.index().get_by_symbol("f"),
         TermIndex::new(&terms, &[quantified]).get_by_symbol("f")
@@ -113,7 +113,10 @@ fn bool_uf_arguments_are_ground_at_their_own_occurrence() {
     let bound_c = terms.mk_forall(vec![("c".to_string(), Sort::Bool)], h_c);
     let _unasserted = bound_c;
     assert_eq!(collect_bool_uf_arg_terms(&terms, &[h_c]), vec![c]);
-    assert!(collect_bool_uf_arg_terms(&terms, &[bound_c]).is_empty());
+    assert_eq!(
+        collect_bool_uf_arg_terms(&terms, &[bound_c]),
+        [] as [TermId; 0]
+    );
 
     let mixed = terms.mk_app(Symbol::named("Mixed"), vec![x, c], Sort::Bool);
     let bound_x = terms.mk_forall(vec![("x".to_string(), Sort::Int)], mixed);

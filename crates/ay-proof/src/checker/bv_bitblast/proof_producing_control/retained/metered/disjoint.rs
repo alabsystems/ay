@@ -13,6 +13,10 @@ use crate::checker::bv_bitblast::{
 };
 use std::cell::RefCell;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source, shape, three independent limit owners, allowance, and control stay explicit"
+)]
 pub(super) fn capture(
     terms: &TermStore,
     clause: &[TermId],
@@ -77,6 +81,10 @@ pub(super) fn capture(
     .map_err(MeteredBridgeError::from)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source, wire, three independent limit owners, allowance, and control stay explicit"
+)]
 pub(super) fn replay(
     terms: &TermStore,
     clause: &[TermId],
@@ -152,6 +160,10 @@ fn prerequisite_count(plan: FrameSet) -> Result<usize, MeteredError> {
     }
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "the callback signature is the exact indexed prerequisite proof schema"
+)]
 fn lower(
     terms: &TermStore,
     shape: Shape,

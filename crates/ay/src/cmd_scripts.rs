@@ -936,8 +936,8 @@ pub(crate) fn check_at(root: &Path) -> Result<i32> {
 }
 
 fn run_check_at(root: &Path, args: CheckArgs) -> Result<i32> {
-    let loaded = Loaded::load(&root)?;
-    let tracked = git_tracked(&root)?;
+    let loaded = Loaded::load(root)?;
+    let tracked = git_tracked(root)?;
     let mut findings: Vec<Finding> = Vec::new();
 
     // (a) every index path exists and is tracked.

@@ -89,6 +89,7 @@ use super::boolean::{decode_app, strip_not};
 ///      `strip_not(source)` is `None` (an `and` application),
 ///      `decode_ite(args[index])` is `None` (`and`-headed), and the `and`
 ///      arm demands `source` be `or`-headed, which it is not.
+///
 ///    Its second probe is `clause[1] == args[index]` — the other identity
 ///    this arm requires — so it returns `true` with no matcher call.
 ///

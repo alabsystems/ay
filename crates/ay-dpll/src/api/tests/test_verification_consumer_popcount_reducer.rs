@@ -257,7 +257,7 @@ fn assert_strict_native_popcount_bundle(solver: &Solver) {
         .expect("exact-source native popcount bundle");
     let checked = re_check_bundle_strict(&bundle).expect("independent bundle replay");
     assert!(checked.quality.is_complete());
-    assert!(!checked.assume_terms.is_empty());
+    assert_ne!(checked.assume_terms, [] as [ay_core::TermId; 0]);
     // The exact source keeps every root, while canonical proof construction
     // drops true roots and duplicates after transparent-definition adoption.
     assert!(checked

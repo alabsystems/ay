@@ -98,7 +98,7 @@ fn saturating_fp_integer_queries_replay_without_trust() {
                     serde_json::from_slice(&bytes).unwrap();
                 let checked = ay_proof::re_check_bundle_strict(&copied).expect("offline replay");
                 assert_eq!(checked.quality.trust_count, 0);
-                assert!(!checked.assume_terms.is_empty());
+                assert_ne!(checked.assume_terms, [] as [ay_dpll::api::TermId; 0]);
             }
         }
     }

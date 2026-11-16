@@ -53,7 +53,7 @@ fn fixture() -> (
 
 #[test]
 fn ordinary_price_covers_actual_meter_and_narrow_storage_replays_without_search() {
-    let (lhs, rhs, mut proof, mut gates, mut wire, bytes) = fixture();
+    let (lhs, rhs, mut proof, gates, mut wire, bytes) = fixture();
     let before = producer_test_counter::count();
     let price = price(
         &lhs,

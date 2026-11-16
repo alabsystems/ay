@@ -234,7 +234,7 @@ fn test_subsume_retains_queued_theory_conflict_without_tripping_postcondition() 
     // The discriminator that decides "over-strong assert" vs "real subsume
     // bug": the retained clause is not a reason for any assigned literal, so
     // the old assertion's premise — not the algorithm — was what was wrong.
-    assert!(solver.trail.is_empty());
+    assert_eq!(solver.trail.len(), 0);
     assert!(!solver.is_reason_clause_marked(subsumed_idx));
     assert_eq!(
         solver.classify_forward_subsumption_retention(subsumed_idx),

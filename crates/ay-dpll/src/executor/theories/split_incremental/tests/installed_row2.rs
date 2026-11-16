@@ -232,7 +232,7 @@ fn planned_seen_row2_without_sat_installation_does_not_acknowledge_live_work() {
         recheck_installed_theory_lemmas(&mut theory, repeated_result, &[], &|| false);
     let repeated = need_rows(without_install);
     let (new, skipped) = take_new_theory_lemmas(repeated, &mut seen);
-    assert!(new.is_empty());
+    assert_eq!(new, [] as [TheoryLemma; 0]);
     assert_eq!(
         skipped, 1,
         "a planned duplicate is still not an installed clause"

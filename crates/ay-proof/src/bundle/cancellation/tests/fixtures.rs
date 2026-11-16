@@ -5,6 +5,7 @@
 #![cfg(test)]
 
 use super::*;
+use ay_core::AletheRule;
 
 fn append_contradiction(terms: &mut TermStore, proof: &mut Proof, duplicate: bool) -> Vec<TermId> {
     let positive = terms.mk_var("cancel-contradiction", Sort::Bool);

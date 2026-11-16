@@ -55,8 +55,6 @@ pub(crate) struct QueryAnchoredGhostCandidate {
     pub(crate) vars: Vec<ChcVar>,
     /// Scalar, Boolean candidate over `vars`.
     pub(crate) formula: ChcExpr,
-    /// Predicate occurring in the source query that produced this candidate.
-    pub(crate) source_query_predicate: PredicateId,
 }
 
 pub(super) struct QueryCandidateBatch {
@@ -73,6 +71,7 @@ pub(super) struct QueryCandidateBatch {
 /// fit the configured ghost slots, either together or in every positive OR
 /// branch. Unsupported queries are skipped as candidate
 /// sources; Houdini still checks every raw query before any model can be sealed.
+#[cfg(test)]
 pub(crate) fn query_anchored_ghost_candidates(
     problem: &ChcProblem,
     spec: &GhostPairSpec,
@@ -80,6 +79,7 @@ pub(crate) fn query_anchored_ghost_candidates(
     query_anchored_ghost_candidates_with_budget(problem, spec, MAX_TOTAL_REWRITE_NODES)
 }
 
+#[cfg(test)]
 fn query_anchored_ghost_candidates_with_budget(
     problem: &ChcProblem,
     spec: &GhostPairSpec,
@@ -218,7 +218,6 @@ struct QueryTransportSource<'a> {
     problem: &'a ChcProblem,
     spec: &'a GhostPairSpec,
     constraint: &'a ChcExpr,
-    predicate: PredicateId,
     arg_positions: &'a FxHashMap<ChcVar, usize>,
     layout: &'a GhostPredSpec,
     local_reads: &'a [LocalIndexRead],
@@ -244,7 +243,6 @@ fn rewrite_transports_for_query(
             source.problem,
             source.spec,
             source.constraint,
-            source.predicate,
             source.arg_positions,
             source.layout,
             transport.predicate,
@@ -271,7 +269,6 @@ fn rewrite_query_for_target(
     problem: &ChcProblem,
     spec: &GhostPairSpec,
     constraint: &ChcExpr,
-    source_predicate: PredicateId,
     source_arg_positions: &FxHashMap<ChcVar, usize>,
     source_layout: &GhostPredSpec,
     target_predicate: PredicateId,
@@ -320,7 +317,6 @@ fn rewrite_query_for_target(
             predicate: target_predicate,
             vars,
             formula,
-            source_query_predicate: source_predicate,
         },
     )
 }

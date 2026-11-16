@@ -321,10 +321,10 @@ fn test_empty_matrix_operations_are_no_ops() {
     // Empty matrix should be handled without panic
     let mut empty: Matrix = vec![];
     gaussian_elimination(&mut empty);
-    assert!(empty.is_empty());
+    assert_eq!(empty, [] as [std::vec::Vec<num_rational::Ratio<i64>>; 0]);
 
     to_reduced_row_echelon_form(&mut empty);
-    assert!(empty.is_empty());
+    assert_eq!(empty, [] as [std::vec::Vec<num_rational::Ratio<i64>>; 0]);
 
     assert_eq!(matrix_nullity(&empty), 0);
 

@@ -87,7 +87,7 @@ mod tests {
         let text = renderer
             .format_array_select_store(ProofId(0), &[hit], true)
             .unwrap();
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
         let mut term_work_only = renderer.work_used();
         assert!(term_work_only > 0);
         assert!(!checked_array_read_lowering_supported(

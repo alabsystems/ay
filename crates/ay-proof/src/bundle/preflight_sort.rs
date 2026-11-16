@@ -49,7 +49,7 @@ fn insert_name<'a>(
     name: &'a str,
     progress: Progress<'_>,
 ) -> Result<bool, ProofCheckError> {
-    let levels = add((usize::BITS - names.len().leading_zeros()) as usize, 1)?;
+    let levels = add(names.len().bit_width() as usize, 1)?;
     let comparisons = add(names.len(), 1)?.min(mul(levels, 12)?);
     charge(progress, mul(comparisons, add(name.len(), 1)?)?, 0)?;
     // alloc's B=6 tree has 11 keys/12 edges. One sibling per visited level
@@ -152,6 +152,10 @@ pub(super) fn validate_sort_with_progress(
     charge(progress, 0, 0)
 }
 
+/// Refuses an empty constructor set, a duplicate constructor name in the
+/// datatype or field name in a constructor, and a field sort that
+/// `validate_sort_with_progress` refuses. Names are raw symbol text, so an
+/// empty name (the SMT-LIB symbol `||`) is admitted like any other.
 fn validate_datatype(
     datatype: &ay_core::DatatypeSort,
     node_index: usize,
@@ -160,27 +164,25 @@ fn validate_datatype(
     progress: Progress<'_>,
 ) -> Result<(), ProofCheckError> {
     charge(progress, add(datatype.name.len(), 1)?, 0)?;
-    if datatype.name.is_empty() || datatype.constructors.is_empty() {
+    if datatype.constructors.is_empty() {
         return invalid(role, progress, || {
-            format!("term t{node_index} {role} has an empty datatype name or constructor set")
+            format!("term t{node_index} {role} has an empty constructor set")
         });
     }
     let mut constructors = BTreeSet::new();
     for constructor in &datatype.constructors {
         charge(progress, add(constructor.name.len(), 1)?, 0)?;
-        if constructor.name.is_empty()
-            || !insert_name(&mut constructors, &constructor.name, progress)?
-        {
+        if !insert_name(&mut constructors, &constructor.name, progress)? {
             return invalid(role, progress, || {
-                format!("term t{node_index} {role} has an empty or duplicate datatype constructor")
+                format!("term t{node_index} {role} has a duplicate datatype constructor")
             });
         }
         let mut fields = BTreeSet::new();
         for field in &constructor.fields {
             charge(progress, add(field.name.len(), 1)?, 0)?;
-            if field.name.is_empty() || !insert_name(&mut fields, &field.name, progress)? {
+            if !insert_name(&mut fields, &field.name, progress)? {
                 return invalid(role, progress, || {
-                    format!("term t{node_index} {role} has an empty or duplicate datatype field")
+                    format!("term t{node_index} {role} has a duplicate datatype field")
                 });
             }
             validate_sort_with_progress(

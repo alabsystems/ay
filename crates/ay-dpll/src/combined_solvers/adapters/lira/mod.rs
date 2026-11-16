@@ -113,21 +113,6 @@ impl<'a> LiraSolver<'a> {
         self.lra.terms()
     }
 
-    /// Point both sub-solvers at `terms`, opening their read
-    /// brackets (persistent-arm lifecycle; mirrors
-    /// `LraSolver::set_terms`).
-    pub(crate) fn set_terms(&mut self, terms: &'a TermStore) {
-        self.lia.set_terms(terms);
-        self.lra.set_terms(terms);
-    }
-
-    /// Close both sub-solvers' read brackets (persistent-arm
-    /// lifecycle; mirrors `LraSolver::unset_terms`).
-    pub(crate) fn unset_terms(&mut self) {
-        self.lia.unset_terms();
-        self.lra.unset_terms();
-    }
-
     /// Create a new combined LIA+LRA solver
     pub(crate) fn new(terms: &'a TermStore) -> Self {
         let mut lia = LiaSolver::new(terms);

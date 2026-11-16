@@ -1,11 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+use super::super::super::cancellation_fixtures as fixtures;
 use super::*;
-use ay_core::AletheRule;
-
-#[path = "../../cancellation/tests/fixtures.rs"]
-mod fixtures;
 
 fn usage(bundle: &SerializableProofBundle) -> (usize, usize, usize) {
     let (mut work, mut bytes, mut polls) = (0, 0, 0);
@@ -117,7 +114,7 @@ fn raw_clone_and_independent_replay_debit_one_combined_allowance() {
     let (copy_work, copy_bytes, _) = usage(&source);
     let copied = source.try_clone_with_progress(&mut |_, _| true).unwrap();
     let (mut replay_work, mut replay_bytes) = (0, 0);
-    crate::re_check_bundle_strict_with_resource_control(&copied, &mut |w, b| {
+    re_check_bundle_strict_with_resource_control(&copied, &mut |w, b| {
         replay_work += w;
         replay_bytes += b;
         true
@@ -138,7 +135,7 @@ fn raw_clone_and_independent_replay_debit_one_combined_allowance() {
             w <= work_cap && b <= bytes_cap
         };
         let copied = source.try_clone_with_progress(&mut progress).unwrap();
-        let checked = crate::re_check_bundle_strict_with_resource_control(&copied, &mut progress);
+        let checked = re_check_bundle_strict_with_resource_control(&copied, &mut progress);
         assert_eq!(checked.is_ok(), admitted);
         if let Ok(checked) = checked {
             assert!(checked.quality.is_complete());

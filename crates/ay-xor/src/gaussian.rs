@@ -837,6 +837,9 @@ mod proof_clause_encoding_tests {
         assert!(matches!(solver.eliminate(), GaussResult::Conflict(_)));
         assert!(!solver.has_complete_proof_ladder());
         assert!(solver.try_generate_complete_proof_clauses().is_none());
-        assert!(solver.generate_proof_clauses().is_empty());
+        assert_eq!(
+            solver.generate_proof_clauses().as_slice(),
+            &[] as &[Vec<Literal>]
+        );
     }
 }

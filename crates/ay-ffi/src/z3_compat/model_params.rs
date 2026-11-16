@@ -175,6 +175,97 @@ fn model_entries(solver: &Solver, model: &Model) -> Vec<(String, Sort)> {
     entries
 }
 
+/// The declaration inventories include both the solved snapshot and explicit
+/// caller assignments. Replacing an interpretation retains its index instead
+/// of counting the same declaration twice; matching includes the full signature.
+fn model_constant_declarations(ctx: &Z3Context, handle: &ModelHandle) -> Vec<FuncDecl> {
+    let mut declarations: Vec<_> = model_entries(&ctx.solver, &handle.model)
+        .into_iter()
+        .map(|(name, sort)| {
+            let public_sort = ctx
+                .ffi_const_terms_by_identity
+                .get(&name)
+                .map(|&term| super::public_ast_sort(ctx, term_to_ast(ctx, term), term))
+                .unwrap_or(sort);
+            FuncDecl::new(name, Vec::new(), public_sort)
+        })
+        .collect();
+    include_model_declarations(
+        &mut declarations,
+        handle
+            .user_const_interps
+            .iter()
+            .filter_map(|(declaration, value)| {
+                (*value != 0 && declaration.arity() == 0).then_some(declaration)
+            }),
+    );
+    declarations
+}
+
+fn model_function_declarations(handle: &ModelHandle) -> Vec<FuncDecl> {
+    let mut declarations: Vec<_> = handle
+        .func_interps
+        .iter()
+        .map(|interpretation| {
+            FuncDecl::new(
+                interpretation.name.clone(),
+                interpretation.param_sorts.clone(),
+                interpretation.result_sort.clone(),
+            )
+        })
+        .collect();
+    include_model_declarations(
+        &mut declarations,
+        handle
+            .user_func_interps
+            .iter()
+            .filter_map(|(declaration, interpretation)| {
+                (!interpretation.is_null()).then_some(declaration)
+            }),
+    );
+    declarations
+}
+
+fn model_declaration_key(declaration: &FuncDecl) -> (&str, &[Sort], &Sort) {
+    (
+        declaration.declaration_identity_name(),
+        declaration.domain(),
+        declaration.range(),
+    )
+}
+
+fn include_model_declarations<'a>(
+    declarations: &mut Vec<FuncDecl>,
+    assignments: impl Iterator<Item = &'a FuncDecl>,
+) {
+    let assignments: Vec<_> = assignments.collect();
+    // Borrowed semantic keys avoid quadratic scans or copying signatures into
+    // another index. Hash iteration never determines the public index order.
+    let mut replacements: StdHashMap<_, _> = assignments
+        .iter()
+        .map(|&declaration| (model_declaration_key(declaration), declaration))
+        .collect();
+    let mut updates = Vec::new();
+    for (index, previous) in declarations.iter().enumerate() {
+        if let Some(replacement) = replacements.remove(&model_declaration_key(previous)) {
+            updates.push((index, replacement.clone()));
+        }
+    }
+    let mut additions = Vec::new();
+    for declaration in assignments {
+        if let Some(addition) = replacements.remove(&model_declaration_key(declaration)) {
+            additions.push(addition.clone());
+        }
+    }
+    // Queries into the borrowed-key index can retain the immutable inventory
+    // borrow. End that phase before replacing entries or growing its storage.
+    drop(replacements);
+    for (index, replacement) in updates {
+        declarations[index] = replacement;
+    }
+    declarations.extend(additions);
+}
+
 pub(crate) fn model_entry_display_name(ctx: &Z3Context, identity: &str) -> String {
     model_entry_display_name_owned(ctx, identity, None)
 }
@@ -1426,7 +1517,7 @@ pub unsafe extern "C" fn Z3_model_dec_ref(_c: Z3_context, _m: Z3_model) {}
 /// Get number of constant declarations in model.
 ///
 /// Counts EXACTLY the entries `Z3_model_get_const_decl` enumerates (the two
-/// share [`model_entries`]'s index space), so every index below this count
+/// share [`model_constant_declarations`]'s index space), so every index below this count
 /// yields a named decl — including array/datatype/uninterpreted-sort entries.
 ///
 /// # Safety
@@ -1442,8 +1533,7 @@ pub unsafe extern "C" fn Z3_model_get_num_consts(_c: Z3_context, m: Z3_model) ->
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(_c, 0, |ctx| {
-            let model = &(*m).model;
-            model_entries(&ctx.solver, model).len() as c_uint
+            model_constant_declarations(ctx, &*m).len() as c_uint
         })
     }
 }
@@ -2258,10 +2348,10 @@ pub unsafe extern "C" fn Z3_model_get_const_decl(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let model = &(*m).model;
-            let entries = model_entries(&ctx.solver, model);
+            let entries = model_constant_declarations(ctx, &*m);
             match entries.get(i as usize) {
-                Some((name, sort)) => {
+                Some(decl) => {
+                    let name = decl.declaration_identity_name();
                     if let Some(term) = ctx.ffi_const_terms_by_identity.get(name).copied() {
                         if let Some((_, symbol)) = ctx.ffi_const_metadata.get(&term).cloned() {
                             // The constant's PUBLIC sort (a finite-domain or Char
@@ -2269,11 +2359,11 @@ pub unsafe extern "C" fn Z3_model_get_const_decl(
                             // must give back this constant, as in z3.
                             let ast = term_to_ast(ctx, term);
                             let public = super::public_ast_sort(ctx, ast, term);
-                            let decl = FuncDecl::new(name.clone(), vec![], public);
+                            let decl = FuncDecl::new(name.to_string(), vec![], public);
                             return cache_func_decl_with_symbol(ctx, decl, symbol);
                         }
                     }
-                    cache_func_decl(ctx, FuncDecl::new(name.clone(), vec![], sort.clone()))
+                    cache_func_decl(ctx, decl.clone())
                 }
                 None => ptr::null_mut(),
             }
@@ -2314,7 +2404,7 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
             // (Z3_mk_model + Z3_add_const_interp) takes precedence and reads back
             // exactly the value AST the caller stored.
             for (udecl, uast) in &(*m).user_const_interps {
-                if *uast != 0 && udecl.name() == name {
+                if *uast != 0 && super::model_build::same_model_declaration(udecl, decl) {
                     let _term = require_term_ast_or_return!(
                         ctx,
                         *uast,
@@ -2355,9 +2445,8 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
 
 /// Get the number of function interpretations in the model.
 ///
-/// Counts the arity > 0 function tables the snapshot carries (parsed from the
-/// engine's raw model text at materialization time; see
-/// [`ModelHandle::func_interps`](super::ModelHandle)).
+/// Counts the snapshot's function tables and caller-added interpretations in
+/// the same index space as `Z3_model_get_func_decl`. Reassignment counts once.
 ///
 /// # Safety
 /// All pointers must be valid.
@@ -2370,7 +2459,11 @@ pub unsafe extern "C" fn Z3_model_get_num_funcs(c: Z3_context, m: Z3_model) -> c
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_uint` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
-    unsafe { ffi_guard_uint(c, 0, |_ctx| (*m).func_interps.len() as c_uint) }
+    unsafe {
+        ffi_guard_uint(c, 0, |_ctx| {
+            model_function_declarations(&*m).len() as c_uint
+        })
+    }
 }
 
 /// Check whether the model has an interpretation for a given func_decl.
@@ -2391,16 +2484,20 @@ pub unsafe extern "C" fn Z3_model_has_interp(_c: Z3_context, m: Z3_model, d: Z3_
             let model = &(*m).model;
             let decl = &(*d).decl;
             let name = decl.name();
+            let user_has = (*m).user_const_interps.iter().any(|(udecl, uast)| {
+                *uast != 0 && super::model_build::same_model_declaration(udecl, decl)
+            }) || (*m).user_func_interps.iter().any(|(udecl, uinterp)| {
+                !uinterp.is_null() && super::model_build::same_model_declaration(udecl, decl)
+            });
+            if user_has {
+                return 1;
+            }
             // Recursively defined names never report a snapshot interp (see
             // `Z3_model_get_const_interp`/`Z3_model_get_func_interp`) — keep
             // this predicate aligned so has-interp and get-interp agree.
             // A user-stored interp on a hand-built model still counts.
             if ctx.rec_fun_defs.contains_key(name) {
-                let user_has = (*m)
-                    .user_const_interps
-                    .iter()
-                    .any(|(udecl, uast)| *uast != 0 && udecl.name() == name);
-                return i32::from(user_has);
+                return 0;
             }
             // `value_by_name` searches EVERY sort map (including arrays,
             // datatypes and uninterpreted-sort constants), keeping this
@@ -2518,7 +2615,7 @@ pub unsafe extern "C" fn Z3_model_get_func_interp(
             // (Z3_mk_model + Z3_add_func_interp) takes precedence and returns the
             // exact arena-owned handle the caller has been populating.
             for (udecl, uinterp) in &(*m).user_func_interps {
-                if !uinterp.is_null() && udecl.arity() == decl_arity && udecl.name() == decl_name {
+                if !uinterp.is_null() && super::model_build::same_model_declaration(udecl, decl) {
                     return *uinterp;
                 }
             }
@@ -2571,16 +2668,9 @@ pub unsafe extern "C" fn Z3_model_get_func_decl(
     // model handle; `ffi_guard_ptr` checks `c` before reading its tables.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let interps = &(*m).func_interps;
-            match interps.get(i as usize) {
-                Some(fi) => {
-                    let decl = FuncDecl::new(
-                        fi.name.clone(),
-                        fi.param_sorts.clone(),
-                        fi.result_sort.clone(),
-                    );
-                    cache_func_decl(ctx, decl)
-                }
+            let declarations = model_function_declarations(&*m);
+            match declarations.get(i as usize) {
+                Some(decl) => cache_func_decl(ctx, decl.clone()),
                 None => ptr::null_mut(),
             }
         })

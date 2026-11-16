@@ -686,7 +686,7 @@ fn test_fmla_main_lrat_rewrite_materializer_is_default_off() {
     )
     .expect("disabled materializer must stay inert");
 
-    assert!(materialized.records.is_empty());
+    assert_eq!(materialized.records.len(), 0);
     assert!(!materialized.stats.enabled);
     assert_eq!(materialized.stats.sidecar_rows_seen, 1);
     assert_eq!(materialized.stats.records_materialized, 0);

@@ -21,7 +21,6 @@ fn fn_adapter_latches_refusal_without_reinvoking_a_changing_callback() {
     assert!(!call_fn(&predicate));
     assert!(call_fn(&predicate));
     assert!(call_fn(&predicate));
-    drop(control);
     assert_eq!(calls, 2);
 }
 
@@ -35,7 +34,6 @@ fn caught_callback_panic_cannot_resurrect_progress() {
     let control = ProofControl::new(&mut progress);
     assert!(catch_unwind(AssertUnwindSafe(|| control.poll())).is_err());
     assert_eq!(control.poll(), Err(ResolutionProofError::Cancelled));
-    drop(control);
     assert_eq!(calls, 1);
 }
 
@@ -64,7 +62,6 @@ fn final_refusal_happens_after_private_scratch_destruction() {
         Ok(7)
     });
     assert_eq!(result, Err(ResolutionProofError::Cancelled));
-    drop(control);
     assert_eq!(calls, 2);
 }
 
@@ -109,7 +106,6 @@ fn ordinary_error_has_no_new_callback_but_prior_refusal_still_wins() {
                 ResolutionProofError::NoEmptyClause
             })
         );
-        drop(control);
         assert_eq!(calls, if caught_refusal { 2 } else { 1 });
     }
 }

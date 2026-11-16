@@ -39,7 +39,7 @@ fn split_pair_reuse_of_an_encoded_atom_is_reported_only_when_armed() {
         (lt, gt),
     )
     .expect("fresh split encodes");
-    assert!(negations.take_reused_atoms().is_empty());
+    assert_eq!(negations.take_reused_atoms(), [] as [ay_core::TermId; 0]);
 
     // Re-encoding maps both onto their existing vars: both are reported.
     encode_split_pair_incremental(
@@ -67,7 +67,7 @@ fn split_pair_reuse_of_an_encoded_atom_is_reported_only_when_armed() {
         (lt, gt),
     )
     .expect("repeated split reuses its vars");
-    assert!(negations.take_reused_atoms().is_empty());
+    assert_eq!(negations.take_reused_atoms(), [] as [ay_core::TermId; 0]);
 }
 
 #[test]

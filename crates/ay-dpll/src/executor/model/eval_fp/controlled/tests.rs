@@ -139,7 +139,7 @@ fn concretization_observes_scoped_binding_before_ambient_operand_and_result_pins
         let visits = Cell::new(0);
         let constructed = Cell::new(false);
         let result = executor.evaluate_fp_term_via_bitblast_controlled(&model, term, &|phase| {
-            if let FpEvalPhase::Concretize(_) = phase {
+            if let FpEvalPhase::Concretize = phase {
                 visits.set(visits.get() + 1);
                 if visits.get() == 3 {
                     interrupt.store(true, Ordering::Relaxed);

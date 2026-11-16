@@ -775,7 +775,7 @@ fn test_project_with_residuals_empty_vars() {
 
     let result = mbp.project_with_residuals(&formula, &[], &model);
 
-    assert!(result.residual_vars.is_empty());
+    assert_eq!(result.residual_vars, [] as [ChcVar; 0]);
     assert_eq!(result.formula, formula);
 }
 

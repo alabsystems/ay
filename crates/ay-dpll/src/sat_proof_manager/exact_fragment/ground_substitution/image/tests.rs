@@ -65,5 +65,5 @@ fn ground_substitution_image_precharges_before_interning_or_proof_emission() {
         ))
     ));
     assert_eq!(terms.true_memory_bytes(), baseline);
-    assert!(proof.steps.is_empty());
+    assert_eq!(proof.steps, [] as [ay_core::ProofStep; 0]);
 }

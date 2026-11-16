@@ -55,7 +55,10 @@ fn case(id: String, input_sha256: String, outcome: ValidatorCaseOutcome) -> Vali
 fn receipt_passing_the_first_replay(proof: Option<&str>) -> Vec<ValidatorCase> {
     let mut rows = vec![case(
         "carcara.identity".to_string(),
-        checker_identity_input_sha(CARCARA_SHA256, CARCARA_VERSION_OUTPUT),
+        checker_identity_input_sha(
+            checker_cohort::LEGACY_SHA256,
+            checker_cohort::version_for_sha(checker_cohort::LEGACY_SHA256).unwrap(),
+        ),
         ValidatorCaseOutcome::Fail,
     )];
     for (index, fixture) in FIXTURES.into_iter().enumerate() {
@@ -154,21 +157,24 @@ fn a_receipt_counting_valid_over_a_misjudged_or_missing_proof_is_rejected() {
     assert_eq!(
         validate_receipt_rows(
             &receipt_passing_the_first_replay(Some(CLEAN_PROOF)),
-            CARCARA_SHA256,
+            checker_cohort::LEGACY_SHA256,
         ),
         Ok(())
     );
     let misjudged = validate_receipt_rows(
         &receipt_passing_the_first_replay(Some(FALSE_VALID_CONTROL_PROOF)),
-        CARCARA_SHA256,
+        checker_cohort::LEGACY_SHA256,
     )
     .expect_err("a valid over a misjudged proof");
     assert!(
         misjudged.contains("has invalid independent replay evidence"),
         "{misjudged}"
     );
-    let missing = validate_receipt_rows(&receipt_passing_the_first_replay(None), CARCARA_SHA256)
-        .expect_err("a valid over no retained proof");
+    let missing = validate_receipt_rows(
+        &receipt_passing_the_first_replay(None),
+        checker_cohort::LEGACY_SHA256,
+    )
+    .expect_err("a valid over no retained proof");
     assert!(
         missing.contains("has invalid independent replay evidence"),
         "{missing}"

@@ -278,8 +278,8 @@ pub(in crate::executor) fn keep_ground_content_of_entailed(
 ) -> usize {
     let truth = terms.mk_bool(true);
     let mut rewritten_count = 0;
-    for index in 0..assertions.len() {
-        let original = assertions[index];
+    for assertion in assertions.iter_mut() {
+        let original = *assertion;
         if protected.contains(&original) || !crate::ematching::contains_quantifier(terms, original)
         {
             continue;
@@ -296,7 +296,7 @@ pub(in crate::executor) fn keep_ground_content_of_entailed(
         let map: DetHashMap<TermId, TermId> = maximal.iter().map(|&q| (q, truth)).collect();
         let mut cache: DetHashMap<TermId, TermId> = DetHashMap::default();
         if let Some(rewritten) = substitute_top_down(terms, original, &map, &mut cache) {
-            assertions[index] = rewritten;
+            *assertion = rewritten;
             rewritten_count += 1;
         }
     }

@@ -82,7 +82,7 @@ fn strings_reject_a_raw_surrogate_carrier_character() {
     let escaped = parse_sexp(r#""\u{d800}""#).expect("a surrogate escape is legal");
     assert_eq!(
         escaped,
-        SExpr::String(ay_core::unescape_string_contents(r"\u{d800}"))
+        SExpr::String(unescape_string_contents(r"\u{d800}"))
     );
     for raw in ['\u{10D7FF}', '\u{10E000}', '\u{30000}'] {
         assert_eq!(

@@ -11,6 +11,32 @@ pub fn validate_reachable_assumes_in_problem_scope(
     problem_assertions: &[TermId],
 ) -> Result<(), AlethePrintError> {
     let problem_assertions: HashSet<TermId> = problem_assertions.iter().copied().collect();
+    let reachable = empty_clause_cone(proof);
+    for (index, step) in proof.steps.iter().enumerate() {
+        if !reachable[index] {
+            continue;
+        }
+        if let ProofStep::Assume(term) = step {
+            if !problem_assertions.contains(term) {
+                return Err(AlethePrintError::NonProblemAssume {
+                    id: ProofId(index as u32),
+                    term: *term,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The dependency cone of `proof`'s empty clauses, as one flag per step
+/// (indexed like `proof.steps`): every `Step`, `Resolution`, `TheoryLemma`,
+/// `FiniteFieldLinear` or `NraSos` step whose clause is empty, and every step
+/// reached from one through the premises of a `Step` and both parents of a
+/// `Resolution`. A premise id past the last step is ignored.
+/// [`validate_reachable_assumes_in_problem_scope`] checks the `Assume` steps
+/// of this cone.
+#[must_use]
+pub fn empty_clause_cone(proof: &Proof) -> Vec<bool> {
     let mut reachable = vec![false; proof.steps.len()];
     let mut stack = Vec::new();
     for (index, step) in proof.steps.iter().enumerate() {
@@ -51,18 +77,5 @@ pub fn validate_reachable_assumes_in_problem_scope(
             _ => {}
         }
     }
-    for (index, step) in proof.steps.iter().enumerate() {
-        if !reachable[index] {
-            continue;
-        }
-        if let ProofStep::Assume(term) = step {
-            if !problem_assertions.contains(term) {
-                return Err(AlethePrintError::NonProblemAssume {
-                    id: ProofId(index as u32),
-                    term: *term,
-                });
-            }
-        }
-    }
-    Ok(())
+    reachable
 }

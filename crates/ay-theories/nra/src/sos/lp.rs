@@ -18,6 +18,7 @@ use super::{one, zero};
 
 /// Find a rational solution to `{ A x = b, x >= 0 }`, if the bounded Phase-1
 /// search succeeds. `None` is not a proof of infeasibility.
+#[cfg(test)]
 pub(super) fn lp_phase1_feasible(
     a: Vec<Vec<BigRational>>,
     b: Vec<BigRational>,
@@ -154,8 +155,8 @@ fn normalize_rhs(
             return None;
         }
         if b[row].is_negative() {
-            for column in 0..n {
-                a[row][column] = lp_neg(&a[row][column], budget)?;
+            for coefficient in &mut a[row][..n] {
+                *coefficient = lp_neg(coefficient, budget)?;
             }
             b[row] = lp_neg(&b[row], budget)?;
         }
@@ -235,23 +236,25 @@ fn pivot_tableau(
     total: usize,
     budget: &mut SosLpBudget<'_>,
 ) -> Option<()> {
-    if !budget.charge_rational_clone(&tableau[leaving][entering])
-        || !budget.charge_array::<usize>(total.checked_add(1)?)
-    {
+    if !budget.charge_rational_clone(&tableau[leaving][entering]) {
+        return None;
+    }
+    let columns = total.checked_add(1)?;
+    if !budget.charge_array::<usize>(columns) {
         return None;
     }
     let pivot = tableau[leaving][entering].clone();
     if !pivot.is_one() {
-        for column in 0..=total {
+        for coefficient in &mut tableau[leaving][..columns] {
             if !budget.charge(1, 0) {
                 return None;
             }
-            if !tableau[leaving][column].is_zero() {
-                tableau[leaving][column] = lp_div(&tableau[leaving][column], &pivot, budget)?;
+            if !coefficient.is_zero() {
+                *coefficient = lp_div(coefficient, &pivot, budget)?;
             }
         }
     }
-    let support: Vec<usize> = (0..=total)
+    let support: Vec<usize> = (0..columns)
         .filter(|&column| !tableau[leaving][column].is_zero())
         .collect();
     for row in 0..tableau.len() {

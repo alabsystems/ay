@@ -1045,7 +1045,7 @@ mod tests {
         assert_eq!(run.verdict, Verdict::Unknown);
         assert!(run.memout);
         assert!(!run.timed_out);
-        assert!(run.stdout.is_empty());
+        assert_eq!(run.stdout, "");
         assert!(
             spawn_and_parse(Command::new("/no-such-ay-diagnostic-executable"), limits,).is_err()
         );

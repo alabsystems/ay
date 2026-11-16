@@ -170,15 +170,10 @@ fn write_swap_segments<W: PermutationText>(
         n.checked_add(a.len())?.checked_add(b.len())
     })?;
     output.admit_copy(
-        clone_bytes.checked_add(
-            printed
-                .left
-                .len()
-                .checked_mul(std::mem::size_of::<PrintedEntry>())?,
-        )?,
+        clone_bytes.checked_add(printed.left.len().checked_mul(size_of::<PrintedEntry>())?)?,
     )?;
     let mut current = printed.left.clone();
-    output.admit_copy(swaps.len().checked_mul(std::mem::size_of::<Segment>())?)?;
+    output.admit_copy(swaps.len().checked_mul(size_of::<Segment>())?)?;
     let mut segments = Vec::with_capacity(swaps.len());
     for (nth, &at) in swaps.iter().enumerate() {
         let rest = admitted_store_chain_text(output, &printed.base, &current[at + 2..])?;
@@ -195,8 +190,8 @@ fn write_swap_segments<W: PermutationText>(
             outer,
             inner,
             &printed.index_sort,
-            &premise,
-            (&diseq_lhs, &diseq_rhs),
+            premise,
+            (diseq_lhs, diseq_rhs),
             false_fact,
         )?;
         output.admit_copy(tag.len())?;
@@ -206,10 +201,10 @@ fn write_swap_segments<W: PermutationText>(
             let next_before = output.term(format_args!("(store {before} {index} {value})"))?;
             let next_after = output.term(format_args!("(store {after} {index} {value})"))?;
             let step = output.term(format_args!("{tag}.l{depth}"))?;
-            write!(
+            writeln!(
                 output,
                 "(step {step} (cl (= {next_before} {next_after})) \
-                 :rule cong :premises ({lifted}))\n"
+                 :rule cong :premises ({lifted}))"
             )
             .ok()?;
             lifted = step;
@@ -234,10 +229,10 @@ fn compose_segments<W: PermutationText>(
     let mut chain_end = first.2.clone();
     for (nth, (step, _, after)) in segments.iter().enumerate().skip(1) {
         let composed = output.term(format_args!("{id}.tr{nth}"))?;
-        write!(
+        writeln!(
             output,
             "(step {composed} (cl (= {} {after})) \
-             :rule trans :premises ({chain_step} {step}))\n",
+             :rule trans :premises ({chain_step} {step}))",
             printed.left_text
         )
         .ok()?;

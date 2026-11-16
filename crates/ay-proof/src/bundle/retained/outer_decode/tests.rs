@@ -139,7 +139,7 @@ fn present_empty_inventory_and_omitted_or_null_legacy_options_are_preserved() {
             let (actual, inventory) = decoded.parts();
             assert_eq!(actual.true_term, None);
             assert_eq!(actual.false_term, None);
-            assert!(inventory.is_empty());
+            assert_eq!(inventory, []);
             value.as_object_mut().unwrap().remove("retained");
             let expected: SerializableProofBundle = serde_json::from_value(value).unwrap();
             assert_eq!(
@@ -401,7 +401,7 @@ fn every_success_and_inventory_failure_poll_is_terminal_including_cleanup() {
 fn all_original_deadlines_refuse_without_callback_or_new_inner_deadline() {
     for source in 0..3 {
         let (mut bound, mut wire, mut deadline) = (limits(), wire(), end());
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         match source {
             0 => deadline = expired,
             1 => bound.deadline = expired,

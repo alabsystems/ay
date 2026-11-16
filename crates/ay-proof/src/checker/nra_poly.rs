@@ -717,6 +717,10 @@ fn extract_polynomial_relation(
             args.len()
         ));
     };
+    meter.charge_nodes(2)?;
+    if terms.entry_stamp(a).is_none() || terms.entry_stamp(b).is_none() {
+        return Err("arithmetic relation has a missing operand".to_string());
+    }
     if !matches!(terms.sort(a), Sort::Int | Sort::Real)
         || !matches!(terms.sort(b), Sort::Int | Sort::Real)
     {
@@ -785,6 +789,9 @@ pub(crate) fn extract_constraints(
     }
     meter.charge_nodes(clause.len())?;
     for &lit in clause {
+        if terms.entry_stamp(lit).is_none() {
+            return Err("arithmetic clause has a missing literal".to_string());
+        }
         if !matches!(terms.sort(lit), Sort::Bool) {
             return Err(format!(
                 "literal has non-Bool sort {:?}; lemma clauses must be propositional",
@@ -808,9 +815,15 @@ pub(crate) fn extract_constraints(
 
     while let Some((t, asserted)) = pending.pop() {
         meter.poll()?;
+        meter.charge_node()?;
+        if terms.entry_stamp(t).is_none() || terms.sort(t) != &Sort::Bool {
+            return Err("arithmetic Boolean descendant is missing or non-Boolean".to_string());
+        }
+        if declared_application(terms, t, meter)? {
+            return Err("declared Boolean application is not an arithmetic operator".to_string());
+        }
         match terms.get(t) {
             TermData::Not(inner) => {
-                meter.charge_node()?;
                 pending
                     .try_reserve(1)
                     .map_err(|_| "nra pending-negation allocation refused".to_string())?;
@@ -889,16 +902,20 @@ pub(crate) fn extract_constraints(
     // so the pass costs nothing when no `bv2nat` occurs.
     let mut range_constraints: Vec<Constraint> = Vec::new();
     for &var in &vars {
+        meter.charge_node()?;
         let TermData::App(Symbol::Named(name), args) = terms.get(var) else {
             continue;
         };
-        if name != "bv2nat" || args.len() != 1 {
+        if name != "bv2nat" || args.len() != 1 || declared_application(terms, var, meter)? {
             continue;
+        }
+        if terms.entry_stamp(args[0]).is_none() || terms.sort(var) != &Sort::Int {
+            return Err("malformed bv2nat range source".to_string());
         }
         let Sort::BitVec(bv) = terms.sort(args[0]) else {
             continue;
         };
-        if u64::from(bv.width) > MAX_POLY_COEFF_BITS {
+        if bv.width == 0 || u64::from(bv.width) > MAX_POLY_COEFF_BITS {
             continue;
         }
         meter.charge_ops(bit_scaled(2, u64::from(bv.width)))?;
@@ -951,6 +968,9 @@ fn parse_poly(
     if depth > MAX_PARSE_DEPTH {
         return Err("nra term nesting exceeds depth cap".to_string());
     }
+    if terms.entry_stamp(t).is_none() || !matches!(terms.sort(t), Sort::Int | Sort::Real) {
+        return Err("arithmetic term is missing or has a non-numeric sort".to_string());
+    }
     meter.charge_private_allocation(GENERIC_MEMO_TREE_WORK, 0)?;
     if let Some(p) = memo.get(&t) {
         charge_poly_result(p, meter)?;
@@ -976,6 +996,13 @@ fn parse_poly_uncached(
     meter: &mut WorkMeter<'_>,
     depth: usize,
 ) -> Result<MPoly, String> {
+    // A declaration owns its application before any arithmetic spelling.
+    // Its arguments need not have arithmetic sorts and must not be expanded:
+    // universal abstraction of its numeric result is the sound direction.
+    if declared_application(terms, t, meter)? {
+        meter.charge_monomials(1)?;
+        return Ok(MPoly::var(t));
+    }
     match terms.get(t) {
         TermData::Const(Constant::Int(n)) => {
             let bits = n.bits().saturating_add(1); // denominator is one
@@ -1000,8 +1027,11 @@ fn parse_poly_uncached(
         }
         TermData::App(Symbol::Named(name), args) if name == "+" => {
             let result_sort = terms.sort(t);
+            meter.charge_nodes(args.len())?;
             if !matches!(result_sort, Sort::Int | Sort::Real)
-                || args.iter().any(|&arg| terms.sort(arg) != result_sort)
+                || args
+                    .iter()
+                    .any(|&arg| terms.entry_stamp(arg).is_none() || terms.sort(arg) != result_sort)
             {
                 return Err("ill-sorted arithmetic addition".to_string());
             }
@@ -1014,6 +1044,7 @@ fn parse_poly_uncached(
         }
         TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
             if !matches!(terms.sort(t), Sort::Int | Sort::Real)
+                || terms.entry_stamp(args[0]).is_none()
                 || terms.sort(args[0]) != terms.sort(t)
             {
                 return Err("ill-sorted arithmetic negation".to_string());
@@ -1022,8 +1053,11 @@ fn parse_poly_uncached(
         }
         TermData::App(Symbol::Named(name), args) if name == "-" && args.len() >= 2 => {
             let result_sort = terms.sort(t);
+            meter.charge_nodes(args.len())?;
             if !matches!(result_sort, Sort::Int | Sort::Real)
-                || args.iter().any(|&arg| terms.sort(arg) != result_sort)
+                || args
+                    .iter()
+                    .any(|&arg| terms.entry_stamp(arg).is_none() || terms.sort(arg) != result_sort)
             {
                 return Err("ill-sorted arithmetic subtraction".to_string());
             }
@@ -1036,8 +1070,11 @@ fn parse_poly_uncached(
         }
         TermData::App(Symbol::Named(name), args) if name == "*" => {
             let result_sort = terms.sort(t);
+            meter.charge_nodes(args.len())?;
             if !matches!(result_sort, Sort::Int | Sort::Real)
-                || args.iter().any(|&arg| terms.sort(arg) != result_sort)
+                || args
+                    .iter()
+                    .any(|&arg| terms.entry_stamp(arg).is_none() || terms.sort(arg) != result_sort)
             {
                 return Err("ill-sorted arithmetic multiplication".to_string());
             }
@@ -1063,7 +1100,23 @@ fn parse_poly_uncached(
         TermData::App(Symbol::Named(name), args)
             if name == "bv2nat" && args.len() == 1 && matches!(terms.sort(t), Sort::Int) =>
         {
-            if let TermData::Const(Constant::BitVec { value, .. }) = terms.get(args[0]) {
+            let argument = args[0];
+            if terms.entry_stamp(argument).is_none() {
+                return Err("bv2nat has a missing argument".to_string());
+            }
+            let Sort::BitVec(argument_sort) = terms.sort(argument) else {
+                return Err("bv2nat requires a bit-vector argument".to_string());
+            };
+            if argument_sort.width == 0 {
+                return Err("bv2nat requires a nonzero bit-vector width".to_string());
+            }
+            if let TermData::Const(Constant::BitVec { value, width }) = terms.get(argument) {
+                if *width != argument_sort.width
+                    || value.is_negative()
+                    || value.bits() > u64::from(*width)
+                {
+                    return Err("bv2nat has a malformed bit-vector literal".to_string());
+                }
                 let bits = value.bits().saturating_add(1);
                 if bits > MAX_POLY_COEFF_BITS {
                     return Err(format!(
@@ -1094,7 +1147,7 @@ fn parse_poly_uncached(
             // here for no semantic reason. Int-sorted argument only; the
             // relaxation of Int variables to reals downstream is the usual
             // sound direction for infeasibility.
-            if *terms.sort(args[0]) != Sort::Int {
+            if terms.entry_stamp(args[0]).is_none() || *terms.sort(args[0]) != Sort::Int {
                 return Err("ill-sorted to_real embedding".to_string());
             }
             parse_poly(terms, args[0], memo, meter, depth + 1)
@@ -1112,6 +1165,22 @@ fn parse_poly_uncached(
     }
 }
 
+/// The name lookup itself is work, including long user identities. This uses
+/// the same arithmetic meter and does not traverse opaque application inputs.
+fn declared_application(
+    terms: &TermStore,
+    term: TermId,
+    meter: &mut WorkMeter<'_>,
+) -> Result<bool, String> {
+    let TermData::App(Symbol::Named(name), _) = terms.get(term) else {
+        return Ok(false);
+    };
+    meter.charge_ops(
+        u64::try_from(name.len()).map_err(|_| WORK_METER_RESOURCE_LIMIT.to_string())?,
+    )?;
+    Ok(terms.is_declared_function(name))
+}
+
 fn parse_real_division(
     terms: &TermStore,
     term: TermId,
@@ -1120,7 +1189,11 @@ fn parse_real_division(
     meter: &mut WorkMeter<'_>,
     depth: usize,
 ) -> Result<MPoly, String> {
-    if args.iter().any(|&arg| *terms.sort(arg) != Sort::Real) {
+    meter.charge_nodes(args.len())?;
+    if args
+        .iter()
+        .any(|&arg| terms.entry_stamp(arg).is_none() || *terms.sort(arg) != Sort::Real)
+    {
         return Err("ill-sorted real division".to_string());
     }
     let &[numer_term, denom_term] = args else {
@@ -1209,9 +1282,13 @@ pub(crate) fn rat_bits(v: &BigRational) -> u64 {
     v.numer().bits().saturating_add(v.denom().bits())
 }
 
-/// Reject an attacker-sized exact coefficient before it can be cloned or used
-/// by another polynomial operation.
+/// Reject malformed or attacker-sized exact coefficients before cloning or
+/// polynomial arithmetic. SMT division by zero remains an opaque application;
+/// it is not a rational literal with an invalid denominator.
 pub(crate) fn ensure_coeff_width(v: &BigRational) -> Result<(), String> {
+    if !v.denom().is_positive() {
+        return Err("nra polynomial coefficient has a non-positive denominator".into());
+    }
     if rat_bits(v) > MAX_POLY_COEFF_BITS {
         Err(format!(
             "nra polynomial coefficient exceeds cap {MAX_POLY_COEFF_BITS} bits"
@@ -1857,6 +1934,37 @@ mod resource_regression_tests {
         assert_eq!(error, WORK_METER_RESOURCE_LIMIT);
         assert!(refused, "fixture must reach the scratch precharge");
         assert_eq!(left, before, "coefficient changed before scratch approval");
+    }
+
+    #[test]
+    fn malformed_rational_literals_refuse_before_polynomial_arithmetic() {
+        for denominator in [0, -1] {
+            let mut terms = TermStore::new();
+            let malformed = terms.mk_rational(BigRational::new_raw(1.into(), denominator.into()));
+            let one = terms.mk_rational(BigRational::one());
+            let sum = terms.mk_app_structural(Symbol::named("+"), [malformed, one], Sort::Real);
+            let mut memo = BTreeMap::new();
+            let mut meter = WorkMeter::new();
+            let error = parse_poly(&terms, sum, &mut memo, &mut meter, 0)
+                .expect_err("malformed literal must not reach rational addition");
+            assert!(error.contains("non-positive denominator"), "{error}");
+        }
+
+        let mut terms = TermStore::new();
+        let half = terms.mk_rational(BigRational::new(1.into(), 2.into()));
+        let zero = terms.mk_rational(BigRational::zero());
+        let quotient = terms.mk_app_structural(Symbol::named("/"), [half, zero], Sort::Real);
+        let mut memo = BTreeMap::new();
+        let mut meter = WorkMeter::new();
+        assert_eq!(
+            parse_poly(&terms, half, &mut memo, &mut meter, 0).unwrap(),
+            MPoly::constant(BigRational::new(1.into(), 2.into()))
+        );
+        assert_eq!(
+            parse_poly(&terms, quotient, &mut memo, &mut meter, 0).unwrap(),
+            MPoly::var(quotient),
+            "SMT division by zero must remain an opaque numeric application"
+        );
     }
 
     /// The n-ary accumulator must touch each existing coefficient only when

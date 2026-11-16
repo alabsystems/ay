@@ -973,6 +973,10 @@ fn try_template(
 /// Rebuild the exact Gram matrix and constraint multipliers from one feasible
 /// coefficient-matching solution. Every rational operation remains metered.
 #[allow(clippy::needless_range_loop)] // Gram reconstruction: multi-array index access.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "certificate reconstruction consumes the exact matrix column layout and one shared arithmetic budget"
+)]
 fn reconstruct_certificate(
     basis: &[Vec<TermId>],
     squares: &[Square],

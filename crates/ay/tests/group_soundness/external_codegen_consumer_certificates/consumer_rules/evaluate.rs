@@ -324,13 +324,17 @@ fn evaluate(
         // is spelled: never folded as the operator it is named like.
         let operator = document.head(id).is_some();
         let folded = match values {
-            Some(values) => operator
-                .then(|| fold(&name, &values))
-                .unwrap_or(Err(()))
-                .map_or_else(
+            Some(values) => {
+                let folding = if operator {
+                    fold(&name, &values)
+                } else {
+                    Err(())
+                };
+                folding.map_or_else(
                     |()| undecided(format!("evaluating ({name} …) is not mirrored")),
                     Ok,
-                )?,
+                )?
+            }
             None => Folded::Kept,
         };
         let result = match folded {

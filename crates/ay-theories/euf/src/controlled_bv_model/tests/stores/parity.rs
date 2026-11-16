@@ -25,7 +25,7 @@ fn flat_store_bool_bv_endpoints_preserve_all_legacy_fields() {
             })
             .unwrap();
         compare(&actual, &expected);
-        assert!(!actual.function_tables["store"].is_empty());
+        assert_ne!(actual.function_tables["store"].len(), 0);
         assert_eq!(source.uf.parent, parents);
         assert!(Instant::now() < end);
     }

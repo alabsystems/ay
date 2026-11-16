@@ -867,7 +867,7 @@ mod tests {
         let assumptions = vec![parse_term("(> x 10)")];
         let outcome = apply_ctx_simplify(assertions, &assumptions);
         assert_eq!(outcome.removed_assertions, 1);
-        assert!(outcome.assertions.is_empty());
+        assert_eq!(outcome.assertions.as_slice(), &[] as &[Term]);
     }
 
     #[test]

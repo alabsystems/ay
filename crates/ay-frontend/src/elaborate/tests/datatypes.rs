@@ -17,17 +17,17 @@ fn test_declare_datatype_simple() {
     assert!(ctx.sort_defs.contains_key("Color"));
 
     let red = ctx.symbols.get("Red").expect("Red constructor not found");
-    assert!(red.arg_sorts.is_empty());
+    assert_eq!(red.arg_sorts.len(), 0);
     assert!(red.term.is_some());
 
     let green = ctx
         .symbols
         .get("Green")
         .expect("Green constructor not found");
-    assert!(green.arg_sorts.is_empty());
+    assert_eq!(green.arg_sorts.len(), 0);
 
     let blue = ctx.symbols.get("Blue").expect("Blue constructor not found");
-    assert!(blue.arg_sorts.is_empty());
+    assert_eq!(blue.arg_sorts.len(), 0);
 
     let is_red = ctx.symbols.get("is-Red").expect("is-Red tester not found");
     assert_eq!(is_red.arg_sorts.len(), 1);
@@ -209,7 +209,7 @@ fn test_declare_datatypes_mutually_recursive() {
     assert_eq!(node.arg_sorts[0], Sort::Uninterpreted("Forest".to_string()));
 
     let nil = ctx.symbols.get("nil").expect("nil constructor not found");
-    assert!(nil.arg_sorts.is_empty());
+    assert_eq!(nil.arg_sorts.len(), 0);
     assert!(nil.term.is_some());
 
     let cons = ctx.symbols.get("cons").expect("cons constructor not found");

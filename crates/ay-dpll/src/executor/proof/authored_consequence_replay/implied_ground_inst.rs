@@ -63,7 +63,7 @@
 //!
 //! NOTHING IS TAKEN ON THE PRODUCER'S WORD. The witness tuple is a pure hint:
 //! `validate_implies_pos` re-derives the implication's own two literals,
-//! `validate_forall_inst` re-derives binder/argument arity and sorts, argument
+//! `validate_forall_inst_with_progress` re-derives binder/argument arity and sorts, argument
 //! groundness, and the exact simultaneous substitution, and the probe's ground
 //! steps are replayed by the outer strict checker over the authored scope. A
 //! wrong witness or a still-satisfiable consequence set can only cost a
@@ -329,7 +329,7 @@ impl Executor {
     /// occupants of the body's binder slots: for every slot `(f, k)` the body
     /// gives this binder, every ground authored `(f ... t_k ...)` proposes
     /// `t_k`. Deterministic order, deduplicated, bounded. Purely a hint —
-    /// `validate_forall_inst` re-derives sort and substitution for every
+    /// `validate_forall_inst_with_progress` re-derives sort and substitution for every
     /// proposal, so a junk witness can only cost probe time.
     fn slot_ground_witnesses(
         &self,

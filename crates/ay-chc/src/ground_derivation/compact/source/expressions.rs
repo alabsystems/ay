@@ -9,7 +9,7 @@ impl<'a> Source<'a> {
         &mut self,
         expr: &'a ChcExpr,
         state: &mut Expressions<'a>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
         depth: usize,
     ) -> Result<Type<'a>> {
         owner.admit(1, 128)?;
@@ -102,7 +102,7 @@ impl<'a> Source<'a> {
         &mut self,
         args: &'a [std::sync::Arc<ChcExpr>],
         state: &mut Expressions<'a>,
-        owner: &mut Owner,
+        owner: &mut Owner<'_>,
         depth: usize,
     ) -> Result<Vec<Type<'a>>> {
         owner.admit(

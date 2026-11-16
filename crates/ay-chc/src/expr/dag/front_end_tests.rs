@@ -204,7 +204,7 @@ fn real_instance_dag_passes_equal_tree_walks() {
         );
         // Hash/Eq: pointer-distinct reparse is equal and hashes equal; small
         // expressions hash exactly as the former derive.
-        assert!(e == copy);
+        assert_eq!(e, copy);
         assert_eq!(e.structural_hash(), copy.structural_hash());
         if tree <= crate::expr::structural::HASH_EXACT_CHILD_VISITS as u128 {
             let mut r = Recorder::default();
@@ -278,7 +278,7 @@ fn real_instance_front_end_micro_benchmark() {
     time("hash", &mut || {
         std::hint::black_box(e.structural_hash());
     });
-    time("eq (reparsed copy)", &mut || assert!(e == copy));
+    time("eq (reparsed copy)", &mut || assert_eq!(e, copy));
     time("vars", &mut || {
         std::hint::black_box(e.vars());
     });

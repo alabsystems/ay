@@ -59,19 +59,16 @@ fn exact_store_boundary_is_inclusive_and_does_not_reset_live_accounting() {
 #[test]
 fn every_raw_entry_refuses_an_inherited_zero_before_solver_work() {
     use super::super::{
-        check_unsat_smtlib_via_executor, smtlib_first_verdict_via_executor,
-        smtlib_first_verdict_via_executor_until, smtlib_strict_unsat_cert_via_executor,
+        check_unsat_smtlib_via_executor, smtlib_first_verdict_via_executor_until,
         smtlib_strict_unsat_cert_via_executor_until,
     };
     let _scope = SmtContext::scoped_thread_term_memory_budget(Some(0));
-    let deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = ay_core::time::Instant::now() + std::time::Duration::from_mins(1);
     for script in ["(assert false) (check-sat)", "(check-sat)", "(invalid"] {
         assert!(!check_unsat_smtlib_via_executor(script));
-        assert!(smtlib_first_verdict_via_executor(script, None).is_none());
         assert!(
             smtlib_first_verdict_via_executor_until(script, deadline, Some(usize::MAX)).is_none()
         );
-        assert!(smtlib_strict_unsat_cert_via_executor(script, None).is_none());
         assert!(smtlib_strict_unsat_cert_via_executor_until(script, deadline).is_none());
     }
 }

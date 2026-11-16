@@ -248,7 +248,7 @@ fn a_rescued_authored_spelling_refusal_publishes_an_accepted_verdict() {
     );
     // The disclosed document is the canonical spelling, paired with the
     // canonical problem transport so the two agree throughout.
-    assert!(!artifact.alethe.is_empty());
+    assert_ne!(artifact.alethe, "");
     assert!(
         artifact.alethe_problem_smt2.is_some(),
         "the rescued document must ship its paired canonical problem transport",

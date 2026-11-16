@@ -54,7 +54,7 @@ pub(super) fn assert_unsat(mut solver: Solver) {
         "{details:?}"
     );
     let core = solver.try_get_unsat_core().expect("named core");
-    assert!(!core.is_empty());
+    assert_ne!(core, [] as [String; 0]);
     assert!(core.iter().all(|name| name.starts_with("qh")), "{core:?}");
     assert_eq!(
         original,
@@ -71,7 +71,7 @@ pub(super) fn assert_sat(mut solver: Solver) {
     assert!(details.result.was_model_validated(), "{details:?}");
     assert!(details.result.has_sat_emission_witness(), "{details:?}");
     let printed = solver.try_get_model_str().expect("published SAT model");
-    assert!(!printed.is_empty());
+    assert_ne!(printed, "");
     for &root in &roots {
         assert!(
             matches!(solver.try_get_value(root), Ok(ModelValue::Bool(true))),

@@ -416,10 +416,10 @@ fn test_nra_reset_clears_state() {
 
     solver.reset();
     assert!(solver.monomials.is_empty());
-    assert!(solver.asserted.is_empty());
+    assert_eq!(solver.asserted.as_slice(), &[] as &[(TermId, bool)]);
     assert!(solver.sign_constraints.is_empty());
     assert!(solver.var_sign_constraints.is_empty());
-    assert!(solver.scopes.is_empty());
+    assert_eq!(solver.scopes.as_slice(), &[] as &[(usize, usize, usize)]);
 }
 
 /// Check after reset behaves like fresh solver.

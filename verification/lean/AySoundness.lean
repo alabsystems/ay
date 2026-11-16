@@ -6,6 +6,9 @@ import AySoundness.Euf
 import AySoundness.ArrayThy
 import AySoundness.Datatype
 import AySoundness.BitVecThy
+import AySoundness.BitVecSourceRelations
+import AySoundness.ConditionalEquality
+import AySoundness.SignedDivisionRelation
 import AySoundness.StringThy
 import AySoundness.RegexThy
 import AySoundness.SetThy

@@ -441,7 +441,6 @@ pub struct InprocessingPassAccounting {
 ///
 /// Reference: CaDiCaL `Stats` struct groups all counters separately from
 /// solver state.
-
 /// Two-stage clause management telemetry (arXiv:2602.20829).
 ///
 /// Only the two-stage code paths can make any field non-zero, so this doubles

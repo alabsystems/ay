@@ -24,9 +24,10 @@
 //! - anything else (SAT / Unknown / timeout / structural mismatch) fails the
 //!   certification ⇒ the caller withholds the verdict (fail-closed).
 //!
-//! [`GhostPairCertificate`] is construction-sealed: the ONLY way to obtain one
-//! is [`GhostPairCertificate::certify_and_seal`], which runs the full per-rule
-//! discharge above on every original clause.
+//! [`GhostPairCertificate`] is construction-sealed: the ONLY production way to
+//! obtain one is
+//! [`GhostPairCertificate::certify_and_seal_with_term_memory_limit`], which
+//! runs the full per-rule discharge above on every original clause.
 
 mod quantified;
 pub(crate) use quantified::{try_quantified_source, QuantifiedSourceCertificate};
@@ -69,7 +70,8 @@ const MIN_EXECUTOR_BUDGET: Duration = Duration::from_millis(1);
 /// Holds the quantifier-free PDR model over the ghost-extended signature plus
 /// the ghost layout; together they denote the quantified original model
 /// `forall i. I'(args, i, select(arr, i))`. Construction requires passing the
-/// full per-rule discharge on the ORIGINAL clauses (`certify_and_seal`).
+/// full per-rule discharge on the ORIGINAL clauses
+/// (`certify_and_seal_with_term_memory_limit`).
 #[derive(Debug, Clone)]
 pub(crate) struct GhostPairCertificate {
     checked: GhostPairModel,
@@ -91,6 +93,7 @@ impl GhostPairCertificate {
     /// ghost-extended signature described by `spec`) against every clause of
     /// the ORIGINAL `problem`. Returns a sealed certificate only when every
     /// clause is discharged; any failure returns `None` (fail-closed).
+    #[cfg(test)]
     pub(crate) fn certify_and_seal(
         problem: &ChcProblem,
         spec: GhostPairSpec,
@@ -100,9 +103,9 @@ impl GhostPairCertificate {
         Self::certify_and_seal_with_term_memory_limit(problem, spec, model, total_budget, None)
     }
 
-    /// As [`Self::certify_and_seal`], while carrying the route's configured
-    /// memory envelope into every raw quantified-executor discharge and later
-    /// replay of the sealed certificate.
+    /// Run the full quantified per-rule discharge while carrying the route's
+    /// configured memory envelope into every raw quantified-executor discharge
+    /// and later replay of the sealed certificate.
     pub(crate) fn certify_and_seal_with_term_memory_limit(
         problem: &ChcProblem,
         spec: GhostPairSpec,
@@ -228,7 +231,7 @@ fn discharge_all(
             return false;
         }
     }
-    !deadline.is_some_and(|deadline| Instant::now() >= deadline)
+    deadline.is_none_or(|deadline| Instant::now() < deadline)
 }
 
 fn validate_interpretation(
@@ -1086,7 +1089,8 @@ fn is_predeclared_sort_name(name: &str) -> bool {
 ///
 /// One obligation per ORIGINAL clause, each the same fully quantified
 /// discharge query [`quantified_discharge_smtlib`] builds in-process during
-/// `certify_and_seal`: clause constraint + one `forall`-quantified
+/// `certify_and_seal_with_term_memory_limit`: clause constraint + one
+/// `forall`-quantified
 /// interpretation instance per ghost-carrying body atom + the negated
 /// skolemized head instance. Every obligation must be UNSAT for the
 /// quantified model `forall i. I'(args, i, select(arr, i))` to solve the

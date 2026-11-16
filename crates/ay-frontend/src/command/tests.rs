@@ -1142,7 +1142,7 @@ fn test_parse_declare_datatype_bare_symbol_constructors() {
             assert_eq!(name, "Maybe");
             assert_eq!(dec.constructors.len(), 2);
             assert_eq!(dec.constructors[0].name, "nothing");
-            assert!(dec.constructors[0].selectors.is_empty());
+            assert_eq!(dec.constructors[0].selectors.len(), 0);
             assert_eq!(dec.constructors[1].name, "just");
             assert_eq!(dec.constructors[1].selectors.len(), 1);
             assert_eq!(dec.constructors[1].selectors[0].name, "val");

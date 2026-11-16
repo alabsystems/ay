@@ -96,7 +96,7 @@ fn test_empty_clause_add() {
     let steps = parse_text_drat(data).unwrap();
     assert_eq!(steps.len(), 1);
     match &steps[0] {
-        ProofStep::Add(lits) => assert!(lits.is_empty()),
+        ProofStep::Add(lits) => assert_eq!(lits.as_slice(), &[] as &[Literal]),
         _ => panic!("expected Add"),
     }
 }

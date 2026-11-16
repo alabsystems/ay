@@ -65,7 +65,10 @@ fn signature_copy_limits_are_exact_atomic_and_shared_with_prior_parse_work() {
             &sexp("(_ BitVec 8)")
         )
         .is_err());
-    assert!(malformed.functions.declarations.is_empty());
+    assert_eq!(
+        malformed.functions.declarations,
+        [] as [QuantifiedChcFunction; 0]
+    );
     assert!(!malformed.functions.contains("bad"));
     assert!(declare(&mut parser()).is_ok());
 }

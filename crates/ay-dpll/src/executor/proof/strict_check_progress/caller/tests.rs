@@ -172,11 +172,10 @@ fn accepting_caller_preserves_legacy_result_work_and_stop_poll_count() {
     let deadline = end();
     let (executor, proof, scope) = fixture();
     let legacy_polls = Cell::new(0);
-    let legacy =
-        super::super::check_strict_under_controls(&executor, walk(&proof, &scope), &|| {
-            legacy_polls.set(legacy_polls.get() + 1);
-            Instant::now() >= deadline
-        });
+    let legacy = check_strict_under_controls(&executor, walk(&proof, &scope), &|| {
+        legacy_polls.set(legacy_polls.get() + 1);
+        Instant::now() >= deadline
+    });
     let caller_polls = Cell::new(0);
     let caller = check_with_caller_progress(
         &executor,

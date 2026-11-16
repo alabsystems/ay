@@ -158,12 +158,11 @@ fn pinned_carcara_checks_an_equated_universal_certificate() {
     // The mod fixture is not judged here: its closing `evaluate` over
     // `(mod 1 3)` is a step pinned carcara misjudges
     // (`ay_core::pinned_carcara`), so its verdict is not evidence either way.
-    for (label, problem) in [("w1_ite_coefficient", ITE_COEFFICIENT)] {
-        let proof = default_posture_unsat_document(problem, label);
-        let verdict = carcara_verdict(&carcara, problem, &proof);
-        assert!(
-            matches!(verdict.as_str(), "valid" | "holey"),
-            "{label}: carcara answered {verdict}:\n{proof}"
-        );
-    }
+    let (label, problem) = ("w1_ite_coefficient", ITE_COEFFICIENT);
+    let proof = default_posture_unsat_document(problem, label);
+    let verdict = carcara_verdict(&carcara, problem, &proof);
+    assert!(
+        matches!(verdict.as_str(), "valid" | "holey"),
+        "{label}: carcara answered {verdict}:\n{proof}"
+    );
 }

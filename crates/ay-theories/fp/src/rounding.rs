@@ -46,7 +46,7 @@ impl FpSolver<'_> {
 
         // Unbias: unbiased = biased - bias
         // bias_bv is eb bits wide
-        let bias_bv = self.const_bv(u64::from(bias), eb);
+        let bias_bv = self.const_bv(bias, eb);
         let normal_exp = self.bv_sub(&fp.exponent, &bias_bv);
 
         // Denormal case: sig = concat(hidden_0, mantissa), exp = 1 - bias
@@ -175,7 +175,7 @@ impl FpSolver<'_> {
     ) -> FpDecomposed {
         let eb = precision.exponent_bits() as usize;
         let sb = precision.significand_bits() as usize;
-        let bias = u64::from(precision.bias());
+        let bias = precision.bias();
 
         debug_assert_eq!(sig.len(), sb + 4, "sig must be sbits+4 wide");
         // `exp` is signed and at least `eb + 2` wide. `eb + 2` is z3's choice

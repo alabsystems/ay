@@ -225,28 +225,29 @@ impl DelayedBvState {
             }
 
             let mut clauses = Vec::new();
-            for j in 0..width {
+            let result_bits = &op.result_bits[..width];
+            for (j, &result_bit) in result_bits.iter().enumerate() {
                 if j < k {
                     // result[j] must be 0 (shifted out)
                     let mut c = antecedent.clone();
-                    c.push(neg_lit(op.result_bits[j]));
+                    c.push(neg_lit(result_bit));
                     clauses.push(CnfClause::new(c));
                 } else {
                     let src = j - k;
                     if src < other_bits.len() {
                         // result[j] <=> other[src]
                         let mut c1 = antecedent.clone();
-                        c1.push(neg_lit(op.result_bits[j]));
+                        c1.push(neg_lit(result_bit));
                         c1.push(other_bits[src]);
                         clauses.push(CnfClause::new(c1));
                         let mut c2 = antecedent.clone();
-                        c2.push(op.result_bits[j]);
+                        c2.push(result_bit);
                         c2.push(neg_lit(other_bits[src]));
                         clauses.push(CnfClause::new(c2));
                     } else {
                         // src out of range: result[j] must be 0
                         let mut c = antecedent.clone();
-                        c.push(neg_lit(op.result_bits[j]));
+                        c.push(neg_lit(result_bit));
                         clauses.push(CnfClause::new(c));
                     }
                 }

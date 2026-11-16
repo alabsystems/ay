@@ -26,8 +26,8 @@ pub(super) fn build_bundle_registry<'a>(
         // Unlike our grow-only registries, this borrowed table can contain
         // tombstones. Its allocation bounds the raw bucket count even when
         // len/capacity were reduced by deletions. No table scan is necessary.
-        let declaration_slots = declaration_term_symbols.allocation_size()
-            / std::mem::size_of::<(String, &'static str)>();
+        let declaration_slots =
+            declaration_term_symbols.allocation_size() / size_of::<(String, &'static str)>();
         meter.lookup(&binding.name, declaration_slots)?;
         if let Some(role) = declaration_term_symbols.get(&binding.name) {
             return Err(invalid_named(meter, binding.step, "Skolem symbol collides in the serialized datatype declaration-owned term namespace", &[&binding.name, role])?);

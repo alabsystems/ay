@@ -166,7 +166,7 @@ fn rewritten_conjunct_scan_precharges_and_bounds_deep_paths() {
     assert!(planner
         .plan_rewritten_conjunct(&mut cx, fixture.target)
         .is_none());
-    assert!(cx.chain.steps.is_empty());
+    assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
     assert_eq!(planner.terms.len(), original_terms);
 
     cx.budget = PLAN_NODE_BUDGET;
@@ -182,7 +182,7 @@ fn rewritten_conjunct_scan_precharges_and_bounds_deep_paths() {
         planner.rewritten_conjunct_path(&mut cx, deep, fixture.target),
         Some(AndPath::Missing)
     ));
-    assert!(cx.chain.steps.is_empty());
+    assert_eq!(cx.chain.steps, [] as [ProofStep; 0]);
     assert_eq!(planner.terms.len(), original_terms);
     assert!(
         cx.budget > 0,

@@ -6694,7 +6694,10 @@ mod tests {
                 true
             )
             .is_err());
-            assert!(cache.completed_replays.is_empty());
+            assert_eq!(
+                cache.completed_replays.as_slice(),
+                &[] as &[ReceiptReplayKey]
+            );
         }
         assert_eq!(replays.get(), 2);
     }

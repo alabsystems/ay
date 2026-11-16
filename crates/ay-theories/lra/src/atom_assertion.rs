@@ -414,8 +414,10 @@ impl LraSolver {
         let mut interval: Option<Option<(bool, ExprInterval)>> = None;
         if !self.propagated_atoms.contains(&(compound.term, true)) {
             // #8467: Check if interval bounds imply TRUE, but defer reason collection.
-            let interval_true_implied = if !direct_true_implied && implied_true_row.is_none() {
-                match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term)) {
+            let interval_true_implied = !direct_true_implied
+                && implied_true_row.is_none()
+                && match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term))
+                {
                     Some((is_le, (lb, ub))) => {
                         if *is_le {
                             ub.as_ref().is_some_and(|ep| {
@@ -428,10 +430,7 @@ impl LraSolver {
                         }
                     }
                     None => false,
-                }
-            } else {
-                false
-            };
+                };
             // #8467: Dispatch to type-specific deferred reasons so
             // explain_propagation() can use the most precise reconstruction
             // path. DirectBound reasons read var.upper/lower.reason_pairs(),
@@ -533,8 +532,10 @@ impl LraSolver {
 
         if !self.propagated_atoms.contains(&(compound.term, false)) {
             // #8467: Check if interval bounds imply FALSE, but defer reason collection.
-            let interval_false_implied = if !direct_false_implied && implied_false_row.is_none() {
-                match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term)) {
+            let interval_false_implied = !direct_false_implied
+                && implied_false_row.is_none()
+                && match interval.get_or_insert_with(|| self.compound_expr_interval(compound.term))
+                {
                     Some((is_le, (lb, ub))) => {
                         if *is_le {
                             lb.as_ref().is_some_and(|ep| {
@@ -547,10 +548,7 @@ impl LraSolver {
                         }
                     }
                     None => false,
-                }
-            } else {
-                false
-            };
+                };
             // #8467: Same type-specific dispatch as the true case above.
             if direct_false_implied {
                 Self::note_propagated(

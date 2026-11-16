@@ -43,7 +43,7 @@ fn check_prepared_sync(s: &Solver, mut actual: RelevancyFrontier, mut expected: 
         actual.sync_prepared(s, Some(&mut storage)),
         expected.sync(s)
     );
-    assert!(storage.extra_occ.is_empty());
+    assert_eq!(storage.extra_occ.len(), 0);
     assert_eq!(capacities(&actual), reserved);
     assert_eq!(
         actual.backtrack_test_snapshot(),
@@ -170,8 +170,7 @@ fn expired_debug_query_quota_does_not_allocate_reference_scratch() {
 fn occurrence_preallocation_preserves_even_non_power_of_two_capacity() {
     for capacity in 0..10 {
         for required in 0..20 {
-            let mut actual = Vec::with_capacity(capacity);
-            actual.resize(capacity, 0u32);
+            let mut actual = vec![0u32; capacity];
             let mut expected = actual.clone();
             let owner = test_owner(10_000, 10_000);
             reserve_pushes(&mut actual, required, &owner).unwrap();

@@ -17,7 +17,7 @@ fn input(polarities: &[i8]) -> (TseitinResult, Vec<i8>, Vec<Application>, [usize
     let mut counts = [0; 3];
     let mut group = Vec::new();
     for (index, &value) in polarities.iter().enumerate() {
-        let term = terms.mk_var(&format!("g{index}"), Sort::Bool);
+        let term = terms.mk_var(format!("g{index}"), Sort::Bool);
         cnf.term_to_var.insert(term, index as u32 + 1);
         cnf.var_to_term.insert(index as u32 + 1, term);
         values.push(value);
@@ -105,19 +105,21 @@ fn residual_exact_work_shared_exhaustion_and_zero_pair_fastpath() {
 
     let (cnf, values, group, counts) = input(&vec![1; 256]);
     let mut polls = 0;
-    assert!(pairs(&cnf, &values, &group, counts, &mut Work(0), &mut || {
-        polls += 1;
-        Ok::<_, ()>(())
-    })
-    .unwrap()
-    .unwrap()
-    .is_empty());
+    assert_eq!(
+        pairs(&cnf, &values, &group, counts, &mut Work(0), &mut || {
+            polls += 1;
+            Ok::<_, ()>(())
+        })
+        .unwrap()
+        .unwrap(),
+        [] as [(usize, usize); 0]
+    );
     assert_eq!(
         polls, 0,
         "parent retains entry/final controls; uniform pair phase does no work"
     );
 
-    let (cnf, values, group, counts) = input(&vec![0; 65]);
+    let (cnf, values, group, counts) = input(&[0; 65]);
     assert!(pairs(
         &cnf,
         &values,

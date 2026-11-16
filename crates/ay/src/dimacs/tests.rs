@@ -171,12 +171,17 @@ use super::{
     SAT_MULTIPLIER_EQUIV_CONSERVATION_TARGET_ISSUE_KEY, XOR_EXTENSION_MAX_CLAUSES,
 };
 use crate::{stats_output, ProofConfig, ProofFormat, TIMED_OUT, VERDICT_PRINTED};
+#[cfg(target_os = "linux")]
+use ay_sat::SatResult;
 use ay_sat::{
-    Literal, ProofOutput, SatResult, Solver as SatSolver, SolverVariant, Variable, VariantInput,
+    Literal, ProofOutput, Solver as SatSolver, SolverVariant, Variable, VariantInput,
     VariantProofMode, VariantRouteProfile, VariantStartupPolicy,
 };
 use ay_test_support::env::{lock_env, ScopedEnvVar};
-use std::io::{BufWriter, Write as _};
+#[cfg(target_os = "linux")]
+use std::io::BufWriter;
+#[cfg(any(target_os = "linux", all(feature = "cli", target_os = "macos")))]
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -5060,7 +5065,7 @@ fn allocator_ceiling_discards_a_byte_bearing_proof_generation() {
     const CHILD: &str = "AY_TEST_BYTE_BEARING_PROOF_CEILING";
     if let Some(directory) = std::env::var_os(CHILD) {
         let proof = ProofConfig {
-            path: std::path::PathBuf::from(directory)
+            path: PathBuf::from(directory)
                 .join("proof.drat")
                 .to_string_lossy()
                 .into_owned(),
@@ -5090,7 +5095,7 @@ fn allocator_ceiling_discards_a_byte_bearing_proof_generation() {
         panic!("the real allocation ceiling did not terminate the child");
     }
     let directory = tempfile::tempdir().unwrap();
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
             "--exact",
@@ -5102,7 +5107,7 @@ fn allocator_ceiling_discards_a_byte_bearing_proof_generation() {
     let output = ay_sys::metadata_capture::capture(
         command,
         ay_sys::metadata_capture::CaptureLimits {
-            timeout: std::time::Duration::from_secs(10),
+            timeout: Duration::from_secs(10),
             output_bytes: 64 * 1024,
             resident_bytes: None,
         },

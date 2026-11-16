@@ -23,7 +23,7 @@ mod simplify;
 mod structural;
 mod types;
 
-pub use array_lambda::ChcArrayLambda;
+pub(crate) use array_lambda::ChcArrayLambda;
 pub use types::{
     ChcDtConstructor, ChcDtConstructors, ChcDtId, ChcDtSelector, ChcExpr, ChcOp, ChcSort, ChcVar,
 };

@@ -221,7 +221,7 @@ impl CoreSolver {
             // through an EQC concat member (`x = "ab"·v·"cd"`), and
             // without it the violated membership is never refuted.
             let rep = state.find(string_term);
-            let mut value_reasons: Vec<ay_core::TheoryLit> = Vec::new();
+            let mut value_reasons: Vec<TheoryLit> = Vec::new();
             let Some(s) = state
                 .get_eqc(&rep)
                 .and_then(|e| e.constant.as_deref())

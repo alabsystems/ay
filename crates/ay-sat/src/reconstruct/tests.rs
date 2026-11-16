@@ -199,7 +199,7 @@ fn test_drain_witness_entries_preserves_sweep_steps() {
 fn test_drain_witness_entries_empty_stack() {
     let mut stack = ReconstructionStack::new();
     let result = stack.drain_witness_entries();
-    assert!(result.reactivate_vars.is_empty());
+    assert_eq!(result.reactivate_vars.len(), 0);
     assert_eq!(stack.len(), 0);
 }
 

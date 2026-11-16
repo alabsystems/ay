@@ -188,8 +188,8 @@ fn variable_field_certificate_crosses_eight_rows_and_rejects_forged_data() {
         );
     }
     let mut mixed_terms = executor.terms().clone();
-    let field = ay_core::FiniteFieldSort::new(11).unwrap();
-    let other = mixed_terms.mk_var("other-field", ay_core::Sort::FiniteField(field));
+    let field = FiniteFieldSort::new(11).unwrap();
+    let other = mixed_terms.mk_var("other-field", Sort::FiniteField(field));
     let zero = mixed_terms.mk_finite_field(0, field);
     let row = mixed_terms.mk_eq(other, zero);
     let negative = mixed_terms.mk_not(row);

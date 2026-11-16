@@ -41,7 +41,7 @@ use crate::ematching::contains_quantifier;
 use crate::executor::exact_exists_bounds::ExactExistsDecision;
 use crate::executor_types::{Result, SolveResult, StatValue, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
-use crate::logic_detection::{LogicCategory, FAIL_CLOSED_COMBINED};
+use crate::logic_detection::LogicCategory;
 
 use super::{EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE};
 pub(in crate::executor) use ground_first::GroundFirstStats;
@@ -60,7 +60,7 @@ impl Executor {
             return None;
         }
         let ticket = UNKNOWN_FUNNEL_TRACE_RECORDS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 if count <= UNKNOWN_FUNNEL_TRACE_LIMIT {
                     Some(count + 1)
                 } else {
@@ -109,7 +109,7 @@ impl Executor {
         if !ay_core::misc_cli_flags().model_reject_dump {
             return;
         }
-        let ticket = match UNKNOWN_FUNNEL_TRACE_RECORDS.fetch_update(
+        let ticket = match UNKNOWN_FUNNEL_TRACE_RECORDS.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |count| {
@@ -154,7 +154,7 @@ impl Executor {
             "[ay-unknown-funnel] seq={} stage={} executor={:p} epoch=0x{:x} category={:?} result={} model_present={} model_validated={} skip={} defer={} assertions={} first={:?} last={:?} unknown_reason={:?} failure_boundary={:?} failure_detail={:?}",
             ticket,
             stage,
-            self as *const Self,
+            std::ptr::from_ref(self),
             self.query_authority_epoch.diagnostic_address(),
             category,
             result,
@@ -4061,6 +4061,10 @@ impl Executor {
         use crate::executor::unsat_cert::{
             CheckedExactForallUfGroundUnsat, CheckedExactRmDomainExpansionUnsat,
         };
+        #[expect(
+            clippy::large_enum_variant,
+            reason = "boxing authenticated evidence would add an unmetered allocation after authorization"
+        )]
         enum Sealed {
             ForallUfGround(CheckedExactForallUfGroundUnsat),
             RmDomainExpansion(CheckedExactRmDomainExpansionUnsat),
@@ -4069,12 +4073,9 @@ impl Executor {
             self.try_authorize_current_query_exact_forall_uf_ground_unsat()
         {
             Sealed::ForallUfGround(evidence)
-        } else if let Some(evidence) =
-            self.try_authorize_current_query_exact_rm_domain_expansion_unsat()
-        {
-            Sealed::RmDomainExpansion(evidence)
         } else {
-            return None;
+            let evidence = self.try_authorize_current_query_exact_rm_domain_expansion_unsat()?;
+            Sealed::RmDomainExpansion(evidence)
         };
         if self.prepare_check_sat_internal_state() {
             self.finalize_array_ext_shadow();

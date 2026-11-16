@@ -125,7 +125,7 @@ pub(crate) fn plan(
         .and_then(|n| n.checked_add(extra_work))
         .ok_or("conversion work overflow")?;
     let storage = limbs
-        .checked_mul(32 * std::mem::size_of::<u64>())
+        .checked_mul(32 * size_of::<u64>())
         .and_then(|n| n.checked_add(extra_storage))
         .ok_or("conversion storage overflow")?;
     Ok(ConversionPlan {

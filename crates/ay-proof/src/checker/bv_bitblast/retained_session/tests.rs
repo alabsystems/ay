@@ -76,7 +76,7 @@ fn replay(
     for index in 0..proof.steps.len() {
         session.validate_step(ProofId(index as u32), &mut |_, _| true)?;
     }
-    assert!(session.finish(&mut |_, _| true)?.is_empty());
+    assert_eq!(session.finish(&mut |_, _| true)?, []);
     Ok(())
 }
 
@@ -165,7 +165,7 @@ fn cheap_and_non_bv_steps_are_not_retained_acceptances() {
         session.validate_step(ProofId(1), &mut |_, _| true),
         Ok(None)
     );
-    assert!(session.finish(&mut |_, _| true).unwrap().is_empty());
+    assert_eq!(session.finish(&mut |_, _| true).unwrap(), []);
     // The enclosing strict checker, not this empty session, must check these
     // source steps and reject the absent terminal contradiction.
 }

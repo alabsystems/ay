@@ -114,7 +114,7 @@ pub(super) fn plan<E: Encoder>(
     fp.checkpoint()?;
     let mut clauses: Vec<Vec<PlanLit>> = Vec::new();
     let mut incomplete = false;
-    let mut forced = super::forced_outputs::ForcedOutputs::new();
+    let mut forced = forced_outputs::ForcedOutputs::new();
     for group in &scan.groups {
         check()?;
         let residual = if group.len() > MAX_GROUP_APPLICATIONS {

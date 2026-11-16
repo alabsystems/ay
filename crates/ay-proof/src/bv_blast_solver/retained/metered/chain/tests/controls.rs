@@ -160,7 +160,7 @@ fn caught_child_callback_panics_cannot_resume_even_at_post_payload_cleanup() {
 #[test]
 fn child_deadlines_only_shorten_and_expired_child_cannot_enter_producer() {
     let (proof, gates, wire) = limits();
-    let end = wire.deadline - Duration::from_secs(1);
+    let end = wire.deadline.checked_sub(Duration::from_secs(1)).unwrap();
     for field in 0..3 {
         let mut child = proof.clone();
         let mut child_gates = gates;
@@ -186,7 +186,8 @@ fn child_deadlines_only_shorten_and_expired_child_cannot_enter_producer() {
             },
         )
         .unwrap();
-        child.resolution.deadline = Some(Instant::now() - Duration::from_secs(1));
+        child.resolution.deadline =
+            Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
         let before = producer_test_counter::count();
         assert!(run(
             &proof,

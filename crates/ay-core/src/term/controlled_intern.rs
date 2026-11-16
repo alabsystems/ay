@@ -18,7 +18,8 @@ mod tests;
 /// Refusal of bounded producer construction, never a solver verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ControlledTermInternError {
-    /// The caller's bounded work or storage callback refused further growth.
+    /// A progress callback, checked identity/accounting bound, or fallible
+    /// allocation refused growth.
     #[error("controlled term interning resource limit exceeded")]
     ResourceLimit,
     /// The requested term or sort is outside the supported fragment.

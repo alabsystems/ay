@@ -187,7 +187,7 @@ fn collect_expression_metadata(
     let mut stack = vec![root];
     while let Some(expression) = stack.pop() {
         if !crate::expr::dag::children(expression).is_empty()
-            && !seen.insert(expression as *const ChcExpr)
+            && !seen.insert(std::ptr::from_ref::<ChcExpr>(expression))
         {
             continue;
         }

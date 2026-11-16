@@ -23,7 +23,7 @@ impl Arena {
         self.nodes.get(id.0 as usize)
     }
 
-    pub(crate) fn intern(&mut self, node: &ValueNode, owner: &mut Owner) -> Result<ValueId> {
+    pub(crate) fn intern(&mut self, node: &ValueNode, owner: &mut Owner<'_>) -> Result<ValueId> {
         let result = self.intern_inner(node, owner);
         match result {
             Err(Error::Resource) => owner.refuse(Error::Resource),
@@ -31,7 +31,7 @@ impl Arena {
         }
     }
 
-    fn intern_inner(&mut self, node: &ValueNode, owner: &mut Owner) -> Result<ValueId> {
+    fn intern_inner(&mut self, node: &ValueNode, owner: &mut Owner<'_>) -> Result<ValueId> {
         owner.poll()?;
         let payload = match node {
             ValueNode::Bool(_) => 1,

@@ -60,8 +60,11 @@ fn empty_native_batches_do_not_return_success_after_cancellation() {
     assert!(solver.try_get_named_values(&[]).is_err());
     assert!(solver.values_smtlib(&[]).is_none());
     solver.clear_interrupt();
-    assert!(solver.try_get_values(&[]).unwrap().is_empty());
-    assert!(solver.try_get_named_values(&[]).unwrap().is_empty());
+    assert_eq!(solver.try_get_values(&[]).unwrap(), [] as [ModelValue; 0]);
+    assert_eq!(
+        solver.try_get_named_values(&[]).unwrap(),
+        [] as [ModelValue; 0]
+    );
     assert_eq!(solver.values_smtlib(&[]), Some("()".into()));
 }
 

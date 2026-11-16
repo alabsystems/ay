@@ -37,6 +37,9 @@
 //! consumer responsibility.
 
 mod cancellation;
+#[cfg(test)]
+#[path = "bundle/cancellation/tests/fixtures.rs"]
+mod cancellation_fixtures;
 mod construction;
 mod retained;
 mod retained_api;
@@ -63,7 +66,7 @@ mod preflight_proof;
 mod preflight_sort;
 mod preflight_term;
 #[cfg(test)]
-use preflight_proof::{validate_proof_snapshot, validate_proof_snapshot_with_progress};
+use preflight_proof::validate_proof_snapshot;
 use preflight_sort::validate_sort_with_progress;
 #[cfg(test)]
 mod nra_sos_tests;

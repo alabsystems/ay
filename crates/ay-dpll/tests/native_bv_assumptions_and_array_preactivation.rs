@@ -199,14 +199,14 @@ fn public_no_select_decline_preserves_live_context_and_scoped_solving() {
         .context_mut()
         .elaborate_shared_surface_reading_array(&source, ground_limits(), |_| false)
         .is_none());
-    assert!(
-        before
-            == (
-                executor.terms().len(),
-                executor.terms().checker_visible_metadata_generation(),
-                executor.terms().var_counter(),
-                executor.context().source_context_stamp(),
-            )
+    assert_eq!(
+        before,
+        (
+            executor.terms().len(),
+            executor.terms().checker_visible_metadata_generation(),
+            executor.terms().var_counter(),
+            executor.context().source_context_stamp(),
+        )
     );
     assert!(executor.last_proof().is_none());
     assert_eq!(

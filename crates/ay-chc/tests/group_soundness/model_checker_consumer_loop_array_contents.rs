@@ -259,8 +259,8 @@ fn require_safe(run: &ChcPdrProofRun, original: &ChcProblem, budget: &Budget) {
         checked.problem_bytes(),
         original.normalized_input().as_bytes()
     );
-    assert!(!checked.certificate_bytes().is_empty());
-    assert!(!checked.checked_report_bytes().is_empty());
+    assert_ne!(checked.certificate_bytes(), &[] as &[u8]);
+    assert_ne!(checked.checked_report_bytes(), &[] as &[u8]);
     drop(checked);
     budget.check();
 }

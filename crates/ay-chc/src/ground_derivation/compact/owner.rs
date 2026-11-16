@@ -68,7 +68,7 @@ impl Owner<'static> {
     pub(crate) fn capture() -> Result<Self> {
         let original = ay_core::resource::current_check_stop().map_err(|_| Error::Stopped)?;
         let guard = ay_core::resource::current_guard();
-        let (lane, interrupt) = try_lane_cancellation().map_err(|_| Error::Stopped)?;
+        let (lane, interrupt) = try_lane_cancellation().map_err(|()| Error::Stopped)?;
         let deadline = [
             effective_thread_deadline(),
             guard.as_ref().and_then(Guard::effective_deadline),
@@ -303,6 +303,10 @@ struct Scope<M> {
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+#[expect(
+    clippy::empty_drop,
+    reason = "the explicit Drop bound keeps every owned scope guard alive behind the returned impl Drop"
+)]
 impl<M> Drop for Scope<M> {
     fn drop(&mut self) {}
 }

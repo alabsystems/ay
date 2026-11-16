@@ -140,7 +140,7 @@ impl FpSolver<'_> {
     ) -> Result<(Vec<CnfLit>, Vec<CnfLit>), C::Error> {
         self.conversion_poll(control)?;
         let Format { eb, sb, .. } = format;
-        let result = (|| {
+        let result = {
             // Phase 11: Overflow result based on rounding mode
             // For ties-to-even and ties-to-away: overflow -> infinity
             // For toward-zero: overflow -> max finite
@@ -188,7 +188,7 @@ impl FpSolver<'_> {
             };
 
             (ovf_exp, ovf_sig)
-        })();
+        };
         self.conversion_poll(control)?;
         Ok(result)
     }

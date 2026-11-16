@@ -311,7 +311,7 @@ fn random_difference_instance(rng: &mut Rng) -> (usize, Vec<Atom>, Vec<Vec<(usiz
     }
     let clauses: Vec<Vec<(usize, bool)>> = (0..3 + rng.below(6))
         .map(|_| {
-            (0..1 + rng.below(3))
+            (0..=rng.below(3))
                 .map(|_| {
                     (
                         usize::try_from(rng.below(6)).unwrap_or(0),

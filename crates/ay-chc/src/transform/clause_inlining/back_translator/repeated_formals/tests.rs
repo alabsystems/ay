@@ -51,7 +51,7 @@ fn distinct_formals_are_unchanged() {
     let clause = fact(&head, ChcExpr::Bool(true));
     let (formals, equalities) = build(&clause, &head, &ValidityWitness::new());
     assert_eq!(formals, head);
-    assert!(equalities.is_empty());
+    assert_eq!(equalities, [] as [ChcExpr; 0]);
 }
 
 #[test]

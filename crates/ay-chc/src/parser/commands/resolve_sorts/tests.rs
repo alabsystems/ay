@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::ChcParser;
+use std::fmt::Write as _;
 
 mod fixtures;
 mod reference;
@@ -79,7 +80,7 @@ fn unchanged_resolution_is_borrowed_without_structural_equality() {
         let mut memo = ResolutionMemo::default();
         let mut resolver = Resolver::new(&parser.declared_datatype_sorts, &mut memo);
         let result = resolver.resolve(&sort);
-        assert!(matches!(result, Cow::Borrowed(value) if std::ptr::eq(value, &sort)));
+        assert!(matches!(result, Cow::Borrowed(value) if std::ptr::eq(value, &raw const sort)));
         assert!(resolver.seen.is_empty());
     }
 }
@@ -232,18 +233,20 @@ fn parsed_conflicting_redefinition_remains_visible_to_problem_validation() {
 /// `D1 = mk(a: leaf, b: leaf)`, `Dk = mk(a: D(k-1), b: D(k-1))`, one
 /// `declare-datatype` per level: `O(k)` text, `2^k` paths.
 fn struct_dag(leaf: &str, k: usize) -> String {
-    (1..=k)
-        .map(|level| {
-            let inner = if level == 1 {
-                leaf.to_owned()
-            } else {
-                format!("D{}", level - 1)
-            };
-            format!(
-                "(declare-datatype D{level} ((mk{level} (a{level} {inner}) (b{level} {inner})))) "
-            )
-        })
-        .collect()
+    let mut text = String::new();
+    for level in 1..=k {
+        let inner = if level == 1 {
+            leaf.to_owned()
+        } else {
+            format!("D{}", level - 1)
+        };
+        write!(
+            &mut text,
+            "(declare-datatype D{level} ((mk{level} (a{level} {inner}) (b{level} {inner})))) "
+        )
+        .unwrap();
+    }
+    text
 }
 
 #[test]
@@ -285,59 +288,69 @@ const LIST: &str = "(declare-datatype List ((nil) (cons (head Int) (tail List)))
 
 /// One `declare-datatypes` command holding every level of [`struct_dag`].
 fn struct_dag_one_block(leaf: &str, k: usize) -> String {
-    let names: String = (1..=k).map(|level| format!("(D{level} 0)")).collect();
-    let bodies: String = (1..=k)
-        .map(|level| {
-            let inner = if level == 1 {
-                leaf.to_owned()
-            } else {
-                format!("D{}", level - 1)
-            };
-            format!("((mk{level} (a{level} {inner}) (b{level} {inner})))")
-        })
-        .collect();
+    let mut names = String::new();
+    for level in 1..=k {
+        write!(&mut names, "(D{level} 0)").unwrap();
+    }
+    let mut bodies = String::new();
+    for level in 1..=k {
+        let inner = if level == 1 {
+            leaf.to_owned()
+        } else {
+            format!("D{}", level - 1)
+        };
+        write!(
+            &mut bodies,
+            "((mk{level} (a{level} {inner}) (b{level} {inner})))"
+        )
+        .unwrap();
+    }
     format!("(declare-datatypes ({names}) ({bodies}))")
 }
 
 /// [`struct_dag`] with one `declare-datatypes` command per level.
 fn struct_dag_plural_per_level(leaf: &str, k: usize) -> String {
-    (1..=k)
-        .map(|level| {
-            let inner = if level == 1 {
-                leaf.to_owned()
-            } else {
-                format!("D{}", level - 1)
-            };
-            format!(
-                "(declare-datatypes ((D{level} 0)) (((mk{level} (a{level} {inner}) (b{level} {inner}))))) "
-            )
-        })
-        .collect()
+    let mut text = String::new();
+    for level in 1..=k {
+        let inner = if level == 1 {
+            leaf.to_owned()
+        } else {
+            format!("D{}", level - 1)
+        };
+        write!(
+            &mut text,
+            "(declare-datatypes ((D{level} 0)) (((mk{level} (a{level} {inner}) (b{level} {inner}))))) "
+        )
+        .unwrap();
+    }
+    text
 }
 
 /// One block of `k` datatypes, each with a field of the next one's sort.
 fn chained_block(k: usize) -> String {
-    let names: String = (1..=k).map(|level| format!("(T{level} 0)")).collect();
-    let bodies: String = (1..=k)
-        .map(|level| {
-            let next = if level == k {
-                "Int".to_owned()
-            } else {
-                format!("T{}", level + 1)
-            };
-            format!("((mk{level} (f{level} {next})))")
-        })
-        .collect();
+    let mut names = String::new();
+    for level in 1..=k {
+        write!(&mut names, "(T{level} 0)").unwrap();
+    }
+    let mut bodies = String::new();
+    for level in 1..=k {
+        let next = if level == k {
+            "Int".to_owned()
+        } else {
+            format!("T{}", level + 1)
+        };
+        write!(&mut bodies, "((mk{level} (f{level} {next})))").unwrap();
+    }
     format!("(declare-datatypes ({names}) ({bodies}))")
 }
 
 /// `k` unrelated self-recursive lists, one `declare-datatype` each.
 fn recursive_lists(k: usize) -> String {
-    (1..=k)
-        .map(|level| {
-            format!("(declare-datatype L{level} ((nil{level}) (cons{level} (h{level} Int) (t{level} L{level})))) ")
-        })
-        .collect()
+    let mut text = String::new();
+    for level in 1..=k {
+        write!(&mut text, "(declare-datatype L{level} ((nil{level}) (cons{level} (h{level} Int) (t{level} L{level})))) ").unwrap();
+    }
+    text
 }
 
 #[test]

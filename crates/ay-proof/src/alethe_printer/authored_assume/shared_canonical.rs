@@ -401,10 +401,10 @@ impl<'t> CanonicalDag<'t> {
         )
     }
 
-    pub(super) fn children<'a>(
-        &'a self,
+    pub(super) fn children(
+        &self,
         term: TermId,
-    ) -> Option<impl Iterator<Item = (TermId, Range<usize>)> + 'a> {
+    ) -> Option<impl Iterator<Item = (TermId, Range<usize>)> + '_> {
         let node = self.nodes.iter().find(|node| node.term == term)?;
         let begin = usize::from(node.first_child);
         let end = begin.checked_add(usize::from(node.child_count))?;

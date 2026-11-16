@@ -80,7 +80,7 @@ fn plan_eq_refuses_cross_sort_sides_without_interning() {
         before,
         "a refused cross-sort plan must not intern anything"
     );
-    assert!(ill_sorted_equalities(&exec.ctx.terms).is_empty());
+    assert_eq!(ill_sorted_equalities(&exec.ctx.terms), [] as [TermId; 0]);
 }
 
 /// The D1 shape: the only same-head source pairs `L` arguments with `U`
@@ -122,5 +122,5 @@ fn substitution_bridge_still_plans_a_same_sorted_congruence() {
             .is_some(),
         "`(= u (hd a))` and `(= a b)` derive `(= u (hd b))` by congruence"
     );
-    assert!(ill_sorted_equalities(&exec.ctx.terms).is_empty());
+    assert_eq!(ill_sorted_equalities(&exec.ctx.terms), [] as [TermId; 0]);
 }

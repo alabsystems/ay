@@ -58,8 +58,11 @@ fn original_raw_word_is_linked_lsb_first_and_all_roots_are_retained() {
     let mut budget = WorkBudget::new(10_000_000_000, &mut checkpoint);
     let output = lower_fp_clause(&terms, &roots, &inputs, &namespace, &mut budget).unwrap();
     assert_eq!(output.source_roots(), &roots);
-    assert!(std::ptr::eq(output.source_terms(), &terms));
-    assert!(std::ptr::eq(output.source_namespace(), &namespace));
+    assert!(std::ptr::eq(output.source_terms(), &raw const terms));
+    assert!(std::ptr::eq(
+        output.source_namespace(),
+        &raw const namespace
+    ));
     let ChcExpr::Op(crate::ChcOp::And, constraints) = output.constraint() else {
         panic!()
     };

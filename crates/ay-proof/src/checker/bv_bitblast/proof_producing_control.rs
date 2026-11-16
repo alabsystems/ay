@@ -299,13 +299,13 @@ fn admit_success(deadline: Instant, poll: semantic_control::Poll<'_>) -> Result<
 /// too large to walk counts as mentioning one).
 fn mentions_array(terms: &TermStore, clause: &[TermId]) -> bool {
     const MAX_VISITS: usize = 1 << 20;
-    let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
+    let mut seen: HashSet<TermId> = HashSet::new();
     let mut stack: Vec<TermId> = clause.to_vec();
     while let Some(term) = stack.pop() {
         if !seen.insert(term) {
             continue;
         }
-        if seen.len() > MAX_VISITS || matches!(terms.sort(term), ay_core::Sort::Array(_)) {
+        if seen.len() > MAX_VISITS || matches!(terms.sort(term), Sort::Array(_)) {
             return true;
         }
         stack.extend(terms.children(term));

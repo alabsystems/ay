@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(p.counters.len(), 200);
         assert_eq!(p.creation_conflicts(), 5000);
         assert!(p.counters.iter().all(|&c| c == 0));
-        assert!(p.clause_counters.is_empty());
+        assert_eq!(p.clause_counters.as_slice(), &[] as &[u32]);
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_clause_counter_lazy_growth() {
         let mut p = PgoProfile::new(2, 0);
-        assert!(p.clause_counters.is_empty());
+        assert_eq!(p.clause_counters.as_slice(), &[] as &[u32]);
         // Recording a high clause_id should grow the vec lazily
         p.record_clause_propagation(100);
         assert!(p.clause_counters.len() >= 101);
@@ -309,14 +309,14 @@ mod tests {
 
         // Threshold 1000: nothing
         let hot = p.hot_vars(1000);
-        assert!(hot.is_empty());
+        assert_eq!(hot.as_slice(), &[] as &[(usize, usize)]);
     }
 
     #[test]
     fn test_hot_vars_empty_profile() {
         let p = PgoProfile::new(5, 0);
         let hot = p.hot_vars(1);
-        assert!(hot.is_empty());
+        assert_eq!(hot.as_slice(), &[] as &[(usize, usize)]);
     }
 
     #[test]

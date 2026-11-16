@@ -897,6 +897,13 @@ impl Executor {
         }
 
         let mut var_subst = VariableSubstitution::new();
+        // Linear-equality solving (DR-AY-DPLL-VARSUBST-LINEAR-SOLVE-20261116)
+        // stays OFF on this lane, including outside proof production
+        // (DR-AY-DPLL-LIA-LINEAR-SOLVE-REJECTED-20261116): LIA artifacts
+        // feed the #4751 proof replay, which licenses a substitution only
+        // from a source spelled exactly `(= var value)`; a solved row
+        // withholds the whole replay run and leaves premiseless `trust`
+        // steps (measured: 3 eq_diffvar proof tests fail).
         // Proof-interpolation knob (#campaign-rank-4): see
         // preprocess_auflia_assertions_with_proof_provenance for rationale.
         // Variable substitution rewrites assertions in place, which detaches
@@ -1183,6 +1190,13 @@ impl Executor {
                 VariableSubstitution::new_skip_arrays()
             };
             var_subst.set_preserve_nonlinear_vars(true);
+            if !features.has_uf {
+                // Post-normalization rows isolate no variable; solve
+                // linear equalities for one (z3 solve-eqs /
+                // arith-fixed-eqs parity). Constants-only UF mode keeps
+                // its conservative fold set.
+                var_subst.set_solve_linear_equalities(true);
+            }
             let before = preprocessed_assertions.clone();
             let changed = var_subst.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
             self.record_var_substitutions(&var_subst);
@@ -1365,6 +1379,11 @@ impl Executor {
         let features =
             crate::features::StaticFeatures::collect(&self.ctx.terms, &preprocessed_assertions);
         let mut var_subst = VariableSubstitution::new_skip_arrays();
+        // Solve linear equalities that isolate no variable syntactically
+        // (z3 solve-eqs / arith-fixed-eqs parity on post-normalization
+        // rows). The constants-only UF branch below replaces this pass and
+        // keeps its conservative fold set.
+        var_subst.set_solve_linear_equalities(true);
         // Proof-interpolation knob (#campaign-rank-4): variable substitution
         // rewrites assertions in place, which invalidates proof provenance and
         // forces Trust-step fallbacks in the reconstructed resolution proof.
@@ -1373,21 +1392,31 @@ impl Executor {
         // for proof-based Craig interpolation). See
         // Executor::proof_no_varsubst_enabled (option or env knob).
         let skip_subst_for_proofs = self.skip_varsubst_for_proofs();
-        if features.has_uf {
+        // The array fixpoint can reintroduce pre-substitution UF applications
+        // from the term store. Their eliminated arguments still need their
+        // defining equalities in EUF: recovering arithmetic values only after
+        // search leaves congruent array results in disequal classes.
+        let preserve_array_uf_definitions = features.has_arrays && features.has_uf;
+        if preserve_array_uf_definitions {
+            // Mixed route: the blanket skip that used to apply here left
+            // blast SSA definitions (the s3 family) entirely uncollapsed.
+            // Full substitution is now allowed for variables that never
+            // occur inside a non-builtin application or select/store —
+            // exactly the arguments the fixpoint can reintroduce — and the
+            // defining assertions of substituted variables are retained
+            // below (the has_uf retained-sources path), so EUF keeps
+            // every binding it could need.
+            var_subst = VariableSubstitution::new_skip_arrays();
+            var_subst.set_solve_linear_equalities(true);
+            var_subst.set_preserve_app_argument_vars(true);
+        } else if features.has_uf {
             // #qfuflia-const-subst: full substitution stays gated off with UF
             // present (#7884), but VAR := CONSTANT does not inline UF
             // applications into arithmetic. Retain its defining source below:
             // later array axioms can mention the original variable again.
             var_subst = VariableSubstitution::new_constants_only();
         }
-        // The array fixpoint can reintroduce pre-substitution UF applications
-        // from the term store. Their eliminated arguments still need their
-        // defining equalities in EUF: recovering arithmetic values only after
-        // search leaves congruent array results in disequal classes. On this
-        // mixed route, use the definition-preserving propagation below instead
-        // of deleting those equalities in the early substitution pass.
-        let preserve_array_uf_definitions = features.has_arrays && features.has_uf;
-        if !skip_subst_for_proofs && !preserve_array_uf_definitions {
+        if !skip_subst_for_proofs {
             let before = preprocessed_assertions.clone();
             let var_subst_changed =
                 var_subst.apply(&mut self.ctx.terms, &mut preprocessed_assertions);

@@ -35,7 +35,7 @@ const KIND_VALIDATION_GRACE: Duration = Duration::from_secs(3);
 
 /// Share of the remaining window the ladder-race member probe searches in; the
 /// rest is the final validation's (a counterexample found at the very edge
-/// would otherwise reach `finalize_verified_result` with no replay budget).
+/// would otherwise reach `finalize_verified_result_with_boundary` with no replay budget).
 const FRONT_PROBE_MEMBER_SHARE: f64 = 0.9;
 
 impl AdaptivePortfolio {
@@ -1022,7 +1022,7 @@ impl AdaptivePortfolio {
                     // Kind produces concrete counterexample traces via
                     // make_unsafe_with_trace (base case SAT + fresh cross-check).
                     // Return it as PortfolioResult::Unsafe for validation by
-                    // finalize_verified_result. Part of #7897. Its clause
+                    // finalize_verified_result_with_boundary. Part of #7897. Its clause
                     // indices name the ITE-split copy Kind searched; the
                     // validator reads them against `problem`.
                     let cex = match &split_origins {
@@ -1581,7 +1581,7 @@ impl AdaptivePortfolio {
         }
 
         // Map transformed-space results back into the original space before
-        // classification (mirrors run_preprocessed_acyclic_bmc_probe).
+        // classification (mirrors run_preprocessed_acyclic_bmc_probe_until).
         let result = match result {
             crate::ChcEngineResult::Unsafe(cex) => match &forwarding_back {
                 // Ground-witness landing for the follow-on lane (item 4 BMC-only

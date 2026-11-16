@@ -1708,7 +1708,7 @@ fn check_declared_boolean_negation(when: BooleanRegistration) {
             let y = store.mk_var("ns_y", Sort::Bool);
             let c = store.mk_var("ns_c", Sort::Bool);
             let z = store.mk_var("ns_z", Sort::Bool);
-            let app = store.mk_app_structural(Symbol::named(head), &[x, y], Sort::Bool);
+            let app = store.mk_app_structural(Symbol::named(head), [x, y], Sort::Bool);
             let conditional = store.mk_ite(c, app, z);
             if matches!(when, BooleanRegistration::AfterCachedNegation) {
                 let _ = store.mk_not(app);

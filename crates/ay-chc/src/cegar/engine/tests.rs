@@ -1248,8 +1248,8 @@ fn abstract_post_context_exists_only_while_the_session_is_enabled() {
             engine.search_smt.is_none(),
             "flag off: one legacy context, exactly as before Rung 4"
         );
-        let expansion = engine.expansion_smt() as *const SmtContext;
-        assert!(std::ptr::eq(expansion, &engine.smt));
+        let expansion = std::ptr::from_ref(engine.expansion_smt());
+        assert!(std::ptr::eq(expansion, &raw const engine.smt));
     }
     {
         let _mode = crate::smt::lane::ScopedSessionMode::set(2);
@@ -1258,7 +1258,7 @@ fn abstract_post_context_exists_only_while_the_session_is_enabled() {
             .search_smt
             .as_ref()
             .is_some_and(SmtContext::session_designated));
-        let expansion = engine.expansion_smt() as *const SmtContext;
-        assert!(!std::ptr::eq(expansion, &engine.smt));
+        let expansion = std::ptr::from_ref(engine.expansion_smt());
+        assert!(!std::ptr::eq(expansion, &raw const engine.smt));
     }
 }

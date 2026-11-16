@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn test_extract_orbits_empty() {
         let orbits = extract_orbits(&[]);
-        assert!(orbits.is_empty());
+        assert_eq!(orbits.len(), 0);
     }
 
     #[test]
@@ -207,6 +207,6 @@ mod tests {
     fn test_lex_leader_sbp_single_var() {
         let orbit = vec![Variable(0)];
         let clauses = encode_orbit_lex_leader_sbp(&orbit);
-        assert!(clauses.is_empty());
+        assert_eq!(clauses.len(), 0);
     }
 }

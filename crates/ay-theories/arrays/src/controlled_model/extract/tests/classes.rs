@@ -51,8 +51,8 @@ impl ClassFixture {
         }
         let _ = solver.check();
         solver.rebuild_assign_indices();
-        assert!(!solver.eq_adj.is_empty());
-        assert!(!solver.array_var_merge_log.is_empty());
+        assert_ne!(solver.eq_adj.len(), 0);
+        assert_ne!(solver.array_var_merge_log.len(), 0);
         assert_eq!(
             solver.array_var_merge_log.len(),
             solver.array_var_merge_undo.len()
@@ -99,7 +99,6 @@ fn class_costs(
         .unwrap();
     drop(output);
     work.charge(0).unwrap();
-    drop(work);
     totals.get()
 }
 

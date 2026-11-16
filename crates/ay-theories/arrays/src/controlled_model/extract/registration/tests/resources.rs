@@ -80,7 +80,7 @@ fn final_stop_after_real_registration_view_cleanup_is_sticky_after_raw_reset() {
         FiniteAdmissionGrant::new(units as u64, bytes),
         end,
         Arc::new(move || {
-            armed.load(Ordering::Acquire) && count.fetch_add(1, Ordering::AcqRel) + 1 >= polls + 1
+            armed.load(Ordering::Acquire) && count.fetch_add(1, Ordering::AcqRel) + 1 > polls
         }),
     );
     assert!(matches!(
@@ -101,7 +101,13 @@ fn original_expired_end_refuses_before_constructor_and_cannot_be_replaced() {
     let start = Instant::now();
     let fixture = Fixture::new();
     let source = ArraySolver::new(&fixture.terms);
-    let original = owner(start - Duration::from_secs(1), 1_000_000, 128 << 20);
+    let original = owner(
+        start
+            .checked_sub(Duration::from_secs(1))
+            .expect("a current instant has an earlier representable second"),
+        1_000_000,
+        128 << 20,
+    );
     assert!(matches!(
         original.with_work(
             |work| source.try_extract_registered_model_with_budget(&fixture.values(), work)
@@ -127,9 +133,10 @@ fn observer_panic_after_registration_is_terminal_across_caller_clones() {
         FiniteAdmissionGrant::new(units as u64, bytes),
         end,
         Arc::new(move || {
-            if count.fetch_add(1, Ordering::AcqRel) + 1 >= polls {
-                panic!("test observer");
-            }
+            assert!(
+                count.fetch_add(1, Ordering::AcqRel) + 1 < polls,
+                "test observer"
+            );
             false
         }),
     );
@@ -169,7 +176,6 @@ fn retained_spare_capacity_has_no_rehash_offer_but_keeps_full_backing_probes() {
     let mut work = WorkBudget::with_admission(expected as u64, &mut sink);
     maps::insert(&mut map, TermId(10), TermId(10), &mut work).unwrap();
     assert_eq!(work.remaining(), 0);
-    drop(work);
     assert_eq!(charged.get(), expected);
     assert_eq!(map.allocation_size(), allocation);
     assert!(actual > fresh && bytes.get() > 0);
@@ -198,7 +204,6 @@ fn true_growth_prepays_all_collision_reinserts_and_keeps_legacy_bucket_order() {
     };
     let mut work = WorkBudget::with_admission(1_000_000, &mut sink);
     maps::insert(&mut map, TermId(3), TermId(3), &mut work).unwrap();
-    drop(work);
     legacy.insert(TermId(3), TermId(3));
     let actual = map.allocation_size() / size_of::<(TermId, TermId)>() + 32;
     assert_eq!(

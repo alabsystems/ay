@@ -97,7 +97,7 @@ pub(super) fn prepare(
     stop.check()?;
     let build_error = |error| FpPreparationError::Stopped(stop.refuse_build_error(error));
     let mut should_stop = |progress| {
-        observe(FpPhase::Construction(progress));
+        observe(FpPhase::construction(progress));
         stop.should_stop()
     };
     let mut fp = FpConstruction::new(solver, &mut should_stop).map_err(build_error)?;

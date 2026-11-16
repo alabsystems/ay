@@ -273,9 +273,7 @@ impl SatProofManager<'_> {
             vec![derivation.witness],
         );
         let not_equality = terms.mk_not_raw(equality);
-        let derived_id;
-        let derived_literal;
-        if derivation.positive {
+        let (derived_id, derived_literal) = if derivation.positive {
             let not_quantified = terms.mk_not_raw(derivation.quantified);
             let tautology = proof.add_rule_step(
                 AletheRule::EquivPos2,
@@ -289,13 +287,15 @@ impl SatProofManager<'_> {
                 tautology,
                 sko,
             );
-            derived_id = proof.add_resolution(
-                vec![derivation.instance],
-                derivation.quantified,
-                elided,
-                assume_id,
-            );
-            derived_literal = derivation.instance;
+            (
+                proof.add_resolution(
+                    vec![derivation.instance],
+                    derivation.quantified,
+                    elided,
+                    assume_id,
+                ),
+                derivation.instance,
+            )
         } else {
             let not_instance = terms.mk_not_raw(derivation.instance);
             let tautology = proof.add_rule_step(
@@ -310,10 +310,11 @@ impl SatProofManager<'_> {
                 tautology,
                 sko,
             );
-            derived_id =
-                proof.add_resolution(vec![not_instance], derivation.quantified, assume_id, elided);
-            derived_literal = not_instance;
-        }
+            (
+                proof.add_resolution(vec![not_instance], derivation.quantified, assume_id, elided),
+                not_instance,
+            )
+        };
         if derived_literal == unit {
             return Ok(derived_id);
         }

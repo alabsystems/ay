@@ -675,7 +675,7 @@ fn test_all_false_zero_objective_optimum_rejects_nonzero_false_model() {
         },)
         .is_none()
     );
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -695,7 +695,7 @@ fn test_all_false_zero_objective_optimum_rejects_infeasible_false_model() {
         },)
         .is_none()
     );
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -742,7 +742,7 @@ fn test_unconstrained_all_false_incumbent_rejects_constrained_model() {
         },)
         .is_none()
     );
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -1331,7 +1331,7 @@ fn test_pre_native_core_guided_sat_returns_certified_unsat() {
     assert_eq!(result.status, PbStatus::Unsatisfiable);
     assert_eq!(result.objective, None);
     assert_eq!(best_assignment, None);
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -1412,7 +1412,7 @@ fn test_validated_prefix_incumbent_rejects_full_invalid_model() {
     );
 
     assert_eq!(best, None);
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -1549,7 +1549,7 @@ fn test_solve_optimization_native_returns_unknown_when_budget_expired() {
     );
 
     assert_eq!(result, unknown_solution());
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -1676,7 +1676,7 @@ fn test_solve_optimization_portfolio_skips_fallback_when_budget_expired() {
     );
 
     assert_eq!(result, unknown_solution());
-    assert!(improvements.is_empty());
+    assert_eq!(improvements.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 #[test]
@@ -1779,7 +1779,7 @@ fn test_solve_decision_portfolio_tiny_sat() {
     let result =
         solve_decision_portfolio(&instance, Some(Duration::from_secs(5)), start, &term_flag);
     assert_eq!(result.status, PbStatus::Satisfiable);
-    assert!(!result.assignment.is_empty());
+    assert_ne!(result.assignment.as_slice(), &[] as &[bool]);
 }
 
 #[test]
@@ -2272,7 +2272,7 @@ fn test_sat_optimization_portfolio_reports_only_real_witness_improvement() {
     );
 
     assert_eq!(improvements.len(), 1);
-    assert!(!improvements[0].1.is_empty());
+    assert_ne!(improvements[0].1.as_slice(), &[] as &[bool]);
     assert_eq!(
         improvements[0].0,
         result.objective.expect("result should have objective")
@@ -3691,9 +3691,14 @@ fn test_parallel_pools_use_sequential_work_when_other_units_are_retained() {
         return;
     }
     let compute = ay_sys::compute_budget::ComputeScope::enter().expect("caller");
-    let mut retained = Vec::new();
+    // Ownership, not inspection, exhausts the spare compute units through this scope.
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+    )]
+    let mut _retained_units = Vec::new();
     while let Some(unit) = compute.try_extra().expect("probe") {
-        retained.push(unit);
+        _retained_units.push(unit);
     }
     let instance =
         parse_opb("* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n").expect("decision fixture");
@@ -6625,7 +6630,7 @@ fn external_upgrade_boundary_rejects_invalid_result_and_stream() {
         &mut |value, assignment| streamed.push((value, assignment.to_vec())),
     );
     assert!(result.is_none());
-    assert!(streamed.is_empty());
+    assert_eq!(streamed.as_slice(), &[] as &[(i128, Vec<bool>)]);
 }
 
 // ---------------------------------------------------------------------------

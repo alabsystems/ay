@@ -11,9 +11,9 @@ use std::rc::Rc;
 
 use super::super::surface_tokens::next_smt_term_slice;
 
-const RC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+const RC_HEADER: usize = 2 * size_of::<usize>();
 pub(crate) const COUNTER_BYTES: usize =
-    RC_HEADER + std::mem::size_of::<ChargeState>() + std::mem::align_of::<ChargeState>() - 1;
+    RC_HEADER + size_of::<ChargeState>() + align_of::<ChargeState>() - 1;
 
 pub(crate) struct ChargeState {
     bytes: Cell<usize>,
@@ -70,6 +70,7 @@ pub(crate) struct TextBudget {
     pub(crate) limit: usize,
 }
 impl TextBudget {
+    #[cfg(test)]
     pub(crate) fn new(limit: usize) -> Self {
         Self {
             used: Rc::new(ChargeState::root()),
@@ -107,11 +108,11 @@ impl TextBudget {
         Some(OwnedText::from_reserved(text, lease))
     }
     pub(crate) fn vector<T>(&self, count: usize) -> Option<ScratchVec<T>> {
-        let mut lease = self.reserve(count.checked_mul(std::mem::size_of::<T>())?)?;
+        let mut lease = self.reserve(count.checked_mul(size_of::<T>())?)?;
         let data = Vec::with_capacity(count);
         // Vec's requested capacity is exact for these non-ZST callers. Still
         // account the actual capacity before exposing the allocation.
-        let actual = data.capacity().checked_mul(std::mem::size_of::<T>())?;
+        let actual = data.capacity().checked_mul(size_of::<T>())?;
         lease.resize(actual, self.limit)?;
         Some(ScratchVec {
             data,
@@ -162,12 +163,7 @@ struct TextAllocation {
 pub(crate) struct OwnedText(Rc<TextAllocation>);
 impl OwnedText {
     pub(crate) fn cost(len: usize) -> Option<usize> {
-        len.checked_add(
-            RC_HEADER
-                + std::mem::size_of::<TextAllocation>()
-                + std::mem::align_of::<TextAllocation>()
-                - 1,
-        )
+        len.checked_add(RC_HEADER + size_of::<TextAllocation>() + align_of::<TextAllocation>() - 1)
     }
     fn from_reserved(text: &str, lease: Reservation) -> Self {
         Self(Rc::new(TextAllocation {
@@ -178,27 +174,6 @@ impl OwnedText {
     pub(crate) fn precharged(text: &str, used: Rc<ChargeState>) -> Self {
         let cost = Self::cost(text.len()).unwrap_or(usize::MAX);
         Self::from_reserved(text, Reservation::precharged(used, cost))
-    }
-    pub(crate) fn join(budget: &TextBudget, parts: &[&str], len: usize) -> Option<Self> {
-        if parts
-            .iter()
-            .try_fold(0usize, |n, part| n.checked_add(part.len()))?
-            != len
-        {
-            return None;
-        }
-        let lease = budget.reserve(Self::cost(len)?)?;
-        let mut text = String::with_capacity(len);
-        for part in parts {
-            text.push_str(part);
-        }
-        if text.len() != len || text.capacity() != len {
-            return None;
-        }
-        Some(Self(Rc::new(TextAllocation {
-            text: text.into_boxed_str(),
-            _lease: lease,
-        })))
     }
     pub(crate) fn wrapped(&self, shells: usize, budget: &TextBudget) -> Option<Self> {
         if shells == 0 {
@@ -368,10 +343,7 @@ impl WireLiteral {
 pub(crate) fn decoded_body(mut text: &str) -> Option<(&str, usize)> {
     text = text.trim();
     let mut depth = 0usize;
-    loop {
-        let Some(inner) = text.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
-            break;
-        };
+    while let Some(inner) = text.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         let mut cursor = 0;
         let Ok(Some("not")) = next_smt_term_slice(inner, &mut cursor) else {
             break;
@@ -500,18 +472,9 @@ impl<T> AsRef<[T]> for ScratchVec<T> {
 
 pub(crate) fn matrix_bytes<T>(data: &Vec<Vec<T>>) -> Option<usize> {
     data.iter().try_fold(
-        data.capacity().checked_mul(std::mem::size_of::<Vec<T>>())?,
-        |n, row| n.checked_add(row.capacity().checked_mul(std::mem::size_of::<T>())?),
+        data.capacity().checked_mul(size_of::<Vec<T>>())?,
+        |n, row| n.checked_add(row.capacity().checked_mul(size_of::<T>())?),
     )
-}
-
-impl TextBudget {
-    pub(crate) fn concat(&self, parts: &[&str]) -> Option<OwnedText> {
-        let len = parts
-            .iter()
-            .try_fold(0usize, |n, p| n.checked_add(p.len()))?;
-        OwnedText::join(self, parts, len)
-    }
 }
 
 impl Tracked<Vec<Vec<super::PrintedLiteral>>> {
@@ -526,8 +489,8 @@ impl Tracked<Vec<Vec<super::PrintedLiteral>>> {
             .try_fold(extra.checked_mul(3)?, |n, row| n.checked_add(row.len()))?;
         let lease = budget.reserve(
             outer
-                .checked_mul(std::mem::size_of::<Vec<super::PrintedLiteral>>())?
-                .checked_add(fields.checked_mul(std::mem::size_of::<super::PrintedLiteral>())?)?,
+                .checked_mul(size_of::<Vec<super::PrintedLiteral>>())?
+                .checked_add(fields.checked_mul(size_of::<super::PrintedLiteral>())?)?,
         )?;
         let mut data = Vec::with_capacity(outer);
         for row in source {

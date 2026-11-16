@@ -52,6 +52,7 @@ pub(super) enum AuthoredAssumptionSurfaces {
 impl Executor {
     /// Exact external query assumptions, excluding named-core redirects and
     /// minimizer probes that may overwrite the operational last_assumptions.
+    #[cfg(feature = "z3-compat-internals")]
     pub(crate) fn native_proof_query_assumptions(&self) -> Option<&[TermId]> {
         self.last_proof()?;
         self.unsat_query_epoch.as_ref()?.assumptions.as_deref()
