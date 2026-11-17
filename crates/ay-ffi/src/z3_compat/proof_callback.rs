@@ -10,6 +10,7 @@ use ay_dpll::{api::NativeProofInputBinding, Executor};
 use std::{
     ffi::{c_void, CStr},
     panic::{catch_unwind, AssertUnwindSafe},
+    ptr,
 };
 
 #[allow(non_camel_case_types)]
@@ -34,7 +35,7 @@ pub unsafe extern "C" fn Z3_set_proof_check_callback(
             ctx.proof_check_user_context = if callback.is_some() {
                 user
             } else {
-                std::ptr::null_mut()
+                ptr::null_mut()
             };
         })
     }
@@ -105,7 +106,7 @@ unsafe fn proof_event(
                 }
                 return;
             };
-            let Some(proof) = super::proof_dag::materialize(ctx, &dag) else {
+            let Some(proof) = proof_dag::materialize(ctx, &dag) else {
                 if matches!(event, ProofEvent::UnsatCheck) {
                     error =
                         Some("proof is not available for the proof checking callback".to_owned());
@@ -113,9 +114,7 @@ unsafe fn proof_event(
                 return;
             };
             match event {
-                ProofEvent::GetProof => {
-                    view = super::proofs::proof_text_for_ast(ctx, proof).map(str::to_owned)
-                }
+                ProofEvent::GetProof => view = proof_text_for_ast(ctx, proof).map(str::to_owned),
                 ProofEvent::UnsatCheck => {
                     let Some(callback) = ctx.proof_check_callback else {
                         return;

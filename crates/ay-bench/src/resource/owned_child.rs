@@ -25,7 +25,7 @@ impl LocalOwnedChild {
         Self {
             child,
             #[cfg(unix)]
-            identity: watchdog.identity,
+            identity: watchdog.identity(),
             watchdog: Some(watchdog),
             state: CleanupState::Unwaited,
             label,

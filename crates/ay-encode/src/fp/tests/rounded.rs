@@ -29,22 +29,24 @@ fn exact(actual: Expr, expected: Expr, budget: &mut WorkBudget<'_>) {
     let problem = ChcProblem::new();
     for (root, expected) in [(correct.clone(), true), (correct.not(), false)] {
         let roots = [root];
-        let output = relation(&roots, &[], &problem, budget);
-        let (body, source) = output.into_parts().unwrap();
-        assert_eq!(units::consistent(&body, budget), expected);
-        assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-        drop(body);
-        drop(source);
+        {
+            let output = relation(&roots, &[], &problem, budget);
+            let (body, source) = output.into_parts().unwrap();
+            assert_eq!(units::consistent(&body, budget), expected);
+            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+            drop(body);
+        }
         budget.charge(0).unwrap();
     }
 }
 
 fn attempt(roots: &[Expr], budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
     let problem = ChcProblem::new();
-    let output = lower_fp_expr_clause(roots, &[], &problem, budget)?;
-    let (body, source) = output.into_body(ClauseBody::empty())?.into_parts()?;
-    drop(body);
-    drop(source);
+    {
+        let output = lower_fp_expr_clause(roots, &[], &problem, budget)?;
+        let (body, _source) = output.into_body(ClauseBody::empty())?.into_parts()?;
+        drop(body);
+    }
     budget.charge(0)?;
     Ok(())
 }
@@ -241,32 +243,34 @@ fn rounded_total_work_and_bytes_have_exact_one_short_sticky_refusals() {
         let roots = [simple(fused)];
         let paid = Cell::new(0usize);
         let stored = Cell::new(0usize);
-        let mut count = |work: usize, bytes: usize| {
-            if Instant::now() >= end {
-                return Err(QueryError::Interrupted(StopReason::Deadline));
-            }
-            paid.set(paid.get().checked_add(work).unwrap());
-            stored.set(stored.get().checked_add(bytes).unwrap());
-            Ok(())
-        };
-        let mut baseline = WorkBudget::with_admission(WORK, &mut count);
-        attempt(&roots, &mut baseline).unwrap();
-        drop(baseline);
-        assert!(paid.get() > 0 && stored.get() > 0);
-        let mut permit = |_: usize, _: usize| {
-            if Instant::now() >= end {
-                Err(QueryError::Interrupted(StopReason::Deadline))
-            } else {
+        {
+            let mut count = |work: usize, bytes: usize| {
+                if Instant::now() >= end {
+                    return Err(QueryError::Interrupted(StopReason::Deadline));
+                }
+                paid.set(paid.get().checked_add(work).unwrap());
+                stored.set(stored.get().checked_add(bytes).unwrap());
                 Ok(())
-            }
-        };
-        let mut short = WorkBudget::with_admission((paid.get() - 1) as u64, &mut permit);
-        assert_eq!(
-            attempt(&roots, &mut short).err(),
-            Some(FpAdapterError::Owner(QueryError::Exhausted))
-        );
-        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-        drop(short);
+            };
+            let mut baseline = WorkBudget::with_admission(WORK, &mut count);
+            attempt(&roots, &mut baseline).unwrap();
+        }
+        assert!(paid.get() > 0 && stored.get() > 0);
+        {
+            let mut permit = |_: usize, _: usize| {
+                if Instant::now() >= end {
+                    Err(QueryError::Interrupted(StopReason::Deadline))
+                } else {
+                    Ok(())
+                }
+            };
+            let mut short = WorkBudget::with_admission((paid.get() - 1) as u64, &mut permit);
+            assert_eq!(
+                attempt(&roots, &mut short).err(),
+                Some(FpAdapterError::Owner(QueryError::Exhausted))
+            );
+            assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+        }
         let mut remaining = stored.get() - 1;
         let mut permit = |_: usize, bytes: usize| {
             if Instant::now() >= end {

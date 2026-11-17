@@ -666,6 +666,24 @@ impl NiaSolver<'_> {
             return 0;
         }
 
+        // Relevance restriction (exact): a probe can only succeed when
+        // `lo`, `hi` and `z` are all factors of registered monomials --
+        // the lookup keys must equal some monomial's var list, and every
+        // monomial var is in this set by construction, so a side outside
+        // it misses both lookups and emits nothing. Unfiltered, the
+        // orders x signed-terms product was ~97k allocating probes per
+        // check on Certora `65782_..._8` (4 monomials, ~550 orders,
+        // ~176 signed terms). Filtering keeps the surviving pairs in
+        // their original iteration order, so emissions are unchanged.
+        let mut factors: Vec<TermId> = self
+            .monomials
+            .values()
+            .flat_map(|m| m.vars.iter().copied())
+            .collect();
+        factors.sort_unstable();
+        factors.dedup();
+        let is_factor = |t: TermId| factors.binary_search(&t).is_ok();
+
         // Candidate shared factors: subjects with an asserted weak sign
         // (sorted for determinism).
         let mut signed_terms: Vec<TermId> = signs
@@ -673,20 +691,26 @@ impl NiaSolver<'_> {
             .keys()
             .chain(signs.nonpos.keys())
             .copied()
+            .filter(|&t| is_factor(t))
             .collect();
         signed_terms.sort_unstable();
         signed_terms.dedup();
+        if signed_terms.is_empty() {
+            return 0;
+        }
 
         let mut added = 0;
         for &(lo, hi, order_reason) in orders {
+            if !is_factor(lo) || !is_factor(hi) {
+                continue;
+            }
             for &z in &signed_terms {
-                let mut key_lo = vec![lo, z];
-                key_lo.sort_unstable_by_key(|t| t.0);
-                let mut key_hi = vec![hi, z];
-                key_hi.sort_unstable_by_key(|t| t.0);
+                self.mul_mono_probe_count += 1;
+                let key_lo = if lo.0 <= z.0 { [lo, z] } else { [z, lo] };
+                let key_hi = if hi.0 <= z.0 { [hi, z] } else { [z, hi] };
                 let (Some(m_lo), Some(m_hi)) = (
-                    self.monomials.get(&key_lo).map(|m| m.aux_var),
-                    self.monomials.get(&key_hi).map(|m| m.aux_var),
+                    self.monomials.get(key_lo.as_slice()).map(|m| m.aux_var),
+                    self.monomials.get(key_hi.as_slice()).map(|m| m.aux_var),
                 ) else {
                     continue;
                 };

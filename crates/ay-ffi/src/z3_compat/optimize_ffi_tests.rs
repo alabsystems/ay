@@ -423,9 +423,10 @@ fn successful_mutations_retire_optimize_outcomes() {
         assert!(Z3_optimize_get_model(c, o).is_null());
         assert_eq!(Z3_optimize_get_upper(c, o, maximize_x), 0);
         assert_eq!(Z3_ast_vector_size(c, Z3_optimize_get_unsat_core(c, o)), 0);
-        assert!(CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o))
-            .to_bytes()
-            .is_empty());
+        assert_eq!(
+            CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o)).to_bytes(),
+            &[] as &[u8]
+        );
 
         assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
@@ -849,7 +850,7 @@ fn params_help_and_descrs() {
         // get_help is a real, non-empty string.
         let help = Z3_optimize_get_help(c, o);
         assert!(!help.is_null());
-        assert!(!CStr::from_ptr(help).to_bytes().is_empty());
+        assert_ne!(CStr::from_ptr(help).to_bytes(), &[] as &[u8]);
 
         // get_param_descrs is a real, queryable set.
         let pd = Z3_optimize_get_param_descrs(c, o);

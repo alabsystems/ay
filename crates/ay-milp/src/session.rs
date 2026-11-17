@@ -4448,7 +4448,7 @@ impl LpSession {
         if self.implied_box.is_none() {
             let deadline = self.opts.effective_deadline(Instant::now());
             self.implied_box = Some(crate::presolve::implied_box_f64(&self.model, deadline));
-            self.implied_box_pinned = !deadline.is_some_and(|d| Instant::now() >= d);
+            self.implied_box_pinned = deadline.is_none_or(|d| Instant::now() < d);
         }
     }
 
@@ -6738,7 +6738,10 @@ mod exact_reduction_fallback_tests {
             let mut session = BabSession::new(model, &opts).expect("session");
             let outcome = session.check().expect("open-domain solve");
             assert!(matches!(outcome, Outcome::Infeasible { .. }));
-            assert!(session.replay_claims().is_empty());
+            assert_eq!(
+                session.replay_claims(),
+                &[] as &[crate::cert_io::ReplayClaim]
+            );
             assert!(
                 session
                     .open_domain_single_row_dp_infeasibility_certificate()

@@ -28,7 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or_else(|| path.clone(), |s| s.to_string_lossy().into_owned());
     let name = stem.trim_end_matches(".mps").to_owned();
 
-    let text = if path.ends_with(".gz") {
+    let text = if std::path::Path::new(&path)
+        .extension()
+        .is_some_and(|ext| ext == "gz")
+    {
         decompress_gz(&path)?
     } else {
         std::fs::read_to_string(&path)?

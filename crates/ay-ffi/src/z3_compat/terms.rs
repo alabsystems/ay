@@ -19,8 +19,8 @@ use super::arithmetic::coerce_mixed_int_real;
 use super::provenance::StructuralRefusal;
 use super::{
     activate_finite_set_sat_gate, cache_func_decl_with_symbol, ffi_count_within_limit,
-    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_mk, ffi_guard_produced, ffi_guard_ptr,
-    ffi_read_bounded_text, ffi_try_declare_function, finite_set_engine_public_sort,
+    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_mk, ffi_guard_ptr, ffi_read_bounded_text,
+    ffi_try_declare_function, finite_set_engine_public_sort,
     has_unsupported_finite_set_datatype_embedding, public_ast_sort, record_ast_sort,
     require_term_ast, require_term_asts, sort_mentions_finite_set, term_to_ast, DatatypeOp,
     SymbolKey, Z3_ast, Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG,

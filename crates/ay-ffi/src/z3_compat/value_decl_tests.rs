@@ -208,7 +208,7 @@ fn substitute_refuses_a_compound_pattern_rewritten_away() {
         let got = Z3_substitute(c, sum, 2, [fa, fb].as_ptr(), [one, one].as_ptr());
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         let mut numeral = 0;
-        assert!(Z3_get_numeral_int(c, Z3_simplify(c, got), &mut numeral));
+        assert!(Z3_get_numeral_int(c, Z3_simplify(c, got), &raw mut numeral));
         assert_eq!(numeral, 2);
         Z3_del_context(c);
     }

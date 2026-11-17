@@ -523,7 +523,6 @@ impl Solver {
         self.cold.symmetry_oneshot = oneshot;
     }
 
-    /// Enable the official SAT Competition Main conflict-analysis pruning policy.
     /// Tell a VeriPB proof writer how many clause lines the formula has, so
     /// it deletes its derived constraints by id (`ProofOutput::set_veripb_original_clauses`).
     /// The streaming DIMACS reader knows the count only after the last clause.

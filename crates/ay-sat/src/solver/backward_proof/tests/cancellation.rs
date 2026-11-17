@@ -48,9 +48,11 @@ fn every_reconstruction_poll(solver: &Solver, limits: &BackwardProofLimits) -> u
         });
         assert!(matches!(refused, Err(BackwardProofFailure::Cancelled)));
         assert_eq!(calls.get(), refused_at, "refusal cannot resume");
+        // Both calls use the same engine: this checks repeatability after
+        // cancellation, not an independent oracle. The loop checks every poll.
         assert_same_result(
             solver.reconstruct_lrat_backward_bounded_with_cancellation(limits, &|| true),
-            solver.reconstruct_lrat_backward_bounded(limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(limits, &|| true),
         );
     }
     count

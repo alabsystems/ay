@@ -21,10 +21,12 @@ fn exact_199_bit_snapshot_dispatch_preserves_every_field_in_the_model_ast() {
     let mut solver = Solver::new(Logic::QfFp);
     let sort = Sort::FloatingPoint(8, 200);
     let literal = format!("(fp #b1 #b01111111 #b1{}1)", "0".repeat(197));
-    let mut values = ModelValue::decode_typed_literals(&[(&literal, &sort)]).unwrap();
+    let mut values = ModelValue::decode_typed_literals(&[(&literal, &sort)])
+        .expect("199-bit floating-point literal must decode");
     let value = values.remove(0);
     assert_eq!(scalar_value_sort(&value), Some(sort.clone()));
-    let term = super::super::model_value_to_term(&mut solver, &value, &sort).unwrap();
+    let term = model_value_to_term(&mut solver, &value, &sort)
+        .expect("decoded floating-point value must convert to a model term");
     assert_eq!(solver.term_sort(term), sort);
     let children = solver.term_children(term);
     assert_eq!(children.len(), 3);
@@ -38,9 +40,9 @@ fn exact_199_bit_snapshot_dispatch_preserves_every_field_in_the_model_ast() {
         assert_eq!(
             solver
                 .numeral_string(child)
-                .unwrap()
+                .expect("floating-point field must have a numeral spelling")
                 .parse::<BigInt>()
-                .unwrap(),
+                .expect("floating-point field spelling must be an integer"),
             value
         );
     }
@@ -66,7 +68,11 @@ fn assert_fields(solver: &Solver, term: Term, fields: (bool, u64, u128, u32, u32
     ]) {
         assert_eq!(solver.term_kind(child), TermKind::Const);
         assert_eq!(solver.term_sort(child), Sort::bitvec(width));
-        let actual: BigInt = solver.numeral_string(child).unwrap().parse().unwrap();
+        let actual: BigInt = solver
+            .numeral_string(child)
+            .expect("floating-point field must have a numeral spelling")
+            .parse()
+            .expect("floating-point field spelling must be an integer");
         assert_eq!(
             actual, value,
             "every unsigned field bit must survive BigInt transfer"
@@ -87,7 +93,8 @@ fn binary128_snapshot_dispatch_preserves_high_and_low_fraction_bits() {
     ] {
         let value = wide(sign, exponent, significand, 15, 113);
         let sort = Sort::FloatingPoint(15, 113);
-        let term = super::super::model_value_to_term(&mut solver, &value, &sort).unwrap();
+        let term = model_value_to_term(&mut solver, &value, &sort)
+            .expect("valid binary128 snapshot must convert to a model term");
         assert_eq!(Some(term), value_to_term(&mut solver, &value, &sort));
         assert_fields(&solver, term, (sign, exponent, significand, 15, 113));
     }
@@ -98,7 +105,8 @@ fn snapshot_transfer_preserves_unsigned_carriers_without_widening_api_admission(
     let mut solver = Solver::new(Logic::QfFp);
     // These checks concern term construction only, not arithmetic admission.
     let maximum = wide(true, (1u64 << 31) - 1, u128::MAX, 31, 129);
-    let term = value_to_term(&mut solver, &maximum, &Sort::FloatingPoint(31, 129)).unwrap();
+    let term = value_to_term(&mut solver, &maximum, &Sort::FloatingPoint(31, 129))
+        .expect("maximum admitted snapshot must convert to a term");
     assert_fields(&solver, term, (true, (1u64 << 31) - 1, u128::MAX, 31, 129));
     // A lossless value carrier does not override the existing API eb<=31 bound.
     let outside_api = wide(true, u64::MAX, u128::MAX, 64, 129);
@@ -111,9 +119,8 @@ fn snapshot_transfer_preserves_unsigned_carriers_without_widening_api_admission(
         eb: 15,
         sb: 65,
     };
-    let term =
-        super::super::model_value_to_term(&mut solver, &narrow, &Sort::FloatingPoint(15, 65))
-            .unwrap();
+    let term = model_value_to_term(&mut solver, &narrow, &Sort::FloatingPoint(15, 65))
+        .expect("legacy-width snapshot must convert to a model term");
     assert_fields(&solver, term, (false, 123, u128::from(u64::MAX), 15, 65));
 }
 
@@ -145,7 +152,7 @@ fn snapshot_transfer_rejects_malformed_fields_and_declared_sorts() {
             value_to_term(&mut solver, &value, &sort).is_none(),
             "{value:?} at {sort:?}"
         );
-        assert!(super::super::model_value_to_term(&mut solver, &value, &sort).is_none());
+        assert!(model_value_to_term(&mut solver, &value, &sort).is_none());
     }
     assert!(value_to_term(
         &mut solver,
@@ -154,6 +161,7 @@ fn snapshot_transfer_rejects_malformed_fields_and_declared_sorts() {
     )
     .is_none());
     let fresh = wide(false, 0x3fff, 1u128 << 111, 15, 113);
-    let term = value_to_term(&mut solver, &fresh, &Sort::FloatingPoint(15, 113)).unwrap();
+    let term = value_to_term(&mut solver, &fresh, &Sort::FloatingPoint(15, 113))
+        .expect("valid floating-point snapshot must convert to a term");
     assert_fields(&solver, term, (false, 0x3fff, 1u128 << 111, 15, 113));
 }

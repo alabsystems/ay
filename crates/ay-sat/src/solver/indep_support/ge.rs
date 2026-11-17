@@ -100,7 +100,7 @@ pub(super) fn build_ge_basis(
         rhs.push(*r);
     }
     let pivot_of_col = gauss_jordan(&mut rows, &mut rhs, cols.len())?;
-    read_basis(&rows, &pivot_of_col, &cols)
+    read_basis(&rows, &rhs, &pivot_of_col, &cols)
 }
 
 /// Dedupe XOR gates into `(sorted variables, rhs)` equations over decidable
@@ -213,7 +213,12 @@ fn gauss_jordan(
 /// Read free variables and pivot expressions out of the RREF matrix. In
 /// RREF a pivot row's set bits are its pivot column plus free columns only,
 /// so the expression is the row's bit set minus the pivot.
-fn read_basis(rows: &[Vec<u64>], pivot_of_col: &[Option<usize>], cols: &[u32]) -> Option<GeBasis> {
+fn read_basis(
+    rows: &[Vec<u64>],
+    rhs: &[bool],
+    pivot_of_col: &[Option<usize>],
+    cols: &[u32],
+) -> Option<GeBasis> {
     let mut free: Vec<u32> = Vec::new();
     let mut exprs: Vec<Definition> = Vec::new();
     for (col, piv) in pivot_of_col.iter().enumerate() {
@@ -232,6 +237,8 @@ fn read_basis(rows: &[Vec<u64>], pivot_of_col: &[Option<usize>], cols: &[u32]) -
                     output: var,
                     inputs,
                 });
+                // Keep the original parallel-RHS shape refusal.
+                let _ = rhs.get(row_idx)?;
             }
         }
     }
@@ -240,4 +247,24 @@ fn read_basis(rows: &[Vec<u64>], pivot_of_col: &[Option<usize>], cols: &[u32]) -
         return None;
     }
     Some(GeBasis { free, exprs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_basis;
+
+    #[test]
+    fn read_basis_requires_rhs_for_each_pivot_row() {
+        let rows = [vec![0b11_u64]];
+        let pivots = [Some(0), None];
+        let cols = [7, 11];
+        assert!(read_basis(&rows, &[], &pivots, &cols).is_none());
+
+        let basis = read_basis(&rows, &[false], &pivots, &cols)
+            .expect("a complete RHS admits the valid RREF basis");
+        assert_eq!(basis.free, vec![11]);
+        assert_eq!(basis.exprs.len(), 1);
+        assert_eq!(basis.exprs[0].output, 7);
+        assert_eq!(basis.exprs[0].inputs, vec![11]);
+    }
 }

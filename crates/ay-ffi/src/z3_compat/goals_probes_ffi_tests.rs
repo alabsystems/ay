@@ -33,8 +33,7 @@ fn field_sat_public_boolean_field_models_and_native_refutation_transport() {
             Z3_mk_string_symbol(ctx, c"p".as_ptr()),
             Z3_mk_bool_sort(ctx),
         );
-        let eq =
-            |value: *const std::ffi::c_char| Z3_mk_eq(ctx, x, Z3_mk_numeral(ctx, value, field));
+        let eq = |value: *const c_char| Z3_mk_eq(ctx, x, Z3_mk_numeral(ctx, value, field));
         let x1 = eq(c"1".as_ptr());
         let x2 = eq(c"2".as_ptr());
         let x3 = eq(c"3".as_ptr());
@@ -64,7 +63,7 @@ fn field_sat_public_boolean_field_models_and_native_refutation_transport() {
                 if models {
                     for root in [a, b, x2, p] {
                         let mut value = 0;
-                        assert!(Z3_model_eval(ctx, model, root, false, &mut value));
+                        assert!(Z3_model_eval(ctx, model, root, false, &raw mut value));
                         assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
                     }
                 } else {
@@ -124,7 +123,7 @@ fn field_solve_public_goal_witness_copy_flags_and_proof_refusal() {
                 if models {
                     for root in [a, b] {
                         let mut value = 0;
-                        assert!(Z3_model_eval(ctx, model, root, false, &mut value));
+                        assert!(Z3_model_eval(ctx, model, root, false, &raw mut value));
                         assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
                     }
                 } else {

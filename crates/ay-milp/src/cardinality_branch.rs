@@ -246,7 +246,7 @@ mod tests {
         let bad_bound = model.add_row(f64::NEG_INFINITY, 1.0, &[(a, 1.0), (b, 1.0)]);
         model.record_inexact_row_bound(bad_bound, false, BigRational::from_integer(2.into()));
 
-        assert!(unit_amo_rows(&model).is_empty());
+        assert_eq!(unit_amo_rows(&model), Vec::<UnitAmoRow>::new());
     }
 
     #[test]

@@ -2210,3 +2210,135 @@ fn test_model_point_verification_scaled_product_sat() {
          verification must decide it, got {result:?}"
     );
 }
+
+/// At a refinement stall the loop needs a branch, not another cut: a
+/// sign-undetermined Int factor yields the exhaustive dichotomy
+/// `v <= -1 OR v >= 0`, at most once per variable per instance (a
+/// persistent eager-lane instance re-checks every quiescence, and
+/// re-offering the identical split churns split-loop rounds —
+/// DR-AY-NIA-SIGN-SPLIT-REJECTED-20261116). Once both factors are
+/// sign-determined by asserted bounds, no split is offered.
+#[test]
+fn monomial_sign_split_offers_each_variable_once_until_signs_determined() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let xy = terms.mk_mul(vec![x, y]);
+    let seven = terms.mk_int(BigInt::from(7));
+    let zero = terms.mk_int(BigInt::from(0));
+    let eq = terms.mk_eq(xy, seven);
+    let x_ge_0 = terms.mk_ge(x, zero);
+    let y_ge_0 = terms.mk_ge(y, zero);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(eq, true);
+    let _ = solver.check();
+
+    let first = solver
+        .monomial_sign_split()
+        .expect("sign-undetermined factors must offer a sign split");
+    assert!(first.variable == x || first.variable == y);
+    assert_eq!(first.floor, BigInt::from(-1));
+    assert_eq!(first.ceil, BigInt::from(0));
+    assert!(!first.value.is_integer(), "split value must be fractional");
+    let second = solver
+        .monomial_sign_split()
+        .expect("the other factor is still sign-undetermined");
+    assert_ne!(
+        second.variable, first.variable,
+        "each variable is offered at most once per instance"
+    );
+    assert!(
+        solver.monomial_sign_split().is_none(),
+        "both factors offered: no third split from this instance"
+    );
+
+    let mut solver = NiaSolver::new(&terms);
+    for atom in [eq, x_ge_0, y_ge_0] {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.check();
+    assert!(
+        solver.monomial_sign_split().is_none(),
+        "sign-determined factors must not be split"
+    );
+
+    // A boxed factor is bisected instead: x in [-1, 1] splits at -1/2
+    // first (narrowest box wins over the unbounded y), and in the
+    // [0, 1] sub-box at 1/2 — distinct floors, both offerable.
+    let neg_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let x_ge_m1 = terms.mk_ge(x, neg_one);
+    let x_le_1 = terms.mk_le(x, one);
+    let mut solver = NiaSolver::new(&terms);
+    for atom in [eq, x_ge_m1, x_le_1] {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.check();
+    let boxed = solver
+        .monomial_sign_split()
+        .expect("boxed factor must offer a bisection split");
+    assert_eq!(boxed.variable, x, "narrowest box splits first");
+    assert_eq!(boxed.floor, BigInt::from(-1));
+    assert_eq!(boxed.ceil, BigInt::from(0));
+
+    let mut solver = NiaSolver::new(&terms);
+    for atom in [eq, x_ge_0, x_le_1] {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.check();
+    let sub = solver
+        .monomial_sign_split()
+        .expect("the [0, 1] sub-box must offer its own bisection");
+    assert_eq!(sub.variable, x);
+    assert_eq!(sub.floor, BigInt::from(0));
+    assert_eq!(sub.ceil, BigInt::from(1));
+}
+
+/// The Int-leaf and scaled-product walks are pure functions of the
+/// immutable term store, memoized per term: a second collection over
+/// the same asserted atoms must return identical lists while
+/// visiting zero additional term nodes. Unmemoized, the walks
+/// re-traversed shared subterm DAGs per asserted atom per check
+/// (sampled at ~4% of the solver thread on Certora `65782_..._8`).
+#[test]
+fn pure_term_walks_are_memoized_per_term() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let two = terms.mk_int(BigInt::from(2));
+    let zero = terms.mk_int(BigInt::from(0));
+    // Scaled product `2*x*y`, shared through a doubling DAG so an
+    // unmemoized walk visits exponentially many nodes.
+    let scaled = terms.mk_mul(vec![two, x, y]);
+    let mut dag = scaled;
+    for _ in 0..12 {
+        dag = terms.mk_add(vec![dag, dag]);
+    }
+    let atom = terms.mk_ge(dag, zero);
+
+    let mut solver = NiaSolver::new(&terms);
+    solver.assert_literal(atom, true);
+
+    assert!(solver.has_scaled_product_vars(), "2*x*y is scaled");
+    let mut leaves: Vec<TermId> = Vec::new();
+    solver.collect_int_var_leaves(dag, &mut leaves);
+    let mut sorted = leaves.clone();
+    sorted.sort_by_key(|t| t.0);
+    let mut expect = vec![x, y];
+    expect.sort_by_key(|t| t.0);
+    assert_eq!(sorted, expect, "leaves of the DAG are x and y");
+
+    let after_first = solver.pure_walk_nodes.get();
+    assert!(after_first > 0, "first walks must visit nodes");
+
+    assert!(solver.has_scaled_product_vars());
+    let mut leaves2: Vec<TermId> = Vec::new();
+    solver.collect_int_var_leaves(dag, &mut leaves2);
+    assert_eq!(leaves2, leaves, "memoized walk returns identical lists");
+    assert_eq!(
+        solver.pure_walk_nodes.get(),
+        after_first,
+        "second walks must be served from the per-term memos"
+    );
+}

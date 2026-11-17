@@ -2910,7 +2910,10 @@ mod tests {
         );
 
         args.competition = false;
-        assert!(solver_args_for_eval("chc", &args, 12.3456).is_empty());
+        assert_eq!(
+            solver_args_for_eval("chc", &args, 12.3456).as_slice(),
+            &[] as &[String]
+        );
     }
 
     #[test]
@@ -3229,7 +3232,7 @@ inputs:
         assert_eq!(first.domain, "sat");
         assert_eq!(first.competition, "SAT-COMP");
         assert_eq!(first.score_scope, None);
-        assert!(!first.items.is_empty());
+        assert_ne!(first.items.as_slice(), &[] as &[EvalBenchmarkIdentity]);
         assert!(first.content_inventory_sha256.starts_with("sha256:"));
         assert!(first
             .items

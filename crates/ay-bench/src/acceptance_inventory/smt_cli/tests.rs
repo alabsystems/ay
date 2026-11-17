@@ -42,8 +42,8 @@ fn stats(status: &str, memory: u64) -> String {
         "version":"0.1.0","datetime_utc":"2026-09-29T00:00:00Z"}})
     .to_string()
 }
-fn checked(stdout: &str, stderr: &str, exit: Option<i32>) -> super::assess::Assessment {
-    super::assess::assess(
+fn checked(stdout: &str, stderr: &str, exit: Option<i32>) -> assess::Assessment {
+    assess::assess(
         &case(SmtMemoryVariant::Serial4GiB),
         &binary(),
         stdout,
@@ -62,7 +62,7 @@ fn profiles_preserve_no_flag_default_and_explicit_limits() {
         (SmtMemoryVariant::Historical2GiB, Some("2048")),
         (SmtMemoryVariant::MachineDefault, None),
     ] {
-        let args = super::execution::argv(
+        let args = execution::argv(
             &case(variant),
             std::path::Path::new("/private.smt2"),
             Duration::from_millis(9),
@@ -83,7 +83,7 @@ fn profiles_preserve_no_flag_default_and_explicit_limits() {
 fn exactly_bound_self_check_is_narrow_in_tree_evidence() {
     let result = checked("sat\n", &stats("sat", 4 * 1024 * 1024 * 1024), Some(0));
     assert!(result.checked);
-    assert!(result.blockers.is_empty());
+    assert_eq!(result.blockers.as_slice(), &[] as &[SmtCliBlocker]);
 }
 #[test]
 fn contradictory_duplicate_or_absent_verdicts_refuse() {
@@ -169,7 +169,7 @@ fn missing_duplicate_malformed_stats_refuse() {
 #[test]
 fn default_observation_must_exist_and_match_actual_case() {
     for expected in [None, Some(1)] {
-        let result = super::assess::assess(
+        let result = assess::assess(
             &case(SmtMemoryVariant::MachineDefault),
             &binary(),
             "sat\n",
@@ -186,7 +186,7 @@ fn default_observation_must_exist_and_match_actual_case() {
         )));
     }
     assert!(
-        super::assess::assess(
+        assess::assess(
             &case(SmtMemoryVariant::MachineDefault),
             &binary(),
             "sat\n",
@@ -205,7 +205,7 @@ fn stop_flags_dominate_matching_status() {
         (true, false, SmtCliBlocker::Deadline),
         (false, true, SmtCliBlocker::MemoryLimit),
     ] {
-        let result = super::assess::assess(
+        let result = assess::assess(
             &case(SmtMemoryVariant::Serial4GiB),
             &binary(),
             "sat\n",
@@ -223,7 +223,7 @@ fn stop_flags_dominate_matching_status() {
 fn unknown_binary_commit_is_not_qualified() {
     let mut b = binary();
     b.build_commit = "unknown".into();
-    let result = super::assess::assess(
+    let result = assess::assess(
         &case(SmtMemoryVariant::Serial4GiB),
         &b,
         "sat\n",
@@ -244,7 +244,7 @@ fn inventory(root: &std::path::Path) -> Inventory {
     std::fs::write(root.join("case.smt2"), bytes).unwrap();
     for input in doc["stored_inputs"].as_array_mut().unwrap() {
         if input["id"] == "input:range-len" {
-            input["sha256"] = json!(super::snapshot::hash(bytes).trim_start_matches("sha256:"));
+            input["sha256"] = json!(snapshot::hash(bytes).trim_start_matches("sha256:"));
         }
     }
     for request in doc["request_inventory"].as_array_mut().unwrap() {
@@ -259,7 +259,7 @@ fn select_original_smt_preserves_all_other_routes_and_performance() {
     let temp = tempfile::tempdir().unwrap();
     let inventory = inventory(temp.path());
     let roots = BTreeMap::from([("model-checker-consumer".into(), temp.path().to_path_buf())]);
-    let cases = super::selection::select(
+    let cases = selection::select(
         &inventory,
         &roots,
         &["input:range-len".into()],
@@ -278,7 +278,10 @@ fn select_original_smt_preserves_all_other_routes_and_performance() {
         .unwrap();
     assert_eq!(request.routes.len(), 2);
     assert!(request.routes.iter().all(|r| !r.evidence_qualified));
-    assert!(!request.performance_contract_ids.is_empty());
+    assert_ne!(
+        request.performance_contract_ids.as_slice(),
+        &[] as &[String]
+    );
 }
 #[test]
 fn missing_historical_bytes_horn_and_duplicate_selection_refuse() {
@@ -290,13 +293,9 @@ fn missing_historical_bytes_horn_and_duplicate_selection_refuse() {
         vec!["input:budget-bitreverse".into()],
         vec!["input:range-len".into(), "input:range-len".into()],
     ] {
-        assert!(super::selection::select(
-            &inventory,
-            &roots,
-            &ids,
-            &[SmtMemoryVariant::Serial4GiB]
-        )
-        .is_err());
+        assert!(
+            selection::select(&inventory, &roots, &ids, &[SmtMemoryVariant::Serial4GiB]).is_err()
+        );
     }
 }
 #[test]
@@ -309,13 +308,9 @@ fn undeclared_or_duplicate_profiles_refuse() {
         vec![SmtMemoryVariant::MachineDefault],
         vec![SmtMemoryVariant::Serial4GiB, SmtMemoryVariant::Serial4GiB],
     ] {
-        assert!(super::selection::select(
-            &inventory,
-            &roots,
-            &["input:range-len".into()],
-            &variants
-        )
-        .is_err());
+        assert!(
+            selection::select(&inventory, &roots, &["input:range-len".into()], &variants).is_err()
+        );
     }
 }
 #[test]
@@ -324,26 +319,26 @@ fn exact_snapshot_and_expired_original_owner_are_checked() {
     let src = temp.path().join("in");
     std::fs::write(&src, b"sat\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    super::snapshot::copy(
+    snapshot::copy(
         &src,
         &temp.path().join("ok"),
-        &super::snapshot::hash(b"sat\n"),
+        &snapshot::hash(b"sat\n"),
         4,
         deadline,
     )
     .unwrap();
-    assert!(super::snapshot::copy(
+    assert!(snapshot::copy(
         &src,
         &temp.path().join("bad"),
-        &super::snapshot::hash(b"bad\n"),
+        &snapshot::hash(b"bad\n"),
         4,
         deadline
     )
     .is_err());
-    assert!(super::snapshot::copy(
+    assert!(snapshot::copy(
         &src,
         &temp.path().join("late"),
-        &super::snapshot::hash(b"sat\n"),
+        &snapshot::hash(b"sat\n"),
         4,
         Instant::now()
     )
@@ -358,10 +353,10 @@ fn symlink_snapshot_cannot_supply_original_bytes() {
     std::fs::write(&src, b"sat\n").unwrap();
     let link = temp.path().join("link");
     std::os::unix::fs::symlink(&src, &link).unwrap();
-    assert!(super::snapshot::copy(
+    assert!(snapshot::copy(
         &link,
         &temp.path().join("out"),
-        &super::snapshot::hash(b"sat\n"),
+        &snapshot::hash(b"sat\n"),
         4,
         Instant::now() + Duration::from_secs(5)
     )
@@ -372,7 +367,7 @@ fn symlink_snapshot_cannot_supply_original_bytes() {
 fn original_smt_unsat_polarity_is_not_the_horn_query_mapping() {
     let mut input = case(SmtMemoryVariant::Historical2GiB);
     input.expected = CliStatus::Unsat;
-    let result = super::assess::assess(
+    let result = assess::assess(
         &input,
         &binary(),
         "unsat\n",
@@ -383,7 +378,7 @@ fn original_smt_unsat_polarity_is_not_the_horn_query_mapping() {
         None,
     );
     assert!(result.checked);
-    let wrong = super::assess::assess(
+    let wrong = assess::assess(
         &input,
         &binary(),
         "sat\n",
@@ -411,7 +406,7 @@ fn guarded_synthetic_cli_binds_artifacts_without_qualifying_requests() {
         &selection,
         json!({
             "schema":"ay.model-checker-consumer-smt-cli-selection/v1", "inventory":"inventory.json",
-            "inventory_sha256":super::snapshot::hash(&inventory_bytes),
+            "inventory_sha256":snapshot::hash(&inventory_bytes),
             "repository_roots":{"model-checker-consumer":temp.path()},"stored_input_ids":["input:range-len"],
             "memory_variants":["serial-enforced-tree-4g"]
         })
@@ -455,11 +450,11 @@ fn guarded_synthetic_cli_binds_artifacts_without_qualifying_requests() {
 fn known_default_above_tree_cap_is_preserved_and_distinguished() {
     let observed = Some(32 * 1024 * 1024 * 1024_u64);
     let mut blockers = Vec::new();
-    super::execution::default_envelope(observed, &mut blockers);
+    execution::default_envelope(observed, &mut blockers);
     assert_eq!(observed, Some(34_359_738_368));
     assert_eq!(blockers, [SmtCliBlocker::DefaultMemoryExceedsTreeEnvelope]);
     blockers.clear();
-    super::execution::default_envelope(None, &mut blockers);
+    execution::default_envelope(None, &mut blockers);
     assert_eq!(blockers, [SmtCliBlocker::DefaultMemoryUnavailable]);
 }
 

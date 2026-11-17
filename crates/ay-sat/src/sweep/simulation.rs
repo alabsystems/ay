@@ -119,17 +119,6 @@ impl Sweeper {
     /// Signed literal convention matches the existing probe code: each class
     /// member is the literal (positive or negative) whose polarity dominated
     /// the simulation signature (popcount > 32).
-    #[cfg(test)]
-    pub(super) fn find_candidates_by_simulation(
-        &self,
-        clauses: &ClauseArena,
-        vals: &[i8],
-        frozen: &[u32],
-    ) -> Vec<Vec<u32>> {
-        self.find_candidates_by_simulation_budgeted(clauses, vals, frozen, None)
-            .0
-    }
-
     /// The simulation with its work charged to a tick budget: one tick per
     /// literal of the copied formula, per variable visited in a round and per
     /// clause scanned by the propagation. The round loop stops after the

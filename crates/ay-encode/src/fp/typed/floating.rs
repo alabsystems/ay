@@ -9,7 +9,11 @@ use super::{both, fixed, scalar, Operator, Scalar, Shape};
 use crate::fp::FpAdapterError;
 
 pub(super) fn describe(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> {
-    use ExprValue::*;
+    use ExprValue::{
+        BvToFp, BvToFpUnsigned, FpAbs, FpAdd, FpDiv, FpFma, FpFromBvs, FpMinusInfinity,
+        FpMinusZero, FpMul, FpNaN, FpNeg, FpPlusInfinity, FpPlusZero, FpRem, FpSqrt, FpSub,
+        FpTruncatingRem,
+    };
     match expr.value() {
         FpPlusZero { eb, sb }
         | FpMinusZero { eb, sb }
@@ -110,7 +114,7 @@ fn mode(rm: RoundingMode) -> Result<usize, FpAdapterError> {
 }
 
 fn arithmetic(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> {
-    use ExprValue::*;
+    use ExprValue::{FpAdd, FpDiv, FpMul, FpSub};
     let (name, r, a, b) = match expr.value() {
         FpAdd(r, a, b) => ("fp.add", r, a, b),
         FpSub(r, a, b) => ("fp.sub", r, a, b),
@@ -131,7 +135,7 @@ fn arithmetic(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> 
 // The literal RM is inserted by the positional builder, not a new source input.
 // All original operands stay visited, including a zero FMA factor.
 fn rounded(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> {
-    use ExprValue::*;
+    use ExprValue::{FpFma, FpSqrt};
     let (name, rm, children) = match expr.value() {
         FpSqrt(rm, a) => ("fp.sqrt", rm, fixed(Some(a), None, None)),
         FpFma(rm, a, b, c) => ("fp.fma", rm, fixed(Some(a), Some(b), Some(c))),
@@ -171,7 +175,7 @@ fn fields<'a>(
 }
 
 fn predicate(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> {
-    use ExprValue::*;
+    use ExprValue::{FpEq, FpGe, FpGt, FpLe, FpLt};
     if result != Scalar::Bool {
         return Err(FpAdapterError::Unsupported("typed FP source operation"));
     }
@@ -199,7 +203,9 @@ fn predicate(expr: &Expr, result: Scalar) -> Result<Shape<'_>, FpAdapterError> {
 }
 
 fn classification(expr: &Expr) -> Result<Shape<'_>, FpAdapterError> {
-    use ExprValue::*;
+    use ExprValue::{
+        FpIsInfinite, FpIsNaN, FpIsNegative, FpIsNormal, FpIsPositive, FpIsSubnormal, FpIsZero,
+    };
     let (name, a) = match expr.value() {
         FpIsNaN(a) => ("fp.isNaN", a),
         FpIsInfinite(a) => ("fp.isInfinite", a),

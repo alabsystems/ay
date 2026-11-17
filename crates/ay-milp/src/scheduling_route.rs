@@ -1212,7 +1212,10 @@ mod tests {
             .expect("typed scheduling certificate");
         verify_optimality_certificate(session.model(), &value, certificate)
             .expect("published certificate replay");
-        assert!(session.replay_claims().is_empty());
+        assert_eq!(
+            session.replay_claims(),
+            &[] as &[crate::cert_io::ReplayClaim]
+        );
     }
 
     #[test]

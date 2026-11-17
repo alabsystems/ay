@@ -15,11 +15,12 @@ fn nan_structural_identity_is_not_ieee_fp_equality_in_the_public_clause_entry() 
                 (nan.clone().fp_eq(nan).not(), true),
             ] {
                 let roots = [root];
-                let output = relation(&roots, &[], &problem, budget);
-                let (body, source) = output.into_parts().unwrap();
-                assert_eq!(units::consistent(&body, budget), expected);
-                drop(body);
-                drop(source);
+                {
+                    let output = relation(&roots, &[], &problem, budget);
+                    let (body, _source) = output.into_parts().unwrap();
+                    assert_eq!(units::consistent(&body, budget), expected);
+                    drop(body);
+                }
                 budget.charge(0).unwrap();
             }
         }
@@ -39,11 +40,12 @@ fn signed_zero_structural_identity_and_ieee_equality_keep_their_distinction() {
                 (positive.fp_eq(negative), true),
             ] {
                 let roots = [root];
-                let output = relation(&roots, &[], &problem, budget);
-                let (body, source) = output.into_parts().unwrap();
-                assert_eq!(units::consistent(&body, budget), expected);
-                drop(body);
-                drop(source);
+                {
+                    let output = relation(&roots, &[], &problem, budget);
+                    let (body, _source) = output.into_parts().unwrap();
+                    assert_eq!(units::consistent(&body, budget), expected);
+                    drop(body);
+                }
                 budget.charge(0).unwrap();
             }
         }
@@ -66,15 +68,16 @@ fn all_five_literal_modes_use_the_real_public_whole_relation_entry() {
             ] {
                 let root = zero.clone().fp_add(rm, zero.clone()).fp_is_zero();
                 let roots = [root];
-                let output = relation(&roots, &[], &problem, budget);
-                assert!(output.body().constraint.is_some());
-                assert!(
-                    matches!(output.source().roots()[0].value(),ExprValue::FpIsZero(value)
-                    if matches!(value.value(),ExprValue::FpAdd(actual,_,_) if *actual==rm))
-                );
-                let (body, source) = output.into_parts().unwrap();
-                drop(body);
-                drop(source);
+                {
+                    let output = relation(&roots, &[], &problem, budget);
+                    assert!(output.body().constraint.is_some());
+                    assert!(
+                        matches!(output.source().roots()[0].value(),ExprValue::FpIsZero(value)
+                        if matches!(value.value(),ExprValue::FpAdd(actual,_,_) if *actual==rm))
+                    );
+                    let (body, _source) = output.into_parts().unwrap();
+                    drop(body);
+                }
                 budget.charge(0).unwrap();
             }
         }
@@ -92,16 +95,17 @@ fn constant_condition_still_preserves_both_typed_arms_in_the_stable_source() {
     let roots = [selected.fp_is_zero()];
     let problem = ChcProblem::new();
     with_owner(|budget| {
-        let output = relation(&roots, &[], &problem, budget);
-        assert!(
-            matches!(output.source().roots()[0].value(),ExprValue::FpIsZero(inner)
-            if matches!(inner.value(),ExprValue::Ite { else_expr,.. }
-                if matches!(else_expr.value(),ExprValue::FpMinusInfinity { .. })))
-        );
-        let (body, source) = output.into_parts().unwrap();
-        assert!(units::consistent(&body, budget));
-        drop(body);
-        drop(source);
+        {
+            let output = relation(&roots, &[], &problem, budget);
+            assert!(
+                matches!(output.source().roots()[0].value(),ExprValue::FpIsZero(inner)
+                if matches!(inner.value(),ExprValue::Ite { else_expr,.. }
+                    if matches!(else_expr.value(),ExprValue::FpMinusInfinity { .. })))
+            );
+            let (body, _source) = output.into_parts().unwrap();
+            assert!(units::consistent(&body, budget));
+            drop(body);
+        }
         budget.charge(0).unwrap();
     });
 }

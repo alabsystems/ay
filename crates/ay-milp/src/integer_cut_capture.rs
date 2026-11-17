@@ -92,7 +92,7 @@ pub(crate) fn finished(outcome: &Outcome) -> bool {
         outcome,
         Outcome::Optimal { .. }
             | Outcome::Infeasible { .. }
-            | Outcome::Unbounded { .. }
+            | Outcome::Unbounded
             | Outcome::Feasible {
                 incumbent_only: false,
                 ..
@@ -262,7 +262,13 @@ mod tests {
         assert_eq!(capture.pending.summary.adopted_root_sides, 1);
         assert!(!capture.pending.summary.adoption_scan_complete);
         assert!(capture.pending.summary.interrupted);
-        assert!(capture.adopted.is_empty());
+        assert_eq!(
+            capture.adopted.as_slice(),
+            &[] as &[(
+                Vec<(u32, num_rational::BigRational)>,
+                num_rational::BigRational
+            )]
+        );
         capture.finish(
             &Outcome::Feasible {
                 model_values: vec![],
@@ -277,7 +283,7 @@ mod tests {
         assert!(batch.summary.interrupted);
         assert!(!batch.summary.adoption_scan_complete);
         assert_eq!(batch.summary.adopted_root_sides, 1);
-        assert!(batch.cuts.is_empty());
+        assert_eq!(batch.cuts.as_slice(), &[] as &[CertifiedIntegerCut]);
     }
 
     #[test]
@@ -297,7 +303,13 @@ mod tests {
         assert!(capture.pending.summary.adoption_scan_complete);
         assert_eq!(capture.pending.summary.adopted_root_sides, 1);
         assert!(capture.pending.summary.interrupted);
-        assert!(capture.adopted.is_empty());
+        assert_eq!(
+            capture.adopted.as_slice(),
+            &[] as &[(
+                Vec<(u32, num_rational::BigRational)>,
+                num_rational::BigRational
+            )]
+        );
         // The same complete count succeeds without interruption; this pins
         // the actual upper-side negation rather than a row-size rejection.
         drop(capture);
@@ -334,7 +346,7 @@ mod tests {
             panic!("unwind before native finish");
         }));
         assert!(panic.is_err());
-        assert!(owner.take().cuts.is_empty());
+        assert_eq!(owner.take().cuts.as_slice(), &[] as &[CertifiedIntegerCut]);
         let mut interrupted = owner.enter(&source).unwrap();
         interrupted.record_root(&adopted, rows.clone(), None);
         interrupted.finish(
@@ -344,7 +356,7 @@ mod tests {
             &source,
             None,
         );
-        assert!(owner.take().cuts.is_empty());
+        assert_eq!(owner.take().cuts.as_slice(), &[] as &[CertifiedIntegerCut]);
         let mut complete = owner.enter(&source).unwrap();
         complete.record_root(&adopted, rows, None);
         complete.finish(
@@ -357,7 +369,7 @@ mod tests {
             None,
         );
         assert_eq!(owner.take().cuts.len(), 1);
-        assert!(owner.take().cuts.is_empty());
+        assert_eq!(owner.take().cuts.as_slice(), &[] as &[CertifiedIntegerCut]);
     }
 
     #[test]
@@ -427,6 +439,6 @@ mod tests {
         let batch = owner.take();
         assert_eq!(batch.summary.adopted_root_sides, 1);
         assert_eq!(batch.summary.unsupported_sides, 1);
-        assert!(batch.cuts.is_empty());
+        assert_eq!(batch.cuts.as_slice(), &[] as &[CertifiedIntegerCut]);
     }
 }

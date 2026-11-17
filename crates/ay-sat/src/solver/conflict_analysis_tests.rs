@@ -2576,7 +2576,13 @@ fn test_append_lrat_unit_chain_uses_unit_proof_id_for_dynamic_var() {
     assign_test_lit(&mut solver, fresh_lit);
     solver.record_unit_proof_id_for_lit(fresh_lit, 77);
 
-    solver.append_lrat_unit_chain(&[fresh_idx], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[fresh_idx],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
     // get_result requires asserting_literal to be set (debug invariant).
     solver.conflict.set_asserting_literal(fresh_lit);
     let result = solver.conflict.get_result(0, 0);
@@ -2601,7 +2607,13 @@ fn test_append_lrat_unit_chain_counts_missing_visible_hint() {
     solver.trail = vec![lit];
     assign_test_lit(&mut solver, lit);
 
-    solver.append_lrat_unit_chain(&[0], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[0],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
 
     let stats = solver.lrat_materialization_stats();
     assert_eq!(stats.unit_chain_calls, 1);
@@ -2615,7 +2627,13 @@ fn test_append_lrat_unit_chain_counts_missing_visible_hint() {
 fn test_append_lrat_unit_chain_fast_path_emits_seed_units_in_reverse_trail_order() {
     let (mut solver, lits) = setup_lrat_unit_chain_window_fixture();
 
-    solver.append_lrat_unit_chain(&[5, 7], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[5, 7],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
     solver.conflict.set_asserting_literal(lits[7]);
     let result = solver.conflict.get_result(0, 0);
 
@@ -2641,7 +2659,13 @@ fn test_append_lrat_unit_chain_fast_path_honors_rup_satisfied() {
     let mut rup_satisfied = det_hash_set_new();
     rup_satisfied.insert(lits[7]);
 
-    solver.append_lrat_unit_chain(&[5, 7], &rup_satisfied);
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[5, 7],
+            &rup_satisfied,
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
     solver.conflict.set_asserting_literal(lits[7]);
     let result = solver.conflict.get_result(0, 0);
 
@@ -2663,7 +2687,13 @@ fn test_append_lrat_unit_chain_falls_back_on_stale_trail_pos() {
     let (mut solver, lits) = setup_lrat_unit_chain_window_fixture();
     solver.var_data[7].trail_pos = 0;
 
-    solver.append_lrat_unit_chain(&[5, 7], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[5, 7],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
     solver.conflict.set_asserting_literal(lits[7]);
     let result = solver.conflict.get_result(0, 0);
 
@@ -2746,7 +2776,13 @@ fn test_append_lrat_unit_chain_after_materialization_skips_bfs_dependencies() {
     let a_unit_id = solver
         .visible_unit_proof_id_for_lit(a)
         .expect("a should have a materialized visible unit proof");
-    solver.append_lrat_unit_chain(&[0], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[0],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
 
     solver.conflict.set_asserting_literal(a);
     let result = solver.conflict.get_result(0, 0);
@@ -2841,7 +2877,13 @@ fn test_append_lrat_unit_chain_strict_fast_path_ignores_level0_proof_id() {
     assert_eq!(solver.visible_unit_proof_id_for_lit(a), None);
     assert_eq!(solver.level0_var_proof_id(a.variable().index()), Some(501));
 
-    solver.append_lrat_unit_chain(&[a.variable().index()], &det_hash_set_new());
+    solver
+        .append_lrat_unit_chain_admitted(
+            &[a.variable().index()],
+            &det_hash_set_new(),
+            &conflict_analysis_minimize_lrat::root::Ordinary,
+        )
+        .unwrap_or_else(|never| match never {});
     solver.conflict.set_asserting_literal(a);
     let result = solver.conflict.get_result(0, 0);
 

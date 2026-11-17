@@ -134,7 +134,7 @@ fn target_fsb_root_fast_path_spends_no_advice_calls() {
     };
     row.verify(&relaxation).unwrap();
     assert_eq!(report.probe_calls(), 0);
-    assert!(report.selected_splits().is_empty());
+    assert_eq!(report.selected_splits(), &[] as &[Col]);
 }
 
 #[test]

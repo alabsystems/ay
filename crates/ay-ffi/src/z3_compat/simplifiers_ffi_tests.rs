@@ -328,7 +328,7 @@ fn test_add_simplifier_preserves_sat_verdict_and_model() {
                 model,
                 Z3_ast_vector_get(ctx, original, index),
                 true,
-                &mut value,
+                &raw mut value,
             ));
             assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
         }
@@ -414,7 +414,7 @@ fn converted_solver_reconstructs_source_values_across_scopes_and_assumptions() {
                 snapshot,
                 original_value,
                 false,
-                &mut value
+                &raw mut value
             ));
             assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
             Z3_solver_push(ctx, solver);
@@ -425,7 +425,7 @@ fn converted_solver_reconstructs_source_values_across_scopes_and_assumptions() {
             assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
             let impossible = Z3_mk_not(ctx, original_value);
             assert_eq!(
-                Z3_solver_check_assumptions(ctx, solver, 1, &impossible),
+                Z3_solver_check_assumptions(ctx, solver, 1, &raw const impossible),
                 Z3_L_FALSE
             );
             let core = Z3_solver_get_unsat_core(ctx, solver);
@@ -453,7 +453,7 @@ fn converted_solver_reconstructs_source_values_across_scopes_and_assumptions() {
                 snapshot,
                 original_value,
                 false,
-                &mut value
+                &raw mut value
             ));
             assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
             Z3_del_context(ctx);
@@ -481,14 +481,14 @@ fn converted_field_sat_solver_reads_the_actual_authored_boolean_and_field_witnes
         let model = Z3_solver_get_model(ctx, solver);
         assert!(!model.is_null());
         let mut value = 0;
-        assert!(Z3_model_eval(ctx, model, x, false, &mut value));
+        assert!(Z3_model_eval(ctx, model, x, false, &raw mut value));
         assert!(Z3_is_eq_ast(ctx, value, three));
         assert!(Z3_model_eval(
             ctx,
             model,
             Z3_ast_vector_get(ctx, roots, 0),
             false,
-            &mut value
+            &raw mut value
         ));
         assert_eq!(Z3_get_bool_value(ctx, value), Z3_L_TRUE);
         Z3_solver_push(ctx, solver);
@@ -500,7 +500,7 @@ fn converted_field_sat_solver_reads_the_actual_authored_boolean_and_field_witnes
         assert_eq!(Z3_solver_check(ctx, solver), Z3_L_FALSE);
         Z3_solver_pop(ctx, solver, 1);
         assert_eq!(Z3_solver_check(ctx, solver), Z3_L_TRUE);
-        assert!(Z3_model_eval(ctx, model, x, false, &mut value));
+        assert!(Z3_model_eval(ctx, model, x, false, &raw mut value));
         assert!(Z3_is_eq_ast(ctx, value, three));
         Z3_del_context(ctx);
     }

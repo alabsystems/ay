@@ -51,11 +51,11 @@ pub(super) fn validate(input: &StoredInput) -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| BenchError::msg("archive input lacks its container digest"))?;
     validation::sha256(digest)?;
-    if !input
+    if input
         .metadata
         .get("archive_size_bytes")
         .and_then(serde_json::Value::as_u64)
-        .is_some_and(|size| size > 0)
+        .is_none_or(|size| size == 0)
         || input.sha256.is_none()
         || input.size_bytes.is_none()
     {

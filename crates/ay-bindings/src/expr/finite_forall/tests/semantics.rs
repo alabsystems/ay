@@ -64,7 +64,7 @@ fn truth(expr: &Expr, model: Model) -> bool {
             assert_eq!(vars.len(), 1);
             assert_eq!(vars[0].0, "i");
             assert_eq!(vars[0].1.bitvec_width(), Some(2));
-            assert!(triggers.is_empty());
+            assert_eq!(triggers.as_slice(), &[] as &[Vec<Expr>]);
             (0..4).all(|index| truth(body, Model { index, ..model }))
         }
         other => panic!("unexpected Boolean oracle node: {other:?}"),

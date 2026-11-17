@@ -767,6 +767,52 @@ impl WatchedLists {
         self.dead_slots += 1;
     }
 
+    /// Remove every entry for clause offset `target` from a literal's
+    /// watch list (#sat-remove-watch-direct).
+    ///
+    /// Semantically identical to the scan in `Solver::remove_watch`
+    /// (same swap-remove sequence, hence the same surviving entries in
+    /// the same order and the same binary-first partition), but works
+    /// directly on the packed entry slice and the literal's meta
+    /// instead of re-resolving the view, offset and packed fields per
+    /// element. Level-0 GC calls this twice per replaced clause, and
+    /// the view-based scan profiled at the top of cruise-control's
+    /// inprocessing stacks.
+    pub(crate) fn remove_all_refs(&mut self, lit: Literal, target: u32) {
+        let start = self.meta[lit.index()].offset as usize;
+        let mut len = self.meta[lit.index()].len;
+        let mut binary_count = self.meta[lit.index()].binary_count;
+        let mut i: u32 = 0;
+        while i < len {
+            if entry_clause_off(self.buf_entries[start + i as usize]) == target {
+                // Inline of `swap_remove`'s two-step binary-partition swap.
+                let last = len - 1;
+                if i < binary_count {
+                    let last_binary = binary_count - 1;
+                    if i != last_binary {
+                        self.buf_entries
+                            .swap(start + i as usize, start + last_binary as usize);
+                    }
+                    if last_binary < last {
+                        self.buf_entries
+                            .swap(start + last_binary as usize, start + last as usize);
+                    }
+                    binary_count -= 1;
+                } else if i != last {
+                    self.buf_entries
+                        .swap(start + i as usize, start + last as usize);
+                }
+                len -= 1;
+                self.dead_slots += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let m = &mut self.meta[lit.index()];
+        m.len = len;
+        m.binary_count = binary_count;
+    }
+
     /// Truncate a literal's watch list to `new_len` entries.
     #[inline]
     #[allow(dead_code)] // audited-unused: kept pending the next dead-code cleanup slice
@@ -794,15 +840,6 @@ impl WatchedLists {
     }
 
     // ─── Slice access into the unified buffer ───────────────────────
-
-    /// Get the packed entries for a literal as an immutable slice.
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn entry_slice(&self, lit: Literal) -> &[u64] {
-        let m = &self.meta[lit.index()];
-        let start = m.offset as usize;
-        &self.buf_entries[start..start + m.len as usize]
-    }
 
     /// Raw mutable pointer to a literal's packed-entry region + length.
     ///

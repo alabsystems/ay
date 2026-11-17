@@ -910,7 +910,7 @@ pub struct Z3Context {
     /// ordinary C solver handles but owned for this context's entire lifetime.
     pub(crate) eval_session: Option<eval_session::EvalSession>,
     pub(crate) eval_active: bool,
-    pub(crate) proof_check_callback: proof_callback::Z3_proof_check_eh,
+    pub(crate) proof_check_callback: Z3_proof_check_eh,
     pub(crate) proof_check_user_context: *mut std::ffi::c_void,
     pub(crate) proof_tracking: ay_dpll::api::NativeProofTrackingCache,
     pub(crate) last_error: c_uint,
@@ -4206,13 +4206,6 @@ pub(crate) fn decode_indexed_ast(ctx: &Z3Context, a: Z3_ast, tag: u64) -> Option
     Some((a & TAGGED_AST_INDEX_MASK) as usize)
 }
 
-/// Mint this context's `+oo` (`negative == false`) or `-oo` AST handle.
-/// Value-canonical: the same inputs always produce the identical `u64`,
-/// so `Z3_is_eq_ast` (raw equality) holds across calls, as in z3.
-pub(crate) fn oo_ast(ctx: &Z3Context, negative: bool) -> Z3_ast {
-    encode_indexed_ast(ctx, OO_AST_TAG, usize::from(negative)).unwrap_or(0)
-}
-
 /// Decode an `oo` AST handle to its sign (`Some(true)` = `-oo`), or
 /// `None` for a foreign/forged/malformed handle.
 pub(crate) fn decode_oo_ast(ctx: &Z3Context, a: Z3_ast) -> Option<bool> {
@@ -4715,7 +4708,7 @@ pub(crate) fn cache_goal_with_depth(
         models: true,
         proofs: false,
         unsat_cores: false,
-        context: ctx as *mut Z3Context,
+        context: ptr::from_mut(ctx),
     }));
     ctx.goal_cache.push(handle);
     handle

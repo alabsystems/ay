@@ -3007,10 +3007,14 @@ mod tests {
         let model = repeated_single_node_blocks(2, 4, 1, true);
         let projection = project_network_design(&model, None).expect("two network blocks");
         assert_eq!(projection.components.len(), 2);
-        assert!(projection
-            .ordered_interchangeable_block_families(None)
-            .is_empty());
-        assert!(projection.adjacent_block_swap_candidates(None).is_empty());
+        assert_eq!(
+            projection.ordered_interchangeable_block_families(None),
+            Vec::<Vec<Vec<u32>>>::new()
+        );
+        assert_eq!(
+            projection.adjacent_block_swap_candidates(None),
+            Vec::<BTreeMap<u32, u32>>::new()
+        );
     }
 
     #[test]
@@ -3019,22 +3023,28 @@ mod tests {
         let model = repeated_single_node_blocks(block_count, 1, 0, false);
         let projection = project_network_design(&model, None).expect("many tiny network blocks");
         assert_eq!(projection.components.len(), block_count);
-        assert!(projection
-            .ordered_interchangeable_block_families(None)
-            .is_empty());
-        assert!(projection.adjacent_block_swap_candidates(None).is_empty());
+        assert_eq!(
+            projection.ordered_interchangeable_block_families(None),
+            Vec::<Vec<Vec<u32>>>::new()
+        );
+        assert_eq!(
+            projection.adjacent_block_swap_candidates(None),
+            Vec::<BTreeMap<u32, u32>>::new()
+        );
     }
 
     #[test]
     fn expired_deadline_declines_block_candidates_atomically() {
         let model = repeated_single_node_blocks(5, 4, 1, false);
         let projection = project_network_design(&model, None).expect("five network blocks");
-        assert!(projection
-            .ordered_interchangeable_block_families(Some(Instant::now()))
-            .is_empty());
-        assert!(projection
-            .adjacent_block_swap_candidates(Some(Instant::now()))
-            .is_empty());
+        assert_eq!(
+            projection.ordered_interchangeable_block_families(Some(Instant::now())),
+            Vec::<Vec<Vec<u32>>>::new()
+        );
+        assert_eq!(
+            projection.adjacent_block_swap_candidates(Some(Instant::now())),
+            Vec::<BTreeMap<u32, u32>>::new()
+        );
     }
 
     struct TinyFixture {

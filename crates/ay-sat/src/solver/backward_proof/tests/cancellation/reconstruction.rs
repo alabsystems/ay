@@ -28,7 +28,7 @@ fn prepared_reserved_reason_keeps_the_frozen_lrat_output() {
         Ok(actual),
         fixture
             .solver
-            .reconstruct_lrat_backward_bounded(&fixture.limits),
+            .reconstruct_lrat_backward_bounded_with_cancellation(&fixture.limits, &|| true),
     );
 }
 
@@ -109,7 +109,9 @@ fn live_failures_preserve_the_original_envelope_and_refusal_is_distinct() {
         );
         assert_same_result(
             actual,
-            fixture.solver.reconstruct_lrat_backward_bounded(&limits),
+            fixture
+                .solver
+                .reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
         );
         assert!(matches!(
             fixture

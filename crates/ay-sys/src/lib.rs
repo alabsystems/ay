@@ -39,6 +39,7 @@ pub fn allocation_page_size() -> Option<usize> {
         None
     }
 }
+#[cfg(unix)]
 pub mod build_observation;
 pub mod child_pipe;
 pub mod compute_budget;

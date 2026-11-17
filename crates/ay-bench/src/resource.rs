@@ -5,16 +5,15 @@
 //! Shared resource admission for benchmark subprocesses.
 //!
 //! Native measurements restrict RAM headroom and job/CPU requests. The existing
-//! `_oom_guard.py` lease and campaign watch-server still own aggregate exclusion
-//! and the RSS backstop; measurement does not confer a shared-machine grant.
+//! campaign lease owns aggregate exclusion; a native observer enforces the RSS
+//! backstop. Measurements do not confer a shared-machine grant.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use wait_timeout::ChildExt as _;
 
-// Every pipe to a sidecar or target this module writes goes through
+// Every target stdin pipe this module writes goes through
 // `ChildPipeWriter`: a `unix_hardened` build runs with SIGPIPE at its default
 // (terminate) disposition, so a write to a child that has died would kill the
 // benchmark parent instead of returning the `EPIPE` the callers handle.
@@ -640,13 +639,12 @@ pub fn effective_execution_envelope(
     ))
 }
 
-/// Process holding the host-wide planner lease for one complete benchmark
-/// campaign. Closing its stdin asks the Python sidecar to exit and releases
-/// the advisory lock; the sidecar is isolated so failed cleanup cannot target
-/// the benchmark parent process group.
+/// Actual native owner of the SAME legacy host/user campaign flock. This
+/// excludes cooperating campaigns; it is not a Targo shared-machine claim.
 #[derive(Debug)]
 struct GlobalHarnessLease {
-    process: std::sync::Mutex<Option<(Child, ChildPipeWriter<ChildStdin>)>>,
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+    native: native::CampaignLease,
 }
 
 static PROCESS_HARNESS_LEASE: std::sync::OnceLock<
@@ -662,16 +660,10 @@ static PROCESS_HARNESS_LEASE: std::sync::OnceLock<
 static TEST_CAMPAIGN_STATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
-// Test-compiled campaigns take the aggregate lease only on `_oom_guard.py`'s
-// explicit `--test-lock-path` seam, private to this test process, never on the
-// shared host/user lease. That lease is global host state: while any real
-// campaign or guarded build holds it, including a runner this test binary runs
-// under, the sidecar refuses and campaign tests fail reading its readiness
-// ("failed to fill whole buffer", 2026-09-22: all three sat_delta campaign
-// tests; 352/352 pass on this seam with that lease still held). While a test
-// holds it, a real campaign starting on the host is refused instead. The build
-// sandbox, whose host lock is read-only, needed this seam first.
-#[cfg(test)]
+// Tests use one private per-process inode and serialize real campaigns against
+// it. Production always uses /tmp, never TMPDIR; this test-only path is not an
+// admission bypass or a second production exclusion domain.
+#[cfg(all(test, unix, not(any(target_os = "redox", target_os = "solaris"))))]
 fn test_campaign_lease_path() -> PathBuf {
     std::env::temp_dir().join(format!("ay-bench-test-lease-{}.lock", std::process::id()))
 }
@@ -710,164 +702,67 @@ impl Drop for TestCampaignLease {
 }
 
 impl GlobalHarnessLease {
-    fn exclusive(guard_script: &Path, label: &str) -> Result<std::sync::Arc<Self>> {
+    fn exclusive(label: &str) -> Result<std::sync::Arc<Self>> {
         let slot =
             PROCESS_HARNESS_LEASE.get_or_init(|| std::sync::Mutex::new(std::sync::Weak::new()));
         let mut weak = vacant_harness_lease_slot(slot)?;
-        let lease = std::sync::Arc::new(Self::acquire(guard_script, label)?);
+        let lease = std::sync::Arc::new(Self::acquire(label)?);
         *weak = std::sync::Arc::downgrade(&lease);
         Ok(lease)
     }
 
-    fn acquire(guard_script: &Path, label: &str) -> Result<Self> {
-        const READY_MARKER: &[u8] = b"AY_OOM_HARNESS_LEASE_READY_V1\n";
-
-        let mut command = Command::new("python3");
-        command
-            .arg(guard_script)
-            .arg("lease")
-            .arg("--label")
-            .arg(label)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        #[cfg(test)]
+    fn acquire(label: &str) -> Result<Self> {
+        #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
         {
-            // The lock identity is the only difference from production; see
-            // `test_campaign_lease_path` for why it is never the host lock.
-            command
-                .arg("--test-lock-path")
-                .arg(test_campaign_lease_path());
+            #[cfg(test)]
+            let path = test_campaign_lease_path();
+            #[cfg(not(test))]
+            let path = PathBuf::from(format!(
+                "/tmp/ay-oom-guard-{}.lock",
+                nix::unistd::getuid().as_raw()
+            ));
+            Ok(Self {
+                native: native::CampaignLease::acquire(&path, label)?,
+            })
         }
-        #[cfg(unix)]
+        #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
         {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
+            let _ = label;
+            Err(BenchError::msg(
+                "native campaign exclusion requires supported POSIX flock",
+            ))
         }
-        let mut child = command
-            .spawn()
-            .with_bench_context(|| format!("acquiring aggregate resource lease for {label}"))?;
-        let stdin = ChildPipeWriter::take_from(&mut child).map_err(|error| {
-            sidecar_stdin_unusable(
-                &mut child,
-                &format!("{label}: aggregate resource lease"),
-                &error,
-            )
-        })?;
-        let Some(mut ready_pipe) = child.stdout.take() else {
-            terminate_process_group(&mut child);
-            return Err(BenchError::msg(format!(
-                "{label}: aggregate resource lease readiness pipe is missing"
-            )));
-        };
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::Read as _;
+    }
 
-            let mut marker = vec![0_u8; READY_MARKER.len()];
-            let result = ready_pipe
-                .read_exact(&mut marker)
-                .map(|()| marker == READY_MARKER)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match receiver.try_recv() {
-                Ok(Ok(true)) => break,
-                Ok(Ok(false)) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "{label}: aggregate resource lease emitted an invalid readiness marker"
-                    )));
-                }
-                Ok(Err(error)) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "{label}: reading aggregate resource lease readiness failed: {error}"
-                    )));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "{label}: aggregate resource lease readiness channel disconnected"
-                    )));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            match observe_child_unreaped(&child, false, label) {
-                Ok(UnreapedChildState::Exited) => {
-                    let status = kill_process_group_and_reap(&mut child, label)?;
-                    return Err(BenchError::msg(format!(
-                        "{label}: aggregate resource lease exited before arming ({status})"
-                    )));
-                }
-                Ok(UnreapedChildState::Running) => {}
-                Ok(UnreapedChildState::Stopped(_)) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "{label}: aggregate resource lease stopped before arming"
-                    )));
-                }
-                Err(error) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "{label}: checking aggregate resource lease failed: {error}"
-                    )));
-                }
-            }
-            if Instant::now() >= deadline {
-                terminate_process_group(&mut child);
-                return Err(BenchError::msg(format!(
-                    "{label}: aggregate resource lease did not arm within 10 seconds"
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        match observe_child_unreaped(&child, false, label) {
-            Ok(UnreapedChildState::Running) => {}
-            Ok(status) => {
-                terminate_process_group(&mut child);
-                return Err(BenchError::msg(format!(
-                    "{label}: aggregate resource lease died immediately after readiness ({status:?})"
-                )));
-            }
-            Err(error) => {
-                terminate_process_group(&mut child);
-                return Err(BenchError::msg(format!(
-                    "{label}: cannot verify aggregate resource lease after readiness: {error}"
-                )));
-            }
-        }
-
+    #[cfg(all(test, unix, not(any(target_os = "redox", target_os = "solaris"))))]
+    fn at_test_path(path: &Path, label: &str) -> Result<Self> {
         Ok(Self {
-            process: std::sync::Mutex::new(Some((child, stdin))),
+            native: native::CampaignLease::acquire(path, label)?,
         })
     }
 
+    fn path(&self) -> Result<&Path> {
+        #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+        {
+            Ok(self.native.path())
+        }
+        #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
+        {
+            Err(BenchError::msg("native campaign exclusion unsupported"))
+        }
+    }
+
     fn ensure_alive(&self, label: &str) -> Result<()> {
-        let process = self
-            .process
-            .lock()
-            .map_err(|_| BenchError::msg("aggregate resource lease mutex was poisoned"))?;
-        let Some((child, _stdin)) = process.as_ref() else {
-            return Err(BenchError::msg(format!(
-                "{label}: aggregate resource lease handle is missing"
-            )));
-        };
-        match observe_child_unreaped(child, false, label) {
-            Ok(UnreapedChildState::Running) => Ok(()),
-            Ok(UnreapedChildState::Exited) => Err(BenchError::msg(format!(
-                "{label}: aggregate resource lease exited and released the host admission lock"
-            ))),
-            Ok(UnreapedChildState::Stopped(signal)) => Err(BenchError::msg(format!(
-                "{label}: aggregate resource lease stopped with {signal} and is not enforcing host admission"
-            ))),
-            Err(error) => Err(BenchError::msg(format!(
-                "{label}: aggregate resource lease health check failed: {error}"
-            ))),
+        #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+        {
+            self.native
+                .ensure_alive()
+                .map_err(|error| BenchError::msg(format!("{label}: {error}")))
+        }
+        #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
+        {
+            let _ = label;
+            Err(BenchError::msg("native campaign exclusion unsupported"))
         }
     }
 }
@@ -886,553 +781,27 @@ fn vacant_harness_lease_slot(
     Ok(weak)
 }
 
-impl Drop for GlobalHarnessLease {
-    fn drop(&mut self) {
-        let process = match self.process.get_mut() {
-            Ok(process) => process.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some((mut child, stdin)) = process else {
-            return;
-        };
-        drop(stdin);
-        match wait_for_child_exit_unreaped(&child, Duration::from_secs(5), "aggregate lease") {
-            Ok(true) => {
-                let _ = kill_process_group_and_reap(&mut child, "aggregate lease");
-            }
-            Ok(false) | Err(_) => terminate_process_group(&mut child),
-        }
-    }
-}
-
-const WATCHDOG_SERVER_READY: &[u8] = b"AY_OOM_WATCHDOG_SERVER_READY_V1\n";
-const WATCHDOG_SERVER_MAX_LINE: u64 = 4096;
-const WATCHDOG_SERVER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
-const WATCHDOG_SERVER_STATE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
-
-#[cfg(target_os = "linux")]
-fn watchdog_server_process_is_responsive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let Some((_, suffix)) = stat.rsplit_once(") ") else {
-        return false;
-    };
-    !matches!(
-        suffix.as_bytes().first().copied(),
-        Some(b'T' | b't' | b'Z' | b'X')
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn watchdog_server_process_is_responsive(_pid: u32) -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WatchdogServerEvent {
-    Ready,
-    Done,
-    Breach(u64),
-}
-
-type WatchdogServerMessage = std::result::Result<WatchdogServerEvent, String>;
-
-#[derive(Debug)]
-struct WatchdogServerProcess {
-    child: Child,
-    /// A server that dies between the health check and a registration must
-    /// fail that registration, not kill the campaign parent.
-    stdin: ChildPipeWriter<ChildStdin>,
-}
-
-/// One Python watchdog process per benchmark campaign. Individual solver
-/// groups retain independent authenticated guards, while the server's threads
-/// share `_oom_guard.py`'s single cached `/proc` snapshot.
-#[derive(Debug)]
-struct SharedWatchdogServer {
-    guard_script: PathBuf,
-    process: std::sync::Mutex<Option<WatchdogServerProcess>>,
-    registrations: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, std::sync::mpsc::Sender<WatchdogServerMessage>>,
-        >,
-    >,
-    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    last_heartbeat_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    last_process_check_ns: std::sync::atomic::AtomicU64,
-    next_id: std::sync::atomic::AtomicU64,
-}
-
-impl SharedWatchdogServer {
-    fn new(guard_script: PathBuf) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            guard_script,
-            process: std::sync::Mutex::new(None),
-            registrations: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            healthy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_heartbeat_ns: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_process_check_ns: std::sync::atomic::AtomicU64::new(0),
-            next_id: std::sync::atomic::AtomicU64::new(1),
-        })
-    }
-
-    fn ensure_started(&self) -> Result<()> {
-        use std::sync::atomic::Ordering;
-
-        let mut process = self
-            .process
-            .lock()
-            .map_err(|_| BenchError::msg("RSS watchdog server mutex was poisoned"))?;
-        if let Some(server) = process.as_mut() {
-            if self.heartbeat_is_fresh() && watchdog_server_process_is_responsive(server.child.id())
-            {
-                return match server.child.try_wait() {
-                    Ok(None) => Ok(()),
-                    Ok(Some(status)) => {
-                        self.healthy.store(false, Ordering::Release);
-                        Err(BenchError::msg(format!(
-                            "campaign RSS watchdog server exited unexpectedly ({status})"
-                        )))
-                    }
-                    Err(error) => {
-                        self.healthy.store(false, Ordering::Release);
-                        Err(error.into())
-                    }
-                };
-            }
-            return Err(BenchError::msg(
-                "campaign RSS watchdog server is no longer healthy",
-            ));
-        }
-
-        let mut command = Command::new("python3");
-        command
-            .arg(&self.guard_script)
-            .arg("watch-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().with_bench_context(|| {
-            format!(
-                "starting campaign RSS watchdog server {}",
-                self.guard_script.display()
-            )
-        })?;
-        let stdin = ChildPipeWriter::take_from(&mut child)
-            .map_err(|error| sidecar_stdin_unusable(&mut child, "RSS watchdog server", &error))?;
-        let Some(stdout) = child.stdout.take() else {
-            terminate_process_group(&mut child);
-            return Err(BenchError::msg("RSS watchdog server stdout is missing"));
-        };
-
-        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
-        let registrations = std::sync::Arc::clone(&self.registrations);
-        let healthy = std::sync::Arc::clone(&self.healthy);
-        let last_heartbeat_ns = std::sync::Arc::clone(&self.last_heartbeat_ns);
-        std::thread::spawn(move || {
-            watchdog_server_reader(
-                stdout,
-                registrations,
-                healthy,
-                last_heartbeat_ns,
-                ready_sender,
-            );
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match ready_receiver.try_recv() {
-                Ok(Ok(())) => break,
-                Ok(Err(error)) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "RSS watchdog server readiness failed: {error}"
-                    )));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(
-                        "RSS watchdog server readiness channel disconnected",
-                    ));
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    terminate_process_group(&mut child);
-                    return Err(BenchError::msg(format!(
-                        "RSS watchdog server exited before arming ({status})"
-                    )));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    terminate_process_group(&mut child);
-                    return Err(error.into());
-                }
-            }
-            if Instant::now() >= deadline {
-                terminate_process_group(&mut child);
-                return Err(BenchError::msg(
-                    "RSS watchdog server did not arm within 10 seconds",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        *process = Some(WatchdogServerProcess { child, stdin });
-        Ok(())
-    }
-
-    fn register(
-        self: &std::sync::Arc<Self>,
-        pid: u32,
-        limit_mb: usize,
-        label: &str,
-    ) -> Result<RssWatchdog> {
-        use std::fmt::Write as _;
-        use std::io::Write as _;
-        use std::sync::atomic::Ordering;
-
-        self.ensure_started()?;
-        if label.len() > 512 {
-            return Err(BenchError::msg("RSS watchdog label exceeds 512 bytes"));
-        }
-        let watch_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if watch_id == 0 || watch_id == u64::MAX {
-            return Err(BenchError::msg("RSS watchdog registration ID exhausted"));
-        }
-        let mut label_hex = String::with_capacity(label.len().saturating_mul(2));
-        for byte in label.as_bytes() {
-            write!(&mut label_hex, "{byte:02x}")
-                .map_err(|_| BenchError::msg("encoding RSS watchdog label failed"))?;
-        }
-        let identity = ay_sys::supervisor::process_group::process_identity(pid)?
-            .ok_or_else(|| BenchError::msg("watch target vanished before registration"))?;
-        let command = format!("WATCH {watch_id} {pid} {limit_mb} {label_hex}\n");
-        if command.len() > WATCHDOG_SERVER_MAX_LINE as usize {
-            return Err(BenchError::msg(
-                "RSS watchdog command exceeds protocol limit",
-            ));
-        }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        self.registrations
-            .lock()
-            .map_err(|_| BenchError::msg("RSS watchdog registration mutex was poisoned"))?
-            .insert(watch_id, sender);
-        let write_result = (|| -> Result<()> {
-            if !self.healthy.load(Ordering::Acquire) {
-                return Err(BenchError::msg("RSS watchdog server became unhealthy"));
-            }
-            let mut process = self
-                .process
-                .lock()
-                .map_err(|_| BenchError::msg("RSS watchdog server mutex was poisoned"))?;
-            let server = process
-                .as_mut()
-                .ok_or_else(|| BenchError::msg("RSS watchdog server process is missing"))?;
-            server
-                .stdin
-                .write_all(command.as_bytes())
-                .and_then(|()| server.stdin.flush())
-                .with_bench_context(|| format!("registering RSS watchdog for child {pid}"))
-        })();
-        // `write_all` can fail after a partial command. Keep the ID registered
-        // until server EOF drains it, so a late response can never become an
-        // unknown-ID failure for unrelated children.
-        write_result?;
-        match receiver.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(WatchdogServerEvent::Ready)) => Ok(RssWatchdog {
-                server: std::sync::Arc::clone(self),
-                aggregate_lease: None,
-                watch_id,
-                #[cfg(unix)]
-                identity,
-                terminal_breach: None,
-                #[cfg(test)]
-                pending_identity_observations: std::cell::Cell::new(0),
-                receiver,
-            }),
-            Ok(Ok(_)) => Err(BenchError::msg(format!(
-                "RSS watchdog {watch_id} terminated before readiness"
-            ))),
-            Ok(Err(error)) => Err(BenchError::msg(format!(
-                "RSS watchdog {watch_id} failed before readiness: {error}"
-            ))),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Keep the sender registered until the server's terminal
-                // event. The caller will kill the stopped target; removing it
-                // early would turn that expected late event into an unknown-ID
-                // protocol failure for every other campaign child.
-                Err(BenchError::msg(format!(
-                    "RSS watchdog {watch_id} did not arm within 10 seconds"
-                )))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(BenchError::msg(format!(
-                "RSS watchdog {watch_id} readiness channel disconnected"
-            ))),
-        }
-    }
-
-    fn heartbeat_is_fresh(&self) -> bool {
-        use std::sync::atomic::Ordering;
-
-        if !self.healthy.load(Ordering::Acquire) {
-            return false;
-        }
-        let Ok(now_ns) = monotonic_time_ns() else {
-            self.healthy.store(false, Ordering::Release);
-            return false;
-        };
-        let last_ns = self.last_heartbeat_ns.load(Ordering::Acquire);
-        if last_ns == 0
-            || now_ns.saturating_sub(last_ns)
-                > u64::try_from(WATCHDOG_SERVER_HEARTBEAT_TIMEOUT.as_nanos()).unwrap_or(u64::MAX)
-        {
-            self.healthy.store(false, Ordering::Release);
-            return false;
-        }
-        true
-    }
-
-    fn is_healthy(&self) -> bool {
-        use std::sync::atomic::Ordering;
-
-        if !self.heartbeat_is_fresh() {
-            return false;
-        }
-        let Ok(now_ns) = monotonic_time_ns() else {
-            self.healthy.store(false, Ordering::Release);
-            return false;
-        };
-        let interval_ns =
-            u64::try_from(WATCHDOG_SERVER_STATE_CHECK_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
-        let previous = self.last_process_check_ns.load(Ordering::Acquire);
-        if now_ns.saturating_sub(previous) < interval_ns
-            || self
-                .last_process_check_ns
-                .compare_exchange(previous, now_ns, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return true;
-        }
-        let responsive = self
-            .process
-            .lock()
-            .ok()
-            .and_then(|process| process.as_ref().map(|server| server.child.id()))
-            .is_some_and(watchdog_server_process_is_responsive);
-        if !responsive {
-            self.healthy.store(false, Ordering::Release);
-        }
-        responsive
-    }
-
-    #[cfg(all(
-        test,
-        any(
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "haiku",
-            target_os = "macos",
-            all(target_os = "linux", not(target_env = "uclibc")),
-        ),
-    ))]
-    fn process_id(&self) -> Option<u32> {
-        self.process
-            .lock()
-            .ok()
-            .and_then(|process| process.as_ref().map(|server| server.child.id()))
-    }
-}
-
-impl Drop for SharedWatchdogServer {
-    fn drop(&mut self) {
-        self.healthy
-            .store(false, std::sync::atomic::Ordering::Release);
-        let process = match self.process.get_mut() {
-            Ok(process) => process.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(mut server) = process else {
-            return;
-        };
-        drop(server.stdin);
-        match server.child.wait_timeout(Duration::from_secs(10)) {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => terminate_process_group(&mut server.child),
-        }
-    }
-}
-
-fn watchdog_server_reader(
-    stdout: std::process::ChildStdout,
-    registrations: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, std::sync::mpsc::Sender<WatchdogServerMessage>>,
-        >,
-    >,
-    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    last_heartbeat_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ready: std::sync::mpsc::Sender<std::result::Result<(), String>>,
-) {
-    use std::io::{BufRead as _, Read as _};
-    use std::sync::atomic::Ordering;
-
-    let result = (|| -> std::result::Result<(), String> {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut marker = vec![0_u8; WATCHDOG_SERVER_READY.len()];
-        reader
-            .read_exact(&mut marker)
-            .map_err(|error| format!("reading server readiness failed: {error}"))?;
-        if marker != WATCHDOG_SERVER_READY {
-            return Err("invalid RSS watchdog server readiness marker".to_string());
-        }
-        last_heartbeat_ns.store(
-            monotonic_time_ns().map_err(|error| error.to_string())?,
-            Ordering::Release,
-        );
-        healthy.store(true, Ordering::Release);
-        let _ = ready.send(Ok(()));
-        loop {
-            let mut line = Vec::new();
-            let read = (&mut reader)
-                .take(WATCHDOG_SERVER_MAX_LINE + 1)
-                .read_until(b'\n', &mut line)
-                .map_err(|error| format!("reading RSS watchdog server response failed: {error}"))?;
-            if read == 0 {
-                return Err("RSS watchdog server closed its response pipe".to_string());
-            }
-            if line.len() > WATCHDOG_SERVER_MAX_LINE as usize {
-                return Err("RSS watchdog server response exceeds protocol limit".to_string());
-            }
-            let Some(line) = line.strip_suffix(b"\n") else {
-                return Err("RSS watchdog server response exceeds protocol limit".to_string());
-            };
-            let line = std::str::from_utf8(line)
-                .map_err(|error| format!("RSS watchdog server emitted non-UTF-8: {error}"))?;
-            if let Some(timestamp) = line.strip_prefix("HEARTBEAT ") {
-                let timestamp = timestamp
-                    .parse::<u64>()
-                    .map_err(|_| "RSS watchdog server heartbeat has invalid timestamp")?;
-                if timestamp == 0 {
-                    return Err("RSS watchdog server heartbeat has zero timestamp".to_string());
-                }
-                last_heartbeat_ns.store(
-                    monotonic_time_ns().map_err(|error| error.to_string())?,
-                    Ordering::Release,
-                );
-                continue;
-            }
-            let (watch_id, event, terminal) = parse_watchdog_server_event(line)?;
-            let sender = {
-                let mut registrations = registrations
-                    .lock()
-                    .map_err(|_| "RSS watchdog registration mutex was poisoned".to_string())?;
-                if terminal {
-                    registrations.remove(&watch_id)
-                } else {
-                    registrations.get(&watch_id).cloned()
-                }
-            }
-            .ok_or_else(|| format!("RSS watchdog server reported unknown id {watch_id}"))?;
-            // A caller can time out and kill its stopped child immediately
-            // before a late response arrives. That receiver disappearing is
-            // local to the registration, not a reason to disarm the campaign.
-            let _ = sender.send(event);
-        }
-    })();
-    if !healthy.swap(false, Ordering::AcqRel) {
-        let _ = ready.send(Err(result
-            .as_ref()
-            .err()
-            .cloned()
-            .unwrap_or_else(|| "RSS watchdog server stopped".to_string())));
-    }
-    let failure = result
-        .err()
-        .unwrap_or_else(|| "RSS watchdog server stopped".to_string());
-    if let Ok(mut registrations) = registrations.lock() {
-        for (_, sender) in registrations.drain() {
-            let _ = sender.send(Err(failure.clone()));
-        }
-    }
-}
-
-fn parse_watchdog_server_event(
-    line: &str,
-) -> std::result::Result<(u64, WatchdogServerMessage, bool), String> {
-    let fields = line.split(' ').collect::<Vec<_>>();
-    let watch_id = fields
-        .get(1)
-        .ok_or_else(|| "watchdog server response omitted id".to_string())?
-        .parse::<u64>()
-        .map_err(|_| "watchdog server response has invalid id".to_string())?;
-    if watch_id == 0 {
-        return Err("watchdog server response has zero id".to_string());
-    }
-    match fields.as_slice() {
-        ["READY", _] => Ok((watch_id, Ok(WatchdogServerEvent::Ready), false)),
-        ["DONE", _] => Ok((watch_id, Ok(WatchdogServerEvent::Done), true)),
-        ["BREACH", _, timestamp] => {
-            let timestamp = timestamp
-                .parse::<u64>()
-                .map_err(|_| "watchdog server breach has invalid timestamp".to_string())?;
-            if timestamp == 0 {
-                return Err("watchdog server breach has zero timestamp".to_string());
-            }
-            Ok((watch_id, Ok(WatchdogServerEvent::Breach(timestamp)), true))
-        }
-        ["ERROR", _, encoded] => {
-            if encoded.len() > 1024 || encoded.len() % 2 != 0 {
-                return Err("watchdog server error has invalid encoding".to_string());
-            }
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve(encoded.len() / 2)
-                .map_err(|_| "watchdog server error cannot be decoded".to_string())?;
-            for pair in encoded.as_bytes().as_chunks::<2>().0 {
-                let pair = std::str::from_utf8(pair)
-                    .map_err(|_| "watchdog server error has invalid encoding".to_string())?;
-                bytes.push(
-                    u8::from_str_radix(pair, 16)
-                        .map_err(|_| "watchdog server error has invalid encoding".to_string())?,
-                );
-            }
-            let message = String::from_utf8(bytes)
-                .map_err(|_| "watchdog server error is not UTF-8".to_string())?;
-            Ok((watch_id, Err(message), true))
-        }
-        _ => Err("invalid RSS watchdog server response".to_string()),
-    }
-}
-
-/// A planned envelope plus the executable planner used to enforce it.
+/// Native restrictions, campaign exclusion, and one shared RSS observer.
 #[derive(Debug, Clone)]
 pub struct PlannedResources {
     /// Exact numeric resource plan admitted for this campaign.
     pub plan: ResourcePlan,
     guard_script: PathBuf,
     _aggregate_lease: Option<std::sync::Arc<GlobalHarnessLease>>,
-    watchdog_server: std::sync::Arc<SharedWatchdogServer>,
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+    observer: std::sync::Arc<native::Observer>,
     #[cfg(test)]
     _test_campaign_lease: Option<std::sync::Arc<TestCampaignLease>>,
 }
 
-fn measured_native_plan(requested: usize, enforcement: &Path) -> Result<ResourcePlan> {
+fn measured_native_plan(requested: usize, lease_path: &Path) -> Result<ResourcePlan> {
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     {
-        native::plan(requested, enforcement)
+        native::plan(requested, lease_path)
     }
     #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
     {
-        let _ = (requested, enforcement);
+        let _ = (requested, lease_path);
         Err(BenchError::msg(
             "native benchmark measurement unsupported on this target",
         ))
@@ -1863,6 +1232,8 @@ impl PlannedResources {
                 reason: "requested benchmark jobs must be positive".to_string(),
             });
         }
+        // Child launching still uses this component until its native worker
+        // lands. Campaign lease ownership itself is now entirely native.
         let guard_script = repo_root.join("scripts").join("_oom_guard.py");
         if !guard_script.is_file() {
             return Err(BenchError::msg(format!(
@@ -1872,14 +1243,17 @@ impl PlannedResources {
         }
         #[cfg(test)]
         let test_campaign_lease = TestCampaignLease::acquire();
-        let aggregate_lease = GlobalHarnessLease::exclusive(&guard_script, label)?;
-
-        let plan = measured_native_plan(requested_jobs, &guard_script)?;
+        let aggregate_lease = GlobalHarnessLease::exclusive(label)?;
+        let plan = measured_native_plan(requested_jobs, aggregate_lease.path()?)?;
         aggregate_lease.ensure_alive(label)?;
+
+        #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+        let observer = std::sync::Arc::new(native::Observer::new(plan.jobs)?);
 
         Ok(Self {
             plan,
-            watchdog_server: SharedWatchdogServer::new(guard_script.clone()),
+            #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+            observer,
             guard_script,
             _aggregate_lease: Some(aggregate_lease),
             #[cfg(test)]
@@ -1912,7 +1286,7 @@ impl PlannedResources {
         Ok(())
     }
 
-    /// Spawn an external child suspended, arm `_oom_guard.rss_watchdog`, then
+    /// Spawn an external child suspended, arm the native RSS observer, then
     /// let the child exec. This handshake eliminates the old attach-after-spawn
     /// window in which a fast allocator could run before its RSS limit existed.
     pub(crate) fn external_command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -2362,21 +1736,16 @@ impl PlannedResources {
             )));
         }
 
-        // Registration travels over private inherited pipes to the single
-        // campaign watcher. `register` returns only after this exact PGID's
-        // zero-grace guard has authenticated and armed while the child remains
-        // SIGSTOPped.
-        let mut watchdog =
-            match self
-                .watchdog_server
-                .register(child.id(), self.plan.memlimit_mb_per_child, label)
-            {
-                Ok(watchdog) => watchdog,
-                Err(error) => {
-                    terminate_process_group(&mut child);
-                    return Err(error);
-                }
-            };
+        // Register the exact unreaped Child with the campaign's native census
+        // while its launch barrier is still stopped. Only this Child owner
+        // resumes or cleans up the isolated group.
+        let mut watchdog = match self.watch_stopped_child(&child) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                terminate_process_group(&mut child);
+                return Err(error);
+            }
+        };
         watchdog.aggregate_lease = self._aggregate_lease.clone();
         if let Err(error) = self.ensure_aggregate_lease_alive(label) {
             terminate_process_group(&mut child);
@@ -2431,25 +1800,26 @@ impl PlannedResources {
             },
             guard_script: repo_root.join("scripts").join("_oom_guard.py"),
             _aggregate_lease: None,
-            watchdog_server: SharedWatchdogServer::new(
-                repo_root.join("scripts").join("_oom_guard.py"),
-            ),
+            #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+            observer: std::sync::Arc::new(native::Observer::new(1).expect("test observer")),
             _test_campaign_lease: None,
         }
     }
 
-    #[cfg(all(
-        test,
-        any(
-            target_os = "android",
-            target_os = "freebsd",
-            target_os = "haiku",
-            target_os = "macos",
-            all(target_os = "linux", not(target_env = "uclibc")),
-        ),
-    ))]
-    fn watchdog_server_pid(&self) -> Option<u32> {
-        self.watchdog_server.process_id()
+    fn watch_stopped_child(&self, child: &Child) -> Result<RssWatchdog> {
+        #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+        {
+            self.observer
+                .register(child, self.plan.memlimit_mb_per_child)
+                .map(|watch| RssWatchdog::new(std::sync::Arc::clone(&self.observer), watch))
+        }
+        #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
+        {
+            let _ = child;
+            Err(BenchError::msg(
+                "native campaign watchdog unsupported on this target",
+            ))
+        }
     }
 
     fn ensure_aggregate_lease_alive(&self, label: &str) -> Result<()> {
@@ -2462,7 +1832,7 @@ impl PlannedResources {
 
 /// Wait for a handshake-guarded child while continuously checking that its
 /// RSS watchdog remains alive. Every return path reaps the isolated process
-/// group and its campaign-server registration, so callers cannot accidentally
+/// group and its native observer registration, so callers cannot accidentally
 /// leak either handle.
 #[cfg(test)]
 fn wait_for_guarded_child(
@@ -2487,9 +1857,6 @@ fn observe_child_unreaped(
         ay_sys::owned_child::ChildEvents::Exit
     };
     ay_sys::owned_child::observe_child_unreaped(child, events, label).map_err(Into::into)
-}
-fn wait_for_child_exit_unreaped(child: &Child, timeout: Duration, label: &str) -> Result<bool> {
-    ay_sys::owned_child::wait_for_child_exit_unreaped(child, timeout, label).map_err(Into::into)
 }
 
 fn wait_for_guarded_child_with_limits(
@@ -2698,138 +2065,14 @@ fn wait_for_guarded_child_with_limits(
     }
 }
 
-/// Handle for one registration in the campaign-wide `_oom_guard.py` server.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WatchdogOutcome {
     breached: bool,
     breach_time_ns: Option<u64>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RssWatchdog {
-    server: std::sync::Arc<SharedWatchdogServer>,
-    aggregate_lease: Option<std::sync::Arc<GlobalHarnessLease>>,
-    watch_id: u64,
-    #[cfg(unix)]
-    identity: ay_sys::supervisor::process_group::ProcessIdentity,
-    terminal_breach: Option<WatchdogOutcome>,
-    #[cfg(test)]
-    pending_identity_observations: std::cell::Cell<usize>,
-    receiver: std::sync::mpsc::Receiver<WatchdogServerMessage>,
-}
-
-impl RssWatchdog {
-    fn observe_owned_child(&self, child: &Child, label: &str) -> Result<UnreapedChildState> {
-        #[cfg(test)]
-        if let Some(left) = self.pending_identity_observations.get().checked_sub(1) {
-            self.pending_identity_observations.set(left);
-            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
-        }
-        #[cfg(unix)]
-        {
-            owned_child::observe_original_unreaped(child, &self.identity, label).map_err(Into::into)
-        }
-        #[cfg(not(unix))]
-        {
-            observe_child_unreaped(child, true, label)
-        }
-    }
-    fn ensure_aggregate_lease_alive(&mut self) -> Result<()> {
-        let result = match self.aggregate_lease.as_deref() {
-            Some(lease) => lease.ensure_alive("guarded solver"),
-            None => Ok(()),
-        };
-        if let Err(error) = result {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Poll watchdog health while the guarded child is still running.
-    pub(crate) fn poll(&mut self) -> Result<Option<WatchdogOutcome>> {
-        self.ensure_aggregate_lease_alive()?;
-        if let Some(breached) = self.terminal_breach {
-            return Ok(Some(breached));
-        }
-        if !self.server.is_healthy() {
-            return Err(BenchError::msg(
-                "campaign RSS watchdog server stopped while a solver was active",
-            ));
-        }
-        match self.receiver.try_recv() {
-            Ok(message) => {
-                // Observations never grant signal authority. Only the owner
-                // retaining the actual unreaped Child may cancel its group.
-                let outcome = self.decode_terminal_event(message)?;
-                self.terminal_breach = Some(outcome);
-                Ok(Some(outcome))
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(BenchError::msg(format!(
-                "RSS watchdog {} response channel disconnected",
-                self.watch_id
-            ))),
-        }
-    }
-
-    /// Receive the terminal report for this registration.
-    pub(crate) fn finish(mut self) -> Result<WatchdogOutcome> {
-        self.ensure_aggregate_lease_alive()?;
-        if let Some(breached) = self.terminal_breach {
-            return Ok(breached);
-        }
-        if !self.server.is_healthy() {
-            return Err(BenchError::msg(
-                "campaign RSS watchdog server stopped before reporting completion",
-            ));
-        }
-        let message = match self.receiver.recv_timeout(Duration::from_secs(12)) {
-            Ok(message) => message,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(BenchError::msg(format!(
-                    "RSS watchdog {} did not report completion within 12 seconds",
-                    self.watch_id
-                )));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(BenchError::msg(format!(
-                    "RSS watchdog {} response channel disconnected",
-                    self.watch_id
-                )));
-            }
-        };
-        let outcome = self.decode_terminal_event(message);
-        if outcome.is_ok() {
-            self.ensure_aggregate_lease_alive()?;
-        }
-        outcome
-    }
-
-    /// Receive completion after the actual Child owner requested cleanup.
-    /// The observer never signals a numeric PID/group, including on failure.
-    fn finish_after_target_cleanup(self) -> Result<WatchdogOutcome> {
-        self.finish()
-    }
-
-    fn decode_terminal_event(&self, event: WatchdogServerMessage) -> Result<WatchdogOutcome> {
-        match event.map_err(|error| {
-            BenchError::msg(format!("RSS watchdog {} failed: {error}", self.watch_id))
-        })? {
-            WatchdogServerEvent::Done => Ok(WatchdogOutcome {
-                breached: false,
-                breach_time_ns: None,
-            }),
-            WatchdogServerEvent::Breach(breach_time_ns) => Ok(WatchdogOutcome {
-                breached: true,
-                breach_time_ns: Some(breach_time_ns),
-            }),
-            WatchdogServerEvent::Ready => Err(BenchError::msg(format!(
-                "RSS watchdog {} emitted duplicate readiness",
-                self.watch_id
-            ))),
-        }
-    }
-}
+mod rss_watchdog;
+pub(crate) use rss_watchdog::RssWatchdog;
 
 use ay_sys::owned_child::GroupCleanup;
 
@@ -2849,14 +2092,6 @@ fn terminate_guarded_child(child: &mut Child, watchdog: RssWatchdog, label: &str
             "{child_error}; watchdog cleanup failed: {watchdog_error}"
         ))),
     }
-}
-
-/// Kill and reap a sidecar whose stdin cannot be taken as a `ChildPipeWriter`,
-/// and say so: a pipe that cannot be marked would let a dead sidecar kill the
-/// campaign on the next write.
-fn sidecar_stdin_unusable(child: &mut Child, sidecar: &str, error: &std::io::Error) -> BenchError {
-    terminate_process_group(child);
-    BenchError::msg(format!("{sidecar} stdin is unusable: {error}"))
 }
 
 /// Kill and reap an isolated solver process group. Callers must not reap the
@@ -2978,160 +2213,103 @@ mod tests {
         .is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
-    fn test_campaigns_take_the_aggregate_lease_only_on_the_private_seam() {
-        let path = test_campaign_lease_path();
-        assert!(path.is_absolute());
-        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
-        let name = path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .expect("test lease filename");
-        assert_eq!(
-            name,
-            format!("ay-bench-test-lease-{}.lock", std::process::id())
-        );
-        assert!(!name.starts_with("ay-oom-guard-"));
-
-        // Pin the call site with the real sidecar, serialized with the campaign
-        // tests that share this lock: its flock record must land in the
-        // private file. Routed to the host lock instead, the sidecar is refused
-        // while any AY harness holds that lock, and otherwise writes no record
-        // here naming this sidecar.
+    fn native_campaigns_take_the_aggregate_lease_only_on_the_private_test_seam() {
         let _serialized = TestCampaignLease::acquire();
-        let guard_script = crate::runner::repo_root_public()
-            .join("scripts")
-            .join("_oom_guard.py");
-        let label = "private seam test lease";
-        let lease = GlobalHarnessLease::acquire(&guard_script, label).expect("private lease");
-        let sidecar = {
-            let process = lease.process.lock().expect("lease process lock");
-            process.as_ref().expect("lease process").0.id()
-        };
-        let record = std::fs::read_to_string(&path).expect("private lease record");
-        assert!(
-            record.starts_with(&format!("pid={sidecar} ")),
-            "private lease record does not name this sidecar: {record:?}"
-        );
-        assert!(
-            record.ends_with(&format!(" label={label}\n")),
-            "private lease record does not carry this label: {record:?}"
-        );
+        let lease = GlobalHarnessLease::acquire("private native lease").unwrap();
+        assert_eq!(lease.path().unwrap(), test_campaign_lease_path());
+        let record = std::fs::read_to_string(lease.path().unwrap()).unwrap();
+        assert!(record.starts_with(&format!("pid={} ", std::process::id())));
+        assert!(record.contains(" start=- "));
+        assert!(record.contains(" native_birth="));
+        lease.ensure_alive("native original owner").unwrap();
+        assert!(GlobalHarnessLease::acquire("independent native contender").is_err());
         drop(lease);
+        GlobalHarnessLease::acquire("after original native drop").unwrap();
     }
 
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     #[test]
     fn independent_active_campaign_cannot_reuse_process_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-lease");
         let slot = std::sync::Mutex::new(std::sync::Weak::new());
-        let lease = std::sync::Arc::new(GlobalHarnessLease {
-            process: std::sync::Mutex::new(None),
-        });
-        *slot.lock().expect("slot") = std::sync::Arc::downgrade(&lease);
-
-        let error = vacant_harness_lease_slot(&slot).expect_err("active lease must be exclusive");
-        assert!(error.to_string().contains("already active"));
+        let lease =
+            std::sync::Arc::new(GlobalHarnessLease::at_test_path(&path, "original").unwrap());
+        *slot.lock().unwrap() = std::sync::Arc::downgrade(&lease);
+        assert!(vacant_harness_lease_slot(&slot).is_err());
+        let clone = std::sync::Arc::clone(&lease);
         drop(lease);
+        assert!(vacant_harness_lease_slot(&slot).is_err());
+        assert!(GlobalHarnessLease::at_test_path(&path, "still held by clone").is_err());
+        drop(clone);
         assert!(vacant_harness_lease_slot(&slot).is_ok());
+        GlobalHarnessLease::at_test_path(&path, "after last clone").unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
-    fn aggregate_lease_death_before_spawn_fails_closed() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let script = temp.path().join("short-lived-lease.py");
-        std::fs::write(
-            &script,
-            "import time\nprint('AY_OOM_HARNESS_LEASE_READY_V1', flush=True)\ntime.sleep(0.2)\n",
-        )
-        .expect("fake lease script");
-        let lease = std::sync::Arc::new(
-            GlobalHarnessLease::acquire(&script, "short-lived test lease")
-                .expect("acquire fake lease"),
-        );
-        std::thread::sleep(Duration::from_millis(400));
-
+    fn native_aggregate_lease_invalidation_before_spawn_stays_refused_after_path_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease");
+        let saved = directory.path().join("held-inode");
+        let marker = directory.path().join("target-started");
+        let lease =
+            std::sync::Arc::new(GlobalHarnessLease::at_test_path(&path, "original").unwrap());
         let mut resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
-        resources._aggregate_lease = Some(lease);
+        resources._aggregate_lease = Some(std::sync::Arc::clone(&lease));
+        std::fs::rename(&path, &saved).unwrap();
         let mut command = resources.external_command("/bin/sh");
-        command.arg("-c").arg("exit 0");
-        let error = resources
-            .spawn_external_child(&mut command, "post-lease-death child")
-            .expect_err("dead aggregate lease must prevent spawn");
-        assert!(error
-            .to_string()
-            .contains("released the host admission lock"));
-        assert_eq!(resources.watchdog_server_pid(), None);
+        command.args([
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new("printf started > \"$1\""),
+            std::ffi::OsStr::new("target"),
+            marker.as_os_str(),
+        ]);
+        assert!(resources
+            .spawn_external_child(&mut command, "invalid native lease")
+            .is_err());
+        assert!(!marker.exists());
+        std::fs::rename(&saved, &path).unwrap();
+        assert!(lease.ensure_alive("restored path").is_err());
+        assert!(resources
+            .spawn_external_child(&mut command, "restored but refused lease")
+            .is_err());
+        assert!(!marker.exists());
+        assert_eq!(resources.observer.registered_children(), 0);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
-    fn aggregate_lease_death_during_run_kills_guarded_child() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let script = temp.path().join("persistent-lease.py");
-        std::fs::write(
-            &script,
-            "import sys\nprint('AY_OOM_HARNESS_LEASE_READY_V1', flush=True)\nwhile sys.stdin.buffer.read(8192):\n    pass\n",
-        )
-        .expect("fake lease script");
-        let lease = std::sync::Arc::new(
-            GlobalHarnessLease::acquire(&script, "persistent test lease")
-                .expect("acquire fake lease"),
-        );
+    fn native_aggregate_lease_invalidation_during_run_reaps_the_original_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lease");
+        let saved = directory.path().join("held-inode");
+        let lease =
+            std::sync::Arc::new(GlobalHarnessLease::at_test_path(&path, "original").unwrap());
         let mut resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
         resources._aggregate_lease = Some(std::sync::Arc::clone(&lease));
         let mut command = resources.external_command("/bin/sh");
         command
-            .arg("-c")
-            .arg("sleep 60")
+            .args(["-c", "sleep 60"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let (mut child, watchdog) = resources
-            .spawn_external_child(&mut command, "lease-loss child")
-            .expect("spawn guarded child");
-        let lease_pid = {
-            let process = lease.process.lock().expect("lease process lock");
-            process.as_ref().expect("lease process").0.id()
-        };
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(lease_pid).expect("lease pid")),
-            nix::sys::signal::Signal::SIGKILL,
-        )
-        .expect("kill fake lease");
-
-        let error = wait_for_guarded_child(
+            .spawn_external_child(&mut command, "native lease target")
+            .unwrap();
+        std::fs::rename(&path, &saved).unwrap();
+        assert!(wait_for_guarded_child(
             &mut child,
             watchdog,
             Duration::from_secs(5),
-            "lease-loss child",
+            "native lease target"
         )
-        .expect_err("lease loss must invalidate and kill active child");
-        assert!(error
-            .to_string()
-            .contains("released the host admission lock"));
-        assert!(child.try_wait().expect("child status").is_some());
+        .is_err());
+        assert!(child.try_wait().unwrap().is_some());
+        std::fs::rename(&saved, &path).unwrap();
+        assert!(lease.ensure_alive("after cleanup").is_err());
     }
 
     #[cfg(any(
@@ -3148,10 +2326,12 @@ mod tests {
         let mut command = Command::new("sh");
         command.arg("-c").arg("exit 7").process_group(0);
         let mut child = command.spawn().expect("spawn child");
-        assert!(
-            wait_for_child_exit_unreaped(&child, Duration::from_secs(2), "test child")
-                .expect("observe child")
-        );
+        assert!(ay_sys::owned_child::wait_for_child_exit_unreaped(
+            &child,
+            Duration::from_secs(2),
+            "test child"
+        )
+        .expect("observe child"));
         let status = kill_process_group_and_reap(&mut child, "test child").expect("cleanup child");
         assert_eq!(status.code(), Some(7));
     }
@@ -3213,7 +2393,7 @@ mod tests {
             .expect("guarded capture");
         assert!(output.status.success());
         assert_eq!(output.stdout, "ready-output\n");
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr, "");
     }
 
     #[cfg(unix)]
@@ -3464,8 +2644,10 @@ os._exit(0)
         target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
-    fn concurrent_children_share_one_campaign_watchdog_server() {
-        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+    fn concurrent_children_share_one_campaign_native_observer() {
+        let mut resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        resources.plan.jobs = 2;
+        resources.observer = std::sync::Arc::new(native::Observer::new(2).unwrap());
         let mut first_command = resources.external_command("/bin/sh");
         first_command
             .args(["-c", "sleep 0.2"])
@@ -3475,9 +2657,6 @@ os._exit(0)
         let (mut first, first_watchdog) = resources
             .spawn_external_child(&mut first_command, "first shared-server child")
             .expect("spawn first child");
-        let server_pid = resources
-            .watchdog_server_pid()
-            .expect("campaign server started");
 
         let mut second_command = resources.external_command("/bin/sh");
         second_command
@@ -3488,7 +2667,7 @@ os._exit(0)
         let (mut second, second_watchdog) = resources
             .spawn_external_child(&mut second_command, "second shared-server child")
             .expect("spawn second child");
-        assert_eq!(resources.watchdog_server_pid(), Some(server_pid));
+        assert_eq!(resources.observer.registered_children(), 2);
 
         let first_outcome = wait_for_guarded_child(
             &mut first,
@@ -3507,171 +2686,19 @@ os._exit(0)
         assert!(first_outcome.status.is_some_and(|status| status.success()));
         assert!(second_outcome.status.is_some_and(|status| status.success()));
         assert!(!first_outcome.memout && !second_outcome.memout);
+        assert_eq!(resources.observer.registered_children(), 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
     #[test]
-    fn stopped_campaign_watchdog_fails_closed_and_kills_target() {
-        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
-        let mut command = resources.external_command("/bin/sh");
-        command
-            .args(["-c", "sleep 60"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let (mut child, watchdog) = resources
-            .spawn_external_child(&mut command, "stopped-watchdog child")
-            .expect("spawn guarded child");
-        let server_pid = resources.watchdog_server_pid().expect("watchdog pid");
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(server_pid).expect("server pid")),
-            nix::sys::signal::Signal::SIGSTOP,
-        )
-        .expect("stop watchdog server");
-
-        let started = Instant::now();
-        let error = wait_for_guarded_child(
-            &mut child,
-            watchdog,
-            Duration::from_secs(5),
-            "stopped-watchdog child",
-        )
-        .expect_err("stopped watchdog must fail closed");
-        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
-        assert!(error.to_string().contains("watchdog"), "{error}");
-        assert!(child.try_wait().expect("child status").is_some());
-
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(server_pid).expect("server pid")),
-            nix::sys::signal::Signal::SIGCONT,
-        )
-        .expect("resume watchdog server for cleanup");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
-    fn missing_campaign_watchdog_heartbeat_kills_target() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let fake_server = temp.path().join("watch-server.py");
-        std::fs::write(
-            &fake_server,
-            "import sys\nsys.stdout.write('AY_OOM_WATCHDOG_SERVER_READY_V1\\n')\nsys.stdout.flush()\nfor line in sys.stdin.buffer:\n    fields = line.decode('ascii').strip().split(' ')\n    if len(fields) == 5 and fields[0] == 'WATCH':\n        print(f'READY {fields[1]}', flush=True)\n",
-        )
-        .expect("write fake watch server");
-        let mut resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
-        resources.watchdog_server = SharedWatchdogServer::new(fake_server);
-        let mut command = resources.external_command("/bin/sh");
-        command
-            .args(["-c", "sleep 60"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let (mut child, watchdog) = resources
-            .spawn_external_child(&mut command, "heartbeat-loss child")
-            .expect("spawn guarded child");
-
-        let started = Instant::now();
-        let error = wait_for_guarded_child(
-            &mut child,
-            watchdog,
-            Duration::from_secs(5),
-            "heartbeat-loss child",
-        )
-        .expect_err("heartbeat loss must fail closed");
-        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
-        assert!(error.to_string().contains("watchdog"), "{error}");
-        assert!(child.try_wait().expect("child status").is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn terminal_watchdog_error_cannot_signal_an_observed_process() {
-        use std::os::unix::process::CommandExt as _;
-        use std::sync::atomic::Ordering;
-        use wait_timeout::ChildExt as _;
-
-        // This process group represents an unrelated group that has reused a
-        // completed target's numeric PGID before the watchdog handle drops.
-        let mut replacement_command = Command::new("/bin/sh");
-        replacement_command
-            .args(["-c", "exec sleep 60"])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut replacement = replacement_command
-            .spawn()
-            .expect("spawn replacement group");
-        let identity = ay_sys::supervisor::process_group::process_identity(replacement.id())
-            .expect("observe replacement")
-            .expect("replacement is alive");
-
-        // Construct the post-READY state directly and inject the terminal
-        // ERROR delivered by the server reader. Future timestamps keep this
-        // process-free test server healthy for the duration of the poll.
-        let server = SharedWatchdogServer::new(PathBuf::from("unused-watchdog-test-script"));
-        server.healthy.store(true, Ordering::Release);
-        server.last_heartbeat_ns.store(u64::MAX, Ordering::Release);
-        server
-            .last_process_check_ns
-            .store(u64::MAX, Ordering::Release);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        sender
-            .send(Err("injected terminal watchdog failure".to_string()))
-            .expect("inject terminal error");
-        let mut watchdog = RssWatchdog {
-            server,
-            aggregate_lease: None,
-            watch_id: 41,
-            identity,
-            terminal_breach: None,
-            pending_identity_observations: std::cell::Cell::new(0),
-            receiver,
-        };
-
-        let poll_result = watchdog.poll();
-        drop(watchdog);
-        let replacement_status = replacement
-            .wait_timeout(Duration::from_millis(250))
-            .expect("observe replacement group");
-        if replacement_status.is_none() {
-            terminate_process_group(&mut replacement);
-        }
-
-        let error = poll_result.expect_err("terminal watchdog error must fail closed");
-        assert!(error
-            .to_string()
-            .contains("injected terminal watchdog failure"));
-        assert!(
-            replacement_status.is_none(),
-            "watchdog cleanup signalled the replacement process group"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "macos",
-        all(target_os = "linux", not(target_env = "uclibc"))
-    ))]
     fn campaign_watchdog_preserves_zero_grace_memout_enforcement() {
         for pending in [0, 3] {
             let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 16);
-            let mut command = resources.external_command("python3");
+            let mut command = resources.external_command(std::env::current_exe().unwrap());
             command
                 .args([
-                    "-c",
-                    "import time; allocation=bytearray(64*1024*1024); time.sleep(60)",
+                    "--exact",
+                    "resource::native::tests::native_rss_allocation_fixture",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

@@ -70,7 +70,7 @@ impl EarlyPropagation {
             && !model.has_inexact_coeffs()
             && model.num_cols() <= MAX_COLUMNS;
         Self {
-            source: model as *const _ as usize,
+            source: std::ptr::from_ref(model) as usize,
             report: Report {
                 eligible,
                 stop: if eligible { "ready" } else { "ineligible" },
@@ -140,7 +140,7 @@ impl EarlyPropagation {
         if !self.report.eligible || seeds.is_empty() {
             return false;
         }
-        if self.source != model as *const _ as usize {
+        if self.source != std::ptr::from_ref(model) as usize {
             self.report.stop = "foreign-source";
             return false;
         }
@@ -236,6 +236,13 @@ impl EarlyPropagation {
 
 /// Legacy callers keep their original caps, seed allocation and no clock read.
 /// Bounded callers supply values; no global tuning atomics are mutated.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::large_enum_variant,
+        reason = "test-only report instrumentation enlarges this stack-local control; boxing would add an unbudgeted allocation to optional bounded propagation"
+    )
+)]
 pub(super) enum Control {
     Legacy,
     Bounded {

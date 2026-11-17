@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{DatatypeSort, Sort, SortInner};
+use super::{Sort, SortInner};
 
 /// One enclosing datatype declaration on the path to a sort position.
 struct Scope<'a> {
@@ -27,16 +27,6 @@ impl Sort {
     pub(crate) fn dangling_datatype_ref(&self) -> Option<&str> {
         dangling_ref(self, None)
     }
-}
-
-/// The dangling-reference check for the field sorts of one declaration: a
-/// field may refer to `dt` itself, or to a datatype declared around the
-/// reference inside the field sort.
-pub(crate) fn dangling_datatype_ref_in_declaration(dt: &DatatypeSort) -> Option<&str> {
-    dt.constructors
-        .iter()
-        .flat_map(|ctor| &ctor.fields)
-        .find_map(|field| dangling_ref(&field.sort, Some(&dt.name)))
 }
 
 fn dangling_ref<'a>(sort: &'a Sort, enclosing: Option<&'a str>) -> Option<&'a str> {

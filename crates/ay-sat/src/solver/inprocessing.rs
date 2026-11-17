@@ -466,7 +466,19 @@ impl Solver {
             // per-replacement gc_occ remove+add was the dominant cost (38%
             // of runtime in replace_clause_impl). Moving the rebuild inside
             // the loop and dropping before mutations eliminates this.
-            {
+            //
+            // Small formulas skip the rebuild entirely
+            // (#l0-gc-small-skip-occ): the conservative full scan below
+            // collects every live clause of length >= 2 containing a
+            // level-0 assigned literal, a superset of the occ-guided set
+            // (at decision level 0 every such literal or its negation is
+            // on the trail). After the shared sort+dedup the affected
+            // set is identical, so the pass is trajectory-identical
+            // without the O(all live clauses) occ rebuild that profiled
+            // hot on cruise-control.
+            const SMALL_FORMULA_L0_GC_FULL_SCAN_WORDS: usize = 100_000;
+            let small_formula = self.arena.len() <= SMALL_FORMULA_L0_GC_FULL_SCAN_WORDS;
+            if !small_formula {
                 // live_indices (husk adjudication #3): garbage-kept husks must
                 // not enter the L0-GC affected set — the strengthen path would
                 // route them into replace_clause_* (now also guarded at the
@@ -541,8 +553,7 @@ impl Solver {
             // rewritten between L0-GC passes that already contain old level-0
             // literals and therefore may not be reached by the optimized affected
             // set in every schedule.
-            const SMALL_FORMULA_L0_GC_FULL_SCAN_WORDS: usize = 100_000;
-            if arena_len <= SMALL_FORMULA_L0_GC_FULL_SCAN_WORDS {
+            if small_formula {
                 // live_indices (husk adjudication #3): exclude garbage-kept
                 // husks from the full-scan affected set, same as the occ path.
                 for cidx in self.arena.live_indices() {
@@ -926,18 +937,12 @@ impl Solver {
 
     /// Remove a watch for a clause from a literal's watch list
     pub(super) fn remove_watch(&mut self, lit: Literal, clause_ref: ClauseRef) {
-        let mut list = self.watches.get_watches_mut(lit);
         // Defensive: a buggy inprocessing pass can leave duplicate watchers behind.
         // Remove all occurrences to avoid stale watches corrupting propagation/transred.
-        let target = clause_ref.0;
-        let mut i = 0;
-        while i < list.len() {
-            if list.clause_ref(i).0 == target {
-                list.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
+        // Slice-direct scan with identical swap semantics
+        // (#sat-remove-watch-direct; equivalence pinned by
+        // test_remove_all_refs_matches_swap_remove_loop).
+        self.watches.remove_all_refs(lit, clause_ref.0);
     }
 
     /// Remove both watches for a clause from the watch lists of its two

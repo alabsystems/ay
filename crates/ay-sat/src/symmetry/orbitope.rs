@@ -419,24 +419,11 @@ fn greedy_order(
     Some(order)
 }
 
-/// Find row-interchangeable at-most-one matrices inside `clauses`.
-///
-/// Returns at most one matrix today (the largest width class); the signature is
-/// a vector so a later pass can peel off independent matrices without changing
-/// callers.
-#[cfg(test)]
-pub(crate) fn detect_row_amo_matrices(
-    clauses: &[Vec<Literal>],
-    limits: OrbitopeLimits,
-) -> (Vec<RowAmoMatrix>, OrbitopeStats) {
-    detect_row_amo_matrices_until(clauses, limits, &|| false)
-}
-
-/// Bounded detector that samples `should_stop` throughout, so the
+/// [`detect_row_amo_matrices_until`] that samples `should_stop` throughout, so the
 /// solve's deadline or interrupt ends detection within milliseconds. A stopped
 /// run returns no matrix and sets [`OrbitopeStats::interrupted`]; detection
 /// only reads `clauses`, so nothing partial is left behind. Unstopped, its
-/// result is the same as an unbounded [`detect_row_amo_matrices_until`] call.
+/// result retains the same structural detection and limit checks.
 pub(crate) fn detect_row_amo_matrices_until(
     clauses: &[Vec<Literal>],
     limits: OrbitopeLimits,
@@ -1002,7 +989,8 @@ mod tests {
 
         let colours = 4;
         let clauses = colouring(10, colours, &edges);
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         assert_eq!(matrices.len(), 1);
         let m = &matrices[0];
         assert_eq!(m.col_count(), 10);
@@ -1027,7 +1015,8 @@ mod tests {
         let edges = [(0, 1), (0, 2), (1, 2), (0, 3), (1, 3), (3, 4)];
         let colours = 3;
         let clauses = colouring(5, colours, &edges);
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         assert_eq!(matrices.len(), 1);
         let m = &matrices[0];
         assert_eq!(m.col_count(), 5);
@@ -1052,7 +1041,8 @@ mod tests {
     #[test]
     fn detects_a_thickness_two_matrix() {
         let clauses = triangle_3colour_thickness(2);
-        let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, stats) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         assert_eq!(stats.row_components, 3, "one row per colour");
         assert_eq!(matrices.len(), 1, "the thickness-2 matrix must be found");
         let m = &matrices[0];
@@ -1085,9 +1075,17 @@ mod tests {
     /// the generalized detector collapses onto the old one.
     #[test]
     fn thickness_one_is_unchanged_by_the_generalization() {
-        let a = detect_row_amo_matrices(&triangle_3colour(), OrbitopeLimits::default()).0;
-        let b =
-            detect_row_amo_matrices(&triangle_3colour_thickness(1), OrbitopeLimits::default()).0;
+        let a =
+            detect_row_amo_matrices_until(&triangle_3colour(), OrbitopeLimits::default(), &|| {
+                false
+            })
+            .0;
+        let b = detect_row_amo_matrices_until(
+            &triangle_3colour_thickness(1),
+            OrbitopeLimits::default(),
+            &|| false,
+        )
+        .0;
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
         assert_eq!(a[0].thickness(), 1);
@@ -1099,7 +1097,8 @@ mod tests {
     #[test]
     fn detects_colour_row_symmetry_in_a_triangle() {
         let clauses = triangle_3colour();
-        let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, stats) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         assert_eq!(stats.columns, 3, "one column per vertex");
         assert_eq!(stats.row_components, 3, "one row per colour");
         assert_eq!(matrices.len(), 1);
@@ -1118,7 +1117,8 @@ mod tests {
     #[test]
     fn sr_steps_cover_the_same_units_in_proof_order() {
         let clauses = triangle_3colour();
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         let m = &matrices[0];
 
         let steps = m.sr_steps();
@@ -1153,7 +1153,8 @@ mod tests {
     #[test]
     fn sr_witness_has_the_dsr_layout_and_swaps_only_later_columns() {
         let clauses = triangle_3colour();
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         let m = &matrices[0];
         let steps = m.sr_steps();
 
@@ -1197,7 +1198,8 @@ mod tests {
     #[test]
     fn fixing_units_are_satisfiability_preserving_on_the_triangle() {
         let clauses = triangle_3colour();
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         let units = matrices[0].fixing_units();
         // Brute force: the triangle is 3-colourable, and it stays satisfiable
         // once the orbitopal units are added.
@@ -1231,7 +1233,8 @@ mod tests {
         let mut clauses = triangle_3colour();
         // Break colour symmetry: forbid colour 0 on vertex 0 only.
         clauses.push(vec![lit(-1)]);
-        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, _) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         // Either no matrix survives, or the verified prefix is too short to fix.
         assert!(
             matrices.is_empty() || matrices[0].verified_rows < 3,
@@ -1242,7 +1245,8 @@ mod tests {
     #[test]
     fn ignores_formulas_without_at_most_one_structure() {
         let clauses = vec![vec![lit(1), lit(2), lit(3)], vec![lit(-1), lit(2)]];
-        let (matrices, stats) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        let (matrices, stats) =
+            detect_row_amo_matrices_until(&clauses, OrbitopeLimits::default(), &|| false);
         assert_eq!(matrices.len(), 0);
         assert_eq!(stats.eo_groups, 0);
     }

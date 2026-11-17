@@ -1,5 +1,5 @@
 pseudo-Boolean proof version 3.0
-% NOT a forgery: `aux.pbp` with the two `fresh_aux` lists restored. A real order with one fresh
+% NOT a forgery: `order-input.pbp` with the two `fresh_aux` lists restored. A real order with one fresh
 % copy per `right` variable and one fresh copy of the auxiliary variable per instance of the
 % relation. All three lists have the declared arity, no entry aliases a `left`, `right` or `aux`
 % variable, and the order still installs -- ACCEPTED before and after.

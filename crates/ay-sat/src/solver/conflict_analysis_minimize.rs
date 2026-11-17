@@ -94,14 +94,4 @@ impl Solver {
             Err(never) => match never {},
         }
     }
-
-    /// The ordinary cached CaDiCaL recursion and its exact flag/abort ordering.
-    /// Shared with the original-owner counted continuation, not reimplemented.
-    #[cfg(test)]
-    pub(super) fn is_redundant_cached(&mut self, lit: Literal, depth: u32) -> bool {
-        match self.redundant_admitted(lit, depth, &admitted::Ordinary) {
-            Ok(redundant) => redundant,
-            Err(never) => match never {},
-        }
-    }
 }

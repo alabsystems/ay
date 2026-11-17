@@ -7,21 +7,22 @@ fn measured(fixture: &Fixture, end: Instant) -> (usize, usize, usize) {
     let work = Cell::new(0usize);
     let bytes = Cell::new(0usize);
     let calls = Cell::new(0usize);
-    let mut owner = |w: usize, b: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        work.set(work.get().checked_add(w).ok_or(QueryError::Exhausted)?);
-        bytes.set(bytes.get().checked_add(b).ok_or(QueryError::Exhausted)?);
-        calls.set(calls.get().checked_add(1).ok_or(QueryError::Exhausted)?);
-        if work.get() as u64 > WORK || bytes.get() as u64 > BYTES {
-            return Err(QueryError::Exhausted);
-        }
-        Ok(())
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut owner);
-    fixture.attempt(&mut budget).unwrap();
-    drop(budget);
+    {
+        let mut owner = |w: usize, b: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            work.set(work.get().checked_add(w).ok_or(QueryError::Exhausted)?);
+            bytes.set(bytes.get().checked_add(b).ok_or(QueryError::Exhausted)?);
+            calls.set(calls.get().checked_add(1).ok_or(QueryError::Exhausted)?);
+            if work.get() as u64 > WORK || bytes.get() as u64 > BYTES {
+                return Err(QueryError::Exhausted);
+            }
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut owner);
+        fixture.attempt(&mut budget).unwrap();
+    }
     (work.get(), bytes.get(), calls.get())
 }
 
@@ -88,7 +89,9 @@ fn numeric_original_raw_and_absolute_end_refusal_cannot_be_reset() {
             Some(FpAdapterError::Owner(QueryError::Interrupted(reason)))
         );
     }
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let mut owner = |_: usize, _: usize| {
         if Instant::now() >= expired {
             Err(QueryError::Interrupted(StopReason::Deadline))
@@ -135,30 +138,31 @@ fn numeric_last_post_cleanup_and_consuming_fences_preserve_original_veto() {
     let end = Instant::now() + Duration::from_secs(20);
     let fixture = Fixture::new();
     let (_, _, last) = measured(&fixture, end);
-    let calls = Cell::new(0usize);
-    let mut owner = |_: usize, _: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        calls.set(calls.get() + 1);
-        if calls.get() == last {
+    {
+        let calls = Cell::new(0usize);
+        let mut owner = |_: usize, _: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            calls.set(calls.get() + 1);
+            if calls.get() == last {
+                Err(QueryError::Invalid("numeric final original veto"))
+            } else {
+                Ok(())
+            }
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut owner);
+        assert_eq!(
+            fixture.attempt(&mut budget).err(),
+            Some(FpAdapterError::Owner(QueryError::Invalid(
+                "numeric final original veto"
+            )))
+        );
+        assert_eq!(
+            budget.charge(0),
             Err(QueryError::Invalid("numeric final original veto"))
-        } else {
-            Ok(())
-        }
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut owner);
-    assert_eq!(
-        fixture.attempt(&mut budget).err(),
-        Some(FpAdapterError::Owner(QueryError::Invalid(
-            "numeric final original veto"
-        )))
-    );
-    assert_eq!(
-        budget.charge(0),
-        Err(QueryError::Invalid("numeric final original veto"))
-    );
-    drop(budget);
+        );
+    }
     consuming_veto(&fixture, end);
 }
 

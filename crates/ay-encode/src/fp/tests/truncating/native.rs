@@ -29,10 +29,11 @@ fn with_native_owner(run: impl FnOnce(&mut WorkBudget<'_>, Instant)) {
             .ok_or(QueryError::Exhausted)?;
         Ok(())
     };
-    let mut budget = WorkBudget::with_admission(WORK, &mut owner);
-    run(&mut budget, end);
-    budget.charge(0).unwrap();
-    drop(budget);
+    {
+        let mut budget = WorkBudget::with_admission(WORK, &mut owner);
+        run(&mut budget, end);
+        budget.charge(0).unwrap();
+    }
     owner(0, 0).unwrap();
 }
 
@@ -45,24 +46,25 @@ pub(in crate::fp::tests) fn check(
     budget.admit(1_048_576, 1_048_576).unwrap();
     let roots = [value];
     let problem = ChcProblem::new();
-    let output = relation(&roots, &[], &problem, budget);
-    let (body, source) = output.into_parts().unwrap();
-    assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-    let mut native = SmtContext::new();
-    native.set_term_memory_budget(Some(128 * 1024 * 1024));
-    budget.charge(0).unwrap();
-    let remaining = end.saturating_duration_since(Instant::now());
-    assert!(!remaining.is_zero());
-    let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
-    if truth {
-        assert!(matches!(result, SmtResult::Sat(_)));
-    } else {
-        assert!(result.is_unsat());
+    {
+        let output = relation(&roots, &[], &problem, budget);
+        let (body, source) = output.into_parts().unwrap();
+        assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+        let mut native = SmtContext::new();
+        native.set_term_memory_budget(Some(128 * 1024 * 1024));
+        budget.charge(0).unwrap();
+        let remaining = end.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
+        if truth {
+            assert!(matches!(result, SmtResult::Sat(_)));
+        } else {
+            assert!(result.is_unsat());
+        }
+        drop(result);
+        drop(native);
+        drop(body);
     }
-    drop(result);
-    drop(native);
-    drop(body);
-    drop(source);
     budget.charge(0).unwrap();
 }
 

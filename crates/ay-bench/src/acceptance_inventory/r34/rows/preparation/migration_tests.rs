@@ -253,7 +253,7 @@ fn captured_static_p22_migrates_without_minting_replay_authority() {
         "f6eaacca705a4f6394e694f220e2f724ade25ce2408a1cb9040605f26d07fa3a"
     );
     let binding = record.current_binding.as_ref().unwrap();
-    assert!(binding.mismatches.is_empty());
+    assert_eq!(binding.mismatches.as_slice(), &[] as &[String]);
     assert_eq!(binding.migrations.len(), 4);
     assert!(
         matches!(&record.status, R34RowStatus::BoundOnly),

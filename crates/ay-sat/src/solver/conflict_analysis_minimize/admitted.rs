@@ -165,6 +165,13 @@ impl Solver {
         Ok(ShrinkRoute::DistinctLevels)
     }
 
+    /// Return true if block-level shrinking has an actual same-level block to
+    /// inspect among the non-UIP learned literals.
+    ///
+    /// If every non-UIP learned literal is at a distinct decision level, the
+    /// shrink path cannot find a block UIP. The existing singleton-block path
+    /// keeps each literal without recursive minimization, so the scratch setup,
+    /// entry sort, and cleanup are avoidable in that case.
     pub(in crate::solver) fn repeated_level_admitted<P: Policy>(
         &mut self,
         count: usize,

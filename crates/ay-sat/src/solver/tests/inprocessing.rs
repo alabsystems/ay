@@ -543,6 +543,51 @@ fn test_collect_level0_garbage_repeats_after_internal_unit_creation() {
     );
 }
 
+/// #l0-gc-small-skip-occ: on small formulas the conservative full scan
+/// already collects a superset of the occ-guided affected set (every
+/// live clause of length >= 2 containing a level-0 assigned literal),
+/// so the per-pass gc_occ rebuild over all live clauses is pure
+/// overhead there (profiled hot on cruise-control: `OccList::add_clause`
+/// plus the arena live-index walk at every inprocessing round). The
+/// pass must skip building gc_occ entirely on that path — identifiable
+/// by the reuse scratch staying empty — while deleting and
+/// strengthening exactly as before.
+#[test]
+fn test_collect_level0_garbage_small_formula_skips_occ_rebuild() {
+    let mut solver = Solver::new(3);
+    let a = Variable(0);
+    let y = Variable(1);
+    let b = Variable(2);
+
+    let satisfied_idx = solver.add_clause_db(&[Literal::positive(a), Literal::positive(b)], false);
+    let shrinks_idx = solver.add_clause_db(&[Literal::positive(y), Literal::negative(a)], false);
+    solver.initialize_watches();
+
+    solver.enqueue(Literal::positive(a), None);
+    solver.qhead = solver.trail.len();
+    solver.fixed_count = 1;
+    solver.cold.last_collect_fixed = 0;
+    solver.l0_gc_dirty[a.index()] = true;
+
+    assert!(
+        !solver.collect_level0_garbage(),
+        "fixture should remain SAT after level-0 garbage collection",
+    );
+    assert!(
+        solver.arena.is_empty_clause(satisfied_idx),
+        "level-0 satisfied clause must still be deleted without gc_occ",
+    );
+    assert_eq!(
+        solver.arena.len_of(shrinks_idx),
+        1,
+        "clause with a level-0 false literal must still be strengthened",
+    );
+    assert!(
+        solver.gc_occ_scratch.is_none(),
+        "small formulas must not build gc_occ: the full scan covers the affected set",
+    );
+}
+
 /// #triage-lra-const-eq (CHC-COMP 2026 batch 3, `heap__findmax.array_000`):
 /// a queued theory conflict that a later ROOT unit satisfies must not make
 /// level-0 GC spin. The queue entry survives the DPLL(T) round (the solve

@@ -6,11 +6,12 @@ use super::*;
 fn constant_attempt(budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
     let roots = [Expr::true_()];
     let problem = ChcProblem::new();
-    let data = lower_fp_expr_clause(&roots, &[], &problem, budget)?;
-    let attached = data.into_body(ClauseBody::empty())?;
-    let (body, source) = attached.into_parts()?;
-    drop(body);
-    drop(source);
+    {
+        let data = lower_fp_expr_clause(&roots, &[], &problem, budget)?;
+        let attached = data.into_body(ClauseBody::empty())?;
+        let (body, _source) = attached.into_parts()?;
+        drop(body);
+    }
     budget.charge(0)?;
     Ok(())
 }
@@ -41,7 +42,9 @@ fn original_raw_callback_refusal_stays_sticky_after_reset() {
 
 #[test]
 fn expired_original_absolute_end_is_not_refreshed_for_translation_or_attachment() {
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let mut admission = |_: usize, _: usize| {
         if Instant::now() >= end {
             Err(QueryError::Interrupted(StopReason::Deadline))
@@ -66,14 +69,15 @@ fn expired_original_absolute_end_is_not_refreshed_for_translation_or_attachment(
 fn exact_one_short_total_work_and_storage_refuse_the_same_ledger() {
     let work = Cell::new(0usize);
     let bytes = Cell::new(0usize);
-    let mut count = |w: usize, b: usize| {
-        work.set(work.get().checked_add(w).unwrap());
-        bytes.set(bytes.get().checked_add(b).unwrap());
-        Ok(())
-    };
-    let mut healthy = WorkBudget::with_admission(WORK, &mut count);
-    constant_attempt(&mut healthy).unwrap();
-    drop(healthy);
+    {
+        let mut count = |w: usize, b: usize| {
+            work.set(work.get().checked_add(w).unwrap());
+            bytes.set(bytes.get().checked_add(b).unwrap());
+            Ok(())
+        };
+        let mut healthy = WorkBudget::with_admission(WORK, &mut count);
+        constant_attempt(&mut healthy).unwrap();
+    }
     let total = work.get();
     let storage = bytes.get();
     assert!(total > 0 && storage > 0);
@@ -128,14 +132,15 @@ fn final_post_arena_cleanup_callback_can_veto_all_complete_data() {
     let calls = Cell::new(0usize);
     let roots = [Expr::true_()];
     let problem = ChcProblem::new();
-    let mut count = |_: usize, _: usize| {
-        calls.set(calls.get() + 1);
-        Ok(())
+    let last = {
+        let mut count = |_: usize, _: usize| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut count);
+        drop(lower_fp_expr_clause(&roots, &[], &problem, &mut budget).unwrap());
+        calls.get()
     };
-    let mut budget = WorkBudget::with_admission(WORK, &mut count);
-    drop(lower_fp_expr_clause(&roots, &[], &problem, &mut budget).unwrap());
-    let last = calls.get();
-    drop(budget);
     calls.set(0);
     let mut stop = |_: usize, _: usize| {
         calls.set(calls.get() + 1);

@@ -168,7 +168,7 @@ fn ladders_collapse_and_the_orbitope_route_fires() {
 /// prefix stays below the fixing minimum. This pins the motivating bug.
 #[test]
 fn shuffled_ladders_blind_the_row_swap_gate_without_the_collapse() {
-    use crate::symmetry::orbitope::{detect_row_amo_matrices, OrbitopeLimits};
+    use crate::symmetry::orbitope::{detect_row_amo_matrices_until, OrbitopeLimits};
     let edges = [(0, 1), (0, 2), (1, 2)];
     let orders = vec![vec![0, 1, 2], vec![2, 0, 1], vec![1, 2, 0]];
     let (_, clauses) = shuffled_ladder_colouring(3, 3, &edges, &orders);
@@ -176,7 +176,8 @@ fn shuffled_ladders_blind_the_row_swap_gate_without_the_collapse() {
     for c in &mut sorted {
         c.sort_unstable_by_key(|l| l.raw());
     }
-    let (matrices, _) = detect_row_amo_matrices(&sorted, OrbitopeLimits::default());
+    let (matrices, _) =
+        detect_row_amo_matrices_until(&sorted, OrbitopeLimits::default(), &|| false);
     assert!(
         matrices.is_empty() || matrices[0].verified_rows < 3,
         "shuffled ladders must not verify as fully row-interchangeable \

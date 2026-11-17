@@ -4,6 +4,7 @@
 use super::*;
 use crate::acceptance_inventory::r34::tests::{fixture, original};
 use ay_chc::{ChcExpr, ChcParser, ChcSort, ChcVar, ClauseHead, PdrConfig};
+use std::collections::btree_map::Entry;
 use std::time::Duration;
 
 fn inspect(archive: &R34Archive, case: R34Witness) -> R34WitnessBinding {
@@ -272,8 +273,8 @@ fn historical_debug(formula: &ChcExpr) -> String {
         match sort {
             ChcSort::Datatype { constructors, .. } => {
                 let identity = format!("{constructors:?}");
-                if !lists.contains_key(&identity) {
-                    lists.insert(identity, format!("{:?}", &**constructors));
+                if let Entry::Vacant(entry) = lists.entry(identity) {
+                    entry.insert(format!("{:?}", **constructors));
                     for selector in constructors.iter().flat_map(|c| &c.selectors) {
                         sorts(&selector.sort, lists);
                     }
@@ -292,10 +293,14 @@ fn historical_debug(formula: &ChcExpr) -> String {
             ChcExpr::Var(var) => sorts(&var.sort, lists),
             ChcExpr::FuncApp(_, sort, args) => {
                 sorts(sort, lists);
-                args.iter().for_each(|arg| exprs(arg, lists));
+                for arg in args {
+                    exprs(arg, lists);
+                }
             }
             ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
-                args.iter().for_each(|arg| exprs(arg, lists));
+                for arg in args {
+                    exprs(arg, lists);
+                }
             }
             _ => {}
         }

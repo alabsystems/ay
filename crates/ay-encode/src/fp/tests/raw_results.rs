@@ -104,18 +104,22 @@ fn arithmetic(
     }];
     let problem = ChcProblem::new();
     let old = ClauseBody::constraint(condition(&target));
-    let (body, source) = lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
-        .unwrap()
-        .into_body(old)
-        .unwrap()
-        .into_parts()
-        .unwrap();
-    assert!(std::ptr::eq(source.raw_results(), results.as_slice()));
-    assert!(std::ptr::eq(source.raw_results()[0].output, &output));
-    assert_eq!(source.bindings()[0].target, &target);
-    drop(source);
+    let body = {
+        let (body, source) = lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
+            .unwrap()
+            .into_body(old)
+            .unwrap()
+            .into_parts()
+            .unwrap();
+        assert!(std::ptr::eq(source.raw_results(), results.as_slice()));
+        assert!(std::ptr::eq(
+            source.raw_results()[0].output,
+            &raw const output
+        ));
+        assert_eq!(source.bindings()[0].target, &target);
+        body
+    };
     native(body, expected, budget, end);
-    drop(results);
     drop(inputs);
     drop(words);
     drop(output);

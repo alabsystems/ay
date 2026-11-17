@@ -16,6 +16,10 @@ fn held_spares_force_actual_caller_inline_work() {
         return;
     }
     let caller = ComputeScope::enter().expect("caller");
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+    )]
     let mut retained = Vec::new();
     while let Some(unit) = caller.try_extra().expect("spare") {
         retained.push(unit);
@@ -98,9 +102,7 @@ fn worker_unwind_keeps_input_cleanup_inside_actual_unit() {
             None,
             |input| {
                 // On a one-CPU host the caller is the only possible worker.
-                if input.index == count - 1 {
-                    panic!("owned worker panic");
-                }
+                assert_ne!(input.index, count - 1, "owned worker panic");
                 input.index
             },
             |_| failed.store(true, Ordering::SeqCst),

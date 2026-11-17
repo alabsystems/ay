@@ -43,6 +43,37 @@ pub(crate) struct UfNiaSolver<'a> {
     interface: InterfaceBridge,
     /// Scope depth counter for push/pop symmetry checking (#4714, #4995).
     scope_depth: usize,
+    /// Recurrence state for BCP disequality-split surfacing: the last
+    /// disequality split the inner NIA requested during
+    /// `check_during_propagate` and how many consecutive BCP checks
+    /// re-derived it identically. Cleared by any non-split NIA result
+    /// and by reset; deliberately kept across push/pop, because the
+    /// guarded split clause is valid in every scope and a backtrack
+    /// does not make a recurring request fresh guidance.
+    bcp_diseq_repeat: Option<(ay_core::DisequalitySplitRequest, u32)>,
+}
+
+/// Consecutive identical BCP disequality-split requests after which
+/// the request surfaces instead of deferring to `Sat`
+/// (DR-AY-NIA-DISEQ-BCP-DEFERRAL-DIAGNOSIS-20261117). Small enough
+/// that a genuinely stuck disequality (re-derived at ~99% of BCP
+/// checks on Certora `65782_..._8`) surfaces almost immediately;
+/// large enough that a split the search resolves within a few
+/// quiescences keeps the landed deferred trajectory exactly
+/// (unconditioned surfacing was rejected for a stable Zohar loss,
+/// DR-AY-UFNIA-BCP-DISEQ-SURFACING-REJECTED-20261117).
+const BCP_DISEQ_SURFACE_REPEATS: u32 = 16;
+
+/// Field-wise identity of two disequality split requests (the
+/// request type derives no `PartialEq`).
+fn same_diseq_request(
+    a: &ay_core::DisequalitySplitRequest,
+    b: &ay_core::DisequalitySplitRequest,
+) -> bool {
+    a.variable == b.variable
+        && a.excluded_value == b.excluded_value
+        && a.disequality_term == b.disequality_term
+        && a.is_distinct == b.is_distinct
 }
 
 impl<'a> UfNiaSolver<'a> {
@@ -56,6 +87,7 @@ impl<'a> UfNiaSolver<'a> {
             nia,
             interface: InterfaceBridge::new(),
             scope_depth: 0,
+            bcp_diseq_repeat: None,
         }
     }
 
@@ -337,7 +369,34 @@ impl TheorySolver for UfNiaSolver<'_> {
     /// BCP-time lightweight check: run each sub-theory's cheap check
     /// individually WITHOUT the Nelson-Oppen fixpoint loop (#8404).
     fn check_during_propagate(&mut self) -> TheoryResult {
-        let nia_result = defer_non_local_result(self.nia.check_during_propagate());
+        // Recurrence-gated disequality-split surfacing: the generic
+        // deferral maps a disequality split to `Sat` at BCP, so a
+        // disequality the search never resolves is re-derived by a
+        // full NIA check at every quiescence and only reaches the
+        // split loop at candidate granularity
+        // (DR-AY-NIA-DISEQ-BCP-DEFERRAL-DIAGNOSIS-20261117). Surface
+        // the exact request once it has recurred identically
+        // `BCP_DISEQ_SURFACE_REPEATS` times consecutively; below the
+        // gate behavior is the landed deferral bit-for-bit.
+        let raw_nia = self.nia.check_during_propagate();
+        if let TheoryResult::NeedDisequalitySplit(req) = &raw_nia {
+            let repeats = match &mut self.bcp_diseq_repeat {
+                Some((prev, n)) if same_diseq_request(prev, req) => {
+                    *n += 1;
+                    *n
+                }
+                slot => {
+                    *slot = Some((req.clone(), 1));
+                    1
+                }
+            };
+            if repeats >= BCP_DISEQ_SURFACE_REPEATS {
+                return raw_nia;
+            }
+        } else {
+            self.bcp_diseq_repeat = None;
+        }
+        let nia_result = defer_non_local_result(raw_nia);
         if !matches!(nia_result, TheoryResult::Sat) {
             return nia_result;
         }
@@ -382,6 +441,7 @@ impl TheorySolver for UfNiaSolver<'_> {
         self.euf.reset();
         self.nia.reset();
         self.interface.reset();
+        self.bcp_diseq_repeat = None;
     }
 
     fn soft_reset(&mut self) {
@@ -393,6 +453,7 @@ impl TheorySolver for UfNiaSolver<'_> {
         self.euf.soft_reset();
         self.nia.soft_reset();
         self.interface.reset();
+        self.bcp_diseq_repeat = None;
     }
 
     fn supports_farkas_semantic_check(&self) -> bool {
@@ -486,5 +547,47 @@ mod tests {
                 "{term:?} carries the NIA's value but is still marked speculative"
             );
         }
+    }
+
+    /// A disequality split the inner NIA keeps re-deriving at BCP must
+    /// eventually surface instead of being deferred to `Sat` forever
+    /// (DR-AY-NIA-DISEQ-BCP-DEFERRAL-DIAGNOSIS-20261117: on Certora
+    /// `65782_..._8` the same request was re-derived at ~99% of BCP
+    /// checks and only reached the split loop at candidate
+    /// granularity). The first requests keep the landed deferral --
+    /// unconditioned surfacing was measured and rejected for a stable
+    /// Zohar loss (DR-AY-UFNIA-BCP-DISEQ-SURFACING-REJECTED-20261117)
+    /// -- so surfacing is gated on recurrence of the identical
+    /// request.
+    #[test]
+    fn bcp_check_surfaces_repeated_disequality_split() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let x_eq_zero = terms.mk_eq(x, zero);
+        let mut solver = UfNiaSolver::new(&terms);
+        solver.register_atom(x_eq_zero);
+        solver.assert_literal(x_eq_zero, false);
+
+        // The relaxation point x = 0 violates the asserted disequality
+        // on every BCP check; the identical request must recur.
+        let mut surfaced_at = None;
+        for call in 1..=64 {
+            match solver.check_during_propagate() {
+                TheoryResult::NeedDisequalitySplit(_) => {
+                    surfaced_at = Some(call);
+                    break;
+                }
+                other => assert!(
+                    matches!(other, TheoryResult::Sat),
+                    "BCP call {call} must defer (Sat) before the recurrence gate, got {other:?}"
+                ),
+            }
+        }
+        let call = surfaced_at.expect("repeated disequality split must surface at BCP");
+        assert!(
+            call > 1,
+            "the first request must keep the landed deferral, surfaced at call {call}"
+        );
     }
 }

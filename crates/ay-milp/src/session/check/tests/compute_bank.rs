@@ -42,7 +42,7 @@ fn blocked_public_solves_keep_deadlines_clear_evidence_and_allow_fresh_requests(
             reason: UnknownReason::Timeout,
         }
     ));
-    assert!(mip.replay_claims.is_empty());
+    assert_eq!(mip.replay_claims, Vec::<crate::cert_io::ReplayClaim>::new());
     assert!(mip.last_deferred.is_none());
     assert!(mip.deferred_claim.is_none());
     assert_eq!(mip.opts.time_limit, opts.time_limit);

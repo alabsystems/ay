@@ -2402,8 +2402,7 @@ fn baseline_checks(
         });
     let comparable = current_envelope
         .as_ref()
-        .ok()
-        .is_some_and(|current| baseline_envelope.as_ref() == Some(current));
+        .is_ok_and(|current| baseline_envelope.as_ref() == Some(current));
     checks.push(GateCheck {
         name: "baseline-resource-envelope".to_string(),
         status: if comparable { "pass" } else { "fail" }.to_string(),
@@ -2705,9 +2704,8 @@ fn write_admission_markdown(path: &Path, report: &ChcGateReport) -> Result<()> {
 }
 
 fn git_provenance() -> GitProvenance {
-    let forced_dirty = std::env::var("AY_BENCH_CHC_GATE_FORCE_DIRTY")
-        .ok()
-        .is_some_and(|value| env_truthy(&value));
+    let forced_dirty =
+        std::env::var("AY_BENCH_CHC_GATE_FORCE_DIRTY").is_ok_and(|value| env_truthy(&value));
     let status = command_stdout("git", &["status", "--short"]).unwrap_or_default();
     let dirty = forced_dirty || !status.trim().is_empty();
     let dirty_entries = if forced_dirty && status.trim().is_empty() {

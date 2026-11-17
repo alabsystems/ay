@@ -275,6 +275,6 @@ mod emission_work_tests {
         // what keeps an empty regular sequence from allocating a Q*S reverse
         // index after the full constraint has already validated its table.
         regular_transitions(&mut ctx, 0, &[], usize::MAX, usize::MAX, &[]);
-        assert!(ctx.output.is_empty());
+        assert_eq!(ctx.output, "");
     }
 }

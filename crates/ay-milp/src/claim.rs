@@ -848,10 +848,12 @@ mod tests {
             claims_of(&bounded_point),
             &[ClaimKind::PointExists, ClaimKind::NoBetterThan]
         );
-        assert!(claims_of(&Outcome::Unknown {
-            reason: crate::outcome::UnknownReason::Timeout
-        })
-        .is_empty());
+        assert_eq!(
+            claims_of(&Outcome::Unknown {
+                reason: crate::outcome::UnknownReason::Timeout
+            }),
+            &[] as &[ClaimKind]
+        );
 
         // The whole-verdict gate agrees with the per-claim gate.
         let m = integral_model();

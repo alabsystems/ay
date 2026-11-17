@@ -147,21 +147,23 @@ fn direct_extract_uses_every_original_base_bit_and_preserves_the_descriptor() {
                         negate(output_pin)
                     },
                 ]);
-                let (body, source) =
-                    lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
-                        .unwrap()
-                        .into_body(ClauseBody::constraint(constraint))
-                        .unwrap()
-                        .into_parts()
-                        .unwrap();
-                assert!(std::ptr::eq(source.bindings()[0].source, &base));
-                let retained = match source.raw_results()[0].operation {
-                    FpRawOperation::SignedIntegerToFpRne(input)
-                    | FpRawOperation::UnsignedIntegerToFpRne(input) => input,
-                    _ => panic!(),
+                let body = {
+                    let (body, source) =
+                        lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
+                            .unwrap()
+                            .into_body(ClauseBody::constraint(constraint))
+                            .unwrap()
+                            .into_parts()
+                            .unwrap();
+                    assert!(std::ptr::eq(source.bindings()[0].source, &raw const base));
+                    let retained = match source.raw_results()[0].operation {
+                        FpRawOperation::SignedIntegerToFpRne(input)
+                        | FpRawOperation::UnsignedIntegerToFpRne(input) => input,
+                        _ => panic!(),
+                    };
+                    assert!(std::ptr::eq(retained, &raw const slice));
+                    body
                 };
-                assert!(std::ptr::eq(retained, &slice));
-                drop(source);
                 native(body, correct, budget, end);
                 drop(slice);
                 drop(base);
@@ -213,15 +215,17 @@ fn repeated_observations_and_distinct_executions_cannot_change_the_unique_word()
                     ],
                 ))],
             );
-            let (body, source) =
-                lower_fp_raw_result_clause(&roots, &results, &bindings, &problem, budget)
-                    .unwrap()
-                    .into_body(ClauseBody::constraint(different))
-                    .unwrap()
-                    .into_parts()
-                    .unwrap();
-            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-            drop(source);
+            let body = {
+                let (body, source) =
+                    lower_fp_raw_result_clause(&roots, &results, &bindings, &problem, budget)
+                        .unwrap()
+                        .into_body(ClauseBody::constraint(different))
+                        .unwrap()
+                        .into_parts()
+                        .unwrap();
+                assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+                body
+            };
             native(body, false, budget, end);
         }
     });

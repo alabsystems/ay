@@ -536,25 +536,6 @@ impl Solver {
         Ok(())
     }
 
-    /// Append LRAT unit chain for conflict analysis learned clause.
-    ///
-    /// Seeds `LRAT_A` in `minimize_flags` from `level0_vars`, then delegates to
-    /// `collect_level0_unit_chain_filtered` with the RUP-satisfied filter.
-    /// Collected proof IDs are appended to `self.conflict` chain.
-    ///
-    /// CaDiCaL reference: analyze.cpp:253-268 (analyze_literal) + 1240-1246.
-    #[cfg(test)]
-    pub(super) fn append_lrat_unit_chain(
-        &mut self,
-        level0_vars: &[usize],
-        rup_satisfied: &DetHashSet<Literal>,
-    ) {
-        match self.append_lrat_unit_chain_admitted(level0_vars, rup_satisfied, &root::Ordinary) {
-            Ok(()) => {}
-            Err(never) => match never {},
-        }
-    }
-
     pub(in crate::solver) fn append_lrat_unit_chain_admitted<P: admitted::Policy>(
         &mut self,
         level0_vars: &[usize],

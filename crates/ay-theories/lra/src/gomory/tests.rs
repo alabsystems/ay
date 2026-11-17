@@ -851,3 +851,10 @@ fn test_gomory_usage_tiebreaker_prefers_high_usage_variable() {
     // At least one cut should be generated for x1's row.
     assert!(!cuts.is_empty(), "expected at least one cut: {cuts:?}");
 }
+
+// Signed ceil reference used only by the retained Gomory semantic control.
+impl LraSolver {
+    pub(super) fn abs_ceil_coeff(coeff: &BigRational) -> BigInt {
+        coeff.ceil().numer().abs()
+    }
+}

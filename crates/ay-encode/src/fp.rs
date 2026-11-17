@@ -117,7 +117,7 @@ pub struct FpExprClauseBody<'a, 'budget, 'owner> {
     budget: &'budget mut WorkBudget<'owner>,
 }
 
-impl<'a, 'budget, 'owner> FpExprClauseBody<'a, 'budget, 'owner> {
+impl<'a> FpExprClauseBody<'a, '_, '_> {
     /// Borrow the entire body, not a selected FP root.
     pub fn body(&self) -> &ClauseBody {
         &self.body

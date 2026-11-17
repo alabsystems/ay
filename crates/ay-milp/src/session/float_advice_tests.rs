@@ -230,7 +230,6 @@ fn float_advice_prefix_excludes_nonfinite_logicals_and_moves_raw_dual_capacity_u
         .primal
         .expect("only original finite prefix is scanned");
     assert_eq!(primal.len(), 2);
-    assert_eq!(std::mem::size_of_val(primal.as_ref()), 16);
     assert_eq!(primal[0].to_bits(), (-0.0_f64).to_bits());
     assert_eq!(primal[1], 1.25);
     assert_eq!(advice.duals.as_ptr(), pointer, "move, not a dual clone");

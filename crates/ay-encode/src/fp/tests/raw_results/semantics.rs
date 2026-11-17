@@ -111,14 +111,16 @@ fn copy_negate_and_abs_preserve_signaling_quietness_and_payload_exactly() {
                     } else {
                         pin(&target, expected, width)
                     };
-                    let (body, source) =
-                        lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
-                            .unwrap()
-                            .into_body(ClauseBody::constraint(condition))
-                            .unwrap()
-                            .into_parts()
-                            .unwrap();
-                    drop(source);
+                    let body = {
+                        let (body, _source) =
+                            lower_fp_raw_result_clause(&[], &results, &bindings, &problem, budget)
+                                .unwrap()
+                                .into_body(ClauseBody::constraint(condition))
+                                .unwrap()
+                                .into_parts()
+                                .unwrap();
+                        body
+                    };
                     native(body, !wrong, budget, end);
                 }
             }
@@ -181,15 +183,17 @@ fn independent_executions_can_differ_but_repeated_reads_keep_one_ssa_word() {
                     pin(word, infinity | quiet | sign, width),
                 ]);
                 let problem = ChcProblem::new();
-                let (body, source) =
-                    lower_fp_raw_result_clause(&[], results, bindings, &problem, budget)
-                        .unwrap()
-                        .into_body(ClauseBody::constraint(condition))
-                        .unwrap()
-                        .into_parts()
-                        .unwrap();
-                assert_eq!(source.raw_results().len(), if independent { 2 } else { 1 });
-                drop(source);
+                let body = {
+                    let (body, source) =
+                        lower_fp_raw_result_clause(&[], results, bindings, &problem, budget)
+                            .unwrap()
+                            .into_body(ClauseBody::constraint(condition))
+                            .unwrap()
+                            .into_parts()
+                            .unwrap();
+                    assert_eq!(source.raw_results().len(), if independent { 2 } else { 1 });
+                    body
+                };
                 native(body, independent, budget, end);
             }
         }

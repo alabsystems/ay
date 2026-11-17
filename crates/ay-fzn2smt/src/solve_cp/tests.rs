@@ -233,7 +233,7 @@ fn portfolio_result_selection_never_masks_worker_failures_as_unknown() {
     let panic_error = super::emit_portfolio_result(None, true, None, Some(unknown()), &mut out)
         .expect_err("worker panic must outrank UNKNOWN");
     assert!(panic_error.to_string().contains("worker panicked"));
-    assert!(out.is_empty());
+    assert_eq!(out.as_slice(), &[] as &[u8]);
 
     let mut out = Vec::new();
     let typed_error = super::emit_portfolio_result(
@@ -245,7 +245,7 @@ fn portfolio_result_selection_never_masks_worker_failures_as_unknown() {
     )
     .expect_err("typed worker error must outrank UNKNOWN");
     assert_eq!(typed_error.to_string(), "worker error");
-    assert!(out.is_empty());
+    assert_eq!(out.as_slice(), &[] as &[u8]);
 
     let mut out = Vec::new();
     super::emit_portfolio_result(
@@ -392,7 +392,7 @@ fn test_latin_square_one_hot_specialist_requires_complete_shape() {
     .expect("specialist failed");
 
     assert!(!emitted, "specialist must reject incomplete Latin shape");
-    assert!(out.is_empty());
+    assert_eq!(out.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn test_costas_specialist_requires_difference_definitions() {
         !emitted,
         "Costas specialist must reject plain all-different"
     );
-    assert!(out.is_empty());
+    assert_eq!(out.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -477,7 +477,7 @@ fn test_steiner_specialist_requires_complete_intersections() {
         !emitted,
         "Steiner specialist must reject an incomplete intersection matrix"
     );
-    assert!(out.is_empty());
+    assert_eq!(out.as_slice(), &[] as &[u8]);
 }
 
 #[test]
@@ -1173,7 +1173,7 @@ fn test_bool_clause() {
         solve satisfy;\n";
     match parse_and_solve(fzn) {
         CpSolveResult::Sat(assignment) => {
-            assert!(!assignment.is_empty());
+            assert_ne!(assignment.as_slice(), &[] as &[(IntVarId, i64)]);
         }
         other => panic!("expected Sat, got {other:?}"),
     }

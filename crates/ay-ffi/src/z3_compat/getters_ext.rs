@@ -25,8 +25,8 @@ use num_bigint::BigInt;
 use super::{
     alloc_sort, cache_dt_func_decl, cache_func_decl, cache_string, engine_ast, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_double, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    ffi_guard_void, finite_set_empty_decl_parameter, lookup_ast_sort, mk_ast, record_ast_sort,
-    require_ast_or_return, require_term_ast_or_return, term_to_ast, DatatypeOp, Z3_ast, Z3_context,
+    ffi_guard_void, finite_set_empty_decl_parameter, lookup_ast_sort, mk_ast,
+    require_ast_or_return, require_term_ast_or_return, DatatypeOp, Z3_ast, Z3_context,
     Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
 };
 

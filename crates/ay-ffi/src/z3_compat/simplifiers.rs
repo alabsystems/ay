@@ -416,7 +416,7 @@ pub unsafe extern "C" fn Z3_solver_add_simplifier(
                 None => simplifier.tactic.clone(),
             };
             let mut new_handle = Z3SolverHandle::new(Some(combined));
-            new_handle.params = source.params.clone();
+            new_handle.params = source.params;
             let handle = Box::into_raw(Box::new(new_handle));
             ctx.solver_handle_cache.push(handle);
             ctx.last_error = Z3_OK;

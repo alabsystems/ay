@@ -11,7 +11,11 @@ fn original_file() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
     let path = dir.path().join("archive.tar.gz");
     let bytes = include_str!("../fixtures/original-archive.hex")
         .split_whitespace()
-        .flat_map(|line| line.as_bytes().chunks_exact(2))
+        .flat_map(|line| {
+            let (pairs, remainder) = line.as_bytes().as_chunks::<2>();
+            assert_eq!(remainder, &[] as &[u8]);
+            pairs
+        })
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
     std::fs::write(&path, &bytes).unwrap();

@@ -396,7 +396,7 @@ pub unsafe extern "C" fn Z3_solver_assert(c: Z3_context, s: Z3_solver, a: Z3_ast
                     // shared handle reference is borrowed.
                     let (count, converter) = {
                         // SAFETY: goal_cache exclusively owns the handle (see above).
-                        let goal = unsafe { &*goal };
+                        let goal = &*goal;
                         (goal.formulas.len(), goal.model_converter.clone())
                     };
                     if let Some(converter) = converter {
@@ -409,7 +409,7 @@ pub unsafe extern "C" fn Z3_solver_assert(c: Z3_context, s: Z3_solver, a: Z3_ast
                             ));
                         }
                         // SAFETY: the context retains the handle for its lifetime.
-                        let current = unsafe { &*goal };
+                        let current = &*goal;
                         if current.formulas.len() != count {
                             return Err(SolverError::TacticFailed("goal consumer changed".into()));
                         }
@@ -847,10 +847,7 @@ unsafe fn check_solver_handle(
             .checked_mul(2)
             .and_then(|n| n.checked_add(handle.tracked.len()));
         let accepted = count
-            .and_then(|n| {
-                n.checked_mul(std::mem::size_of::<Term>())
-                    .map(|bytes| (n, bytes))
-            })
+            .and_then(|n| n.checked_mul(size_of::<Term>()).map(|bytes| (n, bytes)))
             .is_some_and(|(work, bytes)| operation.admission().admit(work, bytes).is_ok());
         if !accepted || !operation.validate(&ctx.solver) {
             record_tactic_failure(

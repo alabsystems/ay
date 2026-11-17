@@ -6,8 +6,11 @@
 //! and the kernel cgroup-v1/memory and cgroup-v2 controller interfaces.
 
 use super::{BenchError, ResourcePlan, Result, CHILD_FLOOR_MIB, MIB};
+#[cfg(any(target_os = "linux", test))]
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
+use std::path::{Component, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Default, Debug)]
@@ -18,7 +21,7 @@ pub(super) struct Restrictions {
     cores: Option<usize>,
 }
 
-pub(super) fn plan(requested: usize, enforcement: &Path) -> Result<ResourcePlan> {
+pub(super) fn plan(requested: usize, lease_path: &Path) -> Result<ResourcePlan> {
     if requested == 0 {
         return Err(BenchError::msg("requested benchmark jobs must be positive"));
     }
@@ -41,8 +44,8 @@ pub(super) fn plan(requested: usize, enforcement: &Path) -> Result<ResourcePlan>
     check_deadline(end)?;
     let mut result = measured_plan(requested, physical, available, cores, &restrictions)?;
     result.planner = format!(
-        "ay-native-measured-v1;enforcement={}",
-        enforcement.display()
+        "ay-native-measured-v1;rss=ay-bench-native;launch=legacy-stopped-worker;lease=native-legacy-host-flock:{}",
+        lease_path.display()
     );
     Ok(result)
 }
@@ -189,6 +192,7 @@ fn integer(text: &str) -> Result<u64> {
         .map_err(|_| BenchError::msg("kernel observation integer overflow"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_required(path: &Path) -> Result<String> {
     super::super::read_bounded_text(
         path,
@@ -197,6 +201,7 @@ fn read_required(path: &Path) -> Result<String> {
     )
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_optional(path: &Path) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => read_required(path).map(Some),
@@ -209,12 +214,14 @@ fn read_optional(path: &Path) -> Result<Option<String>> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(any(target_os = "linux", test))]
 enum Hierarchy {
     Unified,
     Legacy,
 }
 
 #[derive(Debug)]
+#[cfg(any(target_os = "linux", test))]
 struct ControllerPath {
     path: PathBuf,
     hierarchy: Hierarchy,
@@ -224,11 +231,13 @@ struct ControllerPath {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(target_os = "linux", test))]
 enum PathEncoding {
     MountInfo,
     Literal,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn decode_path(text: &str, encoding: PathEncoding) -> Result<PathBuf> {
     let mut bytes = Vec::with_capacity(text.len());
     let mut input = text.as_bytes().iter().copied();
@@ -259,6 +268,7 @@ fn decode_path(text: &str, encoding: PathEncoding) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn controller_paths(membership: &str, mounts: &str) -> Result<Vec<ControllerPath>> {
     if membership.trim().is_empty() || mounts.trim().is_empty() {
         return Err(BenchError::msg("cgroup hierarchy observation unavailable"));
@@ -366,10 +376,12 @@ fn controller_paths(membership: &str, mounts: &str) -> Result<Vec<ControllerPath
     Ok(result)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn min_assign(slot: &mut Option<usize>, value: usize) {
     *slot = Some(slot.map_or(value, |old| old.min(value)));
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn restrictions_from(paths: &[ControllerPath]) -> Result<Restrictions> {
     let mut result = Restrictions::default();
     for controller in paths {
@@ -470,6 +482,7 @@ fn restrictions_from(paths: &[ControllerPath]) -> Result<Restrictions> {
     Ok(result)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn cpuset_count(text: &str) -> Result<usize> {
     let mut ranges = Vec::new();
     for entry in text.split(',') {

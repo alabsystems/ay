@@ -35,10 +35,11 @@ fn root(width: u32) -> Expr {
 fn attempt(budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
     let roots = [root(32)];
     let problem = ChcProblem::new();
-    let output = lower_fp_expr_clause(&roots, &[], &problem, budget)?;
-    let (body, source) = output.into_body(ClauseBody::empty())?.into_parts()?;
-    drop(body);
-    drop(source);
+    {
+        let output = lower_fp_expr_clause(&roots, &[], &problem, budget)?;
+        let (body, _source) = output.into_body(ClauseBody::empty())?.into_parts()?;
+        drop(body);
+    }
     budget.charge(0)?;
     Ok(())
 }
@@ -119,17 +120,18 @@ fn raw_word_inputs_and_every_repeated_root_keep_their_complete_source_links() {
             lower_fp_expr_clause(&roots, &bindings[..1], &problem, budget),
             Err(FpAdapterError::Invalid(_))
         ));
-        let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
-        let (body, source) = output.into_body(old).unwrap().into_parts().unwrap();
-        assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-        assert_eq!(source.bindings().len(), 2);
-        assert_eq!(
-            body.predicates[0].1,
-            [ChcExpr::Var(a.clone()), ChcExpr::Var(b.clone())]
-        );
-        assert!(body.constraint.is_some());
-        drop(body);
-        drop(source);
+        {
+            let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
+            let (body, source) = output.into_body(old).unwrap().into_parts().unwrap();
+            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+            assert_eq!(source.bindings().len(), 2);
+            assert_eq!(
+                body.predicates[0].1,
+                [ChcExpr::Var(a.clone()), ChcExpr::Var(b.clone())]
+            );
+            assert!(body.constraint.is_some());
+            drop(body);
+        }
         budget.charge(0).unwrap();
     });
 }
@@ -148,11 +150,12 @@ fn ieee_remainder_remains_a_distinct_standard_operator_in_the_same_whole_batch()
                 .fp_rem(word(two, width))
                 .eq(word(minus_one, width));
             let roots = [root(width), ieee];
-            let output = relation(&roots, &[], &problem, budget);
-            let (body, source) = output.into_parts().unwrap();
-            assert!(units::consistent(&body, budget));
-            drop(body);
-            drop(source);
+            {
+                let output = relation(&roots, &[], &problem, budget);
+                let (body, _source) = output.into_parts().unwrap();
+                assert!(units::consistent(&body, budget));
+                drop(body);
+            }
             budget.charge(0).unwrap();
         }
     });

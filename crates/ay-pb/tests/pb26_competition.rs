@@ -350,7 +350,7 @@ fn test_optimization_portfolio_rejects_objective_range_overflow() {
 
     assert_eq!(result.status, PbStatus::Unsupported);
     assert_eq!(result.objective, None);
-    assert!(result.assignment.is_empty());
+    assert_eq!(result.assignment.as_slice(), &[] as &[bool]);
     assert_eq!(
         improvements, 0,
         "unsupported objectives must not emit incumbents"

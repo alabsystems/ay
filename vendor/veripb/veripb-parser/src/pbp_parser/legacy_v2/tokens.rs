@@ -275,7 +275,7 @@ pub enum IntegerToken {
 
 impl IntegerToken {
     pub fn parse_optional(
-        lex: &mut LogosLexer<IntegerToken>,
+        lex: &mut LogosLexer<'_, IntegerToken>,
     ) -> Result<Option<isize>, ParserError> {
         match lex.next() {
             Some(Ok(_)) => Ok(Some(lex.slice().parse()?)),
@@ -284,7 +284,7 @@ impl IntegerToken {
         }
     }
 
-    pub fn parse(lex: &mut LogosLexer<IntegerToken>) -> Result<isize, ParserError> {
+    pub fn parse(lex: &mut LogosLexer<'_, IntegerToken>) -> Result<isize, ParserError> {
         match lex.next() {
             Some(Ok(_)) => Ok(lex.slice().parse()?),
             _ => Err(ParserError::token_error(lex.span(), "integer")),
@@ -305,7 +305,7 @@ pub enum RUPHint {
 }
 
 impl RUPHint {
-    pub fn parse_optional(lex: &mut LogosLexer<RUPHint>) -> Result<Option<isize>, ParserError> {
+    pub fn parse_optional(lex: &mut LogosLexer<'_, RUPHint>) -> Result<Option<isize>, ParserError> {
         match lex.next() {
             Some(Ok(RUPHint::Integer)) => Ok(Some(lex.slice().parse()?)),
             Some(Ok(RUPHint::Tilde)) => Ok(Some(0)),
@@ -314,7 +314,7 @@ impl RUPHint {
         }
     }
 
-    pub fn parse(lex: &mut LogosLexer<RUPHint>) -> Result<isize, ParserError> {
+    pub fn parse(lex: &mut LogosLexer<'_, RUPHint>) -> Result<isize, ParserError> {
         match lex.next() {
             Some(Ok(RUPHint::Integer)) => Ok(lex.slice().parse()?),
             Some(Ok(RUPHint::Tilde)) => Ok(0),
@@ -336,7 +336,7 @@ pub enum IntegerOrSemicolonToken {
 }
 
 impl IntegerOrSemicolonToken {
-    pub fn parse(lex: &mut LogosLexer<Self>) -> Result<Option<isize>, ParserError> {
+    pub fn parse(lex: &mut LogosLexer<'_, Self>) -> Result<Option<isize>, ParserError> {
         match lex.next() {
             Some(Ok(Self::Integer)) => Ok(Some(lex.slice().parse().unwrap())),
             Some(Ok(Self::Semicolon)) => Ok(None),
@@ -354,7 +354,7 @@ pub enum SubproofBeginToken {
 }
 
 impl SubproofBeginToken {
-    pub fn parsed_begin(lex: &mut LogosLexer<Self>) -> Result<bool, ParserError> {
+    pub fn parsed_begin(lex: &mut LogosLexer<'_, Self>) -> Result<bool, ParserError> {
         match lex.next() {
             Some(Ok(Self::Begin)) => Ok(true),
             None => Ok(false),
@@ -375,7 +375,7 @@ pub enum Name {
 
 impl Name {
     #[inline]
-    pub fn parse(lex: &mut LogosLexer<Self>) -> Result<String, ParserError> {
+    pub fn parse(lex: &mut LogosLexer<'_, Self>) -> Result<String, ParserError> {
         match lex.next() {
             Some(Ok(Self::Name)) => Ok(lex.slice().to_string()),
             _ => Err(ParserError::token_error(
@@ -386,7 +386,7 @@ impl Name {
     }
 
     #[inline]
-    pub fn parse_optional(lex: &mut LogosLexer<Self>) -> Result<Option<String>, ParserError> {
+    pub fn parse_optional(lex: &mut LogosLexer<'_, Self>) -> Result<Option<String>, ParserError> {
         match lex.next() {
             Some(Ok(Self::Name)) => Ok(Some(lex.slice().to_string())),
             None => Ok(None),
@@ -408,7 +408,7 @@ pub enum VariableToken {
 impl VariableToken {
     #[inline]
     pub fn parse_optional<V: VarNameRecorder>(
-        lex: &mut LogosLexer<Self>,
+        lex: &mut LogosLexer<'_, Self>,
         var_names: &mut V,
     ) -> Result<Option<VarIdx>, ParserError> {
         match lex.next() {
@@ -434,7 +434,7 @@ pub enum LiteralToken {
 impl LiteralToken {
     #[inline]
     pub fn parse_optional<V: VarNameRecorder>(
-        lex: &mut LogosLexer<Self>,
+        lex: &mut LogosLexer<'_, Self>,
         var_names: &mut V,
     ) -> Result<Option<Lit>, ParserError> {
         match lex.next() {

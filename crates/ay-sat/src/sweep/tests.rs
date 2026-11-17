@@ -361,7 +361,9 @@ fn simulation_finds_candidates_with_unit_propagation() {
     let vals = vec![0i8; 8];
     let frozen: Vec<u32> = vec![0; 4];
     let sweeper = Sweeper::new(4);
-    let classes = sweeper.find_candidates_by_simulation(&clauses, &vals, &frozen);
+    let classes = sweeper
+        .find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, None)
+        .0;
 
     // x0 and x1 should be in the same equivalence class.
     let x0_class = classes.iter().find(|c| c.iter().any(|&l| l >> 1 == 0));
@@ -390,7 +392,9 @@ fn simulation_finds_negated_equivalence_via_propagation() {
     let vals = vec![0i8; 4];
     let frozen: Vec<u32> = vec![0; 2];
     let sweeper = Sweeper::new(2);
-    let classes = sweeper.find_candidates_by_simulation(&clauses, &vals, &frozen);
+    let classes = sweeper
+        .find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, None)
+        .0;
 
     // x0 and x1 should be in the same class (via complement signature folding).
     assert!(
@@ -424,7 +428,9 @@ fn simulation_skips_assigned_and_frozen_variables() {
     let frozen: Vec<u32> = vec![0, 1, 0];
 
     let sweeper = Sweeper::new(3);
-    let classes = sweeper.find_candidates_by_simulation(&clauses, &vals, &frozen);
+    let classes = sweeper
+        .find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, None)
+        .0;
 
     // Neither x0 nor x1 should appear in any class.
     for class in &classes {
@@ -448,7 +454,9 @@ fn simulation_returns_empty_on_no_clauses() {
     let vals: Vec<i8> = vec![0; 4];
     let frozen: Vec<u32> = vec![0; 2];
     let sweeper = Sweeper::new(2);
-    let classes = sweeper.find_candidates_by_simulation(&clauses, &vals, &frozen);
+    let classes = sweeper
+        .find_candidates_by_simulation_budgeted(&clauses, &vals, &frozen, None)
+        .0;
     assert_eq!(classes.len(), 0, "No clauses → no candidates");
 }
 

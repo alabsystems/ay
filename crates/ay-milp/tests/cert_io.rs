@@ -967,7 +967,7 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.single_row_dp_infeasibility_certificate().is_none());
     assert!(session.multi_row_bdd_infeasibility_certificate().is_some());
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     let ayc = emit_session_certificate(&session, BDD_INF, &names, &scale, &outcome);
     assert!(ayc.contains("evidence infeasible SUCCINCT multi-row-bdd"));
     let parsed = cert_io::parse(&ayc).expect("multi-row BDD certificate parses");
@@ -1078,7 +1078,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture open-domain solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     assert!(
         session
             .open_domain_single_row_dp_infeasibility_certificate()
@@ -1185,7 +1185,7 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
         .check()
         .expect("full-posture open-domain hybrid solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
         .is_some());
@@ -1260,7 +1260,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
         .check()
         .expect("full-posture open-domain integer-lift hybrid solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
         .is_none());
@@ -1347,7 +1347,7 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture hybrid solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     assert!(session.hybrid_pb_lp_infeasibility_certificate().is_some());
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
@@ -1412,7 +1412,7 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
         .check()
         .expect("full-posture integer-lift hybrid solve");
     assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
-    assert!(session.replay_claims().is_empty());
+    assert_eq!(session.replay_claims(), &[] as &[cert_io::ReplayClaim]);
     assert!(session.hybrid_pb_lp_infeasibility_certificate().is_none());
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
@@ -1779,7 +1779,7 @@ fn every_verdict_shape_emits_something_parseable() {
         let (ayc, _) = solve_and_emit(text);
         let parsed = cert_io::parse(&ayc).expect("emitted certificates parse");
         assert!(parsed.end_digest_ok, "the emitter seals what it writes");
-        assert!(!parsed.claims.is_empty());
+        assert_ne!(parsed.claims, Vec::<cert_io::ParsedClaim>::new());
     }
 }
 
@@ -2165,7 +2165,7 @@ fn three_outcomes_a_consumer_must_be_able_to_tell_apart() {
     assert_eq!(a.status(), CheckStatus::Partial, "{a:#?}");
     assert_eq!(a.status().exit_code(), 11);
     assert_eq!(a.claims_in(ClaimStanding::Verified), vec!["primal"]);
-    assert!(a.claims_in(ClaimStanding::Refuted).is_empty());
+    assert_eq!(a.claims_in(ClaimStanding::Refuted), Vec::<&str>::new());
     assert_eq!(a.census(), "CLAIMS verified=primal refuted=- unbacked=dual");
 
     // (b) NOTHING verified. The shape every uncertified `Infeasible` takes:
@@ -2188,7 +2188,7 @@ fn three_outcomes_a_consumer_must_be_able_to_tell_apart() {
     let b = cert_io::check(&stripped, INF);
     assert_eq!(b.status(), CheckStatus::Unverified, "{b:#?}");
     assert_eq!(b.status().exit_code(), 10);
-    assert!(b.claims_in(ClaimStanding::Verified).is_empty());
+    assert_eq!(b.claims_in(ClaimStanding::Verified), Vec::<&str>::new());
     assert_eq!(
         b.census(),
         "CLAIMS verified=- refuted=- unbacked=infeasible",
@@ -3078,7 +3078,7 @@ fn a_streamed_tree_that_does_not_fit_the_cap_is_dropped_and_the_claim_downgraded
         &ay_milp::OptimalityTreeBudget::new(4096),
     );
     let streamed = streamed.expect("the streaming descent closes this model");
-    assert!(!streamed.body().is_empty());
+    assert_ne!(streamed.body(), "");
 
     let emit = |cap: Option<usize>| -> String {
         let ctx = cert_io::EmitCtx {

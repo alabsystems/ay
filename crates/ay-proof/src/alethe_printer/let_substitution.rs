@@ -11,6 +11,7 @@
 //! it runs; failure never installs a rendering or a certified bridge.
 
 use super::{HashMap, PrintedLetLevel};
+use std::mem::size_of;
 
 /// One delimiter or whole token, keeping quoted symbols and strings atomic.
 fn piece<'a>(
@@ -106,7 +107,7 @@ pub(super) fn matches(
     mut expected: &str,
     mut admit: impl FnMut(usize) -> bool,
 ) -> bool {
-    if levels.len() > 64 || !admit(65 * std::mem::size_of::<(&str, usize)>()) {
+    if levels.len() > 64 || !admit(65 * size_of::<(&str, usize)>()) {
         return false;
     }
     let binding_count = levels.iter().try_fold(0usize, |count, (bindings, _)| {
@@ -115,9 +116,7 @@ pub(super) fn matches(
     let Some(binding_count) = binding_count else {
         return false;
     };
-    let Some(table_work) =
-        binding_count.checked_mul(2 * std::mem::size_of::<(&str, &str, usize)>())
-    else {
+    let Some(table_work) = binding_count.checked_mul(2 * size_of::<(&str, &str, usize)>()) else {
         return false;
     };
     if !admit(table_work) {

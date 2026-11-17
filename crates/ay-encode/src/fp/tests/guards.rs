@@ -53,10 +53,11 @@ fn attempt(budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
         .or(fields(words[0].clone(), 32).fp_is_nan())];
     let bindings = links(&words, &targets);
     let namespace = ChcProblem::new();
-    let output = lower_fp_expr_clause(&roots, &bindings, &namespace, budget)?;
-    let (body, source) = output.into_body(ClauseBody::empty())?.into_parts()?;
-    drop(body);
-    drop(source);
+    {
+        let output = lower_fp_expr_clause(&roots, &bindings, &namespace, budget)?;
+        let (body, _source) = output.into_body(ClauseBody::empty())?.into_parts()?;
+        drop(body);
+    }
     budget.charge(0)?;
     Ok(())
 }
@@ -107,25 +108,26 @@ fn both_full_raw_inputs_and_every_repeated_mixed_root_survive_consumption() {
             let roots = [root.clone(), root];
             let bindings = links(&words, &targets);
             let namespace = ChcProblem::new();
-            let output = lower_fp_expr_clause(&roots, &bindings, &namespace, budget).unwrap();
-            let (body, source) = output
-                .into_body(ClauseBody::empty())
-                .unwrap()
-                .into_parts()
-                .unwrap();
-            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-            assert_eq!(source.bindings().len(), 2);
-            assert!(std::ptr::eq(
-                source.bindings()[0].source.value(),
-                words[0].value()
-            ));
-            assert!(std::ptr::eq(
-                source.bindings()[1].source.value(),
-                words[1].value()
-            ));
-            assert_input_links(&body, &targets, width, budget);
-            drop(body);
-            drop(source);
+            {
+                let output = lower_fp_expr_clause(&roots, &bindings, &namespace, budget).unwrap();
+                let (body, source) = output
+                    .into_body(ClauseBody::empty())
+                    .unwrap()
+                    .into_parts()
+                    .unwrap();
+                assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+                assert_eq!(source.bindings().len(), 2);
+                assert!(std::ptr::eq(
+                    source.bindings()[0].source.value(),
+                    words[0].value()
+                ));
+                assert!(std::ptr::eq(
+                    source.bindings()[1].source.value(),
+                    words[1].value()
+                ));
+                assert_input_links(&body, &targets, width, budget);
+                drop(body);
+            }
             budget.charge(0).unwrap();
         }
     });

@@ -90,8 +90,8 @@ fn complete_data_moves_into_a_genuine_body_without_changing_predicate_arguments(
             [ChcExpr::Var(target.clone())]
         );
         let (body, source) = attached.into_parts().unwrap();
-        assert!(std::ptr::eq(source.namespace(), &problem));
-        assert!(std::ptr::eq(source.bindings()[0].source, &x));
+        assert!(std::ptr::eq(source.namespace(), &raw const problem));
+        assert!(std::ptr::eq(source.bindings()[0].source, &raw const x));
         let clause = HornClause::new(
             body,
             ClauseHead::Predicate(p, vec![ChcExpr::Var(target.clone())]),
@@ -149,34 +149,36 @@ fn raw_fp_words_are_linked_in_exact_lsb_order_after_the_complete_move() {
         }];
         let problem = ChcProblem::new();
         with_owner(|budget| {
-            let attached = relation(&roots, &bindings, &problem, budget);
-            let (body, source) = attached.into_parts().unwrap();
-            let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
-                panic!()
+            let _bits = {
+                let attached = relation(&roots, &bindings, &problem, budget);
+                let (body, _source) = attached.into_parts().unwrap();
+                let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
+                    panic!()
+                };
+                let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
+                    panic!()
+                };
+                budget.admit(4096, 4096).unwrap();
+                let mut bits = Vec::new();
+                for entry in entries.iter().rev().take(width as usize).rev() {
+                    budget.charge(256).unwrap();
+                    let ChcExpr::Op(ChcOp::Eq, pair) = entry.as_ref() else {
+                        panic!()
+                    };
+                    let ChcExpr::Op(ChcOp::Eq, value) = pair[1].as_ref() else {
+                        panic!()
+                    };
+                    let ChcExpr::Op(ChcOp::BvExtract(hi, lo), word) = value[0].as_ref() else {
+                        panic!()
+                    };
+                    assert_eq!(hi, lo);
+                    assert_eq!(word[0].as_ref(), &ChcExpr::Var(target.clone()));
+                    bits.push(*lo);
+                }
+                assert_eq!(bits, (0..width).collect::<Vec<_>>());
+                drop(body);
+                bits
             };
-            let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
-                panic!()
-            };
-            budget.admit(4096, 4096).unwrap();
-            let mut bits = Vec::new();
-            for entry in entries.iter().rev().take(width as usize).rev() {
-                budget.charge(256).unwrap();
-                let ChcExpr::Op(ChcOp::Eq, pair) = entry.as_ref() else {
-                    panic!()
-                };
-                let ChcExpr::Op(ChcOp::Eq, value) = pair[1].as_ref() else {
-                    panic!()
-                };
-                let ChcExpr::Op(ChcOp::BvExtract(hi, lo), word) = value[0].as_ref() else {
-                    panic!()
-                };
-                assert_eq!(hi, lo);
-                assert_eq!(word[0].as_ref(), &ChcExpr::Var(target.clone()));
-                bits.push(*lo);
-            }
-            assert_eq!(bits, (0..width).collect::<Vec<_>>());
-            drop(body);
-            drop(source);
             budget.charge(0).unwrap();
         });
     }

@@ -32,9 +32,10 @@ fn all_pruned_queries_are_source_bound_vacuity_proofs() {
     assert!(report.trust_full_verifier_admissible());
     assert_eq!(report.source_query_count(), 1);
     assert_eq!(report.source_pruned_false_query_count(), 1);
-    assert!(!report.source_pruned_false_query_ids()[0]
-        .content_bytes()
-        .is_empty());
+    assert_ne!(
+        report.source_pruned_false_query_ids()[0].content_bytes(),
+        &[] as &[u8]
+    );
 
     let json = report.to_json_value();
     assert_eq!(json["result"], "safe");

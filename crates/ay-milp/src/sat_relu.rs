@@ -2754,7 +2754,10 @@ mod tests {
         let mut session = BabSession::new(model, &opts).expect("session");
         let outcome = session.check().expect("solve");
         assert!(matches!(outcome, Outcome::Feasible { .. }));
-        assert!(session.replay_claims().is_empty());
+        assert_eq!(
+            session.replay_claims(),
+            &[] as &[crate::cert_io::ReplayClaim]
+        );
         assert_eq!(test_cdcl_invocations(), 0, "no ordinary-CDCL prepass");
         assert_eq!(test_bounded_cdcl_invocations(), 1, "one bounded pass");
     }
@@ -2960,7 +2963,10 @@ mod tests {
             outcome,
             Outcome::Optimal { ref value, .. } if value.is_zero()
         ));
-        assert!(session.replay_claims().is_empty());
+        assert_eq!(
+            session.replay_claims(),
+            &[] as &[crate::cert_io::ReplayClaim]
+        );
     }
 
     #[test]

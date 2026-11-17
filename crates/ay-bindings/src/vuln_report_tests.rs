@@ -226,7 +226,7 @@ fn test_report_new_sets_default_severity() {
     assert_eq!(report.severity, Severity::High);
     assert_eq!(report.exploit_input.len(), 1);
     assert!(report.affected_memory.is_none());
-    assert!(!report.explanation.is_empty());
+    assert_ne!(report.explanation, "");
 }
 
 #[test]
@@ -335,16 +335,16 @@ fn test_generate_report_for_each_vuln_type() {
 
         // Report is well-formed
         assert_eq!(report.vuln_type, *vuln_type);
-        assert!(!report.explanation.is_empty());
+        assert_ne!(report.explanation, "");
 
         // Format produces non-empty text
         let text = report.format();
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
         assert!(text.contains(vuln_type.name()));
 
         // Markdown format produces non-empty text
         let md = report.format_markdown();
-        assert!(!md.is_empty());
+        assert_ne!(md, "");
         assert!(md.contains(vuln_type.cwe()));
     }
 }

@@ -640,7 +640,7 @@ pub fn cmd_harvest(args: HarvestArgs) -> Result<usize> {
         store_path.display()
     );
     eprintln!(
-        "harvest: resource plan requested_jobs={} jobs={} memory={}MiB/child NBCORE={} headroom={}MiB enforcement=_oom_guard.rss_watchdog(grace=0)+MEMLIMIT/NBCORE-env",
+        "harvest: resource plan requested_jobs={} jobs={} memory={}MiB/child NBCORE={} headroom={}MiB enforcement=native-rss-observer(grace=0)+MEMLIMIT/NBCORE-env",
         resources.plan.requested_jobs,
         resources.plan.jobs,
         resources.plan.memlimit_mb_per_child,

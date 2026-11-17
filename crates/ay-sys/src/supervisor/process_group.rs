@@ -24,7 +24,7 @@ pub(crate) fn census_member_disappeared() -> io::Error {
 }
 
 /// An incomplete observation, never an empty-group or zero-RSS witness.
-pub(crate) fn is_census_member_disappearance(error: &io::Error) -> bool {
+pub fn is_census_member_disappearance(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|cause| cause.is::<CensusMemberDisappeared>())

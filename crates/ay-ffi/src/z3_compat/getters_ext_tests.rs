@@ -215,7 +215,7 @@ fn registry_enumerators() {
         let name0 = CStr::from_ptr(Z3_get_tactic_name(c, 0))
             .to_str()
             .expect("registered tactic name must be valid UTF-8");
-        assert!(!name0.is_empty());
+        assert_ne!(name0, "");
         // out of range → null + IOB
         assert!(Z3_get_tactic_name(c, nt).is_null());
 
@@ -276,7 +276,7 @@ fn as_array_and_lambda_classifiers_recognize_real_terms() {
         assert!(!Z3_is_lambda(c, arr));
         let back = Z3_get_as_array_func_decl(c, arr);
         assert!(!back.is_null());
-        let name = std::ffi::CStr::from_ptr(Z3_get_symbol_string(c, Z3_get_decl_name(c, back)))
+        let name = CStr::from_ptr(Z3_get_symbol_string(c, Z3_get_decl_name(c, back)))
             .to_string_lossy()
             .into_owned();
         assert_eq!(name, "f");
@@ -296,7 +296,7 @@ fn as_array_and_lambda_classifiers_recognize_real_terms() {
 static ERROR_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ERROR_HANDLER_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-unsafe extern "C" fn counting_error_handler(c: Z3_context, code: std::ffi::c_uint) {
+unsafe extern "C" fn counting_error_handler(c: Z3_context, code: c_uint) {
     ERROR_HANDLER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     ERROR_HANDLER_LAST.store(code, std::sync::atomic::Ordering::SeqCst);
     // The handler may query the error state reentrantly (libz3 allows it);

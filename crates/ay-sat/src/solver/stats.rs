@@ -1310,7 +1310,6 @@ impl Solver {
         self.cold.num_arena_compactions
     }
 
-    /// Get the number of reduce_db calls performed.
     /// The dynamic tier boundaries `[tier1 focused, tier2 focused, tier1
     /// stable, tier2 stable]` (`recompute_tier`); Kissat prints its own as
     /// `tier1`/`tier2` per mode, and on schooltt-5-3 lands at 7/12 focused

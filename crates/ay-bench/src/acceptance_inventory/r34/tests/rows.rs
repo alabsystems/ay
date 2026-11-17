@@ -24,7 +24,7 @@ fn all_four_original_rows_preserve_nanosecond_caps_and_expose_identity_migration
                 "ay.chc.normalized-input/v2"
             }
         );
-        assert!(binding.mismatches.is_empty());
+        assert_eq!(binding.mismatches.as_slice(), &[] as &[String]);
         assert_eq!(
             binding.migrations.len(),
             if case == R34Row::AllocErrorP28 { 1 } else { 4 }

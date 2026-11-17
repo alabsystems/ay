@@ -2888,7 +2888,7 @@ mod tests {
         else {
             panic!("expected certified infeasibility");
         };
-        assert!(!certificate.cuts.is_empty());
+        assert_ne!(certificate.cuts, Vec::<HybridPbLpInfeasibilityCut>::new());
         verify_hybrid_pb_lp_infeasibility_certificate(&model, &certificate)
             .expect("generated artifact independently replays");
 

@@ -251,3 +251,22 @@ fn controlled_noartifact_entry_preserves_the_legacy_none_lane() {
         Some(BackwardProofFailure::Cancelled)
     );
 }
+
+// The no-control reference exists only for None/Some proof-progress parity controls.
+impl Solver {
+    /// Interruptible solve without the configured dry-run artifact export.
+    ///
+    /// Test reference for the no-control proof-progress lane.
+    /// The actual bounded ResolutionDag producer uses the live controlled
+    /// entry; this reference preserves the independent None/Some comparison.
+    pub(crate) fn solve_interruptible_without_artifact<F>(
+        &mut self,
+        should_stop: F,
+    ) -> SolverSatResult
+    where
+        F: Fn() -> bool,
+    {
+        let result = self.solve_interruptible_raw(should_stop);
+        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
+    }
+}

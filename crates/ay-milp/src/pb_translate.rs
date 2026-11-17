@@ -899,7 +899,7 @@ mod tests {
             .expect("constant objective")
             .objective
             .expect("explicit objective remains optimization");
-        assert!(objective.terms.is_empty());
+        assert_eq!(objective.terms, Vec::<(u32, i128)>::new());
         assert_eq!(objective.map.denominator(), &BigInt::one());
         assert_eq!(objective.map.model_value(0), br(29, 4));
     }

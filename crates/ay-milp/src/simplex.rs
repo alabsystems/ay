@@ -2432,7 +2432,7 @@ pub(crate) mod stats {
         // build: see [`WORK_LOCAL`]. `bump` is the sole write path to both
         // counters [`work`] sums, so mirroring here is complete.
         #[cfg(test)]
-        if std::ptr::eq(c, &DUAL_ITERS) || std::ptr::eq(c, &PRIMAL_ITERS) {
+        if std::ptr::eq(c, &raw const DUAL_ITERS) || std::ptr::eq(c, &raw const PRIMAL_ITERS) {
             WORK_LOCAL.with(|w| w.set(w.get().wrapping_add(1)));
         }
     }
@@ -14094,9 +14094,6 @@ mod equilibration_kernel_tests {
     /// magnitude, so the SAFE check sees exponents of O(span), never 900).
     struct Fixture {
         model: Model,
-        r: Vec<i32>,
-        c: Vec<i32>,
-        dense_rows: usize,
         dense_cols: usize,
         empty_col: usize,
         empty_row: usize,
@@ -14132,9 +14129,6 @@ mod equilibration_kernel_tests {
         let empty_row = model.num_rows() - 1;
         Fixture {
             model,
-            r,
-            c,
-            dense_rows: rows,
             dense_cols: cols,
             empty_col,
             empty_row,

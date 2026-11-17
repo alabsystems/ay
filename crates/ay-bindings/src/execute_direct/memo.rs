@@ -34,15 +34,20 @@ use std::sync::Arc;
 use ay_dpll::api::Term;
 
 use crate::expr::Expr;
+use crate::sort::Sort;
 
 /// Identity of a node: the addresses of its shared value and sort
 /// allocations.
 pub(super) type NodeKey = (usize, usize);
 
+pub(super) fn sort_key(sort: &Sort) -> usize {
+    std::ptr::from_ref(sort.inner()).cast::<()>() as usize
+}
+
 pub(super) fn node_key(expr: &Expr) -> NodeKey {
     (
         Arc::as_ptr(&expr.value).cast::<()>() as usize,
-        expr.sort().identity(),
+        sort_key(expr.sort()),
     )
 }
 

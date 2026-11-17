@@ -19,7 +19,7 @@ fn incomplete_capture_retains_bounded_prefix_and_error() {
     assert!(evidence.incomplete);
     assert!(evidence.error.as_ref().unwrap().contains("truncated=true"));
     let mut assessment = checked("sat\n", &stats("sat", 4 * 1024 * 1024 * 1024), Some(0));
-    let output = super::super::execution::Output {
+    let output = execution::Output {
         stdout: evidence.text,
         stderr: String::new(),
         terminal: SmtCliTerminal {
@@ -42,7 +42,7 @@ fn incomplete_capture_retains_bounded_prefix_and_error() {
 #[test]
 fn elapsed_terminal_failure_retains_output_argv_binary_and_input() {
     let directory = tempfile::tempdir().unwrap();
-    let output = super::super::execution::Output {
+    let output = execution::Output {
         stdout: "sat\npartial".into(),
         stderr: "deadline diagnostic".into(),
         terminal: SmtCliTerminal {
@@ -74,14 +74,14 @@ fn elapsed_terminal_failure_retains_output_argv_binary_and_input() {
         execution_envelope: "test-only".into(),
         elapsed_ns: 10,
         deadline_from_run_start_ns: 1,
-        stdout_sha256: super::super::snapshot::hash(output.stdout.as_bytes()),
-        stderr_sha256: super::super::snapshot::hash(output.stderr.as_bytes()),
+        stdout_sha256: snapshot::hash(output.stdout.as_bytes()),
+        stderr_sha256: snapshot::hash(output.stderr.as_bytes()),
         blockers: vec![SmtCliBlocker::OutputIncomplete],
         promotable_for_ask_closure: false,
     };
     let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    super::super::execution::retain_output(directory.path(), "solve", &output).unwrap();
-    super::super::execution::publish_record(directory.path(), &mut record, expired).unwrap();
+    execution::retain_output(directory.path(), "solve", &output).unwrap();
+    execution::publish_record(directory.path(), &mut record, expired).unwrap();
     assert!(!record.in_tree_self_check_passed);
     let retained: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.path().join("record.json")).unwrap())

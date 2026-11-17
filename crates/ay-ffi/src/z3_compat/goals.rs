@@ -110,8 +110,8 @@ fn apply_owned_goal(
             .map_err(|e| e.to_string())?;
         let boxes = subgoals
             .len()
-            .checked_mul(std::mem::size_of::<super::GoalHandle>())
-            .and_then(|n| n.checked_add(std::mem::size_of::<super::ApplyResultHandle>()))
+            .checked_mul(size_of::<super::GoalHandle>())
+            .and_then(|n| n.checked_add(size_of::<super::ApplyResultHandle>()))
             .ok_or("goal publication size overflow")?;
         owner
             .admit(subgoals.len(), boxes)
@@ -969,7 +969,7 @@ pub unsafe extern "C" fn Z3_goal_convert_model(c: Z3_context, g: Z3_goal, m: Z3_
                     }
                 };
                 let owner = operation.admission();
-                if owner.admit(1, std::mem::size_of::<ModelHandle>()).is_err()
+                if owner.admit(1, size_of::<ModelHandle>()).is_err()
                     || ay_core::term::reserve_counted(&mut ctx.model_cache, 1, owner).is_err()
                     || !operation.validate(&ctx.solver)
                 {

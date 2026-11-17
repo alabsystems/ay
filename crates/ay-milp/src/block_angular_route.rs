@@ -2565,7 +2565,7 @@ fn prepare_mitm_assignments(
     let right_width = signature.maxima.len() - split;
     let sort_work = right
         .len()
-        .checked_mul((usize::BITS - right.len().max(1).leading_zeros()) as usize + 1)
+        .checked_mul(right.len().bit_width() as usize + 1)
         .and_then(|count| count.checked_mul(2))
         .ok_or(Decline::Resource)?;
     work.charge_terms(sort_work)?;

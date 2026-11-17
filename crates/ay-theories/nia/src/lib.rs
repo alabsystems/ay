@@ -43,6 +43,8 @@ mod factor_split;
 mod factor_split_provenance;
 pub(crate) mod feasible_set;
 mod full_conflict;
+pub(crate) mod groebner;
+mod groebner_lemmas;
 mod interval_contract;
 mod local_search;
 mod local_search_order;
@@ -215,6 +217,13 @@ pub struct NiaSolver<'a> {
     propagation_count: u64,
     /// Number of tangent plane lemmas added
     tangent_lemma_count: u64,
+    /// Diagnostic count of (order, shared-factor) probes performed by the
+    /// multiplication-monotonicity derivation (#nia-zero-bound family 2).
+    /// The derivation runs on every check, so this counts the pairs that
+    /// actually reach a monomial lookup; pairs that cannot name a
+    /// registered monomial (a side that is no monomial's factor) are not
+    /// probed and not counted.
+    mul_mono_probe_count: u64,
     /// Number of successful model patches
     patch_count: u64,
     /// Number of tentative sign cuts injected
@@ -244,6 +253,17 @@ pub struct NiaSolver<'a> {
     /// `nla_basics_lemmas::sign_lemma` discipline: a model-guessed sign is a
     /// decision, never a fact). Reset to zero by `undo_tentative_patch`.
     tentative_guess_count: u32,
+
+    /// `(variable, floor)` splits already offered by this instance at
+    /// the stall exit. A persistent (eager-lane) instance re-checks at
+    /// every BCP quiescence, so re-offering the identical split each
+    /// time only churns split-loop rounds (measured: 41 identical
+    /// offers on `int_check_bvsle_bvudiv1_rtl`, diverting a deciding
+    /// lane into a round-cap `unknown`). Once per `(var, floor)` per
+    /// instance — distinct bisection floors remain offerable, like
+    /// fractional branch-and-bound; fresh split-loop instances start
+    /// empty, where executor clause dedup and bound sync bound repeats.
+    sign_split_offered: HashSet<(TermId, BigInt)>,
 
     // --- clauseSMT NLSAT techniques (#8453, ported from NRA #8445) ---
     /// Per-variable feasible sets: intersection of clause-level feasible sets.
@@ -306,6 +326,23 @@ pub struct NiaSolver<'a> {
     pub(crate) leaf_sign_memo:
         std::cell::RefCell<(Option<u64>, HashMap<TermId, Option<std::cmp::Ordering>>)>,
 
+    /// Per-term memos of the two pure term-store walks the bounded
+    /// enumeration / model-point paths repeat over the asserted atoms
+    /// on every check: Int variable leaves and scaled-product factor
+    /// variables (`bounded_enum.rs`). Both are pure functions of the
+    /// immutable term store -- a term's lists never change once
+    /// interned, and terms minted later simply miss -- so serving
+    /// them from these memos is value- and trajectory-exact. The
+    /// unmemoized walks re-traversed shared subterm DAGs per asserted
+    /// atom per check (sampled at ~4% of the solver thread on Certora
+    /// `65782_..._8`, behind only the LIA's own internals).
+    pub(crate) int_leaf_memo: std::cell::RefCell<HashMap<TermId, std::rc::Rc<Vec<TermId>>>>,
+    pub(crate) scaled_vars_memo: std::cell::RefCell<HashMap<TermId, std::rc::Rc<Vec<TermId>>>>,
+    /// Diagnostic count of term nodes visited by the uncached sides
+    /// of those walks (one per node whose list is actually computed;
+    /// memo hits visit nothing).
+    pub(crate) pure_walk_nodes: std::cell::Cell<u64>,
+
     /// Real per-phase timings for NIA-specific work (#8823). Populated by
     /// `Instant::now()` measurements in `nia_check_loop`. Separate from
     /// `self.lia.timings()` so a dispatcher can see NIA overhead distinct
@@ -350,6 +387,13 @@ pub struct NiaSolver<'a> {
     /// `TermId` first). Cleared on `pop`/`reset` (re-deriving after a scope
     /// change is sound — the equality is universally valid given its reasons).
     congruence_linked: HashSet<(TermId, TermId)>,
+
+    /// Integer signatures of Groebner-derived equalities already
+    /// asserted as cuts in this scope (#nia-groebner, see
+    /// `groebner.rs`). Cleared on `pop`/`reset`; re-deriving after a
+    /// scope change is sound because each cut is re-justified from
+    /// the then-current asserted equality literals.
+    groebner_emitted: HashSet<Vec<(Vec<TermId>, BigInt)>>,
 
     /// Zero-lower-bound product lemmas already emitted in this scope
     /// (#nia-zero-bound, see `zero_bound_lemmas.rs`). Keys are
@@ -469,11 +513,13 @@ impl<'a> NiaSolver<'a> {
             conflict_count: 0,
             propagation_count: 0,
             tangent_lemma_count: 0,
+            mul_mono_probe_count: 0,
             patch_count: 0,
             sign_cut_count: 0,
             unsat_with_guesses_count: 0,
             tentative_depth: 0,
             tentative_guess_count: 0,
+            sign_split_offered: HashSet::default(),
             feasible_sets: HashMap::default(),
             blocked_vars: Vec::new(),
             fixed_vars: Vec::new(),
@@ -483,12 +529,16 @@ impl<'a> NiaSolver<'a> {
             sat_atoms: HashSet::default(),
             phase_memo: std::cell::RefCell::new((None, HashMap::default())),
             leaf_sign_memo: std::cell::RefCell::new((None, HashMap::default())),
+            int_leaf_memo: std::cell::RefCell::new(HashMap::default()),
+            scaled_vars_memo: std::cell::RefCell::new(HashMap::default()),
+            pure_walk_nodes: std::cell::Cell::new(0),
             timings: NiaTimings::default(),
             bounded_enum_model: None,
             bounded_enum_bool_model: HashMap::default(),
             contracted_bounds: HashMap::default(),
             contracted_bound_reasons: HashMap::default(),
             congruence_linked: HashSet::default(),
+            groebner_emitted: HashSet::default(),
             zero_bound_emitted: HashSet::default(),
             box_bound_emitted: HashSet::default(),
             zero_product_emitted: HashSet::default(),
@@ -651,3 +701,6 @@ mod split_probe_tests;
 
 #[cfg(test)]
 mod factor_split_precision_tests;
+
+#[cfg(test)]
+mod groebner_tests;

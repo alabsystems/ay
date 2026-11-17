@@ -243,5 +243,5 @@ fn public_result_alias_uses_fzn2smt_error() {
     let unsupported = assert_public_result_type(solve_cp::unsupported_constraints(&model))
         .expect("empty model should have no unsupported constraints");
 
-    assert!(unsupported.is_empty());
+    assert_eq!(unsupported, Vec::<String>::new());
 }

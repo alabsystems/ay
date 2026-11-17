@@ -462,13 +462,13 @@ fn solve_safe_parity_with_raw_pdr_proof() {
 
             // G5: per-artifact schema/role/digest reachable through Certificate.
             let model = cert.artifacts().model();
-            assert!(!model.schema().is_empty());
-            assert!(!model.role().is_empty());
-            assert!(!model.sha256().is_empty());
-            assert!(!model.bytes().is_empty());
+            assert_ne!(model.schema(), "");
+            assert_ne!(model.role(), "");
+            assert_ne!(model.sha256(), "");
+            assert_ne!(model.bytes(), &[] as &[u8]);
             let replay = cert.artifacts().replay_transcript();
-            assert!(!replay.schema().is_empty());
-            assert!(!replay.role().is_empty());
+            assert_ne!(replay.schema(), "");
+            assert_ne!(replay.role(), "");
 
             // The certificate's normalized-input hash must match the free fn
             // re-exported for the cache-key cross-check (G6).

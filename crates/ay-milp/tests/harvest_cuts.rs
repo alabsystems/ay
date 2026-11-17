@@ -114,9 +114,9 @@ fn integer_cut_actual_finished_tree_exports_replayable_fractional_separating_cut
 fn integer_cut_source_mutation_sibling_domains_and_tampering_cannot_lend_cut_authority() {
     let source = model(3.0);
     let mut session = BabSession::new(source.clone(), &options()).unwrap();
-    session.check().unwrap();
+    let _ = session.check().unwrap();
     let cuts = session.harvest_cuts();
-    assert!(!cuts.is_empty());
+    assert_ne!(cuts, [] as [ay_milp::CertifiedIntegerCut; 0]);
     let relaxed = model(4.0);
     relaxed
         .check_point(&[
@@ -149,9 +149,9 @@ fn integer_cut_source_mutation_sibling_domains_and_tampering_cannot_lend_cut_aut
     let y = local.col_at(1).unwrap();
     local.add_row(f64::NEG_INFINITY, 3.0, &[(x, 2.0), (y, 2.0)]);
     let mut local_session = BabSession::new(local, &options()).unwrap();
-    local_session.check().unwrap();
+    let _ = local_session.check().unwrap();
     let local_cuts = local_session.harvest_cuts();
-    assert!(!local_cuts.is_empty());
+    assert_ne!(local_cuts, [] as [ay_milp::CertifiedIntegerCut; 0]);
     for cut in local_cuts {
         assert!(cut.verify(&relaxed).is_err());
     }
@@ -160,32 +160,38 @@ fn integer_cut_source_mutation_sibling_domains_and_tampering_cannot_lend_cut_aut
 #[test]
 fn integer_cut_harvest_is_invalidated_by_scope_mutation_new_check_and_failed_check() {
     let mut session = BabSession::new(model(3.0), &options()).unwrap();
-    session.check().unwrap();
+    let _ = session.check().unwrap();
     assert!(session.cut_harvest_summary().certified_sides > 0);
     session.push().unwrap();
-    assert!(session.harvest_cuts().is_empty());
-    session.check().unwrap();
+    assert_eq!(
+        session.harvest_cuts(),
+        [] as [ay_milp::CertifiedIntegerCut; 0]
+    );
+    let _ = session.check().unwrap();
     assert!(session.cut_harvest_summary().certified_sides > 0);
     session.pop().unwrap();
     assert!(
         session.harvest_cuts().is_empty(),
         "pop invalidates even a fresh scoped batch"
     );
-    session.check().unwrap();
+    let _ = session.check().unwrap();
     let count = session.cut_harvest_summary().certified_sides;
     assert!(count > 0);
-    session.check().unwrap();
+    let _ = session.check().unwrap();
     assert_eq!(
         session.harvest_cuts().len(),
         count,
         "a new check replaces rather than appends old cuts"
     );
-    session.check().unwrap();
+    let _ = session.check().unwrap();
     let x = session.model().col_at(0).unwrap();
     session.fix_col(x, 0.0).unwrap();
-    assert!(session.harvest_cuts().is_empty());
+    assert_eq!(
+        session.harvest_cuts(),
+        [] as [ay_milp::CertifiedIntegerCut; 0]
+    );
     let mut other = BabSession::new(model(3.0), &options()).unwrap();
-    other.check().unwrap();
+    let _ = other.check().unwrap();
     let x = other.model().col_at(0).unwrap();
     assert!(other.check_shared_binary_prefix(&[x, x]).is_err());
     assert!(
@@ -200,7 +206,10 @@ fn integer_cut_shadow_control_rows_are_not_advertised_as_real_cuts() {
     let engine = opts.engine().with_cut_shadow(2);
     opts = opts.with_engine(engine);
     let mut session = BabSession::new(model(3.0), &opts).unwrap();
-    session.check().unwrap();
-    assert!(session.harvest_cuts().is_empty());
+    let _ = session.check().unwrap();
+    assert_eq!(
+        session.harvest_cuts(),
+        [] as [ay_milp::CertifiedIntegerCut; 0]
+    );
     assert_eq!(session.cut_harvest_summary().adopted_root_sides, 0);
 }

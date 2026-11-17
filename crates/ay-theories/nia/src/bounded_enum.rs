@@ -901,25 +901,58 @@ impl NiaSolver<'_> {
     /// Collect the Int-sorted VARIABLE leaves of `term` into `out` (deduped).
     /// Used to assemble exact integer model points from the LIA model.
     pub(crate) fn collect_int_var_leaves(&self, term: TermId, out: &mut Vec<TermId>) {
+        for &v in self.int_var_leaves(term).iter() {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+
+    /// The Int-sorted variable leaves of `term` in first-occurrence
+    /// traversal order, memoized per term (`int_leaf_memo`): the list
+    /// is a pure function of the immutable term store, so a memo hit
+    /// returns exactly what the walk would rebuild. Children resolve
+    /// through the same memo, making shared-subterm DAGs linear.
+    fn int_var_leaves(&self, term: TermId) -> std::rc::Rc<Vec<TermId>> {
+        if let Some(hit) = self.int_leaf_memo.borrow().get(&term) {
+            return std::rc::Rc::clone(hit);
+        }
+        self.pure_walk_nodes.set(self.pure_walk_nodes.get() + 1);
+        let mut vars: Vec<TermId> = Vec::new();
         match self.terms.get(term) {
-            TermData::Var(_, _)
-                if matches!(self.terms.sort(term), Sort::Int) && !out.contains(&term) =>
-            {
-                out.push(term);
+            TermData::Var(_, _) if matches!(self.terms.sort(term), Sort::Int) => {
+                vars.push(term);
             }
             TermData::App(_, args) => {
-                for &arg in args {
-                    self.collect_int_var_leaves(arg, out);
+                let args: Vec<TermId> = args.clone();
+                for arg in args {
+                    for &v in self.int_var_leaves(arg).iter() {
+                        if !vars.contains(&v) {
+                            vars.push(v);
+                        }
+                    }
                 }
             }
-            TermData::Not(inner) => self.collect_int_var_leaves(*inner, out),
+            TermData::Not(inner) => {
+                let inner = *inner;
+                vars.extend(self.int_var_leaves(inner).iter().copied());
+            }
             TermData::Ite(c, t, e) => {
-                self.collect_int_var_leaves(*c, out);
-                self.collect_int_var_leaves(*t, out);
-                self.collect_int_var_leaves(*e, out);
+                for part in [*c, *t, *e] {
+                    for &v in self.int_var_leaves(part).iter() {
+                        if !vars.contains(&v) {
+                            vars.push(v);
+                        }
+                    }
+                }
             }
             _ => {}
         }
+        let rc = std::rc::Rc::new(vars);
+        self.int_leaf_memo
+            .borrow_mut()
+            .insert(term, std::rc::Rc::clone(&rc));
+        rc
     }
 
     /// Build an exact integer model point for the Int variable leaves of
@@ -1123,6 +1156,107 @@ impl NiaSolver<'_> {
     /// problem again and the split loop walks (signfuzz p066: `y = 1/170`
     /// split 1,940 times under an asserted `y <= 0`). Inside the bounds both
     /// branches are new information (`lb <= val < ceil`, `floor < val <= ub`).
+    /// Branch split for a factor of a tracked monomial, offered only
+    /// at the refinement stall exit (integral model point, monomials
+    /// inconsistent, every exact/SAT-only lane declined, no fractional
+    /// split): without a branch the loop can only return Unknown.
+    ///
+    /// A factor with a finite integer box `[lo, hi]`, `lo < hi`, is
+    /// bisected at its midpoint (`v <= mid OR v >= mid + 1`), so
+    /// successive branches pin boxed factors level by level — the
+    /// DPLL-level analogue of the one-level factor split, which on
+    /// slayer-3 refutes most of its 54 branches immediately but
+    /// leaves the rest inconclusive for want of a second level. A
+    /// sign-undetermined unbounded factor gets the sign dichotomy
+    /// `v <= -1 OR v >= 0`. Once per `(var, floor)` per instance
+    /// (`sign_split_offered`): re-offering the identical split at
+    /// every BCP quiescence of a persistent eager-lane instance
+    /// churns split-loop rounds until the round cap converts a
+    /// deciding solve into `unknown`
+    /// (DR-AY-NIA-SIGN-SPLIT-REJECTED-20261116).
+    pub(crate) fn monomial_sign_split(&mut self) -> Option<ay_core::SplitRequest> {
+        let mut candidates: Vec<TermId> = self
+            .monomials
+            .values()
+            .flat_map(|m| m.vars.iter().copied())
+            .collect();
+        candidates.sort_by_key(|t| t.0);
+        candidates.dedup();
+        // (width in integers, term, split floor); unbounded sign splits
+        // sort last via a maximal width.
+        let mut offers: Vec<(BigInt, TermId, BigInt)> = Vec::new();
+        let zero = BigRational::zero();
+        for v in candidates {
+            // Plain Int variable leaves only: a compound factor has no
+            // single bound atom the split could assert.
+            if !matches!(self.terms.get(v), TermData::Var(..)) {
+                continue;
+            }
+            if *self.terms.sort(v) != Sort::Int {
+                continue;
+            }
+            let (lb, ub) = match self.lia.lra_solver().get_bounds_ref(v) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            // Effective integer box from the direct bounds: lower rounds
+            // up (strict `> c` means `>= floor(c) + 1`), upper rounds down.
+            let lo = lb.map(|b| {
+                let value = b.value_big();
+                let floor = value.floor().to_integer();
+                if b.strict && value.is_integer() {
+                    floor + 1
+                } else if value.is_integer() {
+                    floor
+                } else {
+                    floor + 1
+                }
+            });
+            let hi = ub.map(|b| {
+                let value = b.value_big();
+                let floor = value.floor().to_integer();
+                if b.strict && value.is_integer() {
+                    floor - 1
+                } else {
+                    floor
+                }
+            });
+            match (lo, hi) {
+                (Some(lo), Some(hi)) if lo < hi => {
+                    // Midpoint floor: (lo + hi - 1) / 2 floored, so the
+                    // fractional value floor + 1/2 lies inside the box.
+                    let mid = (&lo + &hi - BigInt::one()).div_floor(&BigInt::from(2));
+                    offers.push((&hi - &lo, v, mid));
+                }
+                (Some(_), Some(_)) => {}
+                _ => {
+                    let determined_nonneg = lb.is_some_and(|b| b.value_big() >= zero);
+                    let determined_negative = ub.is_some_and(|b| {
+                        let value = b.value_big();
+                        value < zero || (value.is_zero() && b.strict)
+                    });
+                    if !determined_nonneg && !determined_negative {
+                        offers.push((BigInt::from(i64::MAX), v, BigInt::from(-1)));
+                    }
+                }
+            }
+        }
+        offers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+        for (_, v, floor) in offers {
+            if self.sign_split_offered.contains(&(v, floor.clone())) {
+                continue;
+            }
+            self.sign_split_offered.insert((v, floor.clone()));
+            return Some(ay_core::SplitRequest {
+                variable: v,
+                value: BigRational::new(&floor * 2 + 1, BigInt::from(2)),
+                ceil: &floor + 1,
+                floor,
+            });
+        }
+        None
+    }
+
     pub(crate) fn fractional_int_split(&self) -> Option<ay_core::SplitRequest> {
         let asserted_terms: Vec<TermId> = self.asserted.iter().map(|&(t, _)| t).collect();
         let mut vars: Vec<TermId> = Vec::new();
@@ -1630,12 +1764,32 @@ impl NiaSolver<'_> {
     /// added — non-variable factors keep `eval_term` fail-closed, so a product
     /// whose factors are not all enumerable Int vars simply yields Unknown.
     fn collect_scaled_product_vars(&self, term: TermId, vars: &mut Vec<TermId>) {
+        for &v in self.scaled_product_vars(term).iter() {
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+        }
+    }
+
+    /// The scaled-product factor variables of `term` in
+    /// first-occurrence traversal order (a product node's own
+    /// factors before its children's), memoized per term
+    /// (`scaled_vars_memo`); see `int_var_leaves` for the exactness
+    /// argument.
+    fn scaled_product_vars(&self, term: TermId) -> std::rc::Rc<Vec<TermId>> {
+        if let Some(hit) = self.scaled_vars_memo.borrow().get(&term) {
+            return std::rc::Rc::clone(hit);
+        }
+        self.pure_walk_nodes.set(self.pure_walk_nodes.get() + 1);
+        let mut vars: Vec<TermId> = Vec::new();
         match self.terms.get(term) {
             TermData::App(Symbol::Named(name), args) => {
-                if name == "*" {
+                let is_mul = name == "*";
+                let args: Vec<TermId> = args.clone();
+                if is_mul {
                     let mut var_factors = 0usize;
                     let mut const_product = BigInt::one();
-                    for &arg in args {
+                    for &arg in &args {
                         if let Some(c) = self.terms.extract_integer_constant(arg) {
                             const_product *= c;
                         } else {
@@ -1650,7 +1804,7 @@ impl NiaSolver<'_> {
                     // unbounded pure product like `r = n*m` — which the relaxation
                     // soundly reports Sat — into the enumeration/Unknown path.
                     if var_factors >= 2 && !const_product.is_one() {
-                        for &arg in args {
+                        for &arg in &args {
                             if matches!(self.terms.get(arg), TermData::Var(_, _))
                                 && matches!(self.terms.sort(arg), Sort::Int)
                                 && !vars.contains(&arg)
@@ -1660,18 +1814,34 @@ impl NiaSolver<'_> {
                         }
                     }
                 }
-                for &arg in args {
-                    self.collect_scaled_product_vars(arg, vars);
+                for arg in args {
+                    for &v in self.scaled_product_vars(arg).iter() {
+                        if !vars.contains(&v) {
+                            vars.push(v);
+                        }
+                    }
                 }
             }
-            TermData::Not(inner) => self.collect_scaled_product_vars(*inner, vars),
+            TermData::Not(inner) => {
+                let inner = *inner;
+                vars.extend(self.scaled_product_vars(inner).iter().copied());
+            }
             TermData::Ite(c, t, e) => {
-                self.collect_scaled_product_vars(*c, vars);
-                self.collect_scaled_product_vars(*t, vars);
-                self.collect_scaled_product_vars(*e, vars);
+                for part in [*c, *t, *e] {
+                    for &v in self.scaled_product_vars(part).iter() {
+                        if !vars.contains(&v) {
+                            vars.push(v);
+                        }
+                    }
+                }
             }
             _ => {}
         }
+        let rc = std::rc::Rc::new(vars);
+        self.scaled_vars_memo
+            .borrow_mut()
+            .insert(term, std::rc::Rc::clone(&rc));
+        rc
     }
 
     /// Check if a variable assignment satisfies all monomial constraints.

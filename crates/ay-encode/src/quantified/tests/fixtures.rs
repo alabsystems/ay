@@ -19,7 +19,7 @@ pub(super) fn source() -> QuantifiedChcProblem {
     .expect("two source-preserving property rows")
 }
 
-pub(super) fn obligations() -> Vec<ay_chc::quantified::QuantifiedChcQueryObligation> {
+pub(super) fn obligations() -> Vec<QuantifiedChcQueryObligation> {
     source()
         .query_obligations(Duration::from_secs(10), &CancellationToken::new())
         .expect("source decomposition")
@@ -76,7 +76,7 @@ pub(super) struct Fake<'a> {
 }
 
 impl<'a> Fake<'a> {
-    pub fn new(
+    pub(super) fn new(
         time: &'a Cell<Duration>,
         parent: &'a CancellationToken,
         actions: Vec<Action>,

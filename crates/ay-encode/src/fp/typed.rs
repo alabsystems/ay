@@ -19,14 +19,14 @@ pub(super) enum Scalar {
 }
 
 impl Scalar {
-    pub fn core(self) -> ay_core::Sort {
+    pub(super) fn core(self) -> ay_core::Sort {
         match self {
             Self::Bool => ay_core::Sort::Bool,
             Self::Bv(w) => ay_core::Sort::bitvec(w),
             Self::Fp(e, s) => ay_core::Sort::FloatingPoint(e, s),
         }
     }
-    pub fn binding(self, target: &ChcSort) -> bool {
+    pub(super) fn binding(self, target: &ChcSort) -> bool {
         match (self, target) {
             (Self::Bool, ChcSort::Bool) => true,
             (Self::Bv(w), ChcSort::BitVec(t)) => w == *t,

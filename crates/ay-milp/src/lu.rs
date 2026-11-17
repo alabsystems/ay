@@ -262,7 +262,7 @@ fn count_sort_by(
     let k = reach.len();
     // Crossover: the counting sort's O(m) scatter+sweep beats ~k·⌈log2 k⌉
     // comparisons only when the reach is dense. `bits` = ⌊log2 k⌋+1.
-    let bits = (u64::BITS - (k as u64).leading_zeros()) as usize;
+    let bits = (k as u64).bit_width() as usize;
     if k < 2 || k.saturating_mul(bits) < m || !enabled {
         if descending {
             reach.sort_unstable_by_key(|&x| Reverse(key(x)));

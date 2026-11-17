@@ -46,6 +46,10 @@ pub(super) enum EvidenceKind {
     Unsafe,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "source-bound evidence stays by value through scheduling and replay without a fresh unmetered post-verdict allocation"
+)]
 pub(super) enum NativeEvidence {
     Safe(QuantifiedChcSafety),
     Unsafe(QuantifiedChcCounterexample),

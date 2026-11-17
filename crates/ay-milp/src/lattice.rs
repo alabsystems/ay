@@ -1146,6 +1146,10 @@ fn box_prune_tables(
         let mut amax = 0.0f64;
         let mut hw = 0.0f64;
         for iv in row {
+            #[expect(
+                clippy::manual_midpoint,
+                reason = "overflow intentionally declines optional box-prune table construction"
+            )]
             let m = (iv.lo + iv.hi) * 0.5;
             if !m.is_finite() {
                 return None;
@@ -1824,6 +1828,10 @@ impl Engine {
                     if !ok {
                         break;
                     }
+                    #[expect(
+                        clippy::manual_midpoint,
+                        reason = "overflow intentionally disables this optional box-prune sweep"
+                    )]
                     let m = (acc.lo + acc.hi) * 0.5;
                     if !m.is_finite() {
                         ok = false;
@@ -2014,7 +2022,7 @@ impl Engine {
                 vec![(); nthreads],
                 "ay-lattice",
                 None,
-                |_| {
+                |()| {
                     loop {
                         if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
                             break;
@@ -2331,7 +2339,7 @@ impl Engine {
                 vec![(); nthreads],
                 "ay-lattice-hunt",
                 None,
-                |_| {
+                |()| {
                     loop {
                         if found.load(Ordering::Acquire) || aborted.load(Ordering::Acquire) {
                             break;
@@ -2710,7 +2718,7 @@ struct SchnorrEuchnerOrder {
 impl SchnorrEuchnerOrder {
     fn new(lo: i64, hi: i64, center: Interval) -> Self {
         debug_assert!(lo <= hi);
-        let cmid = 0.5 * (center.lo + center.hi);
+        let cmid = f64::midpoint(center.lo, center.hi);
         let rounded = cmid.round();
         let start = if rounded.is_finite() {
             (rounded as i64).clamp(lo, hi)
@@ -2969,7 +2977,7 @@ impl EnumState<'_> {
         let n = self.eng.n;
         // Point form of `y_level − e_level` plus an outward deviation bound
         // valid for the ROUNDED midpoint itself (not for the exact midpoint).
-        let dm = (diff.lo + diff.hi) * 0.5;
+        let dm = f64::midpoint(diff.lo, diff.hi);
         let dw = (diff.hi - dm).max(dm - diff.lo).next_up();
         let amax = bp.bstar_absmax[level];
         let bw = bp.bstar_halfw[level];
@@ -4296,7 +4304,7 @@ fn block_svp_parallel(
             vec![(); nthreads],
             "ay-bkz-svp",
             None,
-            |_| {
+            |()| {
                 while let Some(idx) =
                     next_live_svp_item(&next_idx, items.len(), || Instant::now() >= deadline)
                 {
@@ -4338,10 +4346,9 @@ fn block_svp_parallel(
                 }
             },
             |failure| {
-                let _ = failure;
                 if matches!(failure, crate::compute::Failure::Spawn) {
                     spawn_failed.store(true, Ordering::Release);
-                };
+                }
             },
         )
         .is_err()
@@ -6037,7 +6044,7 @@ mod tests {
                 best_x: None,
                 x: vec![0],
                 nodes: 0,
-                deadline: Instant::now() + std::time::Duration::from_secs(10),
+                deadline: Instant::now() + Duration::from_secs(10),
                 aborted: false,
             };
             item.rec(0, 0.0);
@@ -6619,7 +6626,7 @@ mod tests {
         let model = market_split(&[vec![1, 1, 1, 1], vec![0, 1, 2, 3]], &[2, 6]);
         let expired = Instant::now();
         LAST_BUILD_DEADLINE.with(|observed| observed.set(None));
-        assert!(replay_ledger::take().is_empty());
+        assert_eq!(replay_ledger::take(), Vec::<ReplayClaim>::new());
         assert!(try_prove_configured(&model, expired, LatticeSchedule::Threads(1)).is_none());
         assert_eq!(
             LAST_BUILD_DEADLINE.with(std::cell::Cell::get),
@@ -6634,7 +6641,7 @@ mod tests {
         LAST_BUILD_DEADLINE.with(|observed| observed.set(None));
         assert!(try_prove_configured(&model, deadline(), LatticeSchedule::Disabled).is_none());
         assert_eq!(LAST_BUILD_DEADLINE.with(std::cell::Cell::get), None);
-        assert!(replay_ledger::take().is_empty());
+        assert_eq!(replay_ledger::take(), Vec::<ReplayClaim>::new());
     }
 
     #[test]
@@ -7007,6 +7014,10 @@ mod tests {
             return;
         }
         let caller = ay_sys::compute_budget::ComputeScope::enter().expect("actual caller");
+        #[expect(
+            clippy::collection_is_never_read,
+            reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+        )]
         let mut held = Vec::new();
         while let Some(extra) = caller.try_extra().expect("actual spare") {
             held.push(extra);
@@ -7097,7 +7108,7 @@ mod tests {
         assert_eq!(ms.obj_rows, vec![0, 1]);
         assert_eq!(ms.slack_col, vec![4, 5]);
         assert_eq!(ms.col_model, vec![Some(0), Some(1), Some(2), Some(3)]);
-        assert!(ms.singleton_cols.is_empty());
+        assert_eq!(ms.singleton_cols, Vec::<(usize, i64)>::new());
     }
 
     /// Enumerate every point of the integer box (mixed-radix counter).

@@ -18,10 +18,10 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    alloc_sort, apply_surface_replacements, cache_func_decl_with_params, checked_ast_to_pub,
-    engine_ast, engine_pub, ffi_guard_int, ffi_guard_mk, ffi_guard_ptr, ffi_surface_text_base,
-    latest_pub_id, mk_ast, pub_id_to_ast, public_sort, stated_sort, PubTerm, Z3Context, Z3_ast,
-    Z3_context, Z3_func_decl, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR, Z3_UNKNOWN_SORT,
+    alloc_sort, apply_surface_replacements, checked_ast_to_pub, engine_ast, engine_pub,
+    ffi_guard_int, ffi_guard_mk, ffi_guard_ptr, ffi_surface_text_base, latest_pub_id, mk_ast,
+    pub_id_to_ast, public_sort, stated_sort, PubTerm, Z3Context, Z3_ast, Z3_context, Z3_func_decl,
+    Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR, Z3_UNKNOWN_SORT,
 };
 
 /// Public finite-set application kind retained over an engine lowering.

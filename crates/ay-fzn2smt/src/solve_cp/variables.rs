@@ -274,9 +274,8 @@ impl CpContext {
 
         for (offset, indicator) in indicators.iter().copied().enumerate() {
             let element = i128::from(base) + offset as i128;
-            let present = i64::try_from(element)
-                .ok()
-                .is_some_and(|element| members.binary_search(&element).is_ok());
+            let present =
+                i64::try_from(element).is_ok_and(|element| members.binary_search(&element).is_ok());
             self.force_indicator(indicator, i64::from(present));
         }
 
@@ -369,7 +368,7 @@ impl CpContext {
 
         for (offset, source_indicator) in source_indicators.iter().copied().enumerate() {
             let element = i128::from(source_base) + offset as i128;
-            let is_in_target = i64::try_from(element).ok().is_some_and(|element| {
+            let is_in_target = i64::try_from(element).is_ok_and(|element| {
                 set_indicator(target_base, &target_indicators, element).is_some()
             });
             if !is_in_target {
@@ -709,9 +708,9 @@ impl CpContext {
                 FznType::SetOfIntRange(lo, hi) => {
                     element >= i128::from(*lo) && element <= i128::from(*hi)
                 }
-                FznType::SetOfIntSet(values) => i64::try_from(element)
-                    .ok()
-                    .is_some_and(|element| values.contains(&element)),
+                FznType::SetOfIntSet(values) => {
+                    i64::try_from(element).is_ok_and(|element| values.contains(&element))
+                }
                 _ => true,
             };
             if !allowed {

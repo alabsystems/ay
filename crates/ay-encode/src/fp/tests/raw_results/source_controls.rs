@@ -53,53 +53,54 @@ fn source_keeps_all_ordered_roots_raw_operands_policy_and_output_links() {
             )],
             None,
         );
-        let (body, source) =
-            lower_fp_raw_result_clause(&roots, &results, &bindings, &namespace, budget)
-                .unwrap()
-                .into_body(old)
-                .unwrap()
-                .into_parts()
-                .unwrap();
-        assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-        assert!(std::ptr::eq(source.raw_results(), results.as_slice()));
-        assert!(std::ptr::eq(source.namespace(), &namespace));
-        let FpRawOperation::Arithmetic {
-            operation,
-            inputs: retained,
-            nan_policy,
-        } = source.raw_results()[0].operation
-        else {
-            panic!()
-        };
-        assert_eq!(operation, RustFpArithmetic::FusedMultiplyAdd);
-        assert_eq!(nan_policy, RustNanPolicy::WasmConditional);
-        for (retained, original) in retained.iter().zip(inputs) {
-            assert!(std::ptr::eq(*retained, original));
-        }
-        assert_eq!(
-            body.predicates[0].1,
-            [
-                ChcExpr::Var(va.clone()),
-                ChcExpr::Var(vb.clone()),
-                ChcExpr::Var(vc.clone()),
-                ChcExpr::Var(vo.clone())
-            ]
-        );
-        let clause = HornClause::new(
-            body,
-            ClauseHead::Predicate(
-                p,
-                vec![
+        {
+            let (body, source) =
+                lower_fp_raw_result_clause(&roots, &results, &bindings, &namespace, budget)
+                    .unwrap()
+                    .into_body(old)
+                    .unwrap()
+                    .into_parts()
+                    .unwrap();
+            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+            assert!(std::ptr::eq(source.raw_results(), results.as_slice()));
+            assert!(std::ptr::eq(source.namespace(), &raw const namespace));
+            let FpRawOperation::Arithmetic {
+                operation,
+                inputs: retained,
+                nan_policy,
+            } = source.raw_results()[0].operation
+            else {
+                panic!()
+            };
+            assert_eq!(operation, RustFpArithmetic::FusedMultiplyAdd);
+            assert_eq!(nan_policy, RustNanPolicy::WasmConditional);
+            for (retained, original) in retained.iter().zip(inputs) {
+                assert!(std::ptr::eq(*retained, original));
+            }
+            assert_eq!(
+                body.predicates[0].1,
+                [
                     ChcExpr::Var(va.clone()),
                     ChcExpr::Var(vb.clone()),
                     ChcExpr::Var(vc.clone()),
-                    ChcExpr::Var(vo.clone()),
-                ],
-            ),
-        );
-        assert!(clause.body.constraint.is_some());
-        drop(clause);
-        drop(source);
+                    ChcExpr::Var(vo.clone())
+                ]
+            );
+            let clause = HornClause::new(
+                body,
+                ClauseHead::Predicate(
+                    p,
+                    vec![
+                        ChcExpr::Var(va.clone()),
+                        ChcExpr::Var(vb.clone()),
+                        ChcExpr::Var(vc.clone()),
+                        ChcExpr::Var(vo.clone()),
+                    ],
+                ),
+            );
+            assert!(clause.body.constraint.is_some());
+            drop(clause);
+        }
         budget.charge(0).unwrap();
     });
 }
@@ -262,15 +263,16 @@ fn old_extension_refusals_and_ieee_rem_are_not_silently_reinterpreted() {
             RustFpArithmetic::Divide
         );
         let roots = [zero.clone().fp_rem(zero).fp_is_nan()];
-        let (body, source) = lower_fp_expr_clause(&roots, &[], &namespace, budget)
-            .unwrap()
-            .into_body(ClauseBody::empty())
-            .unwrap()
-            .into_parts()
-            .unwrap();
-        assert!(source.raw_results().is_empty());
-        drop(body);
-        drop(source);
+        {
+            let (body, source) = lower_fp_expr_clause(&roots, &[], &namespace, budget)
+                .unwrap()
+                .into_body(ClauseBody::empty())
+                .unwrap()
+                .into_parts()
+                .unwrap();
+            assert!(source.raw_results().is_empty());
+            drop(body);
+        }
         budget.charge(0).unwrap();
     });
 }

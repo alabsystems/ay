@@ -95,7 +95,7 @@ fn original_quantified_counterexample_batch_requires_fresh_full_path_sat() {
     };
     assert_eq!(evidence.source_smtlib(), row.problem().source_smtlib());
     assert_eq!(row.id().aggregate_source_sha256(), report.source_sha256());
-    assert!(!evidence.clause_indices().is_empty());
+    assert_ne!(evidence.clause_indices(), &[] as &[usize]);
     assert!(evidence.replay_obligation().contains("(forall"));
     assert!(!evidence.recheck(&problem, Duration::from_secs(1), &token));
 }

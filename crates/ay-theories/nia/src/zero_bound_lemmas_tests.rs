@@ -765,3 +765,59 @@ fn fixed_factor_quotient_bound_unsat() {
         "x=3, x*y<=7, y>=3 must be UNSAT via the quotient bound, got {result:?}"
     );
 }
+
+/// Family 2 (multiplication monotonicity) probes only pairs that can
+/// name a registered monomial: an order side or shared factor that is
+/// no monomial's factor makes the `[lo, z]` / `[hi, z]` lookups miss by
+/// construction, so probing it re-derives nothing. The derivation runs
+/// on every `check()`; on Certora `65782_..._8` the unfiltered
+/// orders × signed-terms product was ~97k allocating probes per check
+/// against 4 registered monomials (~93% of the zero-bound derivation,
+/// itself ~69% of per-check cost).
+#[test]
+fn mul_monotonicity_probes_only_monomial_factor_pairs() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let xz = terms.mk_mul(vec![x, z]);
+    let yz = terms.mk_mul(vec![y, z]);
+    let zero = terms.mk_int(BigInt::from(0));
+    let x_le_y = terms.mk_le(x, y);
+    let z_nonneg = terms.mk_ge(z, zero);
+    let xz_atom = terms.mk_ge(xz, zero);
+    let yz_atom = terms.mk_ge(yz, zero);
+
+    // Noise: signed terms and orders among variables that factor no
+    // monomial. None of these can participate in a family-2 lemma.
+    let mut noise_atoms = Vec::new();
+    let mut prev: Option<TermId> = None;
+    for i in 0..40 {
+        let w = terms.mk_var(format!("w{i}"), Sort::Int);
+        noise_atoms.push(terms.mk_ge(w, zero));
+        if let Some(p) = prev {
+            noise_atoms.push(terms.mk_le(p, w));
+        }
+        noise_atoms.push(terms.mk_le(w, x));
+        prev = Some(w);
+    }
+
+    let mut solver = NiaSolver::new(&terms);
+    for atom in [x_le_y, z_nonneg, xz_atom, yz_atom] {
+        solver.assert_literal(atom, true);
+    }
+    for atom in noise_atoms {
+        solver.assert_literal(atom, true);
+    }
+
+    let added = solver.add_zero_bound_product_lemmas();
+    assert_eq!(
+        added, 1,
+        "exactly the x*z <= y*z monotonicity cut must be emitted"
+    );
+    assert!(
+        solver.mul_mono_probe_count <= 4,
+        "family 2 must probe only pairs over monomial factors, probed {}",
+        solver.mul_mono_probe_count
+    );
+}

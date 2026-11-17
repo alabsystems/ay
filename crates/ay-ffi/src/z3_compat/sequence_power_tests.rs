@@ -72,7 +72,7 @@ fn sequence_power_symbolic_count_solves_membership_and_length() {
             if expected == Z3_L_TRUE {
                 let model = Z3_solver_get_model(context, solver);
                 let mut value = 0;
-                assert!(Z3_model_eval(context, model, power, true, &mut value));
+                assert!(Z3_model_eval(context, model, power, true, &raw mut value));
                 let text = Z3_get_string(context, value);
                 assert!(!text.is_null());
                 assert_eq!(std::ffi::CStr::from_ptr(text), c"ababab");

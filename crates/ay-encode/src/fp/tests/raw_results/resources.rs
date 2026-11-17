@@ -28,12 +28,13 @@ impl Fixture {
             source: &self.output,
             target: &self.target,
         }];
-        let (body, source) =
-            lower_fp_raw_result_clause(&[], &results, &bindings, &self.namespace, budget)?
-                .into_body(ClauseBody::empty())?
-                .into_parts()?;
-        drop(body);
-        drop(source);
+        {
+            let (body, _source) =
+                lower_fp_raw_result_clause(&[], &results, &bindings, &self.namespace, budget)?
+                    .into_body(ClauseBody::empty())?
+                    .into_parts()?;
+            drop(body);
+        }
         budget.charge(0)?;
         Ok(())
     }
@@ -44,19 +45,21 @@ fn exact_work_and_bytes_succeed_and_each_one_short_is_sticky() {
     let end = Instant::now() + Duration::from_secs(20);
     let paid = Cell::new(0usize);
     let stored = Cell::new(0usize);
-    let mut count = |work: usize, bytes: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        paid.set(paid.get().checked_add(work).unwrap());
-        stored.set(stored.get().checked_add(bytes).unwrap());
-        Ok(())
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut count);
-    budget.admit(FIXTURE, FIXTURE).unwrap();
-    let fixture = Fixture::new();
-    fixture.attempt(&mut budget).unwrap();
-    drop(budget);
+    let fixture;
+    {
+        let mut count = |work: usize, bytes: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            paid.set(paid.get().checked_add(work).unwrap());
+            stored.set(stored.get().checked_add(bytes).unwrap());
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut count);
+        budget.admit(FIXTURE, FIXTURE).unwrap();
+        fixture = Fixture::new();
+        fixture.attempt(&mut budget).unwrap();
+    }
     assert!(paid.get() > 0 && stored.get() > 0);
     for (work, bytes, expected) in [
         (paid.get(), stored.get(), true),
@@ -131,7 +134,9 @@ fn original_stop_reset_cannot_revive_a_raw_result_attempt() {
 
 #[test]
 fn expired_original_absolute_end_refuses_before_any_synthetic_relation() {
-    let end = Instant::now() - Duration::from_secs(1);
+    let end = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let namespace = ChcProblem::new();
     let mut owner = |_: usize, _: usize| {
         if Instant::now() >= end {
@@ -157,30 +162,34 @@ fn expired_original_absolute_end_refuses_before_any_synthetic_relation() {
 fn final_synthetic_and_arena_cleanup_poll_can_veto_complete_data() {
     let end = Instant::now() + Duration::from_secs(20);
     let calls = Cell::new(0usize);
-    let mut count = |_: usize, _: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        calls.set(calls.get() + 1);
-        Ok(())
+    let fixture;
+    let results;
+    let bindings;
+    let final_call = {
+        let mut count = |_: usize, _: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut count);
+        budget.admit(FIXTURE, FIXTURE).unwrap();
+        fixture = Fixture::new();
+        results = [FpRawResultRelation {
+            operation: FpRawOperation::Copy(&fixture.input),
+            output: &fixture.output,
+        }];
+        bindings = [FpExprInputBinding {
+            source: &fixture.output,
+            target: &fixture.target,
+        }];
+        drop(
+            lower_fp_raw_result_clause(&[], &results, &bindings, &fixture.namespace, &mut budget)
+                .unwrap(),
+        );
+        calls.get()
     };
-    let mut budget = WorkBudget::with_admission(WORK, &mut count);
-    budget.admit(FIXTURE, FIXTURE).unwrap();
-    let fixture = Fixture::new();
-    let results = [FpRawResultRelation {
-        operation: FpRawOperation::Copy(&fixture.input),
-        output: &fixture.output,
-    }];
-    let bindings = [FpExprInputBinding {
-        source: &fixture.output,
-        target: &fixture.target,
-    }];
-    drop(
-        lower_fp_raw_result_clause(&[], &results, &bindings, &fixture.namespace, &mut budget)
-            .unwrap(),
-    );
-    let final_call = calls.get();
-    drop(budget);
     calls.set(0);
     let mut stop = |_: usize, _: usize| {
         if Instant::now() >= end {

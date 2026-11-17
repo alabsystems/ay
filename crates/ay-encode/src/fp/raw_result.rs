@@ -6,6 +6,8 @@
 mod construct;
 mod nan;
 
+use std::mem::{align_of, size_of};
+
 use ay_bindings::{Expr, ExprValue, SortInner};
 use ay_chc::ChcProblem;
 use ay_core::original_query::WorkBudget;
@@ -191,12 +193,12 @@ fn prepay(r: usize, n: usize, b: usize, budget: &mut WorkBudget<'_>) -> Result<(
         .and_then(|v| v.checked_add(65_536))
         .ok_or_else(|| budget.refuse_exhaustion())?;
     budget.admit(work, bytes)?;
-    if std::mem::size_of::<usize>() > 8
-        || std::mem::size_of::<Expr>() > 64
-        || std::mem::size_of::<ExprValue>() > 256
-        || std::mem::size_of::<SortInner>() > 256
-        || std::mem::align_of::<ExprValue>() > 16
-        || std::mem::align_of::<SortInner>() > 16
+    if size_of::<usize>() > 8
+        || size_of::<Expr>() > 64
+        || size_of::<ExprValue>() > 256
+        || size_of::<SortInner>() > 256
+        || align_of::<ExprValue>() > 16
+        || align_of::<SortInner>() > 16
     {
         return Err(FpAdapterError::Unsupported(
             "raw-result logical layout envelope",

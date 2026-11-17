@@ -132,12 +132,12 @@ impl Provenance {
             (
                 self.built.len(),
                 self.built.capacity(),
-                std::mem::size_of::<(PubId, &'static str)>(),
+                size_of::<(PubId, &'static str)>(),
             ),
             (
                 self.ambiguous.len(),
                 self.ambiguous.capacity(),
-                std::mem::size_of::<PubId>(),
+                size_of::<PubId>(),
             ),
         ] {
             if length == capacity {
@@ -207,7 +207,7 @@ impl Provenance {
             let bytes = if snapshot.0 == snapshot.1 {
                 snapshot
                     .1
-                    .checked_mul(std::mem::size_of::<Term>())
+                    .checked_mul(size_of::<Term>())
                     .and_then(|n| n.checked_mul(4))
                     .and_then(|n| n.checked_add(4096))
                     .ok_or("provenance storage overflow")?

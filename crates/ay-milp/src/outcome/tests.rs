@@ -293,7 +293,7 @@ fn internal_bounds_and_no_verdict_never_look_like_exported_proofs() {
         let EvidenceShape::MissingFields { why } = shape else {
             panic!("{outcome:?} must not look independently checkable")
         };
-        assert!(!why.trim().is_empty());
+        assert_ne!(why.trim(), "");
         assert!(matches!(
             outcome.check_against(&model),
             Err(OutcomeCheckError::MissingEvidence { .. })

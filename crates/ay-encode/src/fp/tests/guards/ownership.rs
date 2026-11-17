@@ -8,17 +8,18 @@ fn zero_and_one_short_total_work_or_storage_poison_the_same_guard_ledger() {
     let end = Instant::now() + Duration::from_secs(20);
     let work = Cell::new(0usize);
     let bytes = Cell::new(0usize);
-    let mut count = |w: usize, b: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        work.set(work.get().checked_add(w).unwrap());
-        bytes.set(bytes.get().checked_add(b).unwrap());
-        Ok(())
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut count);
-    attempt(&mut budget).unwrap();
-    drop(budget);
+    {
+        let mut count = |w: usize, b: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            work.set(work.get().checked_add(w).unwrap());
+            bytes.set(bytes.get().checked_add(b).unwrap());
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut count);
+        attempt(&mut budget).unwrap();
+    }
     // Independent negative fixture owners share the original test end. None
     // is a renewed production retry; every refused ledger remains poisoned.
     for limit in [0, (work.get() - 1) as u64] {
@@ -80,7 +81,9 @@ fn original_raw_and_expired_end_refusals_survive_reset_without_guard_data() {
             StopReason::Cancelled
         )))
     );
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let mut owner = |_: usize, _: usize| {
         if Instant::now() >= expired {
             Err(QueryError::Interrupted(StopReason::Deadline))

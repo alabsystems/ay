@@ -54,7 +54,9 @@ mod prelude;
 mod rebind;
 mod sexp_items;
 use classify::{classify, split_commands, Classified, RecDefinition};
-use prelude::{bind_sorts, build_prelude, declare_text_datatypes, finite_set_reachable};
+use prelude::{
+    bind_sorts, build_prelude, declare_text_datatypes, finite_set_reachable, PreludeError,
+};
 use rebind::Rebinder;
 
 /// Prefix of the parse's own helper names (sort aliases, recursive-definition
@@ -180,7 +182,8 @@ pub(crate) fn bound_parse(ctx: &mut Z3Context, input: &str, scope: &ParseScope) 
     };
     let (prelude, speller, in_scope, given_by_name) = match build_prelude(ctx, scope, &classified) {
         Ok(built) => built,
-        Err(outcome) => return outcome,
+        Err(PreludeError::Failed(reason)) => return BoundParse::Failed(reason),
+        Err(PreludeError::Ineligible(reason)) => return BoundParse::Ineligible(reason),
     };
     if !classified.datatypes.is_empty() {
         if let Some(outcome) = declare_text_datatypes(ctx, &classified) {
@@ -260,6 +263,10 @@ fn run_bound_parse(
     }
     let retained = super::retain_parsed_finite_set_batch(ctx, batch)
         .map_err(|e| format!("parsed public FiniteSet metadata could not be retained: {e}"))?;
+    #[expect(
+        clippy::suspicious_operation_groupings,
+        reason = "retained soft constraints are intentionally compared with parsed text soft entries"
+    )]
     if retained.soft_constraints.len() != classified.softs.len()
         || retained.objectives.len() != classified.objectives.len()
     {

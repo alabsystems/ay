@@ -82,7 +82,7 @@ fn test_simple_enum_type() {
 
     // All constructors should be nullary
     for ctor in &dt.constructors {
-        assert!(ctor.fields.is_empty());
+        assert_eq!(ctor.fields.as_slice(), &[] as &[DatatypeField]);
     }
 }
 

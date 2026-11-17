@@ -90,7 +90,8 @@ fn translate_checked_sort(sort: &Sort) -> Result<ApiSort, ExecuteError> {
 pub(super) fn bridge_datatype(dt: &DatatypeSort) -> Result<ay_core::DatatypeSort, ExecuteError> {
     // A field may refer to this declaration (a recursive datatype) or to a
     // datatype declared around the reference; nothing else.
-    if let Some(name) = crate::sort::dangling_datatype_ref_in_declaration(dt) {
+    let declaration = Sort::from_inner(SortInner::Datatype(dt.clone()));
+    if let Some(name) = declaration.dangling_datatype_ref() {
         return Err(ExecuteError::SortTranslation(format!(
             "datatype reference `{name}` in the declaration of `{}` names no enclosing datatype",
             dt.name

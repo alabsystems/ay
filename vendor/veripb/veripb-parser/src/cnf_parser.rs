@@ -315,7 +315,7 @@ where
 
 /// Parse the problem header of an DIMACS CNF file.
 #[inline]
-fn parse_header(lex: &mut Lexer<CNFToken>) -> Result<(usize, usize), ParserError> {
+fn parse_header(lex: &mut Lexer<'_, CNFToken>) -> Result<(usize, usize), ParserError> {
     if let Some(Ok(CNFToken::Integer(Ok(num_vars)))) = lex.next()
         && let Some(Ok(CNFToken::Integer(Ok(num_clauses)))) = lex.next()
     {

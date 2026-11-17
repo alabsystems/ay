@@ -101,10 +101,10 @@ fn coerce_store_value(value: Expr, arr_sort: &ArraySort) -> Result<Expr, crate::
                 .ok_or_else(collection_coercion_error)?;
             // Generic enum selectors are partial. They cannot define this
             // automatic collection-to-pointer representation conversion.
-            if !value
+            if value
                 .sort
                 .datatype_sort()
-                .is_some_and(|dt| dt.constructors.len() == 1)
+                .is_none_or(|dt| dt.constructors.len() != 1)
             {
                 return Err(collection_coercion_error());
             }

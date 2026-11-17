@@ -123,6 +123,7 @@ pub(super) fn obligation_set_identity(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn obligation_set_sha256(
     source_normalized_input_schema: &str,
     source_normalized_input_sha256: &str,

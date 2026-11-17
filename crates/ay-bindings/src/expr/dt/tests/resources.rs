@@ -39,7 +39,7 @@ fn iterative_sort_comparison_charges_exactly_its_scheduled_pairs() {
         check.charge(CHECK_LIMIT - allowance).unwrap();
         let result = check.same_sort(declared.last().unwrap(), requested.last().unwrap());
         if allowance == work {
-            assert_eq!(result.unwrap(), true);
+            assert!(result.unwrap());
             check.charge(0).unwrap();
             assert!(check.charge(1).is_err());
         } else {

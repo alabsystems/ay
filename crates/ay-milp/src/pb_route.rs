@@ -811,7 +811,6 @@ pub(crate) fn try_solve_production_portfolio(
 /// search and therefore requires an explicit bounded slice.  It uses
 /// `ay-pb-core`, not the `ay-pb` facade, so an embedded MILP solve can never
 /// recurse through the facade's PB-to-MILP optimum-upgrade arm.
-#[allow(dead_code)]
 pub(crate) fn try_solve_portfolio_trial(
     model: &Model,
     trial_deadline: Instant,
@@ -1018,8 +1017,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
                     .map(|term| term.coeff.unsigned_abs())
                     .max()
                     .map_or(0, |coefficient| {
-                        usize::try_from(u128::BITS - coefficient.leading_zeros())
-                            .unwrap_or(usize::MAX)
+                        usize::try_from(coefficient.bit_width()).unwrap_or(usize::MAX)
                     })
             };
             let added = &augmented.constraints[instance.constraints.len()..];
@@ -1029,7 +1027,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
                 .map(|term| term.coeff.unsigned_abs())
                 .max()
                 .map_or(0, |coefficient| {
-                    usize::try_from(u128::BITS - coefficient.leading_zeros()).unwrap_or(usize::MAX)
+                    usize::try_from(coefficient.bit_width()).unwrap_or(usize::MAX)
                 });
             (
                 symmetry.max_lex_coordinates,
@@ -1206,7 +1204,6 @@ pub(crate) fn try_solve_portfolio_trial_with_workers(
 }
 
 /// Interruptible form of [`try_solve_portfolio_trial`].
-#[allow(dead_code)]
 pub(crate) fn try_solve_portfolio_trial_interruptible<F>(
     model: &Model,
     trial_deadline: Instant,

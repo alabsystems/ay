@@ -16,6 +16,7 @@ use crate::{EncodeError, Result};
 
 #[path = "query_proof_report_identity.rs"]
 mod identity;
+#[cfg(test)]
 pub(crate) use identity::obligation_set_sha256;
 #[path = "query_proof_report_json.rs"]
 mod json;

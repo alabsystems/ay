@@ -262,71 +262,6 @@ fn sequence_power_from(
     result
 }
 
-#[cfg(test)]
-mod sequence_power_read_tests {
-    use super::*;
-    use ay_core::original_query::{CountedAdmission, CountedAdmissionError, FiniteAdmissionGrant};
-    use ay_core::term::TermConstructionAdmission;
-    use std::{cell::Cell, sync::Arc};
-
-    fn data(value: String) -> Mutex<Option<HashMap<String, String>>> {
-        Mutex::new(Some(HashMap::from([(
-            "rewriter.max_power_expansion".into(),
-            value,
-        )])))
-    }
-
-    #[test]
-    fn sequence_power_global_read_prices_actual_bytes_cumulatively() {
-        let store = data(format!("{}4", "0".repeat(4096)));
-        let owner = CountedAdmission::new(
-            FiniteAdmissionGrant::new(6000, 4096),
-            None,
-            Arc::new(|| false),
-        )
-        .unwrap();
-        assert_eq!(sequence_power_from(&store, &owner), Ok(4));
-        assert!(sequence_power_from(&store, &owner).is_err());
-        assert_eq!(owner.check(), Err(CountedAdmissionError::WorkExhausted));
-        assert!(sequence_power_from(&store, &owner).is_err());
-    }
-
-    #[test]
-    fn sequence_power_global_read_allows_callback_reentry_but_not_unpaid_growth() {
-        struct Reenter<'a> {
-            store: &'a Mutex<Option<HashMap<String, String>>>,
-            calls: Cell<usize>,
-        }
-        impl TermConstructionAdmission for Reenter<'_> {
-            fn admit(&self, _: usize, _: usize) -> Result<(), CountedAdmissionError> {
-                let n = self.calls.get() + 1;
-                self.calls.set(n);
-                if n == 2 {
-                    self.store
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .unwrap()
-                        .insert("rewriter.max_power_expansion".into(), "00004".into());
-                }
-                Ok(())
-            }
-            fn refuse(&self, e: CountedAdmissionError) -> CountedAdmissionError {
-                e
-            }
-        }
-        let store = data("4".into());
-        let owner = Reenter {
-            store: &store,
-            calls: Cell::new(0),
-        };
-        assert_eq!(
-            sequence_power_from(&store, &owner),
-            Err("global parameter changed during admission")
-        );
-    }
-}
-
 /// Set-time value validation against the registered type (z3 refuses an
 /// invalid value and keeps the prior one — measured).
 fn value_ok(kind: ParamKind, value: &str) -> bool {
@@ -488,3 +423,7 @@ pub extern "C" fn Z3_global_param_reset_all() {
         map.clear();
     }
 }
+
+#[cfg(test)]
+#[path = "global_params_tests.rs"]
+mod sequence_power_read_tests;

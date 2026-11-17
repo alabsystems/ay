@@ -213,9 +213,9 @@ fn store_owned_control(
     owner
         .admit(
             1,
-            std::mem::size_of::<TacticHandle>()
-                + std::mem::size_of::<ay_dpll::api::TacticInstance>()
-                + 2 * std::mem::size_of::<usize>(),
+            size_of::<TacticHandle>()
+                + size_of::<ay_dpll::api::TacticInstance>()
+                + 2 * size_of::<usize>(),
         )
         .map_err(|e| e.to_string())?;
     ay_core::term::reserve_counted(&mut ctx.tactic_handle_cache, 1, owner)
@@ -485,7 +485,7 @@ pub unsafe extern "C" fn Z3_tactic_using_params(
                     .map_err(|e| e.to_string())?;
                 let owner = operation.admission();
                 owner
-                    .admit(ctx.tactic_handle_cache.len(), std::mem::size_of::<Tactic>())
+                    .admit(ctx.tactic_handle_cache.len(), size_of::<Tactic>())
                     .map_err(|e| e.to_string())?;
                 if t.is_null() || !ctx.tactic_handle_cache.contains(&t) {
                     return Err(OwnedControlError::InvalidArgument("foreign or null tactic"));
@@ -771,7 +771,7 @@ pub unsafe extern "C" fn Z3_tactic_try_for(c: Z3_context, t: Z3_tactic, ms: c_ui
                     .map_err(|e| e.to_string())?;
                 let owner = operation.admission();
                 owner
-                    .admit(ctx.tactic_handle_cache.len(), std::mem::size_of::<Tactic>())
+                    .admit(ctx.tactic_handle_cache.len(), size_of::<Tactic>())
                     .map_err(|e| e.to_string())?;
                 if t.is_null() || !ctx.tactic_handle_cache.contains(&t) {
                     return Err(OwnedControlError::InvalidArgument("foreign or null tactic"));
@@ -1274,7 +1274,7 @@ pub(super) fn parameter_descriptions(
         });
     }
     owner
-        .admit(1, std::mem::size_of::<ParamDescrsHandle>())
+        .admit(1, size_of::<ParamDescrsHandle>())
         .map_err(|e| e.to_string())?;
     ay_core::term::reserve_counted(&mut ctx.param_descrs_cache, 1, owner)
         .map_err(|e| e.to_string())?;

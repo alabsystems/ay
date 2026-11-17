@@ -92,7 +92,7 @@ fn test_resolve_search_vars_empty() {
     let domains = HashMap::default();
     let smt_names: Vec<String> = vec![];
     let result = resolve_search_vars(&["nonexistent".into()], &smt_names, &domains);
-    assert!(result.is_empty());
+    assert_eq!(result.as_slice(), &[] as &[String]);
 }
 
 #[test]

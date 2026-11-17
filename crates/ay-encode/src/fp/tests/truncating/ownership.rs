@@ -8,31 +8,33 @@ fn truncating_total_work_and_storage_one_short_remain_sticky() {
     let end = Instant::now() + Duration::from_secs(20);
     let work = Cell::new(0usize);
     let storage = Cell::new(0usize);
-    let mut count = |w: usize, b: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        work.set(work.get().checked_add(w).unwrap());
-        storage.set(storage.get().checked_add(b).unwrap());
-        Ok(())
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut count);
-    attempt(&mut budget).unwrap();
-    drop(budget);
-    let mut healthy = |_: usize, _: usize| {
-        if Instant::now() >= end {
-            Err(QueryError::Interrupted(StopReason::Deadline))
-        } else {
+    {
+        let mut count = |w: usize, b: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            work.set(work.get().checked_add(w).unwrap());
+            storage.set(storage.get().checked_add(b).unwrap());
             Ok(())
-        }
-    };
-    let mut short = WorkBudget::with_admission((work.get() - 1) as u64, &mut healthy);
-    assert_eq!(
-        attempt(&mut short).err(),
-        Some(FpAdapterError::Owner(QueryError::Exhausted))
-    );
-    assert_eq!(short.charge(0), Err(QueryError::Exhausted));
-    drop(short);
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut count);
+        attempt(&mut budget).unwrap();
+    }
+    {
+        let mut healthy = |_: usize, _: usize| {
+            if Instant::now() >= end {
+                Err(QueryError::Interrupted(StopReason::Deadline))
+            } else {
+                Ok(())
+            }
+        };
+        let mut short = WorkBudget::with_admission((work.get() - 1) as u64, &mut healthy);
+        assert_eq!(
+            attempt(&mut short).err(),
+            Some(FpAdapterError::Owner(QueryError::Exhausted))
+        );
+        assert_eq!(short.charge(0), Err(QueryError::Exhausted));
+    }
     let mut bytes = storage.get() - 1;
     let mut limited = |_: usize, b: usize| {
         if Instant::now() >= end {
@@ -77,7 +79,9 @@ fn truncating_raw_and_original_end_refusal_cannot_be_reset_into_data() {
             StopReason::Cancelled
         )))
     );
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let mut owner = |_: usize, _: usize| {
         if Instant::now() >= expired {
             Err(QueryError::Interrupted(StopReason::Deadline))

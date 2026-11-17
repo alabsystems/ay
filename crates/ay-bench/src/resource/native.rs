@@ -62,7 +62,36 @@ pub(super) struct Watch {
     outcome: Arc<Mutex<Observation>>,
 }
 
+impl std::fmt::Debug for Observer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Observer")
+            .field("jobs", &self.jobs)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Watch")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Observer {
+    #[cfg(test)]
+    pub(super) fn registered_children(&self) -> usize {
+        self.shared.census.lock().unwrap().entries.len()
+    }
+
+    #[cfg(test)]
+    fn stop_for_test(&self) {
+        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.changed.notify_all();
+    }
+
     pub(super) fn new(jobs: usize) -> Result<Self> {
         if jobs == 0 {
             return Err(BenchError::msg(
@@ -150,6 +179,10 @@ fn check_census(census: &mut Census) -> Result<()> {
 }
 
 impl Watch {
+    pub(super) fn identity(&self) -> ProcessIdentity {
+        self.identity
+    }
+
     pub(super) fn poll(&self) -> Result<Option<super::WatchdogOutcome>> {
         let mut census = self
             .shared
@@ -234,11 +267,14 @@ fn observe(shared: Arc<Shared>) {
             ay_sys::observed_available_memory_bytes()
         };
         let now = super::monotonic_time_ns();
+        let sample_error = samples.as_ref().err().filter(|error| {
+            !ay_sys::supervisor::process_group::is_census_member_disappearance(error)
+        });
         let refusal = if available.is_none() {
             Some("native available-memory observation failed".to_owned())
         } else if available.is_some_and(|bytes| bytes < CHILD_FLOOR_MIB * MIB) {
             Some("native campaign stopped for machine memory pressure".to_owned())
-        } else if let Err(error) = &samples {
+        } else if let Some(error) = sample_error {
             Some(format!("native group census failed: {error}"))
         } else if let Err(error) = &now {
             Some(error.to_string())
@@ -292,7 +328,13 @@ fn observe(shared: Arc<Shared>) {
                 }
             }
         }
-        census.heartbeat = Instant::now();
+        // A member exiting between the kernel's membership and identity reads
+        // is incomplete evidence, not an empty-group witness or a fatal birth
+        // mismatch. Retry at the same cadence without refreshing the last
+        // complete-census heartbeat; persistent incompleteness still refuses.
+        if samples.is_ok() {
+            census.heartbeat = Instant::now();
+        }
         let waited = shared.changed.wait_timeout(census, SAMPLE_INTERVAL);
         if waited.is_err() {
             return;
@@ -306,7 +348,7 @@ fn observe(shared: Arc<Shared>) {
 #[cfg(unix)]
 #[derive(Debug)]
 pub(super) struct CampaignLease {
-    file: nix::fcntl::Flock<std::fs::File>,
+    file: std::fs::File,
     path: std::path::PathBuf,
     owner: ay_sys::supervisor::process_group::ProcessIdentity,
     refusal: std::sync::OnceLock<String>,
@@ -335,10 +377,25 @@ impl CampaignLease {
         {
             return Err(BenchError::msg("unsafe aggregate lease file metadata"));
         }
-        let mut file = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .map_err(|(_, error)| {
-            BenchError::msg(format!("aggregate campaign lease unavailable: {error}"))
-        })?;
+        let mut file = file;
+        // Flock<T>::Drop calls LOCK_UN explicitly, which could unlock an
+        // original parent's shared open-file-description from a forked child.
+        // Close-only owned File retirement preserves the kernel's last-owner
+        // release semantics; this local safe syscall wrapper is intentional.
+        #[expect(
+            deprecated,
+            reason = "close-only file ownership must not issue foreign-process LOCK_UN on Drop"
+        )]
+        {
+            use std::os::fd::AsRawFd as _;
+            nix::fcntl::flock(
+                file.as_raw_fd(),
+                nix::fcntl::FlockArg::LockExclusiveNonblock,
+            )
+            .map_err(|error| {
+                BenchError::msg(format!("aggregate campaign lease unavailable: {error}"))
+            })?;
+        }
         let owner = ay_sys::supervisor::process_group::process_identity(std::process::id())?
             .ok_or_else(|| BenchError::msg("campaign identity unavailable"))?;
         // No unlink/reclaim of somebody else's held inode: a surviving leaked
@@ -369,15 +426,21 @@ impl CampaignLease {
         Ok(lease)
     }
 
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub(super) fn ensure_alive(&self) -> Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         if let Some(reason) = self.refusal.get() {
             return Err(BenchError::msg(reason.clone()));
         }
         let check = || -> Result<()> {
-            if ay_sys::supervisor::process_group::process_identity(std::process::id())?
-                != Some(self.owner)
-            {
+            // The private live owner cannot outlive this process and become
+            // a reused PID; forked descendants have a different getpid. Keep
+            // the authenticated acquisition birth without a new kernel birth
+            // lookup on every child wait/poll.
+            if std::process::id() != self.owner.pid {
                 return Err(BenchError::msg("aggregate lease original process changed"));
             }
             let held = self.file.metadata()?;
@@ -403,13 +466,56 @@ impl CampaignLease {
 
 /// Preserve the existing planner's headroom and child-floor policy using
 /// checked native measurements. Unknown available memory is never idle RAM.
-pub(super) fn plan(requested: usize, enforcement: &Path) -> Result<ResourcePlan> {
-    planning::plan(requested, enforcement)
+pub(super) fn plan(requested: usize, lease_path: &Path) -> Result<ResourcePlan> {
+    planning::plan(requested, lease_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_watch_retains_sampler_until_actual_child_is_reaped() {
+        let resources =
+            super::super::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
+        let mut command = resources.external_command("/bin/sh");
+        command.args(["-c", "exec sleep 0.05"]);
+        let (mut child, watch) = resources
+            .spawn_external_child(&mut command, "retained sampler")
+            .unwrap();
+        drop(resources);
+        let outcome = super::super::wait_for_guarded_child(
+            &mut child,
+            watch,
+            Duration::from_secs(5),
+            "retained sampler",
+        )
+        .unwrap();
+        assert!(outcome.status.is_some_and(|status| status.success()));
+        assert!(!outcome.memout && !outcome.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_sampler_loss_reaps_the_guarded_child() {
+        let resources =
+            super::super::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
+        let mut command = resources.external_command("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let (mut child, watch) = resources
+            .spawn_external_child(&mut command, "sampler loss")
+            .unwrap();
+        resources.observer.stop_for_test();
+        assert!(super::super::wait_for_guarded_child(
+            &mut child,
+            watch,
+            Duration::from_secs(5),
+            "sampler loss",
+        )
+        .is_err());
+        assert!(child.try_wait().unwrap().is_some());
+    }
     fn measured_plan(
         requested: usize,
         physical: usize,
@@ -484,6 +590,60 @@ mod tests {
         first.ensure_alive().unwrap();
         drop(first);
         CampaignLease::acquire(&path, "after original drop").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_lease_contender_entry() {
+        let args = std::env::args().collect::<Vec<_>>();
+        if !args.iter().any(|arg| arg == "--exact") {
+            return;
+        }
+        let Some(path) = std::env::var_os("AY_TEST_NATIVE_LEASE_PATH") else {
+            return;
+        };
+        let expected = std::env::var("AY_TEST_NATIVE_LEASE_AVAILABLE").unwrap() == "yes";
+        let acquired =
+            CampaignLease::acquire(std::path::Path::new(&path), "independent native process");
+        assert_eq!(acquired.is_ok(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_lease_excludes_an_actual_other_process_until_original_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cross-process-lease");
+        let lease = CampaignLease::acquire(&path, "original process").unwrap();
+        let contender = |expected| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "resource::native::tests::native_lease_contender_entry",
+                    "--nocapture",
+                ])
+                .env("AY_TEST_NATIVE_LEASE_PATH", &path)
+                .env("AY_TEST_NATIVE_LEASE_AVAILABLE", expected);
+            let result = ay_sys::metadata_capture::capture(
+                command,
+                ay_sys::metadata_capture::CaptureLimits {
+                    timeout: Duration::from_secs(5),
+                    output_bytes: 64 * 1024,
+                    resident_bytes: None,
+                },
+                "native lease contender",
+            )
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        contender("no");
+        lease.ensure_alive().unwrap();
+        drop(lease);
+        contender("yes");
     }
 
     #[cfg(unix)]

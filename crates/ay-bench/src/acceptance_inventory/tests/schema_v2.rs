@@ -4,7 +4,7 @@
 
 use serde_json::{json, Value};
 
-use super::super::{BlockerKind, Inventory, INVENTORY_SCHEMA, INVENTORY_SCHEMA_V2};
+use super::super::{BlockerKind, Inventory, PlanBlocker, INVENTORY_SCHEMA, INVENTORY_SCHEMA_V2};
 
 pub(super) fn document() -> Value {
     let mut value = super::document();
@@ -82,7 +82,7 @@ fn v2_admits_exact_32_requests_without_promoting_evidence() {
     assert_eq!(plan.requests.len(), 32);
     assert!(!plan.promotable_for_ask_closure);
     for request in &plan.requests {
-        assert!(!request.blockers.is_empty());
+        assert_ne!(request.blockers.as_slice(), &[] as &[PlanBlocker]);
         assert!(request.routes.iter().all(|route| !route.evidence_qualified));
     }
 }

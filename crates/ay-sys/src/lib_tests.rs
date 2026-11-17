@@ -376,11 +376,16 @@ fn test_standalone_limit_actually_consults_the_kernel_budget() {
         .env("AY_SYS_PRINT_LIMIT", "1")
         .output()
         .expect("re-invoke test binary");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let Some(line) = text.lines().find_map(|l| l.strip_prefix("LIMIT=")) else {
-        panic!("subprocess did not report a limit; stdout was:\n{text}");
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "budget subprocess failed: {text}");
+    // Libtest writes its progress prefix to stdout without a trailing newline.
+    // Keep the semantic report on stderr rather than parsing that presentation.
+    let mut reports = text.lines().filter_map(|line| line.strip_prefix("LIMIT="));
+    let Some(line) = reports.next() else {
+        panic!("subprocess did not report a limit; stderr was:\n{text}");
     };
-    let limit: usize = line.trim().parse().expect("limit parses");
+    assert!(reports.next().is_none(), "ambiguous budget report: {text}");
+    let limit: usize = line.parse().expect("limit parses");
 
     let budget = 512 * 1024 * 1024;
     assert!(
@@ -402,7 +407,7 @@ fn test_standalone_limit_actually_consults_the_kernel_budget() {
 #[test]
 fn print_standalone_limit_for_subprocess() {
     if std::env::var_os("AY_SYS_PRINT_LIMIT").is_some() {
-        println!("LIMIT={}", default_standalone_memory_limit());
+        eprintln!("LIMIT={}", default_standalone_memory_limit());
     }
 }
 

@@ -199,7 +199,7 @@ impl PubStore {
                 capacity
                     .checked_mul(2)?
                     .max(4)
-                    .checked_mul(std::mem::size_of::<NodeData>())?
+                    .checked_mul(size_of::<NodeData>())?
             } else {
                 0
             };
@@ -208,7 +208,7 @@ impl PubStore {
             // copies, not an allowance or a physical live-memory assertion.
             let map_bytes = if map_len == map_capacity {
                 map_capacity
-                    .checked_mul(std::mem::size_of::<(Term, PubId)>())?
+                    .checked_mul(size_of::<(Term, PubId)>())?
                     .checked_mul(4)?
                     .checked_add(4096)?
             } else {
@@ -378,14 +378,16 @@ mod admitted_tactic_tests {
                 None,
                 Arc::new(|| false),
             )
-            .unwrap(),
+            .expect("reentrant test admission must initialize"),
         };
-        let id = store.engine_node_owned(first, Some(&owner)).unwrap();
+        let id = store
+            .engine_node_owned(first, Some(&owner))
+            .expect("admitted engine node must be stored");
         assert!(matches!(store.node(id),Some(NodeData::Engine{term,..}) if term==first));
         assert!(owner.once.get());
         let stopped =
             CountedAdmission::new(FiniteAdmissionGrant::new(0, 0), None, Arc::new(|| false))
-                .unwrap();
+                .expect("zero-budget test admission must initialize");
         let fresh = PubStore::default();
         assert!(fresh.engine_node_owned(first, Some(&stopped)).is_none());
         assert!(fresh.latest(first).is_none());

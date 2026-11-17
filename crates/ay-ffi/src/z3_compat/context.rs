@@ -134,7 +134,7 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             eval_session: None,
             eval_active: false,
             proof_check_callback: None,
-            proof_check_user_context: std::ptr::null_mut(),
+            proof_check_user_context: ptr::null_mut(),
             proof_tracking: Default::default(),
             last_error: Z3_OK,
             error_msg: None,

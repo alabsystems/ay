@@ -31,10 +31,11 @@ fn raw_attempt(budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
         target: &target,
     }];
     let problem = ChcProblem::new();
-    let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget)?;
-    let (body, source) = output.into_body(ClauseBody::empty())?.into_parts()?;
-    drop(body);
-    drop(source);
+    {
+        let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget)?;
+        let (body, _source) = output.into_body(ClauseBody::empty())?.into_parts()?;
+        drop(body);
+    }
     budget.charge(0)?;
     Ok(())
 }
@@ -94,42 +95,44 @@ fn complete_raw_leaf_links_survive_repeated_roots_and_body_consumption() {
             let mut problem = ChcProblem::new();
             let p = problem.declare_predicate("p", vec![ChcSort::BitVec(width)]);
             let old = ClauseBody::new(vec![(p, vec![ChcExpr::Var(target.clone())])], None);
-            let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
-            let (body, source) = output.into_body(old).unwrap().into_parts().unwrap();
-            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-            assert!(std::ptr::eq(source.bindings()[0].source, &word));
-            assert_eq!(body.predicates[0].1, [ChcExpr::Var(target.clone())]);
-            let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
-                panic!()
+            let linked = {
+                let output = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
+                let (body, source) = output.into_body(old).unwrap().into_parts().unwrap();
+                assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+                assert!(std::ptr::eq(source.bindings()[0].source, &raw const word));
+                assert_eq!(body.predicates[0].1, [ChcExpr::Var(target.clone())]);
+                let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
+                    panic!()
+                };
+                let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
+                    panic!()
+                };
+                let mut linked = Vec::new();
+                budget.admit(4096, 4096).unwrap();
+                for entry in entries.iter().rev().take(width as usize).rev() {
+                    budget.charge(256).unwrap();
+                    let ChcExpr::Op(ChcOp::Eq, pair) = entry.as_ref() else {
+                        panic!()
+                    };
+                    let ChcExpr::Op(ChcOp::Eq, bit) = pair[1].as_ref() else {
+                        panic!()
+                    };
+                    let ChcExpr::Op(ChcOp::BvExtract(hi, lo), input) = bit[0].as_ref() else {
+                        panic!()
+                    };
+                    assert_eq!(hi, lo);
+                    assert_eq!(input[0].as_ref(), &ChcExpr::Var(target.clone()));
+                    linked.push(*lo);
+                }
+                assert_eq!(linked, (0..width).collect::<Vec<_>>());
+                let clause = HornClause::new(
+                    body,
+                    ClauseHead::Predicate(p, vec![ChcExpr::Var(target.clone())]),
+                );
+                assert_eq!(clause.body.predicates.len(), 1);
+                drop(clause);
+                linked
             };
-            let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
-                panic!()
-            };
-            let mut linked = Vec::new();
-            budget.admit(4096, 4096).unwrap();
-            for entry in entries.iter().rev().take(width as usize).rev() {
-                budget.charge(256).unwrap();
-                let ChcExpr::Op(ChcOp::Eq, pair) = entry.as_ref() else {
-                    panic!()
-                };
-                let ChcExpr::Op(ChcOp::Eq, bit) = pair[1].as_ref() else {
-                    panic!()
-                };
-                let ChcExpr::Op(ChcOp::BvExtract(hi, lo), input) = bit[0].as_ref() else {
-                    panic!()
-                };
-                assert_eq!(hi, lo);
-                assert_eq!(input[0].as_ref(), &ChcExpr::Var(target.clone()));
-                linked.push(*lo);
-            }
-            assert_eq!(linked, (0..width).collect::<Vec<_>>());
-            let clause = HornClause::new(
-                body,
-                ClauseHead::Predicate(p, vec![ChcExpr::Var(target.clone())]),
-            );
-            assert_eq!(clause.body.predicates.len(), 1);
-            drop(clause);
-            drop(source);
             drop(linked);
             budget.charge(0).unwrap();
         }
@@ -143,14 +146,15 @@ fn constants_are_sliced_without_erasing_the_original_field_nodes() {
             let word = Expr::bitvec_const(bits, width);
             let roots = [fields(word, width).fp_is_negative()];
             let problem = ChcProblem::new();
-            let output = relation(&roots, &[], &problem, budget);
-            assert!(matches!(
-                output.source().roots()[0].value(),
-                ExprValue::FpIsNegative(_)
-            ));
-            let (body, source) = output.into_parts().unwrap();
-            drop(body);
-            drop(source);
+            {
+                let output = relation(&roots, &[], &problem, budget);
+                assert!(matches!(
+                    output.source().roots()[0].value(),
+                    ExprValue::FpIsNegative(_)
+                ));
+                let (body, _source) = output.into_parts().unwrap();
+                drop(body);
+            }
             budget.charge(0).unwrap();
         }
     });
@@ -290,7 +294,7 @@ fn native_source_attempt(
     let roots = [root];
     let namespace = ChcProblem::new();
     let result = ay_chc::fp_adapter::lower_fp_clause(&terms, &roots, &bindings, &namespace, budget);
-    let result = result.map(|data| drop(data));
+    let result = result.map(drop);
     drop(terms);
     drop(entries);
     budget.charge(0)?;

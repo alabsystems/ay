@@ -151,3 +151,32 @@ fn observing_owner(stop: usize, calls: &Arc<AtomicUsize>) -> CountedAdmission {
     )
     .unwrap()
 }
+
+// Test observations/retirement only; production continues through learn_and_assert.
+impl CountedStandardAnalysis<'_> {
+    /// A borrowed observation, not permission for an uncharged traversal.
+    pub(in crate::solver) fn learned_clause(&self) -> &[Literal] {
+        &self.result.learned_clause
+    }
+
+    pub(in crate::solver) fn backtrack_level(&self) -> u32 {
+        self.result.backtrack_level
+    }
+
+    pub(in crate::solver) fn lbd(&self) -> u32 {
+        self.result.lbd
+    }
+
+    pub(in crate::solver) fn resolution_chain(&self) -> &[u64] {
+        &self.result.resolution_chain
+    }
+
+    pub(in crate::solver) fn finish(mut self) -> Result<(), SatUnknownReason> {
+        self.result.learned_clause.clear();
+        self.result.resolution_chain.clear();
+        self.retirement.retire();
+        let result = self.retirement.owner.check();
+        self.retirement.retain_trace = result.is_ok();
+        result.map_err(counted_admission::reason)
+    }
+}

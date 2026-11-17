@@ -444,14 +444,6 @@ impl Solver {
     /// Resource-bounded equivalent of [`Self::reconstruct_lrat_backward`].
     /// The graph walk and emitted ordering are identical; every owned vector
     /// growth is fallible and accounted before allocation.
-    #[cfg(test)]
-    pub(crate) fn reconstruct_lrat_backward_bounded(
-        &self,
-        limits: &BackwardProofLimits,
-    ) -> Result<BoundedBackwardProofResult, BackwardProofFailure> {
-        self.reconstruct_lrat_backward_bounded_with_cancellation(limits, &|| true)
-    }
-
     /// Cancel the actual reconstruction walk without weakening its proof checks.
     /// The borrowed callback runs on this thread; false is irreversible for this
     /// call. Hash operations, allocation and destruction remain opaque intervals.
@@ -1152,7 +1144,7 @@ mod tests {
         } = bounded_reserved_level0_raw_reason_fixture();
 
         let backward = solver
-            .reconstruct_lrat_backward_bounded(&limits)
+            .reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true)
             .expect("bounded raw-reason reconstruction");
         assert!(backward.complete);
         assert_eq!(backward.steps.len(), 1);
@@ -1164,19 +1156,22 @@ mod tests {
         let manager = solver.proof_manager.as_mut().expect("proof manager");
         for step in &backward.steps {
             manager
-                .emit_bounded_backward_rup_step(
+                .emit_bounded_backward_rup_step_with_cancellation(
                     step.clause_id,
                     &step.literals,
                     &step.hints,
                     deadline,
+                    &|| true,
                 )
                 .expect("emit reserved raw reason");
         }
         manager
-            .finish_bounded_backward_emission(deadline)
+            .finish_bounded_backward_emission_with_cancellation(deadline, &|| true)
             .expect("finish bounded roots");
         let empty_id = manager
-            .emit_bounded_empty_rup_step(&backward.empty_hints, deadline)
+            .emit_bounded_empty_rup_step_with_cancellation(&backward.empty_hints, deadline, &|| {
+                true
+            })
             .expect("emit bounded terminal");
 
         let output = solver
@@ -1258,7 +1253,7 @@ mod tests {
         );
 
         let backward = solver
-            .reconstruct_lrat_backward_bounded(&limits)
+            .reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true)
             .expect("22 unit hints fit inside a 16 KiB reconstruction envelope");
         assert!(backward.complete);
         assert_eq!(backward.steps.len(), 0);
@@ -1416,7 +1411,7 @@ mod tests {
 
         let legacy = solver.reconstruct_lrat_backward();
         let bounded = solver
-            .reconstruct_lrat_backward_bounded(&generous_limits())
+            .reconstruct_lrat_backward_bounded_with_cancellation(&generous_limits(), &|| true)
             .expect("bounded reconstruction");
         let mut bounded_steps = bounded.steps;
         bounded_steps.push(LratStep {
@@ -1439,14 +1434,14 @@ mod tests {
         let mut limits = generous_limits();
         limits.deadline = Some(Instant::now());
         assert!(matches!(
-            solver.reconstruct_lrat_backward_bounded(&limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
             Err(BackwardProofFailure::Deadline)
         ));
 
         let mut limits = generous_limits();
         limits.max_steps = 0;
         assert!(matches!(
-            solver.reconstruct_lrat_backward_bounded(&limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
             Err(BackwardProofFailure::Limit {
                 resource: BackwardProofResource::Steps,
                 ..
@@ -1456,7 +1451,7 @@ mod tests {
         let mut limits = generous_limits();
         limits.max_hints = 0;
         assert!(matches!(
-            solver.reconstruct_lrat_backward_bounded(&limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
             Err(BackwardProofFailure::Limit {
                 resource: BackwardProofResource::Hints,
                 ..
@@ -1466,7 +1461,7 @@ mod tests {
         let mut limits = generous_limits();
         limits.max_bytes = 0;
         assert!(matches!(
-            solver.reconstruct_lrat_backward_bounded(&limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
             Err(BackwardProofFailure::Limit {
                 resource: BackwardProofResource::Bytes,
                 ..
@@ -1474,7 +1469,7 @@ mod tests {
         ));
 
         let baseline = solver
-            .reconstruct_lrat_backward_bounded(&generous_limits())
+            .reconstruct_lrat_backward_bounded_with_cancellation(&generous_limits(), &|| true)
             .expect("baseline");
         let literal_count: usize = baseline.steps.iter().map(|step| step.literals.len()).sum();
         assert_eq!(
@@ -1484,7 +1479,7 @@ mod tests {
         let mut limits = generous_limits();
         limits.max_literals = 0;
         assert!(matches!(
-            solver.reconstruct_lrat_backward_bounded(&limits),
+            solver.reconstruct_lrat_backward_bounded_with_cancellation(&limits, &|| true),
             Err(BackwardProofFailure::Limit {
                 resource: BackwardProofResource::Literals,
                 ..

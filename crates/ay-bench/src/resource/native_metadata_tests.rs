@@ -128,8 +128,7 @@ fn check_timeout(placement: Placement) {
         "native metadata timeout",
         Some(directory.path()),
     )
-    .err()
-    .expect("sleeping metadata must time out");
+    .expect_err("sleeping metadata must time out");
     assert!(error.to_string().contains("exceeded"), "{error}");
     let identity = std::fs::read_to_string(directory.path().join("metadata-child")).unwrap();
     let mut fields = identity.split_whitespace();
@@ -163,7 +162,6 @@ fn missing_metadata_program_reports_spawn_failure() {
         Duration::from_secs(1),
         "missing native metadata",
     )
-    .err()
-    .expect("missing metadata executable must fail");
+    .expect_err("missing metadata executable must fail");
     assert!(error.to_string().contains("spawning owned metadata child"));
 }

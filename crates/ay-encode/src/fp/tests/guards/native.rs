@@ -57,25 +57,26 @@ fn check(
             ],
         )));
     }
-    let output = lower_fp_expr_clause(roots, &bindings, &namespace, budget).unwrap();
-    let original = ClauseBody::constraint(ChcExpr::Op(ChcOp::And, pins));
-    let (body, source) = output.into_body(original).unwrap().into_parts().unwrap();
-    assert!(std::ptr::eq(source.roots(), roots));
-    budget.charge(0).unwrap();
-    let mut native = SmtContext::new();
-    native.set_term_memory_budget(Some(128 * 1024 * 1024));
-    let remaining = end.saturating_duration_since(Instant::now());
-    assert!(!remaining.is_zero());
-    let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
-    if expected {
-        assert!(matches!(result, SmtResult::Sat(_)));
-    } else {
-        assert!(result.is_unsat());
+    {
+        let output = lower_fp_expr_clause(roots, &bindings, &namespace, budget).unwrap();
+        let original = ClauseBody::constraint(ChcExpr::Op(ChcOp::And, pins));
+        let (body, source) = output.into_body(original).unwrap().into_parts().unwrap();
+        assert!(std::ptr::eq(source.roots(), roots));
+        budget.charge(0).unwrap();
+        let mut native = SmtContext::new();
+        native.set_term_memory_budget(Some(128 * 1024 * 1024));
+        let remaining = end.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
+        if expected {
+            assert!(matches!(result, SmtResult::Sat(_)));
+        } else {
+            assert!(result.is_unsat());
+        }
+        drop(result);
+        drop(native);
+        drop(body);
     }
-    drop(result);
-    drop(native);
-    drop(body);
-    drop(source);
     budget.charge(0).unwrap();
 }
 

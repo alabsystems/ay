@@ -58,7 +58,7 @@ fn verify_library(path: &Path, digest: &str) -> io::Result<PathBuf> {
         return Err(io::Error::other("native artifact is not a regular file"));
     }
     let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = vec![0u8; 65536].into_boxed_slice();
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {

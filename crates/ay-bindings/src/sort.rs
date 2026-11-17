@@ -192,14 +192,6 @@ impl Sort {
         Self(Arc::new(inner))
     }
 
-    /// Identity of this sort's shared allocation: equal for a sort and its
-    /// clones, and stable while any clone is alive. Identity-keyed tables
-    /// (`execute_direct/memo.rs`) pin the allocation by keeping a clone.
-    #[inline]
-    pub(crate) fn identity(&self) -> usize {
-        Arc::as_ptr(&self.0).cast::<()>() as usize
-    }
-
     // Constructor methods (bool, bitvec, int, real, array, etc.)
     // are in sort_constructors.rs.
 
@@ -454,7 +446,6 @@ impl Display for ArraySort {
 mod core_conversions;
 
 mod datatype_ref;
-pub(crate) use datatype_ref::dangling_datatype_ref_in_declaration;
 
 // Note: The From impls in core_conversions are automatically available as trait impls.
 // No re-export needed.

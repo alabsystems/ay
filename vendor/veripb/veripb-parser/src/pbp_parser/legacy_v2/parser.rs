@@ -34,7 +34,7 @@ use crate::{
 ///
 /// The substitution is parsed from a lexer that generates tokens of the substitution. A format of a substitution is a list of mappings. A the domain of the mapping are variables and the range of the mapping is `0`, `1`, or a literal.
 pub fn parse_substitution<V: VarNameRecorder>(
-    lex: &mut LogosLexer<SubstitutionToken>,
+    lex: &mut LogosLexer<'_, SubstitutionToken>,
     var_names: &mut V,
 ) -> Result<Substitution, Error> {
     let mut sub = Substitution::default();
@@ -95,7 +95,7 @@ pub fn parse_substitution<V: VarNameRecorder>(
 ///
 /// This vector can be used to initialize an assignment or a propagation trail.
 pub fn parse_bool_assignment_to_raw_vec<V: VarNameRecorder>(
-    lex: &mut LogosLexer<AssignmentToken>,
+    lex: &mut LogosLexer<'_, AssignmentToken>,
     var_names: &mut V,
 ) -> Result<Vec<Lit>, Error> {
     let mut assignment = Vec::new();
@@ -1202,7 +1202,7 @@ impl<'a, P: ProofProcessor> Version2Parser<'a, P> {
 }
 
 pub fn parse_objective_update_type(
-    lex: &mut LogosLexer<ObjectiveUpdateType>,
+    lex: &mut LogosLexer<'_, ObjectiveUpdateType>,
 ) -> Result<ObjectiveUpdateType, ParserError> {
     match lex.next() {
         Some(Ok(option)) => Ok(option),
@@ -1211,7 +1211,7 @@ pub fn parse_objective_update_type(
 }
 
 pub fn parse_identifier_option(
-    lex: &mut LogosLexer<IdentifierOption>,
+    lex: &mut LogosLexer<'_, IdentifierOption>,
 ) -> Result<IdentifierOption, ParserError> {
     match lex.next() {
         Some(Ok(option)) => Ok(option),

@@ -117,7 +117,7 @@ fn project<'a>(
     let mut disagrees = false;
     for observation in observations {
         if item.file.as_deref() != Some(observation.file)
-            || hash.filter(|s| !s.is_empty()).is_none()
+            || hash.is_none_or(str::is_empty)
             || hash != observation.hash
         {
             continue;

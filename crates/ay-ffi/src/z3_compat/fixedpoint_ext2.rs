@@ -52,7 +52,7 @@ use super::{
     cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit, ffi_guard_const_ptr,
     ffi_guard_int, ffi_guard_produced, ffi_guard_ptr, ffi_guard_void, require_term_ast_or_return,
     term_to_ast, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string,
-    Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    Z3_symbol, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 // ============================================================================

@@ -39,7 +39,7 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 
-use super::memo::{node_key, NodeKey, ScopedTable};
+use super::memo::{node_key, sort_key, NodeKey, ScopedTable};
 use super::payload::{node_payload, Payload};
 use crate::constraint::Constraint;
 use crate::expr::Expr;
@@ -80,14 +80,14 @@ impl Overlay<'_> {
     fn sort_digest(&mut self, sort: &Sort) -> [u8; 32] {
         let mut stack = vec![sort.clone()];
         while let Some(current) = stack.last().cloned() {
-            if self.sort(current.identity()).is_some() {
+            if self.sort(sort_key(&current)).is_some() {
                 stack.pop();
                 continue;
             }
             let children = sort_children(&current);
             let missing: Vec<Sort> = children
                 .iter()
-                .filter(|child| self.sort(child.identity()).is_none())
+                .filter(|child| self.sort(sort_key(child)).is_none())
                 .cloned()
                 .collect();
             if !missing.is_empty() {
@@ -95,11 +95,11 @@ impl Overlay<'_> {
                 continue;
             }
             stack.pop();
-            let digest = sort_shell_digest(&current, |child| self.sort(child.identity()));
+            let digest = sort_shell_digest(&current, |child| self.sort(sort_key(child)));
             self.new_sorts
-                .insert(current.identity(), (current.clone(), digest));
+                .insert(sort_key(&current), (current.clone(), digest));
         }
-        self.sort(sort.identity())
+        self.sort(sort_key(sort))
             .unwrap_or_else(|| sort_shell_digest(sort, |_| None))
     }
 

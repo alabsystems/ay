@@ -16,14 +16,13 @@ fn attempt(budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
         target: &target,
     }];
     let namespace = ChcProblem::new();
-    let result = lower_fp_raw_result_clause(&[], &results, &bindings, &namespace, budget)
-        .and_then(|data| data.into_body(ClauseBody::empty()))
-        .and_then(|body| body.into_parts());
-    let (body, source) = result?;
-    drop(body);
-    drop(source);
-    drop(results);
-    drop(bindings);
+    {
+        let result = lower_fp_raw_result_clause(&[], &results, &bindings, &namespace, budget)
+            .and_then(|data| data.into_body(ClauseBody::empty()))
+            .and_then(|body| body.into_parts());
+        let (body, _source) = result?;
+        drop(body);
+    }
     drop(input);
     drop(output);
     drop(target);
@@ -36,21 +35,22 @@ fn measured(end: Instant) -> (usize, usize, usize) {
     let work = Cell::new(0usize);
     let bytes = Cell::new(0usize);
     let calls = Cell::new(0usize);
-    let mut owner = |w: usize, b: usize| {
-        if Instant::now() >= end {
-            return Err(QueryError::Interrupted(StopReason::Deadline));
-        }
-        work.set(work.get().checked_add(w).ok_or(QueryError::Exhausted)?);
-        bytes.set(bytes.get().checked_add(b).ok_or(QueryError::Exhausted)?);
-        calls.set(calls.get().checked_add(1).ok_or(QueryError::Exhausted)?);
-        if work.get() as u64 > WORK || bytes.get() as u64 > BYTES {
-            return Err(QueryError::Exhausted);
-        }
-        Ok(())
-    };
-    let mut budget = WorkBudget::with_admission(WORK, &mut owner);
-    attempt(&mut budget).unwrap();
-    drop(budget);
+    {
+        let mut owner = |w: usize, b: usize| {
+            if Instant::now() >= end {
+                return Err(QueryError::Interrupted(StopReason::Deadline));
+            }
+            work.set(work.get().checked_add(w).ok_or(QueryError::Exhausted)?);
+            bytes.set(bytes.get().checked_add(b).ok_or(QueryError::Exhausted)?);
+            calls.set(calls.get().checked_add(1).ok_or(QueryError::Exhausted)?);
+            if work.get() as u64 > WORK || bytes.get() as u64 > BYTES {
+                return Err(QueryError::Exhausted);
+            }
+            Ok(())
+        };
+        let mut budget = WorkBudget::with_admission(WORK, &mut owner);
+        attempt(&mut budget).unwrap();
+    }
     (work.get(), bytes.get(), calls.get())
 }
 
@@ -121,7 +121,9 @@ fn original_cancel_deadline_and_expired_end_are_sticky_after_raw_reset() {
             Some(FpAdapterError::Owner(QueryError::Interrupted(reason)))
         );
     }
-    let expired = Instant::now() - Duration::from_secs(1);
+    let expired = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("fixture instant follows one-second offset");
     let mut owner = |_: usize, _: usize| {
         if Instant::now() >= expired {
             Err(QueryError::Interrupted(StopReason::Deadline))

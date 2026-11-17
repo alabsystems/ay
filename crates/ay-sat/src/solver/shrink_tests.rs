@@ -29,7 +29,9 @@ fn is_redundant_cached_keep_overrides_poison() {
     solver.min.minimize_flags[0] |= MIN_POISON;
 
     assert!(
-        solver.is_redundant_cached(neg_lit, 1),
+        solver
+            .redundant_admitted(neg_lit, 1, &conflict_analysis_minimize::admitted::Ordinary)
+            .unwrap_or_else(|never| match never {}),
         "minimize_keep must take precedence over minimize_poison"
     );
 }

@@ -151,5 +151,5 @@ fn test_non_search_annotation_ignored() {
         Annotation::Call("domain".into(), vec![]),
     ];
     let result = parse_search_annotations(&anns);
-    assert!(result.is_empty());
+    assert_eq!(result.as_slice(), &[] as &[SearchAnnotation]);
 }

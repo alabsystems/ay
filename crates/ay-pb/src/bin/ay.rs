@@ -4637,7 +4637,7 @@ mod tests {
         };
 
         assert_eq!(outcome.solution.status, PbStatus::Unknown);
-        assert!(outcome.solution.assignment.is_empty());
+        assert_eq!(outcome.solution.assignment.as_slice(), &[] as &[bool]);
         assert!(outcome.solution.objective.is_none());
         assert!(
             !proof_path.exists(),
@@ -4710,7 +4710,7 @@ mod tests {
         };
 
         assert_eq!(outcome.solution.status, PbStatus::Unknown);
-        assert!(outcome.solution.assignment.is_empty());
+        assert_eq!(outcome.solution.assignment.as_slice(), &[] as &[bool]);
         assert!(outcome.solution.objective.is_none());
         assert!(
             !proof_path.exists(),
@@ -4975,7 +4975,7 @@ mod tests {
         // Infeasible witness (all-false violates >= 1) -> UNKNOWN.
         let bad = emergency_emit_solution(c, Some(&[false, false, false]));
         assert_eq!(bad.status, PbStatus::Unknown);
-        assert!(bad.assignment.is_empty());
+        assert_eq!(bad.assignment.as_slice(), &[] as &[bool]);
 
         // No witness -> UNKNOWN.
         let none = emergency_emit_solution(c, None);
@@ -5066,7 +5066,7 @@ mod tests {
         };
 
         assert_eq!(outcome.solution.status, PbStatus::Unknown);
-        assert!(outcome.solution.assignment.is_empty());
+        assert_eq!(outcome.solution.assignment.as_slice(), &[] as &[bool]);
         assert!(outcome.solution.objective.is_none());
         assert!(
             !proof_path.exists(),
@@ -5378,7 +5378,7 @@ mod tests {
         let projected = project_wbo_solution(transformed_solution, &wbo);
 
         assert_eq!(projected.status, PbStatus::Unknown);
-        assert!(projected.assignment.is_empty());
+        assert_eq!(projected.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(projected.objective, None);
     }
 
@@ -5396,7 +5396,7 @@ mod tests {
             exact_wbo_solution_from_assignment(&wbo, PbStatus::Satisfiable, &[true], Some(4));
 
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -5440,7 +5440,7 @@ mod tests {
         let projected = project_wbo_solution(solution, &wbo);
 
         assert_eq!(projected.status, PbStatus::Unknown);
-        assert!(projected.assignment.is_empty());
+        assert_eq!(projected.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(projected.objective, None);
     }
 
@@ -5467,7 +5467,7 @@ mod tests {
             exact_wbo_solution_from_assignment(&wbo, PbStatus::Satisfiable, &[false], Some(7));
 
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -6045,7 +6045,7 @@ mod tests {
             pb_cdcl_optimization_result_to_solution(PbCdclResult::Optimal(vec![true], 3), 2);
 
         assert_eq!(result.status, PbStatus::Unknown);
-        assert!(result.assignment.is_empty());
+        assert_eq!(result.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(result.objective, None);
     }
 
@@ -6054,7 +6054,7 @@ mod tests {
         let exact = exact_optimization_incumbent(&[], 2, PbStatus::Satisfiable, 9, &[true]);
 
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -6099,7 +6099,7 @@ mod tests {
         );
 
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -6170,7 +6170,7 @@ mod tests {
                 &[true, false],
             );
             assert_eq!(exact.status, PbStatus::Unknown);
-            assert!(exact.assignment.is_empty());
+            assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
             assert_eq!(exact.objective, None);
         }
 
@@ -6213,7 +6213,7 @@ mod tests {
         );
 
         assert_eq!(exact.status, PbStatus::Unknown);
-        assert!(exact.assignment.is_empty());
+        assert_eq!(exact.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(exact.objective, None);
     }
 
@@ -6332,7 +6332,7 @@ mod tests {
             PbStatus::Unknown,
             "an infeasible model claimed SAT must fail-closed to UNKNOWN"
         );
-        assert!(gated.assignment.is_empty());
+        assert_eq!(gated.assignment.as_slice(), &[] as &[bool]);
         assert_eq!(gated.objective, None);
     }
 

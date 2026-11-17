@@ -880,6 +880,16 @@ impl NiaSolver<'_> {
         // first `lia.check()` already sees them.
         let _zero_bound_added = self.add_zero_bound_product_lemmas();
 
+        // Groebner-derived equalities (#nia-groebner, see groebner.rs):
+        // exact ideal consequences of the asserted equality atoms,
+        // asserted as reason-carrying cuts before the loop so the first
+        // `lia.check()` already sees them. A derived nonzero constant
+        // refutes its provenance atoms outright.
+        if let Some(conflict) = self.add_groebner_equality_lemmas() {
+            self.conflict_count += 1;
+            return TheoryResult::Unsat(conflict);
+        }
+
         for iteration in 0..=MAX_ITERATIONS {
             // Fail-closed memory guard (#nia-oom): each iteration asserts
             // tangent/McCormick/division-refinement lemmas into the persistent
@@ -1440,6 +1450,22 @@ impl NiaSolver<'_> {
                                      splitting {:?} at {}",
                                     split.variable,
                                     split.value
+                                );
+                            }
+                            return TheoryResult::NeedSplit(split);
+                        }
+                        // Integral point, still monomial-inconsistent, and
+                        // every exact/SAT-only lane declined: branch on a
+                        // sign-undetermined monomial factor instead of
+                        // giving up (once per variable per instance; see
+                        // `monomial_sign_split`). After the local search
+                        // for the same reason as the fractional split.
+                        if let Some(split) = self.monomial_sign_split() {
+                            if self.debug {
+                                safe_eprintln!(
+                                    "[NIA] refinement stalled at an integral point: \
+                                     sign-splitting {:?}",
+                                    split.variable
                                 );
                             }
                             return TheoryResult::NeedSplit(split);

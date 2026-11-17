@@ -109,7 +109,9 @@ fn every_record_poll_refusal_poisoned_and_never_retried() {
                 .unwrap_err();
             assert!(is_bounded_emission_cancelled(&error));
             assert!(is_bounded_emission_cancelled(
-                &writer.add_bounded_prevalidated_rup(&[], &[1]).unwrap_err()
+                &writer
+                    .add_bounded_prevalidated_rup_with_cancellation(&[], &[1], &|| true)
+                    .unwrap_err()
             ));
             assert_eq!(*writer.get_ref(), bytes);
             assert!(is_bounded_emission_cancelled(

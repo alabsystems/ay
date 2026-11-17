@@ -97,7 +97,7 @@ pub struct LraSolverMut<'s, 'a> {
 }
 
 impl<'a> LraSolverMut<'_, 'a> {
-    /// Binds the term store used by the next delegated LRA operation batch.
+    /// Bind the term store for the owning LIA lifetime.
     pub fn set_terms(&mut self, terms: &'a TermStore) {
         self.owner.lra.set_terms(terms);
     }

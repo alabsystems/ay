@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn signed_i8_manual_endpoints_select_only_the_complete_expected_fp_word() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for (raw, fp32, fp64) in [
             (0, 0, 0),
             (1, 0x3f800000, 0x3ff0000000000000),
@@ -22,7 +22,7 @@ fn signed_i8_manual_endpoints_select_only_the_complete_expected_fp_word() {
 
 #[test]
 fn unsigned_manual_endpoints_and_u64_max_have_exact_whole_words() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for (n, raw, fp32, fp64) in [
             (8, 0, 0, 0),
             (8, 1, 0x3f800000, 0x3ff0000000000000),
@@ -38,7 +38,7 @@ fn unsigned_manual_endpoints_and_u64_max_have_exact_whole_words() {
 
 #[test]
 fn signed_i64_extremes_and_both_even_ties_round_to_manual_words() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for (raw, fp32, fp64) in [
             (i64::MAX as u64, 0x5f000000, 0x43e0000000000000),
             (i64::MIN as u64, 0xdf000000, 0xc3e0000000000000),
@@ -70,7 +70,7 @@ fn signed_i64_extremes_and_both_even_ties_round_to_manual_words() {
 
 #[test]
 fn unsigned_even_ties_round_to_complete_manual_fp32_and_fp64_words() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for (width, base, low, high) in [
             (32, 1u64 << 24, 0x4b800000, 0x4b800002),
             (64, 1u64 << 53, 0x4340000000000000, 0x4340000000000002),
@@ -84,7 +84,7 @@ fn unsigned_even_ties_round_to_complete_manual_fp32_and_fp64_words() {
 
 #[test]
 fn raw_extract_multiple_casts_and_repeated_roots_share_original_input_links() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for n in [32, 64] {
             budget.admit(1_048_576, 1_048_576).unwrap();
             let base = Expr::var("numeric_base", crate::Sort::bitvec(n));
@@ -106,7 +106,7 @@ fn raw_extract_multiple_casts_and_repeated_roots_share_original_input_links() {
 
 #[test]
 fn mixed_guard_and_both_unchosen_numeric_branches_are_one_complete_relation() {
-    super::super::raw_words::native::original_owner(|budget, end| {
+    raw_words::native::original_owner(|budget, end| {
         for raw in [0x7fu64, 0xff] {
             budget.admit(1_048_576, 1_048_576).unwrap();
             let word = Expr::var("numeric_guard_word", crate::Sort::bitvec(8));

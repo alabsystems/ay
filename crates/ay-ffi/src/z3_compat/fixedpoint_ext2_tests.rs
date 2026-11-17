@@ -354,7 +354,7 @@ fn fixedpoint_from_file_parses() {
         assert_eq!(Z3_get_error_code(c), Z3_PARSER_ERROR);
         let path = std::env::temp_dir().join("ay_fp_from_file_test.smt2");
         std::fs::write(&path, "(declare-rel R (Int))(rule (R 0))(query R)").expect("write script");
-        let cpath = std::ffi::CString::new(path.to_string_lossy().into_owned()).expect("path");
+        let cpath = CString::new(path.to_string_lossy().into_owned()).expect("path");
         let q = Z3_fixedpoint_from_file(c, fp, cpath.as_ptr());
         assert!(!q.is_null(), "err {}", Z3_get_error_code(c));
         assert_eq!(

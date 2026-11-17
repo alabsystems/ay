@@ -15,25 +15,25 @@ pub enum ModelRecoveryFact<'a> {
     /// One valid graph node and its immediate union-find parent. Consumers must
     /// bound/check their traversal; no missing node is claimed a singleton.
     Parent {
-        /// The graph node.
+        /// The current graph node.
         term: TermId,
-        /// The node's immediate union-find parent.
+        /// Its immediate union-find parent.
         parent: TermId,
     },
     /// An active Boolean assignment (also a current kernel-inventory root).
     Boolean {
-        /// The assigned Boolean term.
+        /// The active Boolean term.
         term: TermId,
-        /// The term's current truth value.
+        /// Its current assigned truth value.
         value: bool,
     },
     /// An active decoded equality/biconditional, with its actual truth value.
     Equality {
-        /// The equality's left endpoint.
+        /// The decoded equality's first endpoint.
         left: TermId,
-        /// The equality's right endpoint.
+        /// The decoded equality's second endpoint.
         right: TermId,
-        /// Whether the endpoints are currently equal.
+        /// Truth value of the active equality or biconditional.
         equal: bool,
     },
     /// An active TRUE distinct atom. Every pair, not only a false equality,
@@ -43,9 +43,9 @@ pub enum ModelRecoveryFact<'a> {
     /// arithmetic). Its endpoints are current kernel occurrences, not guesses
     /// from the absence of an explicit false equality.
     SharedDisequality {
-        /// The disequality's left endpoint.
+        /// The first current kernel occurrence.
         left: TermId,
-        /// The disequality's right endpoint.
+        /// The second current kernel occurrence.
         right: TermId,
     },
 }

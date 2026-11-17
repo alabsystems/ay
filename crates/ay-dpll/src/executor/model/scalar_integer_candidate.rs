@@ -12,6 +12,7 @@ use ay_core::term::{reserve_counted, reserve_map_counted, TermConstructionAdmiss
 use ay_core::{Sort, TermData};
 use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
+use std::mem::size_of;
 use std::sync::Arc;
 
 const MAX_NODES: usize = 4096;
@@ -202,8 +203,8 @@ impl Executor {
                     owner
                         .admit(
                             1,
-                            std::mem::size_of::<super::evaluation_copies::RetainedEvaluationMemory>(
-                            ) + 2 * std::mem::size_of::<usize>(),
+                            size_of::<super::evaluation_copies::RetainedEvaluationMemory>()
+                                + 2 * size_of::<usize>(),
                         )
                         .ok()?;
                     candidate._scalar_candidate_memory =

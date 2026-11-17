@@ -40,6 +40,10 @@ pub enum QuantifiedQueryUnknownReason {
 
 /// One complete quantified-source outcome, never an ordinary QF artifact.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "source-bound safety evidence stays by value without an unmetered allocation or public API change"
+)]
 pub enum QuantifiedQueryOutcome {
     /// A sealed source certificate that also passed this invocation's recheck.
     CheckedSafe(QuantifiedChcSafety),

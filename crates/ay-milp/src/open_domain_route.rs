@@ -153,16 +153,18 @@ impl BoundedBackend for AyBoundedBackend {
         }
 
         let decision = if continuous_columns == 0 {
-            crate::pb_route::try_solve_portfolio_trial_interruptible(model, deadline, || {
-                should_stop()
-            })
+            crate::pb_route::try_solve_portfolio_trial_interruptible(
+                model,
+                deadline,
+                &mut *should_stop,
+            )
             .map(map_pb_decision)
         } else if general_integer_columns == 0 {
             crate::hybrid_pb_lp::try_solve_certified_interruptible(
                 model,
                 Some(deadline),
                 crate::hybrid_pb_lp::HybridGoal::Solve,
-                || should_stop(),
+                &mut *should_stop,
             )
             .map(map_certified_hybrid_decision)
         } else {

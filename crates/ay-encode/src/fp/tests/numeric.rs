@@ -58,26 +58,27 @@ fn solve(
             ))
         })
         .collect();
-    let data = lower_fp_expr_clause(roots, &bindings, &problem, budget).unwrap();
-    let old = ClauseBody::constraint(ChcExpr::Op(ChcOp::And, pins));
-    let (body, source) = data.into_body(old).unwrap().into_parts().unwrap();
-    assert!(std::ptr::eq(source.roots(), roots));
-    assert_eq!(source.bindings().len(), inputs.len());
-    budget.charge(0).unwrap();
-    let mut native = SmtContext::new();
-    native.set_term_memory_budget(Some(128 * 1024 * 1024));
-    let remaining = end.saturating_duration_since(Instant::now());
-    assert!(!remaining.is_zero());
-    let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
-    if expected {
-        assert!(matches!(result, SmtResult::Sat(_)));
-    } else {
-        assert!(result.is_unsat());
+    {
+        let data = lower_fp_expr_clause(roots, &bindings, &problem, budget).unwrap();
+        let old = ClauseBody::constraint(ChcExpr::Op(ChcOp::And, pins));
+        let (body, source) = data.into_body(old).unwrap().into_parts().unwrap();
+        assert!(std::ptr::eq(source.roots(), roots));
+        assert_eq!(source.bindings().len(), inputs.len());
+        budget.charge(0).unwrap();
+        let mut native = SmtContext::new();
+        native.set_term_memory_budget(Some(128 * 1024 * 1024));
+        let remaining = end.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero());
+        let result = native.check_sat_with_timeout(body.constraint.as_ref().unwrap(), remaining);
+        if expected {
+            assert!(matches!(result, SmtResult::Sat(_)));
+        } else {
+            assert!(result.is_unsat());
+        }
+        drop(result);
+        drop(native);
+        drop(body);
     }
-    drop(result);
-    drop(native);
-    drop(body);
-    drop(source);
     budget.charge(0).unwrap();
 }
 
@@ -115,10 +116,11 @@ impl Fixture {
         }
     }
     fn attempt(&self, budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
-        let data = lower_fp_expr_clause(&self.roots, &[], &self.problem, budget)?;
-        let (body, source) = data.into_body(ClauseBody::empty())?.into_parts()?;
-        drop(body);
-        drop(source);
+        {
+            let data = lower_fp_expr_clause(&self.roots, &[], &self.problem, budget)?;
+            let (body, _source) = data.into_body(ClauseBody::empty())?.into_parts()?;
+            drop(body);
+        }
         budget.charge(0)?;
         Ok(())
     }
@@ -141,7 +143,7 @@ fn assert_word_link(entry: &ChcExpr, bit: u32, target: &ChcVar) {
 
 #[test]
 fn numeric_eight_bit_links_and_repeated_source_identity_survive_complete_move() {
-    super::raw_words::native::original_owner(|budget, _| {
+    raw_words::native::original_owner(|budget, _| {
         budget.admit(1_048_576, 1_048_576).unwrap();
         let word = Expr::var("numeric_link", crate::Sort::bitvec(8));
         let target = ChcVar::new("numeric_link", ChcSort::BitVec(8));
@@ -152,26 +154,27 @@ fn numeric_eight_bit_links_and_repeated_source_identity_survive_complete_move() 
             target: &target,
         }];
         let problem = ChcProblem::new();
-        let data = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
-        let (body, source) = data
-            .into_body(ClauseBody::empty())
-            .unwrap()
-            .into_parts()
-            .unwrap();
-        assert!(std::ptr::eq(source.roots(), roots.as_slice()));
-        assert!(std::ptr::eq(source.bindings()[0].source, &word));
-        let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
-            panic!()
-        };
-        let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
-            panic!()
-        };
-        for (bit, entry) in entries.iter().skip(entries.len() - 8).enumerate() {
-            budget.charge(256).unwrap();
-            assert_word_link(entry, bit as u32, &target);
+        {
+            let data = lower_fp_expr_clause(&roots, &bindings, &problem, budget).unwrap();
+            let (body, source) = data
+                .into_body(ClauseBody::empty())
+                .unwrap()
+                .into_parts()
+                .unwrap();
+            assert!(std::ptr::eq(source.roots(), roots.as_slice()));
+            assert!(std::ptr::eq(source.bindings()[0].source, &raw const word));
+            let ChcExpr::Op(ChcOp::And, outer) = body.constraint.as_ref().unwrap() else {
+                panic!()
+            };
+            let ChcExpr::Op(ChcOp::And, entries) = outer[0].as_ref() else {
+                panic!()
+            };
+            for (bit, entry) in entries.iter().skip(entries.len() - 8).enumerate() {
+                budget.charge(256).unwrap();
+                assert_word_link(entry, bit as u32, &target);
+            }
+            drop(body);
         }
-        drop(body);
-        drop(source);
         budget.charge(0).unwrap();
     });
 }

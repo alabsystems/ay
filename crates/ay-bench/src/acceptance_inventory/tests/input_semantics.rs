@@ -152,7 +152,10 @@ fn empty_effort_fixture_list_preserves_generator_and_both_source_oracles() {
         .iter()
         .find(|r| r.contract.id == "R25")
         .expect("effort ask");
-    assert!(effort.contract.stored_input_ids.is_empty());
+    assert_eq!(
+        effort.contract.stored_input_ids.as_slice(),
+        &[] as &[String]
+    );
     assert!(effort
         .blockers
         .iter()

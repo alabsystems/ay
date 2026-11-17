@@ -135,7 +135,11 @@ pub(super) struct CrossReplayCoverScratch {
     epoch: u32,
     eligible_epoch: Vec<u32>,
     eligible_value: Vec<bool>,
-    seen: ay_core::kani_compat::DetHashMap<TermId, u32>,
+    /// Dense epoch marks by term id (`seen_epoch[term.0] == epoch` iff
+    /// visited this call); grows to the largest term id touched and is
+    /// never cleared per call. Replaces a hash map whose per-visit
+    /// hashing sat on the AllInterval replay profile.
+    seen_epoch: Vec<u32>,
     stack: Vec<TermId>,
 }
 
@@ -2192,7 +2196,7 @@ impl TheoryCombiner<'_> {
                 .eligible_epoch
                 .iter_mut()
                 .for_each(|e| *e = u32::MAX);
-            scratch.seen.clear();
+            scratch.seen_epoch.iter_mut().for_each(|e| *e = u32::MAX);
             scratch.epoch = 1;
         }
         let epoch = scratch.epoch;
@@ -2205,16 +2209,21 @@ impl TheoryCombiner<'_> {
         let CrossReplayCoverScratch {
             eligible_epoch,
             eligible_value,
-            seen,
+            seen_epoch,
             stack,
             ..
         } = scratch;
         stack.clear();
         stack.push(candidate.lhs);
         while let Some(term) = stack.pop() {
-            if seen.insert(term, epoch) == Some(epoch) {
+            let slot = term.0 as usize;
+            if slot >= seen_epoch.len() {
+                seen_epoch.resize(slot + 1, epoch.wrapping_sub(1));
+            }
+            if seen_epoch[slot] == epoch {
                 continue;
             }
+            seen_epoch[slot] = epoch;
             if term == candidate.rhs {
                 checked_return!(true);
             }
@@ -3477,5 +3486,68 @@ impl TheorySolver for TheoryCombiner<'_> {
             lra.note_conflict_atom(atom);
         }
         self.euf.note_conflict_atom(atom);
+    }
+}
+
+#[cfg(test)]
+mod cover_scratch_tests {
+    use super::*;
+
+    /// The covered-by BFS must mark visited terms in dense epoch
+    /// scratch indexed by term id, not a hash map: same traversal,
+    /// same answers across calls on one scratch (epoch invalidation
+    /// instead of clearing), including sparse high term ids.
+    #[test]
+    fn covered_by_bfs_uses_dense_epoch_seen() {
+        let lit = |t: u32| TheoryLit::new(TermId(t), true);
+        let replay = |a: u32, b: u32, r: u32| {
+            CrossTheoryEqualityReplay::new(TermId(a), TermId(b), vec![lit(r)])
+        };
+        // Chain 10 - 5000 - 20 with reason {r}; candidate 10 ~ 20 is
+        // covered, candidate 10 ~ 30 is not.
+        let replays = vec![replay(10, 5000, 900), replay(5000, 20, 900)];
+        let mut by_endpoint: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>> =
+            Default::default();
+        for (idx, r) in replays.iter().enumerate() {
+            by_endpoint.entry(r.lhs).or_default().push(idx);
+            by_endpoint.entry(r.rhs).or_default().push(idx);
+        }
+        let removed = vec![false; replays.len()];
+        let mut scratch = CrossReplayCoverScratch::default();
+        let covered = CrossTheoryEqualityReplay::new(TermId(10), TermId(20), vec![lit(900)]);
+        assert!(
+            TheoryCombiner::cross_theory_equality_replay_covered_by_indexed(
+                &replays,
+                &by_endpoint,
+                &removed,
+                &mut scratch,
+                &covered,
+            )
+        );
+        assert!(
+            scratch.seen_epoch.len() > 5000,
+            "seen marks must be dense by term id"
+        );
+        let uncovered = CrossTheoryEqualityReplay::new(TermId(10), TermId(30), vec![lit(900)]);
+        assert!(
+            !TheoryCombiner::cross_theory_equality_replay_covered_by_indexed(
+                &replays,
+                &by_endpoint,
+                &removed,
+                &mut scratch,
+                &uncovered,
+            )
+        );
+        // A second covered call on the same scratch still answers
+        // correctly (epoch invalidation, no stale marks).
+        assert!(
+            TheoryCombiner::cross_theory_equality_replay_covered_by_indexed(
+                &replays,
+                &by_endpoint,
+                &removed,
+                &mut scratch,
+                &covered,
+            )
+        );
     }
 }

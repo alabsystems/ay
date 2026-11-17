@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use super::super::super::{CliStatus, InputDialect, Inventory};
+use super::super::super::{CliStatus, InputDialect, Inventory, PlanBlocker};
 use super::super::{selection, SmtMemoryVariant};
 
 fn inventory() -> Inventory {
@@ -142,7 +142,7 @@ fn proof_runaway_smt_rows_cannot_borrow_consumer_grant_or_lose_strict_controls()
         }),
         "Rust source must not require an invented SMT oracle"
     );
-    assert!(!request.blockers.is_empty());
+    assert_ne!(request.blockers.as_slice(), &[] as &[PlanBlocker]);
     assert!(request.routes.iter().all(|route| !route.evidence_qualified));
     assert!(!plan.promotable_for_ask_closure);
 }
@@ -211,7 +211,7 @@ fn fp_consumer_requires_failed_counterexample_inside_original_fifteen_second_own
     assert_eq!(oracle["expected_solver_result"], "Sat");
     assert_eq!(oracle["validated_original_counterexample_required"], true);
     assert_eq!(oracle["independent_source_replay_required"], true);
-    assert!(!request.blockers.is_empty());
+    assert_ne!(request.blockers.as_slice(), &[] as &[PlanBlocker]);
     assert!(request.routes.iter().all(|route| !route.evidence_qualified));
     assert!(!plan.promotable_for_ask_closure);
 }

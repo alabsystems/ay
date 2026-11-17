@@ -23,6 +23,7 @@ use ay_milp::{
     RootDualBudget, RootDualDecline, RootDualLane, Sense, SolveOpts,
 };
 use num_rational::BigRational;
+use std::fmt::Write as _;
 
 fn int(n: i64) -> BigRational {
     BigRational::from_integer(n.into())
@@ -165,7 +166,10 @@ fn a_model_with_no_columns_in_the_objective_still_bounds_itself() {
         .expect("derives");
     certificate.verify(&model).expect("re-verifies");
     assert_eq!(certificate.bound, int(0));
-    assert!(certificate.objective.is_empty());
+    assert_eq!(
+        certificate.objective.as_slice(),
+        &[] as &[(u32, BigRational)]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -253,12 +257,10 @@ fn the_rim_is_what_closes_a_model_the_float_lane_cannot() {
     let (with_rim, rim_report) = derive_root_dual_bound(&model, &budget_with_rim(&model));
     // Whatever the two lanes make of this model, the invariant that matters is
     // that a certificate returned by EITHER stands on its own…
-    for candidate in [&float_only, &with_rim] {
-        if let Some(certificate) = candidate {
-            certificate
-                .verify(&model)
-                .expect("no lane may return a bound that does not re-verify");
-        }
+    for certificate in [&float_only, &with_rim].into_iter().flatten() {
+        certificate
+            .verify(&model)
+            .expect("no lane may return a bound that does not re-verify");
     }
     // …and that a decline is always attributed, never silent.
     assert_eq!(float_only.is_none(), float_report.decline.is_some());
@@ -676,11 +678,10 @@ fn claim<'a>(report: &'a cert_io::CheckReport, name: &str) -> &'a cert_io::Claim
 /// Without this every tamper would be caught by the digest and none of the
 /// checks below would ever run.
 fn reseal(ayc: &str) -> String {
-    let body: String = ayc
-        .lines()
-        .take_while(|l| !l.starts_with("%END"))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let mut body = String::new();
+    for line in ayc.lines().take_while(|line| !line.starts_with("%END")) {
+        writeln!(body, "{line}").expect("writing to a String cannot fail");
+    }
     let digest = cert_io::sha256_hex(body.as_bytes());
     format!("{body}%END sha256:{digest}\n")
 }

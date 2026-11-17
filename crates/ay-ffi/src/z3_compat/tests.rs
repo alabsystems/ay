@@ -5065,7 +5065,7 @@ fn test_model_eval_keeps_undecided_binder_terms_symbolic() {
             Z3_L_UNDEF,
             "an undecided quantifier is not given a fabricated value"
         );
-        assert_eq!(Z3_is_quantifier_forall(ctx, out), true);
+        assert!(Z3_is_quantifier_forall(ctx, out));
 
         Z3_del_context(ctx);
     }

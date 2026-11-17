@@ -30,6 +30,7 @@ impl ProofOutput {
         }
     }
 
+    /// Emit a bounded-producer prevalidated positive-RUP addition.
     pub(crate) fn add_bounded_prevalidated_rup_with_cancellation(
         &mut self,
         clause: &[Literal],
@@ -51,6 +52,7 @@ impl ProofOutput {
         }
     }
 
+    /// Emit a pre-assigned bounded-producer positive-RUP addition.
     pub(crate) fn add_with_id_bounded_prevalidated_rup_with_cancellation(
         &mut self,
         clause_id: u64,

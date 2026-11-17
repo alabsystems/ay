@@ -20,6 +20,7 @@ use ay_milp::{
     OPT_TREE_RIM_BUILD_COST, OPT_TREE_RIM_ITER_COST,
 };
 use num_rational::BigRational;
+use std::fmt::Write as _;
 
 fn int(n: i64) -> BigRational {
     BigRational::from_integer(n.into())
@@ -611,7 +612,9 @@ fn the_deriver_fails_closed() {
     assert!(derive_optimality_tree(&m, &int(-1), &[int(0), int(0)], &budget()).is_none());
     assert!(derive_optimality_tree(&m, &int(-1), &[int(1)], &budget()).is_none());
     let expired = OptimalityTreeBudget::new(4096).with_deadline(Some(
-        std::time::Instant::now() - std::time::Duration::from_secs(1),
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second is within the Instant range"),
     ));
     assert!(derive_optimality_tree(&m, &int(-1), &witness, &expired).is_none());
 }
@@ -663,7 +666,9 @@ fn every_refusal_names_itself() {
     }
 
     let expired = OptimalityTreeBudget::new(4096).with_deadline(Some(
-        std::time::Instant::now() - std::time::Duration::from_secs(1),
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second is within the Instant range"),
     ));
     let late = derive_optimality_tree_reported(&m, &int(-1), &witness, &expired);
     assert_eq!(late.1.decline, Some(OptTreeDecline::Deadline));
@@ -688,7 +693,9 @@ fn every_refusal_names_itself() {
     let both = OptimalityTreeBudget::new(4096)
         .with_work(0)
         .with_deadline(Some(
-            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("one second is within the Instant range"),
         ));
     assert_eq!(
         derive_optimality_tree_reported(&m, &int(-1), &witness, &both)
@@ -1492,11 +1499,10 @@ fn a_streamed_body_verifies_and_a_mutated_one_does_not() {
 
     // 3. A DROPPED SPLIT. Deleting the split record leaves two leaves priced at
     //    boxes neither of them was proved in, and orphans the second.
-    let no_split: String = body
-        .lines()
-        .filter(|l| !l.starts_with("split "))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let mut no_split = String::new();
+    for line in body.lines().filter(|line| !line.starts_with("split ")) {
+        writeln!(no_split, "{line}").expect("writing to a String cannot fail");
+    }
     if no_split != body {
         assert!(
             ay_milp::verify_optimality_tree_block(&m, &int(-1), &no_split).is_err(),
@@ -1513,7 +1519,10 @@ fn a_streamed_body_verifies_and_a_mutated_one_does_not() {
             .map(ToString::to_string)
             .collect();
         lines[idx] = format!("{} {} {} {}", f[0], f[1], f[2], f[3]) + " 999999";
-        let tampered = lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+        let mut tampered = String::new();
+        for line in &lines {
+            writeln!(tampered, "{line}").expect("writing to a String cannot fail");
+        }
         assert!(
             ay_milp::verify_optimality_tree_block(&m, &int(-1), &tampered).is_err(),
             "a body with a multiplier rewritten to 999999 verified"

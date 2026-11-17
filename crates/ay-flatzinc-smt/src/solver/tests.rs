@@ -77,7 +77,7 @@ fn test_parse_ay_output_unsat() {
     let output = "unsat\n";
     let (status, lines) = parse_ay_output(output).unwrap();
     assert_eq!(status, CheckSatResult::Unsat);
-    assert!(lines.is_empty());
+    assert_eq!(lines.as_slice(), &[] as &[String]);
 }
 
 #[test]

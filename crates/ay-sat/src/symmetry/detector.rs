@@ -192,12 +192,11 @@ impl SymmetryDetector {
     /// (disjoint groups compose soundly); the aux variables are fresh.
     ///
     /// `fresh_base` is the first unused variable id; aux equal-prefix variables
-    /// are allocated sequentially from there. Returns `(clauses, aux_allocated)`;
-    /// the caller MUST `ensure_num_vars(fresh_base + aux_allocated)` before adding
-    /// the clauses (they reference variables `>= fresh_base`).
-    /// The returned Schreier–Sims summary describes the generators found
-    /// (symmetry fixing, step 2: the chain fix-and-cut will walk; today only
-    /// counted).
+    /// are allocated sequentially from there. Returns clauses, the auxiliary
+    /// variable count and the Schreier–Sims chain summary over the generators.
+    /// The caller MUST `ensure_num_vars(fresh_base + aux_allocated)` before adding
+    /// the clauses (they reference variables `>= fresh_base`). The counted
+    /// symmetry-fixing continuation walks the same returned chain.
     pub(crate) fn detect_and_encode_composite_with_chain(
         &self,
         clauses: &[Vec<Literal>],

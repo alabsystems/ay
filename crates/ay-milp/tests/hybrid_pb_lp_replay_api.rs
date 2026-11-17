@@ -51,7 +51,10 @@ fn public_hybrid_replay_checks_original_model_ledger_deadline_and_cancel() {
         "another model is not authority"
     );
     let mut wire = serde_json::to_value(proof).expect("public artifact serde");
-    assert!(!wire["cuts"].as_array().expect("cut ledger").is_empty());
+    assert_ne!(
+        wire["cuts"].as_array().expect("cut ledger").as_slice(),
+        &[] as &[serde_json::Value]
+    );
     wire["cuts"] = serde_json::json!([]);
     let omitted: HybridPbLpInfeasibilityCertificate =
         serde_json::from_value(wire).expect("well-formed typed object with its licenses omitted");

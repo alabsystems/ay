@@ -4,7 +4,10 @@ use super::*;
 
 fn decision(ctx: &mut Z3Context) -> ay_dpll::api::TacticDecision {
     let no = ctx.solver.bool_const(false);
-    let operation = ctx.solver.begin_tactic_operation_for_check().unwrap();
+    let operation = ctx
+        .solver
+        .begin_tactic_operation_for_check()
+        .expect("test tactic operation must begin");
     let goal = ctx
         .solver
         .apply_tactic_subgoals_in_operation(
@@ -14,16 +17,18 @@ fn decision(ctx: &mut Z3Context) -> ay_dpll::api::TacticDecision {
             0,
             None,
         )
-        .unwrap()
+        .expect("field-sat test tactic must produce a subgoal")
         .remove(0);
     ctx.solver
         .check_converted_tactic_goal_in_operation(
             operation,
-            goal.model_converter.as_ref().unwrap(),
+            goal.model_converter
+                .as_ref()
+                .expect("field-sat subgoal must retain a model converter"),
             &goal.formulas,
             &[],
         )
-        .unwrap()
+        .expect("converted field-sat goal must produce a decision")
 }
 
 #[test]
@@ -40,7 +45,8 @@ fn converted_renderer_metadata_uses_original_stop_and_exact_source() {
             ctx.solver.declare_const("nested", nested.clone());
             let first = decision(ctx);
             assert!(first.result.is_unsat());
-            let copied = counted_declared_sorts(ctx, &first).unwrap();
+            let copied = counted_declared_sorts(ctx, &first)
+                .expect("live test decision must admit declared-sort inspection");
             assert_eq!(copied.get("nested"), Some(&nested));
             drop(copied);
             ctx.solver.interrupt();
@@ -53,7 +59,9 @@ fn converted_renderer_metadata_uses_original_stop_and_exact_source() {
             drop(first);
             let fresh = decision(ctx);
             assert_eq!(
-                counted_declared_sorts(ctx, &fresh).unwrap().get("nested"),
+                counted_declared_sorts(ctx, &fresh)
+                    .expect("live test decision must admit declared-sort inspection")
+                    .get("nested"),
                 Some(&nested)
             );
             ctx.solver.declare_const("later", Sort::Bool);
@@ -65,7 +73,7 @@ fn converted_renderer_metadata_uses_original_stop_and_exact_source() {
             let final_read = decision(ctx);
             assert_eq!(
                 counted_declared_sorts(ctx, &final_read)
-                    .unwrap()
+                    .expect("live test decision must admit declared-sort inspection")
                     .get("later"),
                 Some(&Sort::Bool)
             );
@@ -96,28 +104,34 @@ fn converted_renderer_keeps_internal_model_keys_and_authored_public_names() {
         let (identity, _) = stored
             .last_model
             .as_ref()
-            .unwrap()
+            .expect("satisfiable test solver must retain a model")
             .iter_ints()
             .next()
-            .unwrap();
-        let snapshot = stored.last_model_text.as_ref().unwrap();
-        let parsed = ay_frontend::sexp::parse_sexp(snapshot).unwrap();
+            .expect("retained model must include the asserted integer");
+        let snapshot = stored
+            .last_model_text
+            .as_ref()
+            .expect("satisfiable test solver must retain model text");
+        let parsed =
+            ay_frontend::sexp::parse_sexp(snapshot).expect("retained model text must parse");
         let row = parsed
             .as_list()
-            .unwrap()
+            .expect("model text must be a list")
             .iter()
             .find(|row| define_fun_name(row) == Some(identity))
-            .unwrap()
+            .expect("model text must contain the internal integer binding")
             .as_list()
-            .unwrap();
+            .expect("define-fun binding must be a list");
         assert_eq!(row[1].to_raw_string(), ay_core::quote_symbol(identity));
         let model = Z3_solver_get_model(raw, solver);
         let mut value = 0;
-        assert!(Z3_model_eval(raw, model, original, false, &mut value));
+        assert!(Z3_model_eval(raw, model, original, false, &raw mut value));
         assert_eq!(Z3_get_bool_value(raw, value), Z3_L_TRUE);
         let output = Z3_model_to_string(raw, model);
         assert!(!output.is_null());
-        let output = CStr::from_ptr(output).to_str().unwrap();
+        let output = CStr::from_ptr(output)
+            .to_str()
+            .expect("rendered model must be valid UTF-8");
         assert!(output.contains("__db0"), "{output}");
         assert!(!output.contains("(:var "), "{output}");
         Z3_del_context(raw);

@@ -853,33 +853,6 @@ pub unsafe extern "C" fn Z3_get_datatype_sort_constructor_accessor(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn datatype_descriptor_budget_is_cumulative_across_reused_lists() {
-        let mut descriptors = 0;
-        extend_datatype_descriptor_budget(&mut descriptors, [2, 1], 5).expect("first list fits");
-        assert_eq!(descriptors, 5, "two constructors plus three fields");
-        assert_eq!(
-            extend_datatype_descriptor_budget(&mut descriptors, [0], 5),
-            Err(())
-        );
-
-        let mut reused = 0;
-        extend_datatype_descriptor_budget(&mut reused, [0, 0], 5)
-            .expect("first constructor list fits");
-        extend_datatype_descriptor_budget(&mut reused, [1], 5)
-            .expect("reused list remains within aggregate limit");
-        assert_eq!(reused, 4);
-        assert_eq!(
-            extend_datatype_descriptor_budget(&mut reused, [1], 5),
-            Err(())
-        );
-    }
-}
-
 /// The constructor a recognizer decl tests for: z3's `is` declaration carries
 /// it as its one `Z3_PARAMETER_FUNC_DECL` parameter (z3py prints a recognizer
 /// application as `is(cons, x)` from it). `None` for any other decl.
@@ -927,4 +900,31 @@ pub(crate) unsafe fn recognizer_constructor_decl(
 pub(crate) unsafe fn is_recognizer_decl(d: Z3_func_decl) -> bool {
     // SAFETY: forwarded from this function's contract.
     unsafe { d.as_ref() }.is_some_and(|h| matches!(h.dt_op, Some(DatatypeOp::Recognizer { .. })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datatype_descriptor_budget_is_cumulative_across_reused_lists() {
+        let mut descriptors = 0;
+        extend_datatype_descriptor_budget(&mut descriptors, [2, 1], 5).expect("first list fits");
+        assert_eq!(descriptors, 5, "two constructors plus three fields");
+        assert_eq!(
+            extend_datatype_descriptor_budget(&mut descriptors, [0], 5),
+            Err(())
+        );
+
+        let mut reused = 0;
+        extend_datatype_descriptor_budget(&mut reused, [0, 0], 5)
+            .expect("first constructor list fits");
+        extend_datatype_descriptor_budget(&mut reused, [1], 5)
+            .expect("reused list remains within aggregate limit");
+        assert_eq!(reused, 4);
+        assert_eq!(
+            extend_datatype_descriptor_budget(&mut reused, [1], 5),
+            Err(())
+        );
+    }
 }

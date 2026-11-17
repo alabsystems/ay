@@ -1856,7 +1856,7 @@ fn render_model_handle_with_sorts(
             continue;
         }
         let display_name = display_name!(name);
-        let sort = resolve_entry_sort(&declared, name, val);
+        let sort = resolve_entry_sort(declared, name, val);
         part!(text!("(define-fun {display_name} () {sort} {val})"));
     }
     for (name, val) in model.iter_seqs() {
@@ -1864,7 +1864,7 @@ fn render_model_handle_with_sorts(
             continue;
         }
         let display_name = display_name!(name);
-        let sort = resolve_entry_sort(&declared, name, val);
+        let sort = resolve_entry_sort(declared, name, val);
         part!(text!("(define-fun {display_name} () {sort} {val})"));
     }
     for (name, val) in model.iter_arrays().chain(model.iter_finite_fields()) {
@@ -1872,7 +1872,7 @@ fn render_model_handle_with_sorts(
             continue;
         }
         let display_name = display_name!(name);
-        let sort = resolve_entry_sort(&declared, name, val);
+        let sort = resolve_entry_sort(declared, name, val);
         let rendered = match (owner, val) {
             (Some(owner), ModelValue::FiniteField { value, field }) => {
                 ctx.solver.format_finite_field_literal_with_admission(
@@ -1891,7 +1891,7 @@ fn render_model_handle_with_sorts(
             continue;
         }
         let display_name = display_name!(name);
-        let sort = resolve_entry_sort(&declared, name, val);
+        let sort = resolve_entry_sort(declared, name, val);
         part!(text!("(define-fun {display_name} () {sort} {val})"));
     }
     for (name, el) in model.iter_uninterpreteds() {

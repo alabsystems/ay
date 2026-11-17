@@ -4,7 +4,7 @@
 #![cfg(test)]
 
 use super::*;
-use ay_chc::{ChcError, ChcParser};
+use ay_chc::{ChcCheckedReplayObligation, ChcError, ChcParser};
 use ay_core::resource::ResourceGuard;
 use std::cell::Cell;
 use std::time::Duration;
@@ -107,7 +107,10 @@ fn checked_success_uses_the_same_original_owner_and_strict_artifact_rules() {
                 checked.proof_run().problem().normalized_input_sha256(),
                 run.problem().normalized_input_sha256()
             );
-            assert!(!checked.summary().obligations.is_empty());
+            assert_ne!(
+                checked.summary().obligations.as_slice(),
+                &[] as &[ChcCheckedReplayObligation]
+            );
             for payload in checked.obligation_payloads() {
                 assert!(payload.smt_query_bytes().is_some());
                 assert!(payload.strict_bundle_bytes().is_some());
@@ -138,7 +141,7 @@ fn exhausted_original_owner_never_enters_a_fresh_replay_allowance() {
     let result = owner
         .with_resources(|| {
             entries.set(entries.get() + 1);
-            strict_replay(&run, owner.deadline(), &token).map(|checked| drop(checked))
+            strict_replay(&run, owner.deadline(), &token).map(drop)
         })
         .unwrap();
     assert_eq!(result, Err(Kind::WorkLimit));

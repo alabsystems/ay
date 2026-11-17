@@ -32,6 +32,18 @@ impl Solver {
         Ok(actual)
     }
 
+    /// Find the best variable above the jump level and return its level.
+    ///
+    /// This implements CaDiCaL's `chronoreusetrail` optimization. Instead of
+    /// always backtracking to the asserting level, we look for valuable variables
+    /// above that level. In stable mode, we look for the variable with highest
+    /// VSIDS activity. In focused mode, we look for the most recently bumped
+    /// variable. We then backtrack only to the level containing that trail
+    /// position, preserving more of the useful search state.
+    ///
+    /// Key: we use trail POSITION to determine level, not the variable's stored
+    /// level. This is important for correctness with chronological backtracking
+    /// where variables can have out-of-order level assignments.
     pub(in crate::solver) fn chrono_reuse_level_admitted<P: Policy>(
         &mut self,
         jump: u32,

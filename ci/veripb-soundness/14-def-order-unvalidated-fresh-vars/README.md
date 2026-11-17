@@ -86,7 +86,7 @@ veripb --opb order.opb sat.pbp     # s VERIFIED SATISFIABLE, before and after
 | `alias-right-vars/alias.pbp` | `fresh_right v1 v2 ;` — right arity, but the "fresh" variables are the `right` variables | `VERIFIED UNSATISFIABLE` | rejected |
 | `freshvars-control/control.pbp` | **one knob**: `fresh_right w1 w2 ;`, two genuinely fresh variables, nothing else changed | rejected | rejected |
 | `freshvars-control/control-short-by-one.pbp` | the middle of the arity sweep: `fresh_right w1 ;` for a two-variable order | rejected | rejected |
-| `missing-fresh-aux/aux.pbp` | the same truncation on the **second** `izip!`: an order that declares `aux $z` but no `fresh_aux_1`/`fresh_aux_2`, so all three instances shared `$z` | `VERIFIED NO CONCLUSION` (the bogus order installed) | rejected |
+| `missing-fresh-aux/order-input.pbp` | the same truncation on the **second** `izip!`: an order that declares `aux $z` but no `fresh_aux_1`/`fresh_aux_2`, so all three instances shared `$z` | `VERIFIED NO CONCLUSION` (the bogus order installed) | rejected |
 | `valid-order/valid.pbp` | **not a forgery**: a real order with correct `fresh_right`, `fresh_aux_1`, `fresh_aux_2` | `VERIFIED NO CONCLUSION` | `VERIFIED NO CONCLUSION` |
 
 `freshvars-control/` is the causation argument: with real fresh variables the transitivity

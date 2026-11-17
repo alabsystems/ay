@@ -27,15 +27,21 @@ fn problem(width: u32, budget: &mut WorkBudget<'_>) -> ChcProblem {
     let mut namespace = ChcProblem::new();
     let p = namespace.declare_predicate("raw_result_state", vec![ChcSort::BitVec(width)]);
     let q = namespace.declare_predicate("later_raw_observation", vec![ChcSort::BitVec(width)]);
-    let (body, source) = lower_fp_raw_result_clause(&[], &results, &bindings, &namespace, budget)
-        .unwrap()
-        .into_body(ClauseBody::empty())
-        .unwrap()
-        .into_parts()
-        .unwrap();
-    assert!(std::ptr::eq(source.namespace(), &namespace));
-    assert!(std::ptr::eq(source.raw_results()[0].output, &output));
-    drop(source);
+    let body = {
+        let (body, source) =
+            lower_fp_raw_result_clause(&[], &results, &bindings, &namespace, budget)
+                .unwrap()
+                .into_body(ClauseBody::empty())
+                .unwrap()
+                .into_parts()
+                .unwrap();
+        assert!(std::ptr::eq(source.namespace(), &raw const namespace));
+        assert!(std::ptr::eq(
+            source.raw_results()[0].output,
+            &raw const output
+        ));
+        body
+    };
     namespace.add_clause(HornClause::new(
         body,
         ClauseHead::Predicate(p, vec![ChcExpr::Var(target.clone())]),

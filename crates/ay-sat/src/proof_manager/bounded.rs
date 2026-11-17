@@ -81,23 +81,6 @@ impl ProofManager {
 
     /// Emit one producer-prevalidated positive-RUP backward step without the
     /// generic signed-RAT preflight's per-step hash-set allocations.
-    #[cfg(test)]
-    pub(crate) fn emit_bounded_backward_rup_step(
-        &mut self,
-        clause_id: u64,
-        clause: &[Literal],
-        hints: &[i64],
-        deadline: Option<Instant>,
-    ) -> io::Result<()> {
-        self.emit_bounded_backward_rup_step_with_cancellation(
-            clause_id,
-            clause,
-            hints,
-            deadline,
-            &|| true,
-        )
-    }
-
     pub(crate) fn emit_bounded_backward_rup_step_with_cancellation(
         &mut self,
         clause_id: u64,
@@ -180,15 +163,6 @@ impl ProofManager {
 
     /// Emit the terminal empty clause for a producer-prevalidated positive-RUP
     /// chain without generic hint filtering/deduplication buffers.
-    #[cfg(test)]
-    pub(crate) fn emit_bounded_empty_rup_step(
-        &mut self,
-        hints: &[u64],
-        deadline: Option<Instant>,
-    ) -> io::Result<u64> {
-        self.emit_bounded_empty_rup_step_with_cancellation(hints, deadline, &|| true)
-    }
-
     pub(crate) fn emit_bounded_empty_rup_step_with_cancellation(
         &mut self,
         hints: &[u64],
@@ -264,14 +238,6 @@ impl ProofManager {
     /// actually emitted. Unreachable reserved IDs must also be removed from
     /// `known_lrat_ids`; merely clearing the reservation bitmap would make
     /// those nonexistent file IDs appear usable to a terminal hint chain.
-    #[cfg(test)]
-    pub(crate) fn finish_bounded_backward_emission(
-        &mut self,
-        deadline: Option<Instant>,
-    ) -> io::Result<()> {
-        self.finish_bounded_backward_emission_with_cancellation(deadline, &|| true)
-    }
-
     pub(crate) fn finish_bounded_backward_emission_with_cancellation(
         &mut self,
         deadline: Option<Instant>,

@@ -321,6 +321,10 @@ fn held_bank_spares_preserve_complete_prefix_proof() {
         return;
     }
     let caller = ay_sys::compute_budget::ComputeScope::enter().expect("actual caller");
+    #[expect(
+        clippy::collection_is_never_read,
+        reason = "the owned compute units intentionally exhaust spare capacity until scope exit"
+    )]
     let mut held = Vec::new();
     while let Some(extra) = caller.try_extra().expect("actual spare") {
         held.push(extra);

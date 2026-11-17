@@ -237,7 +237,7 @@ fn names_given_reports_values_and_switches_together() {
     let f = parse(&["model.mps", "--devex", "--gmi-rounds", "7", "--trace"]).expect("known");
     assert_eq!(f.names_given(), ["devex", "gmi-rounds", "trace"]);
     let bare = parse(&["model.mps"]).expect("no flags at all");
-    assert!(bare.names_given().is_empty());
+    assert_eq!(bare.names_given(), Vec::<&str>::new());
 }
 
 #[test]

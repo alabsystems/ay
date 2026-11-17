@@ -3,7 +3,7 @@
 
 //! Bounded borrowed identity census and independent translator accounting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ay_bindings::{Expr, ExprValue};
 use ay_core::original_query::WorkBudget;
@@ -35,18 +35,18 @@ pub(super) struct Plan<'a> {
 pub(super) fn identity(expr: &Expr) -> usize {
     // Identity only inside this borrowed immutable graph, never semantic Eq,
     // proof identity or a pointer dereference. Original Expr keeps the Arc live.
-    expr.value() as *const ExprValue as usize
+    std::ptr::from_ref::<ExprValue>(expr.value()) as usize
 }
 
 impl Plan<'_> {
-    pub fn index(&self, expr: &Expr) -> Result<usize, FpAdapterError> {
+    pub(super) fn index(&self, expr: &Expr) -> Result<usize, FpAdapterError> {
         match self.seen.get(&identity(expr)) {
             Some(Visit::Done(_, index)) => Ok(*index),
             _ => Err(FpAdapterError::Invalid("missing typed source identity")),
         }
     }
 
-    pub fn prepay(&self, budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
+    pub(super) fn prepay(&self, budget: &mut WorkBudget<'_>) -> Result<(), FpAdapterError> {
         let n = self
             .nodes
             .len()
@@ -120,8 +120,8 @@ pub(super) fn plan<'a>(
 fn validate_bindings(
     bindings: &[FpExprInputBinding<'_>],
     budget: &mut WorkBudget<'_>,
-) -> Result<BTreeMap<usize, ()>, FpAdapterError> {
-    let mut links = BTreeMap::new();
+) -> Result<BTreeSet<usize>, FpAdapterError> {
+    let mut links = BTreeSet::new();
     let mut names = BTreeMap::new();
     for binding in bindings {
         // At most ten levels/twelve keys per balanced B-tree node and
@@ -136,7 +136,7 @@ fn validate_bindings(
         {
             return Err(FpAdapterError::Invalid("typed input name/sort mismatch"));
         }
-        if links.insert(identity(binding.source), ()).is_some()
+        if !links.insert(identity(binding.source))
             || names
                 .insert(name.as_str(), identity(binding.source))
                 .is_some()
@@ -151,7 +151,7 @@ fn validate_bindings(
 
 fn visit<'a>(
     expr: &'a Expr,
-    links: &BTreeMap<usize, ()>,
+    links: &BTreeSet<usize>,
     plan: &mut Plan<'a>,
     depth: usize,
     budget: &mut WorkBudget<'_>,
@@ -177,7 +177,7 @@ fn visit<'a>(
     }
     plan.seen.insert(key, Visit::Active);
     let shape = typed::describe(expr)?;
-    if matches!(shape.op, typed::Operator::Var) && !links.contains_key(&key) {
+    if matches!(shape.op, typed::Operator::Var) && !links.contains(&key) {
         return Err(FpAdapterError::Invalid("omitted typed free input"));
     }
     let mut count = Count {

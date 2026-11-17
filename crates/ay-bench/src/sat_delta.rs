@@ -1587,9 +1587,7 @@ fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
 }
 
 fn proof_file_nonempty(path: &Path) -> bool {
-    fs::metadata(path)
-        .ok()
-        .is_some_and(|meta| meta.is_file() && meta.len() > 0)
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
 }
 
 fn proof_checker_output_is_verified(stdout: &str, stderr: &str) -> bool {
@@ -3210,7 +3208,7 @@ c after
         .unwrap();
 
         assert_eq!(stats.status, "not-applicable");
-        assert!(stats.path.is_empty());
+        assert_eq!(stats.path, "");
         assert_eq!(bcp.enabled, None);
         assert!(!bcp.exercised);
         assert_eq!(search.requested, None);

@@ -118,34 +118,6 @@ impl CountedStandardAnalysis<'_> {
             backtrack: actual,
         })
     }
-
-    /// A borrowed observation, not permission for an uncharged traversal.
-    #[cfg(test)]
-    pub(in crate::solver) fn learned_clause(&self) -> &[Literal] {
-        &self.result.learned_clause
-    }
-    #[cfg(test)]
-    pub(in crate::solver) fn backtrack_level(&self) -> u32 {
-        self.result.backtrack_level
-    }
-    #[cfg(test)]
-    pub(in crate::solver) fn lbd(&self) -> u32 {
-        self.result.lbd
-    }
-    #[cfg(test)]
-    pub(in crate::solver) fn resolution_chain(&self) -> &[u64] {
-        &self.result.resolution_chain
-    }
-
-    #[cfg(test)]
-    pub(in crate::solver) fn finish(mut self) -> Result<(), SatUnknownReason> {
-        self.result.learned_clause.clear();
-        self.result.resolution_chain.clear();
-        self.retirement.retire();
-        let result = self.retirement.owner.check();
-        self.retirement.retain_trace = result.is_ok();
-        result.map_err(counted_admission::reason)
-    }
 }
 
 impl Solver {

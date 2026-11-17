@@ -156,6 +156,12 @@ pub struct IncrementalDiffGraph<W> {
     bwd_pred: Vec<Option<usize>>,
     bwd_done: Vec<bool>,
     bwd_touched: Vec<usize>,
+    /// Priority-queue scratch shared by the feasibility Dijkstra and both
+    /// propagation Dijkstras. Taken out (`mem::take`) for the duration of
+    /// a run and put back cleared, so the frontier allocation is paid
+    /// once instead of per asserted literal (fischer: two Dijkstras per
+    /// assert dominate the DL profile).
+    heap: BinaryHeap<Reverse<(W, usize)>>,
 }
 
 /// An atom the current constraint set ENTAILS, discovered by theory
@@ -196,6 +202,7 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
             bwd_pred: vec![None; n_vars],
             bwd_done: vec![false; n_vars],
             bwd_touched: Vec::new(),
+            heap: BinaryHeap::new(),
         }
     }
 
@@ -385,7 +392,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         self.reset_scratch();
         self.dist[b] = Some(s0);
         self.touched.push(b);
-        let mut heap: BinaryHeap<Reverse<(W, usize)>> = BinaryHeap::new();
+        let mut heap = std::mem::take(&mut self.heap);
+        heap.clear();
         heap.push(Reverse((self.dist[b].clone().expect("just set"), b)));
 
         let mut cycle_at: Option<usize> = None;
@@ -429,6 +437,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 // skipping the edge could miss a required decrease, so refuse.
                 let Some(neg_to) = self.pot[y].negate() else {
                     self.reset_scratch();
+                    heap.clear();
+                    self.heap = heap;
                     return AssertOutcome::Refused;
                 };
                 let cand = {
@@ -449,6 +459,9 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 }
             }
         }
+
+        heap.clear();
+        self.heap = heap;
 
         if let Some(a_vertex) = cycle_at {
             // Recover the cycle as EDGE IDS and self-certify on those, THEN map
@@ -791,7 +804,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
 
     /// Dijkstra over slacks from `src`, following ACTIVE out-edges.
     fn dijkstra_forward(&mut self, src: usize, budget: usize) {
-        let mut heap: BinaryHeap<Reverse<(W, usize)>> = BinaryHeap::new();
+        let mut heap = std::mem::take(&mut self.heap);
+        heap.clear();
         self.fwd[src] = Some(W::zero());
         self.fwd_touched.push(src);
         heap.push(Reverse((W::zero(), src)));
@@ -842,11 +856,14 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 }
             }
         }
+        heap.clear();
+        self.heap = heap;
     }
 
     /// Dijkstra over slacks to `dst`, following ACTIVE in-edges (reverse graph).
     fn dijkstra_backward(&mut self, dst: usize, budget: usize) {
-        let mut heap: BinaryHeap<Reverse<(W, usize)>> = BinaryHeap::new();
+        let mut heap = std::mem::take(&mut self.heap);
+        heap.clear();
         self.bwd[dst] = Some(W::zero());
         self.bwd_touched.push(dst);
         heap.push(Reverse((W::zero(), dst)));
@@ -897,6 +914,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
                 }
             }
         }
+        heap.clear();
+        self.heap = heap;
     }
 
     fn reset_prop_scratch(&mut self) {
@@ -918,5 +937,38 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         (0..self.edges.len())
             .filter(|i| self.active[*i])
             .all(|i| self.slack(i).is_some_and(|s| s >= zero))
+    }
+}
+
+#[cfg(test)]
+mod heap_scratch_tests {
+    use super::*;
+
+    /// The Dijkstras must run on the shared scratch heap: after an
+    /// assert that disturbs potentials and a propagation scan, the
+    /// heap is back in the graph, empty, with its frontier capacity
+    /// retained for the next literal instead of freed per call.
+    #[test]
+    fn dijkstras_reuse_the_scratch_heap() {
+        let mut g: IncrementalDiffGraph<i64> = IncrementalDiffGraph::new(6);
+        // Chain 0->1->2->3->4->5 with weight 1, plus a long edge whose
+        // tightening forces potential decreases along the chain.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(g.register_edge(i, i + 1, 1, i as u64));
+        }
+        let long = g.register_edge(5, 0, -3, 99);
+        let probe = g.register_edge(0, 5, 2, 100);
+        for &id in &ids {
+            assert!(matches!(g.assert_edge(id), AssertOutcome::Consistent));
+        }
+        assert!(matches!(g.assert_edge(long), AssertOutcome::Consistent));
+        let _ = g.entailed_after_assert(long, 256);
+        let _ = probe;
+        assert!(g.heap.is_empty(), "scratch heap must be put back empty");
+        assert!(
+            g.heap.capacity() > 0,
+            "scratch heap capacity must be retained across calls"
+        );
     }
 }

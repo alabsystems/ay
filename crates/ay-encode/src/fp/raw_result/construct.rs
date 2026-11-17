@@ -76,7 +76,9 @@ fn arithmetic(
 ) -> Result<Expr, FpAdapterError> {
     let a = fields(inputs[0], width)?;
     let mode = RoundingMode::RNE;
-    use RustFpArithmetic::*;
+    use RustFpArithmetic::{
+        Add, Divide, FusedMultiplyAdd, Multiply, SquareRoot, Subtract, TruncatingRemainder,
+    };
     match operation {
         SquareRoot => checked(a.try_fp_sqrt(mode)),
         FusedMultiplyAdd => {

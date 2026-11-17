@@ -222,6 +222,8 @@ impl TheorySolver for NiaSolver<'_> {
         self.zero_bound_emitted.clear();
         self.box_bound_emitted.clear();
         self.zero_product_emitted.clear();
+        // #nia-groebner: same discipline for the derived-equality dedup set.
+        self.groebner_emitted.clear();
         self.lia.pop();
         // Reset feasible sets on pop — stale sets from the previous level
         // would include constraints that have been retracted.
@@ -254,6 +256,7 @@ impl TheorySolver for NiaSolver<'_> {
         self.zero_bound_emitted.clear();
         self.box_bound_emitted.clear();
         self.zero_product_emitted.clear();
+        self.groebner_emitted.clear();
         self.lia.reset();
     }
 

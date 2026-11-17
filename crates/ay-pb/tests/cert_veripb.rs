@@ -91,7 +91,7 @@ fn clausal_unsat_proof_is_generated_unverified_shape_only() {
     // Pure-clausal multi-clause refutation: the clause fast-path keeps it
     // auxiliary-variable-free so its DRAT steps can be lifted.
     let generated = generate_unverified(CLAUSAL_UNSAT);
-    assert!(!generated.proof.is_empty());
+    assert_ne!(generated.proof, "");
 }
 
 #[test]

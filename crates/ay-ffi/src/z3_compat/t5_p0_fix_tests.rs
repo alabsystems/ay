@@ -173,8 +173,8 @@ unsafe fn char_record(c: Z3_context) -> (Z3_sort, Z3_func_decl) {
             c,
             ctor,
             1,
-            &mut constructor,
-            &mut tester,
+            &raw mut constructor,
+            &raw mut tester,
             accessor.as_mut_ptr(),
         );
         (sort, accessor[0])
@@ -266,7 +266,7 @@ fn char_values_carry_their_code_point_and_sort() {
         assert_eq!(verdict, Z3_L_TRUE);
         let m = Z3_solver_get_model(c, s);
         let mut evaluated = 0;
-        assert!(Z3_model_eval(c, m, d, true, &mut evaluated));
+        assert!(Z3_model_eval(c, m, d, true, &raw mut evaluated));
         let sort = Z3_get_sort(c, evaluated);
         assert_eq!(Z3_get_sort_kind(c, sort), Z3_CHAR_SORT);
         assert_eq!(text(Z3_ast_to_string(c, evaluated)), "(_ Char 104)");

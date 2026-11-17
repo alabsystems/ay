@@ -1441,10 +1441,16 @@ fn bounded_direct_backward_and_terminal_emission_replay_validly() {
     assert_eq!(learned_id, 4);
     let deadline = Some(Instant::now() + Duration::from_secs(5));
     manager
-        .emit_bounded_backward_rup_step(learned_id, &[lit(1, true)], &[1, 2], deadline)
+        .emit_bounded_backward_rup_step_with_cancellation(
+            learned_id,
+            &[lit(1, true)],
+            &[1, 2],
+            deadline,
+            &|| true,
+        )
         .expect("direct bounded learned step");
     let empty_id = manager
-        .emit_bounded_empty_rup_step(&[learned_id, 3], deadline)
+        .emit_bounded_empty_rup_step_with_cancellation(&[learned_id, 3], deadline, &|| true)
         .expect("direct bounded terminal step");
     assert_eq!(empty_id, 5);
     assert_eq!(manager.added_count(), 2);
@@ -1500,16 +1506,32 @@ fn bounded_direct_multi_root_includes_unrelated_reserved_reason_and_replays() {
     assert_eq!((unrelated_reason, conflict_reason), (6, 7));
     let deadline = Some(Instant::now() + Duration::from_secs(5));
     manager
-        .emit_bounded_backward_rup_step(unrelated_reason, &[lit(3, true)], &[4, 5], deadline)
+        .emit_bounded_backward_rup_step_with_cancellation(
+            unrelated_reason,
+            &[lit(3, true)],
+            &[4, 5],
+            deadline,
+            &|| true,
+        )
         .expect("unrelated level-0 reserved reason");
     manager
-        .emit_bounded_backward_rup_step(conflict_reason, &[lit(1, true)], &[1, 2], deadline)
+        .emit_bounded_backward_rup_step_with_cancellation(
+            conflict_reason,
+            &[lit(1, true)],
+            &[1, 2],
+            deadline,
+            &|| true,
+        )
         .expect("conflict component reason");
     manager
-        .finish_bounded_backward_emission(deadline)
+        .finish_bounded_backward_emission_with_cancellation(deadline, &|| true)
         .expect("all planned roots emitted");
     let empty_id = manager
-        .emit_bounded_empty_rup_step(&[unrelated_reason, conflict_reason, 3], deadline)
+        .emit_bounded_empty_rup_step_with_cancellation(
+            &[unrelated_reason, conflict_reason, 3],
+            deadline,
+            &|| true,
+        )
         .expect("terminal chain may replay an unrelated root before the conflict root");
 
     let dag = ResolutionDag {
@@ -1542,7 +1564,7 @@ fn bounded_direct_multi_root_includes_unrelated_reserved_reason_and_replays() {
 fn bounded_direct_terminal_deadline_expires_before_acceptance() {
     let mut manager = manager_with_complementary_unit_origins();
     let error = manager
-        .emit_bounded_empty_rup_step(&[1, 2], Some(Instant::now()))
+        .emit_bounded_empty_rup_step_with_cancellation(&[1, 2], Some(Instant::now()), &|| true)
         .expect_err("expired direct-emission deadline");
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(manager.added_count(), 0);
@@ -1556,7 +1578,11 @@ fn bounded_direct_terminal_failure_never_sets_terminal_bookkeeping() {
     unusable.register_original_clause(&[lit(0, true)]);
     unusable.register_clause_id(1);
     let error = unusable
-        .emit_bounded_empty_rup_step(&[99], Some(Instant::now() + Duration::from_secs(5)))
+        .emit_bounded_empty_rup_step_with_cancellation(
+            &[99],
+            Some(Instant::now() + Duration::from_secs(5)),
+            &|| true,
+        )
         .expect_err("unknown bounded hint");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(unusable.added_count(), 0);
@@ -1569,7 +1595,11 @@ fn bounded_direct_terminal_failure_never_sets_terminal_bookkeeping() {
     storage.register_original_clause(&[lit(0, false)]);
     storage.register_clause_id(2);
     let error = storage
-        .emit_bounded_empty_rup_step(&[1, 2], Some(Instant::now() + Duration::from_secs(5)))
+        .emit_bounded_empty_rup_step_with_cancellation(
+            &[1, 2],
+            Some(Instant::now() + Duration::from_secs(5)),
+            &|| true,
+        )
         .expect_err("writer failure");
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     assert_eq!(storage.added_count(), 0);
@@ -1588,11 +1618,12 @@ fn bounded_direct_learned_step_only_skips_an_already_visible_id() {
         .expect("visible derived line");
     let before = visible.added_count();
     visible
-        .emit_bounded_backward_rup_step(
+        .emit_bounded_backward_rup_step_with_cancellation(
             visible_id,
             &[lit(0, true)],
             &[1],
             Some(Instant::now() + Duration::from_secs(5)),
+            &|| true,
         )
         .expect("already-visible line is a coherent no-op");
     assert_eq!(visible.added_count(), before);
@@ -1602,11 +1633,12 @@ fn bounded_direct_learned_step_only_skips_an_already_visible_id() {
     unknown.register_original_clause(&[lit(0, true)]);
     unknown.register_clause_id(1);
     let error = unknown
-        .emit_bounded_backward_rup_step(
+        .emit_bounded_backward_rup_step_with_cancellation(
             99,
             &[lit(0, true)],
             &[1],
             Some(Instant::now() + Duration::from_secs(5)),
+            &|| true,
         )
         .expect_err("unknown nonreserved ID must not disappear silently");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1624,15 +1656,21 @@ fn bounded_finish_retires_unemitted_reserved_ids() {
     let unreachable = manager.reserve_lrat_id_for_backward();
     let deadline = Some(Instant::now() + Duration::from_secs(5));
     manager
-        .emit_bounded_backward_rup_step(emitted, &[lit(0, true)], &[1], deadline)
+        .emit_bounded_backward_rup_step_with_cancellation(
+            emitted,
+            &[lit(0, true)],
+            &[1],
+            deadline,
+            &|| true,
+        )
         .expect("planned reservation emits");
     manager
-        .finish_bounded_backward_emission(deadline)
+        .finish_bounded_backward_emission_with_cancellation(deadline, &|| true)
         .expect("retire unreachable reservations");
     assert!(manager.lrat_id_visible_in_file(emitted));
     assert!(!manager.lrat_id_visible_in_file(unreachable));
     let error = manager
-        .emit_bounded_empty_rup_step(&[unreachable], deadline)
+        .emit_bounded_empty_rup_step_with_cancellation(&[unreachable], deadline, &|| true)
         .expect_err("unemitted reservation cannot become a file hint");
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(!manager.has_file_visible_terminal_empty());

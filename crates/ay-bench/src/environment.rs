@@ -762,11 +762,11 @@ mod tests {
     #[test]
     fn test_capture_does_not_panic() {
         let env = Environment::capture(&PathBuf::from("/nonexistent/ay"));
-        assert!(!env.timestamp.is_empty());
-        assert!(!env.os.is_empty());
-        assert!(!env.arch.is_empty());
-        assert!(!env.ay_path.is_empty());
-        assert!(!env.ay_build_stamp.is_empty());
+        assert_ne!(env.timestamp, "");
+        assert_ne!(env.os, "");
+        assert_ne!(env.arch, "");
+        assert_ne!(env.ay_path, "");
+        assert_ne!(env.ay_build_stamp, "");
     }
 
     #[test]

@@ -330,24 +330,6 @@ impl Solver {
         SolverSatResult::from_solver_result(self.finish_counted_sat(result))
     }
 
-    /// Interruptible solve without the configured dry-run artifact export.
-    ///
-    /// The bounded in-memory ResolutionDag producer uses this crate-internal
-    /// entry point so a dry-run artifact destination configured on the solver
-    /// cannot add unmetered serialization or filesystem I/O to its resource
-    /// envelope.
-    #[cfg(test)]
-    pub(crate) fn solve_interruptible_without_artifact<F>(
-        &mut self,
-        should_stop: F,
-    ) -> SolverSatResult
-    where
-        F: Fn() -> bool,
-    {
-        let result = self.solve_interruptible_raw(should_stop);
-        SolverSatResult::from_solver_result(self.finish_counted_sat(result))
-    }
-
     /// Internal interruptible solve returning raw `SatResult`.
     fn solve_interruptible_raw<F>(&mut self, should_stop: F) -> SatResult
     where

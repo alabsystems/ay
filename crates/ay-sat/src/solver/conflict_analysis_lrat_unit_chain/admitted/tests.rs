@@ -50,7 +50,9 @@ fn fast_and_stale_position_paths_keep_exact_reverse_order_and_filtering() {
             if filtered {
                 filter.insert(pos(7));
             }
-            expected.append_lrat_unit_chain(&[5, 7, 5], &filter);
+            expected
+                .append_lrat_unit_chain_admitted(&[5, 7, 5], &filter, &root::Ordinary)
+                .unwrap_or_else(|never| match never {});
             let owner = test_owner(1_000_000, 1_000_000);
             actual
                 .append_lrat_unit_chain_admitted(&[5, 7, 5], &filter, &root::Counted(&owner))
@@ -98,7 +100,9 @@ fn actual_bfs_missing_unit_fallback_keeps_ordinary_chain_without_minting_ids() {
     let unit = actual.unit_proof_id[0];
     assert_ne!(unit, 0);
     let filter = det_hash_set_new();
-    expected.append_lrat_unit_chain(&[2], &filter);
+    expected
+        .append_lrat_unit_chain_admitted(&[2], &filter, &root::Ordinary)
+        .unwrap_or_else(|never| match never {});
     let owner = test_owner(1_000_000, 1_000_000);
     actual
         .append_lrat_unit_chain_admitted(&[2], &filter, &root::Counted(&owner))

@@ -31586,7 +31586,7 @@ mod tests {
         let one = BigRational::from_integer(1.into());
         let zero = BigRational::zero();
         assert!(inexact.check_point(&[one.clone(), one, zero]).is_ok());
-        assert!(conflict_cliques(&inexact).is_empty());
+        assert_eq!(conflict_cliques(&inexact), Vec::<Vec<usize>>::new());
     }
 
     #[test]
@@ -35781,7 +35781,7 @@ mod tests {
         // branch rules read their coefficients from it): rows 0 and 1 of `ms`,
         // nothing of `kn`.
         assert_eq!(market_split_rows(&ms), vec![0u32, 1]);
-        assert!(market_split_rows(&kn).is_empty());
+        assert_eq!(market_split_rows(&kn), Vec::<u32>::new());
     }
 
     /// GUARD for `pure_general_integer_shape`: fires ONLY when every column is a general integer
@@ -38748,7 +38748,7 @@ mod tests {
             &mut seen
         ));
         assert_eq!((lo[0], lo[1]), (0.0, 0.0));
-        assert!(changed.is_empty());
+        assert_eq!(changed, Vec::<usize>::new());
         // Continuous columns: the outward-rounded quotient itself, no ceil.
         let (mut lo, mut up) = (vec![0.0, 0.0], vec![3.0, 3.0]);
         assert!(propagate_cutoff_row(

@@ -272,10 +272,12 @@ impl<'a> GroupCleanup<'a> {
     /// Pending census turnover never grants a cleanup receipt. The caller's
     /// original deadline bounds resampling; each attempt re-establishes kernel
     /// parentage and only a complete native result permits reaping.
+    #[cfg(unix)]
     pub(crate) fn begin_until(child: &'a mut Child, deadline: Instant) -> io::Result<Self> {
         Self::begin_until_with(child, deadline, kill_process_group)
     }
 
+    #[cfg(unix)]
     fn begin_until_with(
         child: &'a mut Child,
         deadline: Instant,
@@ -915,10 +917,22 @@ fn original_child_exit_between_wait_and_identity_retains_terminal_custody() {
     assert!(status.success());
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    )
+))]
 struct CensusTestChild(Child);
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    )
+))]
 impl Drop for CensusTestChild {
     fn drop(&mut self) {
         terminate_process_group(&mut self.0);

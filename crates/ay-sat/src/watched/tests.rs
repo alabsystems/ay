@@ -1458,3 +1458,82 @@ fn small_buffer_growth_keeps_the_stock_vec_policy() {
         "small-buffer growth deviated from Vec::reserve ({cap_before} before)"
     );
 }
+
+// Complete packed-list observations belong to the real watch/dispatch unit tests.
+impl WatchedLists {
+    /// Get the packed entries for a literal as an immutable slice.
+    #[inline]
+    pub(crate) fn entry_slice(&self, lit: Literal) -> &[u64] {
+        let m = &self.meta[lit.index()];
+        let start = m.offset as usize;
+        &self.buf_entries[start..start + m.len as usize]
+    }
+}
+
+/// #sat-remove-watch-direct: `remove_all_refs` is the slice-direct form
+/// of the Solver::remove_watch scan (profiled hot on cruise-control:
+/// every level-0 GC replacement removes two watches through the view
+/// API). It must reproduce the swap_remove loop's result *exactly* —
+/// same surviving entries in the same order with the binary-first
+/// partition intact — including duplicate target entries in both the
+/// binary and long regions, because BCP iterates these lists in order
+/// and any permutation changes the solver trajectory.
+#[test]
+fn test_remove_all_refs_matches_swap_remove_loop() {
+    let build = || {
+        let mut watches = WatchedLists::new(4);
+        let lit = Literal::positive(Variable(0));
+        let blocker = Literal::negative(Variable(1));
+        // target = 20 appears as binary and long, twice in each region
+        // after binary-first insertion reordering.
+        watches.add_watch(lit, Watcher::binary(ClauseRef(20), blocker));
+        watches.add_watch(lit, Watcher::binary(ClauseRef(10), blocker));
+        watches.add_watch(lit, Watcher::new(ClauseRef(20), blocker));
+        watches.add_watch(lit, Watcher::new(ClauseRef(30), blocker));
+        watches.add_watch(lit, Watcher::binary(ClauseRef(20), blocker));
+        watches.add_watch(lit, Watcher::new(ClauseRef(20), blocker));
+        watches.add_watch(lit, Watcher::new(ClauseRef(31), blocker));
+        watches
+    };
+    let lit = Literal::positive(Variable(0));
+
+    let mut via_loop = build();
+    let mut i = 0;
+    while i < via_loop.len_of(lit) {
+        if via_loop.clause_ref(lit, i).0 == 20 {
+            via_loop.swap_remove(lit, i);
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut via_direct = build();
+    via_direct.remove_all_refs(lit, 20);
+
+    assert_eq!(via_direct.len_of(lit), via_loop.len_of(lit));
+    for idx in 0..via_loop.len_of(lit) {
+        assert_eq!(
+            via_direct.clause_raw(lit, idx),
+            via_loop.clause_raw(lit, idx),
+            "entry {idx} clause",
+        );
+        assert_eq!(
+            via_direct.blocker_raw(lit, idx),
+            via_loop.blocker_raw(lit, idx),
+            "entry {idx} blocker",
+        );
+        assert_ne!(via_direct.clause_ref(lit, idx).0, 20);
+    }
+    via_direct.debug_assert_binary_first();
+
+    // Absent target is a no-op with identical contents.
+    let mut noop = build();
+    let before: Vec<u64> = (0..noop.len_of(lit))
+        .map(|j| noop.clause_raw(lit, j))
+        .collect();
+    noop.remove_all_refs(lit, 99);
+    let after: Vec<u64> = (0..noop.len_of(lit))
+        .map(|j| noop.clause_raw(lit, j))
+        .collect();
+    assert_eq!(before, after);
+}

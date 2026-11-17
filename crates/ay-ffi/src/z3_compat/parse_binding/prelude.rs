@@ -16,6 +16,14 @@ use super::{
     BoundParse, Classified, GivenDeclaration, ParseScope, ParsedDeclaration, HELPER_PREFIX,
 };
 
+/// Why prelude construction stopped before the solver was mutated.
+pub(super) enum PreludeError {
+    /// The prelude is invalid in the current declaration context.
+    Failed(String),
+    /// A declaration has no faithful SMT-LIB spelling.
+    Ineligible(String),
+}
+
 /// The prelude of a parse: caller-named declarations, then the solver's
 /// earlier declarations the text does not redeclare, then its earlier
 /// definitions; with the sort spellings it uses, the declarations in scope and
@@ -31,10 +39,10 @@ pub(super) fn build_prelude<'a>(
         Vec<ParsedDeclaration>,
         HashMap<String, &'a GivenDeclaration>,
     ),
-    BoundParse,
+    PreludeError,
 > {
     if let Some(reason) = recursive_definition_collision(ctx, classified) {
-        return Err(BoundParse::Failed(reason));
+        return Err(PreludeError::Failed(reason));
     }
     let mut speller = SortSpeller::default();
     let mut prelude = String::new();
@@ -56,7 +64,7 @@ pub(super) fn build_prelude<'a>(
     }
     for declaration in &in_scope {
         let Some(text) = declaration_text(declaration, &mut speller) else {
-            return Err(BoundParse::Ineligible(format!(
+            return Err(PreludeError::Ineligible(format!(
                 "the name {:?} has no SMT-LIB spelling",
                 declaration.name
             )));
@@ -324,6 +332,10 @@ pub(super) fn declare_text_datatypes(
     }
     // A datatype the context already has (an API `Datatype` of the same name,
     // constructors and fields) is the same sort, as in z3.
+    #[expect(
+        clippy::suspicious_operation_groupings,
+        reason = "context datatype fields are intentionally compared with parsed constructor selectors"
+    )]
     let same_as_context =
         !classified.datatype_decs.is_empty()
             && classified.datatype_decs.iter().all(|(name, dec)| {

@@ -160,7 +160,7 @@ pub unsafe extern "C" fn Z3_mk_ff_bitsum(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_ff_neg(c: Z3_context, arg: Z3_ast) -> Z3_ast {
     // SAFETY: a one-element stack array remains live for the complete call.
-    unsafe { field_app(c, "ff.neg", 1, &arg) }
+    unsafe { field_app(c, "ff.neg", 1, &raw const arg) }
 }
 
 #[cfg(test)]
@@ -178,7 +178,8 @@ mod tests {
             let f = Z3_mk_finite_field_sort(c, c"7".as_ptr());
             Z3_mk_const(c, Z3_mk_string_symbol(c, c"ff1".as_ptr()), f);
             for k in 0..1024 {
-                let name = std::ffi::CString::new(format!("#f{}m7", 1 + 7 * k)).unwrap();
+                let name = CString::new(format!("#f{}m7", 1 + 7 * k))
+                    .expect("generated finite-field literal name cannot contain an interior NUL");
                 Z3_mk_const(c, Z3_mk_string_symbol(c, name.as_ptr()), f);
             }
             let solver = Z3_mk_solver(c);
@@ -218,7 +219,7 @@ mod tests {
             assert_eq!(
                 CStr::from_ptr(Z3_get_finite_field_sort_size(c, f))
                     .to_str()
-                    .unwrap(),
+                    .expect("finite-field sort size must be valid UTF-8"),
                 "7"
             );
             let one = Z3_mk_numeral(c, c"1".as_ptr(), f);
@@ -238,7 +239,7 @@ mod tests {
             assert_eq!(CStr::from_ptr(Z3_ast_to_string(c, three)), c"#f10m7");
             assert!(CStr::from_ptr(Z3_ast_to_string(c, sum))
                 .to_str()
-                .unwrap()
+                .expect("finite-field AST rendering must be valid UTF-8")
                 .contains("#f10m7"));
             let product = Z3_mk_ff_mul(c, 2, [two, three].as_ptr());
             let neg = Z3_mk_ff_neg(c, one);
@@ -249,19 +250,19 @@ mod tests {
             assert_eq!(Z3_solver_check(c, solver), Z3_L_TRUE);
             assert!(CStr::from_ptr(Z3_solver_to_string(c, solver))
                 .to_str()
-                .unwrap()
+                .expect("finite-field solver rendering must be valid UTF-8")
                 .contains("#f10m7"));
             let model = Z3_solver_get_model(c, solver);
             assert!(!model.is_null());
             let text = CStr::from_ptr(Z3_model_to_string(c, model))
                 .to_str()
-                .unwrap();
+                .expect("finite-field model rendering must be valid UTF-8");
             assert!(text.contains("#f10m7"), "{text}");
             let mut value = 0;
-            assert!(Z3_model_eval(c, model, x, false, &mut value));
+            assert!(Z3_model_eval(c, model, x, false, &raw mut value));
             assert_eq!(CStr::from_ptr(Z3_get_numeral_string(c, value)), c"3");
             for (term, expected) in [(sum, c"3"), (product, c"6"), (neg, c"6"), (add, c"0")] {
-                assert!(Z3_model_eval(c, model, term, false, &mut value));
+                assert!(Z3_model_eval(c, model, term, false, &raw mut value));
                 assert_eq!(CStr::from_ptr(Z3_get_numeral_string(c, value)), expected);
             }
             assert_eq!(

@@ -95,9 +95,9 @@ veripb --opb order.opb sat.pbp     # s VERIFIED SATISFIABLE, before and after
 
 | variant | reach path / knob | unfixed | fixed |
 | --- | --- | --- | --- |
-| `dom-route/aux.pbp` | the same forgery on a one-clause formula, through `dom` | `VERIFIED UNSATISFIABLE` | rejected |
-| `red-route/aux.pbp` | through `red … : subproof / scope leq`, no `dom` anywhere | `VERIFIED UNSATISFIABLE` | rejected |
-| `before-load-order/aux.pbp` | the top-level `red` moved **before** `load_order`, where `validate_aux_var` was a total no-op | `VERIFIED UNSATISFIABLE` | rejected |
+| `dom-route/order-input.pbp` | the same forgery on a one-clause formula, through `dom` | `VERIFIED UNSATISFIABLE` | rejected |
+| `red-route/order-input.pbp` | through `red … : subproof / scope leq`, no `dom` anywhere | `VERIFIED UNSATISFIABLE` | rejected |
+| `before-load-order/order-input.pbp` | the top-level `red` moved **before** `load_order`, where `validate_aux_var` was a total no-op | `VERIFIED UNSATISFIABLE` | rejected |
 | `version2-ordinary-identifier/v2.pbp` | the same top-level assertion in **version 2.0**, where auxiliary variables are spelled as ordinary identifiers and the `$` check never runs | `VERIFIED NO CONCLUSION` (the constraint is accepted) | rejected |
 | `controls/A_no_toplevel_aux_red.pbp` | **one knob**: drop the top-level `red`, keep the order, the `dom` and the `scope` | rejected | rejected |
 | `controls/B_ordinary_var.pbp` | **one knob**: assert an ordinary variable `z1` instead of `$a1` | rejected | rejected |

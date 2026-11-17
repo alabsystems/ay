@@ -26,7 +26,6 @@ use std::ptr;
 use std::sync::Mutex;
 
 use ay_dpll::api::{FuncDecl, Sort, Term, TermKind};
-use ay_frontend::parse;
 
 use super::model_params::eval_term_under_model;
 use super::{
@@ -35,10 +34,10 @@ use super::{
     ffi_guard_const_ptr, ffi_guard_produced, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
     record_ast_sort, require_term_ast_or_return, require_term_asts_or_return, sort_handle_to_ast,
-    term_to_ast, transfer_cross_context_ffi_metadata, ModelHandle, ParamDescr, ParamDescrsHandle,
-    Z3Context, Z3_apply_result, Z3_ast, Z3_ast_vector, Z3_constructor, Z3_context, Z3_func_decl,
-    Z3_model, Z3_param_descrs, Z3_params, Z3_pattern, Z3_sort, Z3_string, Z3_symbol,
-    HANDLE_TAG_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK, Z3_PK_BOOL,
+    term_to_ast, transfer_cross_context_ffi_metadata, ModelHandle, Z3Context, Z3_apply_result,
+    Z3_ast, Z3_ast_vector, Z3_constructor, Z3_context, Z3_func_decl, Z3_model, Z3_param_descrs,
+    Z3_params, Z3_pattern, Z3_sort, Z3_string, Z3_symbol, HANDLE_TAG_MASK, Z3_EXCEPTION,
+    Z3_INVALID_ARG, Z3_OK,
 };
 
 // ============================================================================

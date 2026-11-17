@@ -250,7 +250,6 @@ fn define(s: &Expr, names: &HashMap<usize, String>, memo: &mut HashMap<usize, Ex
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constraint::Constraint;
     use crate::program::AYProgram;
     use crate::sort::Sort;
 

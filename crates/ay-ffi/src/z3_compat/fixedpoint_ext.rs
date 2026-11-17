@@ -67,8 +67,8 @@ use super::{
     ffi_read_bounded_text, record_ast_sort, require_term_ast, term_to_ast, ParamDescr,
     ParamDescrsHandle, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint,
     Z3_fixedpoint_query, Z3_func_decl, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
-    Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL,
-    Z3_PK_STRING, Z3_PK_UINT, Z3_SORT_ERROR,
+    Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING,
+    Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================

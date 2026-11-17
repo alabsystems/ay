@@ -91,12 +91,6 @@ fn declared_const_name(ctx: &super::Z3Context, term: Term) -> Option<String> {
     }
 }
 
-/// Get the kind of an AST node.
-///
-/// Returns one of `Z3_NUMERAL_AST`, `Z3_APP_AST`, `Z3_VAR_AST`,
-/// `Z3_QUANTIFIER_AST`, or `Z3_UNKNOWN_AST`.
-///
-/// # Safety
 /// The kind of a tagged non-term handle, or `None` for an ordinary
 /// term handle. Each arena lookup is authenticated before reporting
 /// even its kind: otherwise a foreign sort/decl handle would be
@@ -114,7 +108,7 @@ fn tagged_ast_kind(ctx: &mut super::Z3Context, a: Z3_ast) -> Option<c_uint> {
                 return Some(Z3_UNKNOWN_AST);
             }
             ctx.last_error = super::Z3_OK;
-            return Some(super::Z3_SORT_AST);
+            Some(super::Z3_SORT_AST)
         }
         super::FUNC_DECL_AST_TAG => {
             if super::func_decl_ast_to_handle(ctx, a).is_null() {
@@ -124,7 +118,7 @@ fn tagged_ast_kind(ctx: &mut super::Z3Context, a: Z3_ast) -> Option<c_uint> {
                 return Some(Z3_UNKNOWN_AST);
             }
             ctx.last_error = super::Z3_OK;
-            return Some(super::Z3_FUNC_DECL_AST);
+            Some(super::Z3_FUNC_DECL_AST)
         }
         super::OO_AST_TAG => {
             if super::decode_oo_ast(ctx, a).is_none() {
@@ -136,7 +130,7 @@ fn tagged_ast_kind(ctx: &mut super::Z3Context, a: Z3_ast) -> Option<c_uint> {
             ctx.last_error = super::Z3_OK;
             // z3's `oo` is a nullary application node
             // (measured kind: Z3_APP_AST).
-            return Some(super::Z3_APP_AST);
+            Some(Z3_APP_AST)
         }
         super::PROOF_AST_TAG => {
             if super::proof_text_for_ast(ctx, a).is_none() {
@@ -146,11 +140,11 @@ fn tagged_ast_kind(ctx: &mut super::Z3Context, a: Z3_ast) -> Option<c_uint> {
             } else {
                 ctx.last_error = super::Z3_OK;
             }
-            return Some(if super::proof_dag::application(ctx, a).is_some() {
-                super::Z3_APP_AST
+            Some(if super::proof_dag::application(ctx, a).is_some() {
+                Z3_APP_AST
             } else {
                 Z3_UNKNOWN_AST
-            });
+            })
         }
         super::ALGEBRAIC_AST_TAG => {
             if super::algebraic::ast_as_scalar(ctx, a).is_none() {
@@ -161,17 +155,23 @@ fn tagged_ast_kind(ctx: &mut super::Z3Context, a: Z3_ast) -> Option<c_uint> {
                 ctx.last_error = super::Z3_OK;
             }
             // AY's opaque algebraic handle has no faithful term kind.
-            return Some(Z3_UNKNOWN_AST);
+            Some(Z3_UNKNOWN_AST)
         }
-        0 => return None,
+        0 => None,
         _ => {
             ctx.last_error = super::Z3_INVALID_ARG;
             ctx.error_msg = Some("Z3_get_ast_kind: malformed AST tag".to_string());
-            return Some(Z3_UNKNOWN_AST);
+            Some(Z3_UNKNOWN_AST)
         }
     }
 }
 
+/// Get the kind of an AST node.
+///
+/// Returns one of `Z3_NUMERAL_AST`, `Z3_APP_AST`, `Z3_VAR_AST`,
+/// `Z3_QUANTIFIER_AST`, or `Z3_UNKNOWN_AST`.
+///
+/// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_get_ast_kind(c: Z3_context, a: Z3_ast) -> c_uint {

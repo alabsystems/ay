@@ -1,10 +1,26 @@
-error[E0271]: expected `{closure@primal_run_cannot_return_solution.rs:9:9}` to return `()`, but it returns `PbSolution`
- --> tests/ui/primal_run_cannot_return_solution.rs:9:79
-  |
-9 |         |_instance, _objective, _timeout_dur, _start, _term_flag, _sender| -> ay_pb::PbSolution {
-  |         ----------------------------------------------------------------------^^^^^^^^^^^^^^^^^
-  |         |                                                                     |
-  |         |                                                                     expected `()`, found `PbSolution`
-  |         this closure
-  |
-  = note: required for the cast from `Box<{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}>` to `Box<(dyn for<'a, 'b, 'c, 'd> Fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender) + Send + Sync + 'static)>`
+error[E0277]: expected `Fn(&PbInstance, &PbObjective, Option<Duration>, Instant, &Atomic<bool>, &PrimalSender)` signature, found `{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}`
+  --> tests/ui/primal_run_cannot_return_solution.rs:8:51
+   |
+ 8 |       let _run: ay_pb::portfolio::PrimalWorkerRun = Box::new(
+   |  ___________________________________________________^
+ 9 | |         |_instance, _objective, _timeout_dur, _start, _term_flag, _sender| -> ay_pb::PbSolution {
+   | |         --------------------------------------------------------------------------------------- within this `{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}`
+10 | |             unreachable!()
+11 | |         },
+12 | |     );
+   | |_____^ expected `Fn(&PbInstance, &PbObjective, Option<Duration>, Instant, &Atomic<bool>, &PrimalSender)` signature, found `{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}`
+   |
+help: within `{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}`, the trait `for<'a, 'b, 'c, 'd> Fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender)` is not implemented for closure `{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}`
+  --> tests/ui/primal_run_cannot_return_solution.rs:9:9
+   |
+ 9 |         |_instance, _objective, _timeout_dur, _start, _term_flag, _sender| -> ay_pb::PbSolution {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: expected type with signature `for<'a, 'b, 'c, 'd> fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender)`
+           found closure with signature `fn(&PbInstance, &PbObjective, Option<Duration>, Instant, &Atomic<bool>, &PrimalSender)`
+note: required because it's used within this closure
+  --> tests/ui/primal_run_cannot_return_solution.rs:9:9
+   |
+ 9 |         |_instance, _objective, _timeout_dur, _start, _term_flag, _sender| -> ay_pb::PbSolution {
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `Box<{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}>` to implement `CoerceUnsized<Box<dyn for<'a, 'b, 'c, 'd> Fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender) + Send + Sync>>`
+   = note: required for the cast from `Box<{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}>` to `Box<(dyn for<'a, 'b, 'c, 'd> Fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender) + Send + Sync + 'static)>`

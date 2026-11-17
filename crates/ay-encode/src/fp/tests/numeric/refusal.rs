@@ -13,7 +13,7 @@ fn refuses(root: Expr, budget: &mut WorkBudget<'_>) {
 
 #[test]
 fn non_rne_numeric_modes_widths_and_formats_refuse_before_any_partial_data() {
-    super::super::raw_words::native::original_owner(|budget, _| {
+    raw_words::native::original_owner(|budget, _| {
         budget.admit(1_048_576, 1_048_576).unwrap();
         for rm in [
             RoundingMode::RNA,
@@ -44,7 +44,7 @@ fn non_rne_numeric_modes_widths_and_formats_refuse_before_any_partial_data() {
 
 #[test]
 fn numeric_compound_words_forged_ufs_and_unsupported_unchosen_children_refuse() {
-    super::super::raw_words::native::original_owner(|budget, _| {
+    raw_words::native::original_owner(|budget, _| {
         budget.admit(1_048_576, 1_048_576).unwrap();
         let word = Expr::bitvec_const(1u8, 32);
         let compound = word.clone().bvadd(word.clone());
@@ -70,7 +70,7 @@ fn numeric_compound_words_forged_ufs_and_unsupported_unchosen_children_refuse() 
 
 #[test]
 fn numeric_original_raw_base_cannot_be_omitted_or_replaced_by_slice_alias() {
-    super::super::raw_words::native::original_owner(|budget, _| {
+    raw_words::native::original_owner(|budget, _| {
         budget.admit(1_048_576, 1_048_576).unwrap();
         let base = Expr::var("numeric_original", crate::Sort::bitvec(64));
         let slice = base.clone().extract(7, 0);

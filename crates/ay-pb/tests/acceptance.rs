@@ -633,7 +633,10 @@ fn test_wbo_hard_only() {
     let wbo_str = "soft: 10 ;\n\
                     +1 x1 +1 x2 >= 1 ;\n";
     let wbo = parse_wbo(wbo_str).unwrap();
-    assert!(wbo.soft_constraints.is_empty());
+    assert_eq!(
+        wbo.soft_constraints.as_slice(),
+        &[] as &[(i128, ay_pb::PbConstraint)]
+    );
     assert_eq!(wbo.hard_constraints.len(), 1);
 
     let pbo = wbo_to_pbo(&wbo);

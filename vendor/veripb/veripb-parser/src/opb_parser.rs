@@ -269,7 +269,7 @@ where
 }
 
 fn parse_preserved_vars(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     var_name_manager: &mut VarNameManager,
 ) -> Result<AHashSet<VarIdx>, ParserError> {
     let mut vars = AHashSet::new();
@@ -285,7 +285,7 @@ fn parse_preserved_vars(
 
 /// Parse an objective specified in OPB format.
 pub fn parse_opb_objective<V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     var_name_manager: &mut V,
     is_maximization: bool,
 ) -> Result<PBObjective, ParserError> {
@@ -341,7 +341,7 @@ pub fn parse_opb_objective<V: VarNameRecorder>(
 /// of the proof format and are not accepted here, as this function parses constraints that are
 /// embedded in a version 2 proof.
 pub fn parse_single_constraint<V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     var_names: &mut V,
 ) -> Result<(Constraint, OptionalConstraint), ParserError> {
     let (geq_constraint, leq_constraint) = match lex.next() {
@@ -371,7 +371,7 @@ pub fn parse_single_constraint<V: VarNameRecorder>(
 /// **Note:** When this function is called the lexer has already parsed the first token of the
 /// constraint, which is given as `first`.
 fn parse_opb_constraint<V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     first: OPBToken,
     var_name_manager: &mut V,
 ) -> Result<OptionalConstraintPair, ParserError> {
@@ -406,7 +406,7 @@ fn parse_opb_constraint<V: VarNameRecorder>(
 ///
 /// **Note:** When this function is called the lexer has already parsed the first token, which should start a literal.
 fn parse_reification<V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     first: OPBToken,
     var_name_manager: &mut V,
 ) -> Result<Reification, ParserError> {
@@ -456,7 +456,7 @@ fn parse_reification<V: VarNameRecorder>(
 /// The single literal a reification shorthand named by `arrow` reifies, or an error naming the
 /// shorthand if `literals` holds more than one.
 fn single_literal(
-    lex: &Lexer<OPBToken>,
+    lex: &Lexer<'_, OPBToken>,
     literals: &[Lit],
     arrow: &str,
 ) -> Result<Lit, ParserError> {
@@ -489,7 +489,7 @@ fn single_literal(
 ///
 /// **Note:** When this function is called the lexer has already parsed the first token of the constraint, which is given as `first` and is either an integer, in which case the constraint has terms, or the comparator of a constraint without terms.
 fn parse_opb_constraint_dyn<V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     first: OPBToken,
     var_name_manager: &mut V,
     reification: &Reification,
@@ -571,7 +571,7 @@ fn parse_opb_constraint_dyn<V: VarNameRecorder>(
 /// **Note:** When this function is called the lexer has already parsed the first token, which should be an integer.
 #[inline]
 fn parse_opb_terms<N: Int, V: VarNameRecorder>(
-    lex: &mut Lexer<OPBToken>,
+    lex: &mut Lexer<'_, OPBToken>,
     var_name_manager: &mut V,
     terms: &mut GenericTerms<N>,
     is_equality_allowed: bool,
@@ -640,7 +640,7 @@ fn parse_opb_terms<N: Int, V: VarNameRecorder>(
 ///
 /// The function returns an [`Err`] if the next token is not an integer.
 #[inline]
-fn is_integer(lex: &mut Lexer<OPBToken>) -> Result<(), ParserError> {
+fn is_integer(lex: &mut Lexer<'_, OPBToken>) -> Result<(), ParserError> {
     if lex.next() != Some(Ok(OPBToken::Integer)) {
         return Err(ParserError::token_error(lex.span(), "integer"));
     }
@@ -672,7 +672,7 @@ fn is_integer(lex: &mut Lexer<OPBToken>) -> Result<(), ParserError> {
 /// cross-checked against the file on disk; nothing outside the proved fragment"
 /// on exactly that input. Both readers are fixed; see `read_opb` there.
 #[inline]
-fn check_constraint_end(lex: &mut Lexer<OPBToken>) -> Result<(), ParserError> {
+fn check_constraint_end(lex: &mut Lexer<'_, OPBToken>) -> Result<(), ParserError> {
     if lex.next() != Some(Ok(OPBToken::Semicolon)) {
         Err(ParserError::token_error(lex.span(), "';'"))?;
     }
