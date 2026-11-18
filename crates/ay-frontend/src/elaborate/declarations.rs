@@ -157,10 +157,10 @@ impl Context {
     /// A single-constructor datatype `D = C(f_0: T_0, ..., f_{n-1}: T_{n-1})` is
     /// isomorphic to the tuple `(T_0, ..., T_{n-1})`: every value of `D` is
     /// `C(x_0, ..., x_{n-1})` for unique field values. So binding the constant to
-    /// `C(v!f_0, ..., v!f_{n-1})` over fresh field constants — rather than an
+    /// `C(k_0, ..., k_{n-1})` over fresh field constants `k_i` — rather than an
     /// opaque variable — is BOTH sound and complete. The payoff is decidability
     /// without invoking a datatype decision procedure:
-    ///   * `sel_i(v)` becomes `sel_i(C(...))`, folded to `v!f_i` by the
+    ///   * `sel_i(v)` becomes `sel_i(C(...))`, folded to `k_i` by the
     ///     selector-over-constructor reduction in `elaborate_app`;
     ///   * `v = w` becomes `C(...) = C(...)`, decomposed by constructor
     ///     injectivity into field equalities.
@@ -192,14 +192,25 @@ impl Context {
     /// appear in models. `visiting` holds the datatype names currently being
     /// expanded, guarding against (mutually) recursive single-constructor types.
     ///
+    /// Each field constant's core identity is a fresh private identity from
+    /// [`Self::fresh_dt_field_identity`], never a spelling
+    /// derived from `name` and the selector. A field has no surface name of
+    /// its own (the problem can name it only as a selector application), and
+    /// a derived spelling such as `p!x` is a legal user symbol: registering
+    /// the field under it replaced the user's own `p!x` in the symbol table,
+    /// so `(= p!x 1)` and `(= (x p) 2)` constrained one constant and answered
+    /// `unsat` where z3 answers `sat`. The frontend refuses every `__ay_`
+    /// declaration, so no user symbol can take a private identity.
+    ///
     /// `surface` is `Some` exactly when `name` is an INVENTED field constant:
     /// it carries the selector-application rendering composed so far and the
     /// declared root it hangs off (see [`super::DtFieldSurface`]). It is passed
     /// DOWN rather than looked up because the recursion is depth-first — a
-    /// nested field like `s!right!top` is minted BEFORE any bookkeeping for its
-    /// parent `s!right` exists — and composing it on the way down is what makes
-    /// depth 2 render `(top (right s))` instead of the still-undeclared
-    /// `(top s!right)`.
+    /// nested field (the `top` of `(right s)`) is minted BEFORE any bookkeeping
+    /// for its parent field exists — and composing it on the way down is what
+    /// makes depth 2 render `(top (right s))`. A nested field whose parent has
+    /// no rendering arrives with `surface == None` and a private `name`, so the
+    /// root branch below withholds its rendering too.
     fn build_const_term(
         &mut self,
         name: &str,
@@ -304,7 +315,7 @@ impl Context {
                             };
                             let mut field_terms = Vec::with_capacity(field_info.len());
                             for (index, (sel_name, field_sort)) in field_info.iter().enumerate() {
-                                let field_name = format!("{name}!{sel_name}");
+                                let field_name = self.fresh_dt_field_identity();
                                 let child = parent.as_ref().and_then(|parent| {
                                     // Parametric-instance selectors carry
                                     // mangled internal identities; only the

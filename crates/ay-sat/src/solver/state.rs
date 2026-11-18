@@ -283,6 +283,10 @@ pub struct Solver {
     /// root-satisfied binaries over watch lists averaging 2,200 entries cost
     /// 120-150 s on 2c458ef3 (about 7e10 entry visits).
     pub(super) defer_binary_unlink: bool,
+    /// Set for the duration of `collect_level0_garbage`'s fixpoint
+    /// sweep: irredundant mutations under it are L0 GC's own and do
+    /// not bump `irredundant_mutation_epoch` (#l0-rebuild-epoch).
+    pub(super) l0_gc_sweep_active: bool,
     /// When true, `delete_clause_observed` buffers proof deletion emissions
     /// (both forward checker and proof manager) instead of emitting them
     /// immediately. Used during BVE to ensure all resolvent additions appear

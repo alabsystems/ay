@@ -8,7 +8,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use crate::command;
 use ay_core::Sort;
 
-use super::{is_canonical_theory_operator_identity, Context, ElaborateError, Result, SymbolInfo};
+use super::{
+    is_canonical_theory_operator_identity, Context, DeclarationKind, ElaborateError, Result,
+    SymbolInfo,
+};
 
 /// The class `carrier_surface_class` gives a carrier: the carriers of one
 /// source sort description (`Context::nominal_carriers_share_surface`), such
@@ -27,26 +30,34 @@ pub struct DatatypeOutputNames<'a> {
     /// Selector identity to the carrier, if any, of a constructor that
     /// declares it.
     selector_carriers: HashMap<&'a str, Option<&'a str>>,
-    /// Per surface name and carrier class: how many members carry it, and one
-    /// of them.
-    sharers: HashMap<(&'a str, CarrierSurfaceClass<'a>), (usize, &'a str)>,
+    /// Per surface name, carrier class and member kind: how many members
+    /// carry it, and one of them.
+    sharers: HashMap<(&'a str, CarrierSurfaceClass<'a>, DeclarationKind), (usize, &'a str)>,
 }
 
 impl<'a> DatatypeOutputNames<'a> {
     /// The output name of `identity`, as [`Context::output_symbol_name`]
     /// gives it: its surface name (`identity` when none is recorded), unless
-    /// `identity` has a carrier and another datatype member (a constructor,
-    /// tester or selector) whose carrier is in the same `CarrierSurfaceClass`
-    /// as that carrier has that surface name too; then `identity` itself.
+    /// `identity` is a recorded datatype member with a carrier and another
+    /// member of the same `DeclarationKind` whose carrier is in the same
+    /// `CarrierSurfaceClass` has that surface name too; then `identity`
+    /// itself. A member of another kind with that surface name does not
+    /// count.
     pub fn name(&self, identity: &'a str) -> &'a str {
         let context = self.context;
         let surface = context.dt_surface_name(identity).unwrap_or(identity);
         let Some(carrier) = context.member_carrier_among(identity, &self.selector_carriers) else {
             return surface;
         };
+        let Some(kind) = context
+            .exact_datatype_member_info(identity)
+            .map(SymbolInfo::declaration_kind)
+        else {
+            return surface;
+        };
         let collides = self
             .sharers
-            .get(&(surface, context.carrier_surface_class(carrier)))
+            .get(&(surface, context.carrier_surface_class(carrier), kind))
             .is_some_and(|(count, one)| *count > 1 || *one != identity);
         if collides {
             identity
@@ -74,6 +85,44 @@ pub(crate) fn mangle_datatype_instance(name: &str, args: &[Sort]) -> String {
         out.push('}');
     }
     out
+}
+
+/// The names among `constructors` that are the quoted token of another of
+/// them: `name` is one when `ay_core::symbol_token` gives `name` for a
+/// constructor not itself named `name`. For example `|\|a b\||`, whose name
+/// is `|a b|`, beside `|a b|`; and `|\|\||`, whose name is `||`, beside `||`,
+/// whose name is empty.
+///
+/// A datatype value prints each constructor as the `ay_core::symbol_token` of
+/// its output name, and the model also keeps values with each constructor
+/// written as its core identity. With its name as identity, a constructor
+/// named here would be written in that spelling as the token another
+/// constructor of its datatype prints.
+/// [`Context::datatype_constructor_internal_names`] gives it a private
+/// identity instead.
+fn constructors_named_as_a_sibling_token(
+    constructors: &[command::ConstructorDec],
+) -> HashSet<&str> {
+    // A quoted token begins and ends with `|`; most declarations hold no such
+    // name and build no token.
+    if !constructors
+        .iter()
+        .any(|ctor| ctor.name.len() >= 2 && ctor.name.starts_with('|') && ctor.name.ends_with('|'))
+    {
+        return HashSet::default();
+    }
+    let tokens: HashSet<String> = constructors
+        .iter()
+        .filter_map(|ctor| match ay_core::symbol_token(&ctor.name) {
+            std::borrow::Cow::Owned(token) => Some(token),
+            std::borrow::Cow::Borrowed(_) => None,
+        })
+        .collect();
+    constructors
+        .iter()
+        .map(|ctor| ctor.name.as_str())
+        .filter(|name| tokens.contains(*name))
+        .collect()
 }
 
 /// Mangle a constructor/selector member `surface` into its instance-specific
@@ -151,13 +200,19 @@ impl Context {
     /// Claim the linked constructor/tester identities as one unit. Several
     /// datatype rewrites derive a tester core as `is-<constructor-core>`, so a
     /// fresh constructor identity must also reserve that derived spelling.
+    ///
+    /// With `private` set the constructor gets a fresh private identity even
+    /// when `preferred` is available. The caller sets it for a name of
+    /// [`constructors_named_as_a_sibling_token`].
     fn datatype_constructor_internal_names(
         &mut self,
         surface: &str,
         preferred: &str,
+        private: bool,
     ) -> (String, String) {
         let preferred_tester = format!("is-{preferred}");
-        let (constructor, tester) = if !is_canonical_theory_operator_identity(preferred)
+        let (constructor, tester) = if !private
+            && !is_canonical_theory_operator_identity(preferred)
             && self.declaration_core_identity_is_available(preferred)
             && self.declaration_core_identity_is_available(&preferred_tester)
         {
@@ -243,6 +298,12 @@ impl Context {
     ) -> Vec<String> {
         debug_assert_eq!(constructors.len(), selector_sorts.len());
         let mut registered_constructor_names = Vec::with_capacity(constructors.len());
+        // An instance's constructors do not have their names as identities
+        // (`mangle_member`), so none is given a private one here.
+        let sibling_tokens = match instance {
+            None => constructors_named_as_a_sibling_token(constructors),
+            Some(_) => HashSet::default(),
+        };
         for (ctor, selector_sorts) in constructors.iter().zip(selector_sorts) {
             // For a monomorphized parametric INSTANCE, the constructor/selector/
             // tester get INTERNAL names that are name-disjoint per instance
@@ -253,8 +314,11 @@ impl Context {
             // reincarnation receives fresh private identities as well.
             let preferred_ctor =
                 mangle_member(&ctor.name, instance).unwrap_or_else(|| ctor.name.clone());
-            let (ctor_internal, tester_internal) =
-                self.datatype_constructor_internal_names(&ctor.name, &preferred_ctor);
+            let (ctor_internal, tester_internal) = self.datatype_constructor_internal_names(
+                &ctor.name,
+                &preferred_ctor,
+                sibling_tokens.contains(ctor.name.as_str()),
+            );
             let sel_internals: Vec<String> = ctor
                 .selectors
                 .iter()
@@ -321,7 +385,7 @@ impl Context {
                     .map(super::PublicSort::from_engine)
                     .collect(),
                 (ctor_internal != ctor.name).then(|| ctor_internal.clone()),
-                super::DeclarationKind::DatatypeConstructor,
+                DeclarationKind::DatatypeConstructor,
             );
             self.datatype_member_symbols
                 .insert(ctor_internal.clone(), ctor_info.clone());
@@ -341,7 +405,7 @@ impl Context {
                     super::PublicSort::from_engine(sel_sort),
                     vec![super::PublicSort::from_engine(dt_sort)],
                     (sel_internal != &sel.name).then(|| sel_internal.clone()),
-                    super::DeclarationKind::DatatypeSelector,
+                    DeclarationKind::DatatypeSelector,
                 );
                 self.datatype_member_symbols
                     .insert(sel_internal.clone(), selector_info.clone());
@@ -358,7 +422,7 @@ impl Context {
                 super::PublicSort::Core(Sort::Bool),
                 vec![super::PublicSort::from_engine(dt_sort)],
                 (tester_internal != tester_surface).then(|| tester_internal.clone()),
-                super::DeclarationKind::DatatypeTester,
+                DeclarationKind::DatatypeTester,
             );
             self.datatype_member_symbols
                 .insert(tester_internal, tester_info.clone());
@@ -435,26 +499,46 @@ impl Context {
             .collect()
     }
 
-    /// External spelling for an exact declaration identity. Ordinary private
-    /// overloads and unambiguous datatype members use their source surface.
-    /// Reincarnated datatype members whose carriers have the same source sort
-    /// description keep their exact core spellings, so old and new heads can
-    /// never be rendered as if they were one declaration.
+    /// External spelling for an exact declaration identity: its source surface
+    /// (`identity` when none is recorded), unless `identity` is a recorded
+    /// datatype member with a carrier and another member of the same
+    /// `DeclarationKind` has that surface and a carrier of the same source
+    /// sort description (`nominal_carriers_share_surface`); then `identity`
+    /// itself. For example, the constructor `ScopedC` of a datatype
+    /// `ScopedDt` declared again after `pop`, while the popped `ScopedC` is
+    /// still recorded, prints its identity
+    /// (`popped_datatype_member_core_identities_are_never_reused`). A member
+    /// of another kind with that surface (for example the constructor
+    /// `|is-kiwi|` beside the tester of `kiwi`) does not count, whether it is
+    /// live or popped and whatever its arity: the unary constructor `|is-k|`
+    /// and the tester `is-k` of a constructor `k` of the same datatype both
+    /// print `is-k`.
     pub fn output_symbol_name<'a>(&'a self, identity: &'a str) -> &'a str {
         let surface = self.dt_surface_name(identity).unwrap_or(identity);
         let Some(carrier) = self.datatype_member_carrier(identity) else {
             return surface;
         };
-        let collides = self.datatype_member_symbols.keys().any(|other| {
-            if other == identity || self.dt_surface_name(other).unwrap_or(other.as_str()) != surface
-            {
-                return false;
-            }
-            self.datatype_member_carrier(other)
-                .is_some_and(|other_carrier| {
-                    self.nominal_carriers_share_surface(carrier, other_carrier)
-                })
-        });
+        let Some(kind) = self
+            .exact_datatype_member_info(identity)
+            .map(SymbolInfo::declaration_kind)
+        else {
+            return surface;
+        };
+        let collides = self
+            .datatype_member_symbols
+            .iter()
+            .any(|(other, other_info)| {
+                if other == identity
+                    || other_info.declaration_kind() != kind
+                    || self.dt_surface_name(other).unwrap_or(other.as_str()) != surface
+                {
+                    return false;
+                }
+                self.datatype_member_carrier(other)
+                    .is_some_and(|other_carrier| {
+                        self.nominal_carriers_share_surface(carrier, other_carrier)
+                    })
+            });
         if collides {
             identity
         } else {
@@ -479,15 +563,19 @@ impl Context {
                     .or_insert(carrier);
             }
         }
-        let mut sharers: HashMap<(&str, CarrierSurfaceClass<'_>), (usize, &str)> =
+        let mut sharers: HashMap<(&str, CarrierSurfaceClass<'_>, DeclarationKind), (usize, &str)> =
             HashMap::default();
-        for identity in self.datatype_member_symbols.keys() {
+        for (identity, info) in &self.datatype_member_symbols {
             let Some(carrier) = self.member_carrier_among(identity, &selector_carriers) else {
                 continue;
             };
             let surface = self.dt_surface_name(identity).unwrap_or(identity);
             sharers
-                .entry((surface, self.carrier_surface_class(carrier)))
+                .entry((
+                    surface,
+                    self.carrier_surface_class(carrier),
+                    info.declaration_kind(),
+                ))
                 .or_insert((0, identity.as_str()))
                 .0 += 1;
         }

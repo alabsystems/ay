@@ -90,6 +90,7 @@ impl TheorySolver for NraSolver<'_> {
             ("nra_icp_main_boxes", self.icp_main_box_count.get()),
             ("nra_icp_pin_boxes", self.icp_pin_box_count.get()),
             ("nra_icp_wide_tree_caps", self.icp_wide_tree_cap_count.get()),
+            ("nra_multipoly_cache_hits", self.multipoly_cache_hits.get()),
         ];
         stats.extend(self.lra.collect_statistics());
         stats

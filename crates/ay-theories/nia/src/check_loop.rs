@@ -1793,8 +1793,10 @@ impl NiaSolver<'_> {
 /// Recording every original argument edge and walking the real path fixes this:
 /// the edges form a spanning forest (an edge is added only when the endpoints
 /// were in different classes), so `path_reasons` finds the unique path and
-/// collects the complete, sound justification. The trees are tiny (factors in a
-/// single VC), so the cost is negligible.
+/// collects the complete, sound justification. (Measured on slayer-3:
+/// a fresh BFS per factor pair cost 6.7s of 24s total check time, so
+/// `path_reasons` roots the forest once and climbs to the LCA instead —
+/// the forest path is unique, hence the same literal set.)
 #[derive(Default)]
 struct EqUnionFind {
     /// `parent[x]` = (parent term, connecting literal). Used ONLY for `find`
@@ -1805,6 +1807,85 @@ struct EqUnionFind {
     /// contains `(b, lit)` for every `union(a, b, lit)` (and vice-versa).
     /// `path_reasons` walks this forest to recover the exact literal chain.
     edges: BTreeMap<TermId, Vec<(TermId, TheoryLit)>>,
+    /// Lazily rooted view of `edges` for O(depth) reason recovery;
+    /// invalidated by every merging union.
+    rooted: std::cell::RefCell<Option<RootedForest>>,
+}
+
+/// One rooted spanning tree per edge-forest component: `up[x]` is
+/// x's parent in its tree plus the literal on that original edge.
+#[derive(Default)]
+struct RootedForest {
+    up: BTreeMap<TermId, (TermId, TheoryLit)>,
+    depth: BTreeMap<TermId, u32>,
+}
+
+impl RootedForest {
+    fn build(edges: &BTreeMap<TermId, Vec<(TermId, TheoryLit)>>) -> Self {
+        let mut forest = RootedForest::default();
+        for &start in edges.keys() {
+            if forest.depth.contains_key(&start) {
+                continue;
+            }
+            forest.depth.insert(start, 0);
+            let mut stack = vec![start];
+            while let Some(cur) = stack.pop() {
+                if let Some(neighbors) = edges.get(&cur) {
+                    for &(next, lit) in neighbors {
+                        if !forest.depth.contains_key(&next) {
+                            forest.depth.insert(next, forest.depth[&cur] + 1);
+                            forest.up.insert(next, (cur, lit));
+                            stack.push(next);
+                        }
+                    }
+                }
+            }
+        }
+        forest
+    }
+
+    /// Collect the edge literals on the unique path a <-> b into
+    /// `out` by climbing both endpoints to their lowest common
+    /// ancestor. Unreachable endpoints (different trees, or a node
+    /// absent from the forest) leave `out` untouched, matching the
+    /// old BFS fail-safe.
+    fn path_reasons(&self, a: TermId, b: TermId, out: &mut Vec<(TermId, bool)>) {
+        if a == b {
+            return;
+        }
+        let (Some(&da), Some(&db)) = (self.depth.get(&a), self.depth.get(&b)) else {
+            return;
+        };
+        let mut acc: Vec<(TermId, bool)> = Vec::new();
+        let (mut x, mut y) = (a, b);
+        let (mut dx, mut dy) = (da, db);
+        while dx > dy {
+            let Some(&(p, lit)) = self.up.get(&x) else {
+                return;
+            };
+            acc.push((lit.term, lit.value));
+            x = p;
+            dx -= 1;
+        }
+        while dy > dx {
+            let Some(&(p, lit)) = self.up.get(&y) else {
+                return;
+            };
+            acc.push((lit.term, lit.value));
+            y = p;
+            dy -= 1;
+        }
+        while x != y {
+            let (Some(&(px, lx)), Some(&(py, ly))) = (self.up.get(&x), self.up.get(&y)) else {
+                return;
+            };
+            acc.push((lx.term, lx.value));
+            acc.push((ly.term, ly.value));
+            x = px;
+            y = py;
+        }
+        out.extend(acc);
+    }
 }
 
 impl EqUnionFind {
@@ -1817,46 +1898,21 @@ impl EqUnionFind {
     }
 
     /// Append to `out` the equality literals justifying `a = b` (assumes
-    /// `find(a) == find(b)`). Walks the unique path from `a` to `b` in the
-    /// original-argument edge forest via BFS; every edge literal on that path
-    /// is a literal asserted true, and the chain `a = ... = b` entails `a = b`.
-    /// The reason set is exact (every literal actually used) and sound.
+    /// `find(a) == find(b)`). The edge graph is a forest, so the path is
+    /// unique: root it once (cached in `rooted`, invalidated by union)
+    /// and climb both endpoints to their lowest common ancestor,
+    /// collecting exactly the literals the old per-query BFS collected.
     fn path_reasons(&self, a: TermId, b: TermId, out: &mut Vec<(TermId, bool)>) {
         if a == b {
             return;
         }
-        // BFS from `a`, recording the predecessor edge for each visited node so
-        // the path back to `a` can be reconstructed.
-        let mut prev: BTreeMap<TermId, (TermId, TheoryLit)> = BTreeMap::new();
-        let mut visited: std::collections::BTreeSet<TermId> = std::collections::BTreeSet::new();
-        let mut queue: std::collections::VecDeque<TermId> = std::collections::VecDeque::new();
-        visited.insert(a);
-        queue.push_back(a);
-        while let Some(cur) = queue.pop_front() {
-            if cur == b {
-                break;
-            }
-            let Some(neighbors) = self.edges.get(&cur) else {
-                continue;
-            };
-            for &(next, lit) in neighbors {
-                if visited.insert(next) {
-                    prev.insert(next, (cur, lit));
-                    queue.push_back(next);
-                }
-            }
+        let mut slot = self.rooted.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(RootedForest::build(&self.edges));
         }
-        // Reconstruct `b -> ... -> a`, collecting each edge's literal. If `b`
-        // was unreachable (should not happen when find(a)==find(b)), fail-safe
-        // by returning what was collected so far.
-        let mut node = b;
-        while node != a {
-            let Some(&(p, lit)) = prev.get(&node) else {
-                return;
-            };
-            out.push((lit.term, lit.value));
-            node = p;
-        }
+        slot.as_ref()
+            .expect("rooted forest built above")
+            .path_reasons(a, b, out);
     }
 
     /// Union the classes of `a` and `b`, recording `lit` (the asserting
@@ -1868,6 +1924,7 @@ impl EqUnionFind {
         if ra == rb {
             return;
         }
+        *self.rooted.borrow_mut() = None;
         // Record the exact argument edge (both directions) for reason recovery.
         self.edges.entry(a).or_default().push((b, lit));
         self.edges.entry(b).or_default().push((a, lit));
@@ -1943,6 +2000,91 @@ mod eq_union_find_tests {
                 reasons.contains(&(TermId(t), true)),
                 "chain reason {t} missing; got {reasons:?}"
             );
+        }
+    }
+
+    /// The pre-LCA per-query BFS over the edge forest, kept verbatim
+    /// as the equivalence reference for the rooted climb.
+    fn path_reasons_bfs_reference(
+        uf: &EqUnionFind,
+        a: TermId,
+        b: TermId,
+        out: &mut Vec<(TermId, bool)>,
+    ) {
+        if a == b {
+            return;
+        }
+        let mut prev: std::collections::BTreeMap<TermId, (TermId, TheoryLit)> =
+            std::collections::BTreeMap::new();
+        let mut visited: std::collections::BTreeSet<TermId> = std::collections::BTreeSet::new();
+        let mut queue: std::collections::VecDeque<TermId> = std::collections::VecDeque::new();
+        visited.insert(a);
+        queue.push_back(a);
+        while let Some(cur) = queue.pop_front() {
+            if cur == b {
+                break;
+            }
+            let Some(neighbors) = uf.edges.get(&cur) else {
+                continue;
+            };
+            for &(next, lit) in neighbors {
+                if visited.insert(next) {
+                    prev.insert(next, (cur, lit));
+                    queue.push_back(next);
+                }
+            }
+        }
+        let mut node = b;
+        while node != a {
+            let Some(&(p, lit)) = prev.get(&node) else {
+                return;
+            };
+            out.push((lit.term, lit.value));
+            node = p;
+        }
+    }
+
+    /// LCA climb must produce the identical literal SET as BFS for
+    /// every pair (the forest path is unique), including across a
+    /// union that invalidates the rooted cache mid-sequence.
+    #[test]
+    fn path_reasons_lca_matches_bfs_on_random_forests() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let check_all = |uf: &EqUnionFind, n: u32| {
+            for a in 0..n {
+                for b in 0..n {
+                    let (mut got, mut want) = (Vec::new(), Vec::new());
+                    uf.path_reasons(TermId(a), TermId(b), &mut got);
+                    path_reasons_bfs_reference(uf, TermId(a), TermId(b), &mut want);
+                    got.sort_unstable();
+                    want.sort_unstable();
+                    assert_eq!(got, want, "pair ({a},{b})");
+                }
+            }
+        };
+        for n in [2u32, 5, 17, 40] {
+            for _round in 0..12 {
+                let mut uf = EqUnionFind::default();
+                let mut lit_id = 1000u32;
+                // Random unions, then a full pair check (builds cache).
+                for _ in 0..(n * 2) {
+                    lit_id += 1;
+                    uf.union(TermId(next() % n), TermId(next() % n), lit(lit_id));
+                }
+                check_all(&uf, n);
+                // More unions AFTER queries: cache must invalidate.
+                for _ in 0..n {
+                    lit_id += 1;
+                    uf.union(TermId(next() % n), TermId(next() % n), lit(lit_id));
+                }
+                check_all(&uf, n);
+            }
         }
     }
 

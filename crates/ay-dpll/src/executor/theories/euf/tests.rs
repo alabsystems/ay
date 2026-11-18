@@ -1193,10 +1193,23 @@ fn top_level_datatype_disequality_bridge_reaches_array_field() {
 
     // Eager destructuring names the FIELD, not the constant; the datatype-sorted
     // term the assertion actually mentions is the constructor application.
-    let x_field = exec.ctx.terms.lookup("x!g").expect("x's field declared");
-    let y_field = exec.ctx.terms.lookup("y!g").expect("y's field declared");
-    let x = unary_application(&exec.ctx.terms, "mk", x_field).expect("x is mk(x!g)");
-    let y = unary_application(&exec.ctx.terms, "mk", y_field).expect("y is mk(y!g)");
+    let bound = |name: &str| {
+        exec.ctx
+            .symbol_info(name)
+            .and_then(|info| info.term)
+            .unwrap_or_else(|| panic!("{name} is bound"))
+    };
+    let (x, y) = (bound("x"), bound("y"));
+    for root in [x, y] {
+        let TermData::App(_, args) = exec.ctx.terms.get(root) else {
+            panic!("the root is bound to `mk` of its field constant");
+        };
+        assert!(
+            matches!(exec.ctx.terms.get(args[0]), TermData::Var(name, _)
+                if exec.ctx.is_dt_field_identity(name)),
+            "the root's argument is its field constant"
+        );
+    }
     assert_eq!(
         exec.ctx.terms.sort(x),
         &Sort::Uninterpreted("U1".to_string()),

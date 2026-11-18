@@ -183,6 +183,20 @@ impl Solver {
     ) -> usize {
         let registered_original_id = self.prepare_clause_db_check(literals, forward_check_derived);
         let idx = self.store_clause_db(literals, learned);
+        // Shadow L0-rebuild epoch (#l0-rebuild-epoch): a new
+        // irredundant clause (BVE/HTR/factorize product, bound clause,
+        // initial load) is a destructive-class mutation. The initial
+        // load bumps before the first rebuild snapshot, which reads
+        // fail-closed until that snapshot exists.
+        if !learned {
+            if forward_check_derived {
+                self.cold.derived_irredundant_adds_since_rebuild = self
+                    .cold
+                    .derived_irredundant_adds_since_rebuild
+                    .saturating_add(1);
+            }
+            self.note_irredundant_mutation();
+        }
         let clause_id = self.assign_clause_db_identity(
             idx,
             learned,

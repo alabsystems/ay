@@ -1021,6 +1021,12 @@ pub struct ArraySolver<'a> {
     /// External equalities injected by the combined solver (e.g., from LIA).
     /// These survive `rebuild_assign_indices()` and are merged into `eq_adj` (#4665).
     external_eqs: Vec<(TermId, TermId)>,
+    /// Ordered-pair mirror of `external_eqs` for O(1) already-recorded
+    /// checks (#s3-bridge-early-out): external facts are cleared on pop
+    /// and re-recorded every check cycle, so the former linear scan in
+    /// `record_external_equality` made each cycle quadratic in the
+    /// number of external equalities.
+    external_eq_keys: HashSet<(TermId, TermId)>,
     /// SAT-visible reasons for reason-carrying external equalities.
     ///
     /// Store-chain walkers may traverse sentinel `external_eqs` edges only when
@@ -1123,6 +1129,23 @@ pub struct ArraySolver<'a> {
     /// state, the method short-circuits to an empty result because no new
     /// equalities can be discovered (#6546).
     prop_eq_snapshot: Option<(u64, usize, usize, usize, usize, usize)>,
+    /// Cross-window memo of `explain_equal_if_provable` answers
+    /// (#s3-eq-explain-memo): `(pair) -> (eq_explain_version, answer)`.
+    /// The window-scoped `eq_paths_cache` dies with each propagate
+    /// window, so check/explain paths re-ran the same BFS per call
+    /// (5.86M uncached queries in 20s on s3). A positive answer is a
+    /// list of SAT-visible reason literals, so it stays valid in any
+    /// later state where every reason is still assigned as recorded —
+    /// rechecked on hit. A negative answer is valid only while the
+    /// asserted-equality graph has not grown since it was computed,
+    /// tracked by `eq_explain_version` (bumped when an equality atom
+    /// is assigned true, an external equality edge is recorded, or
+    /// new terms register; cleared on `reset`). A hit is the identical
+    /// value the uncached query returns in the state that passes the
+    /// recheck, so this is behaviour-neutral; on any doubt it
+    /// recomputes.
+    eq_explain_memo: RefCell<HashMap<(TermId, TermId), (u64, Option<Vec<TheoryLit>>)>>,
+    eq_explain_version: u64,
     /// The snapshot at the last FULL scan, never invalidated: measures what
     /// changed between consecutive scans (`arrays_prop_eq_delta_*`).
     prop_eq_last_scan_snapshot: Option<(u64, usize, usize, usize, usize, usize)>,
@@ -1307,6 +1330,7 @@ impl<'a> ArraySolver<'a> {
             external_diseqs: HashSet::default(),
             external_diseq_reasons: HashMap::default(),
             external_eqs: Vec::new(),
+            external_eq_keys: HashSet::default(),
             external_eq_reasons: HashMap::default(),
             sent_equalities: HashSet::default(),
             sent_propagations: HashSet::default(),
@@ -1338,6 +1362,8 @@ impl<'a> ArraySolver<'a> {
             #[cfg(test)]
             assign_index_rebuilds: 0,
             prop_eq_snapshot: None,
+            eq_explain_memo: RefCell::new(HashMap::default()),
+            eq_explain_version: 0,
             prop_eq_last_scan_snapshot: None,
             final_check_snapshot: None,
             final_check_call_count: 0,

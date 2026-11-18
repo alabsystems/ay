@@ -165,6 +165,9 @@ impl CongruenceClosure {
             }
 
             if is_tautology {
+                if !clauses.is_learned(idx) && !clauses.is_dead(idx) {
+                    self.forward_subsume_irredundant_husks += 1;
+                }
                 clauses.mark_garbage_keep_data(idx);
                 subsumed_count += 1;
                 continue;
@@ -254,6 +257,9 @@ impl CongruenceClosure {
                         }
                     }
                     if all_marked {
+                        if !clauses.is_learned(clause_idx) && !clauses.is_dead(clause_idx) {
+                            self.forward_subsume_irredundant_husks += 1;
+                        }
                         clauses.mark_garbage_keep_data(clause_idx);
                         subsumed_count += 1;
                         found_subsuming = true;
@@ -278,6 +284,14 @@ impl CongruenceClosure {
         }
 
         subsumed_count
+    }
+
+    /// Take the irredundant-husk count accumulated by
+    /// `forward_subsume_with_equivalences` (#l0-rebuild-epoch census).
+    pub(crate) fn take_forward_subsume_irredundant_husks(&mut self) -> u64 {
+        let n = self.forward_subsume_irredundant_husks;
+        self.forward_subsume_irredundant_husks = 0;
+        n
     }
 
     /// Same as `forward_subsume_with_equivalences` but returns the list of

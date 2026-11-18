@@ -113,6 +113,72 @@ impl CrossTheoryEqualityReplay {
     }
 }
 
+/// Endpoint index over a replay vec, grouped by reason head
+/// (#allinterval-replay-head-index): endpoint -> sorted
+/// `(reason head, slots)` groups. An edge can only be eligible for a
+/// covered-by candidate when its whole reason is a subset of the
+/// candidate reason, which in particular requires its head (the
+/// smallest reason literal; reasons are sorted by `new`) to occur in
+/// the candidate reason. Grouping by head lets the covered-by DFS
+/// visit only the groups whose head the candidate carries instead of
+/// subset-testing every incident edge — the top stack frame on
+/// QF_ALIA AllInterval-011 (814 top-of-stack samples, 2026-11-18
+/// profile). Groups stay sorted by `(term, value)` so both insert
+/// and lookup binary-search; slots inside a group keep append order.
+pub(super) type CrossReplayEndpointIndex =
+    ay_core::kani_compat::DetHashMap<TermId, Vec<(TheoryLit, Vec<usize>)>>;
+
+/// Group key for empty-reason replays. Empty reasons are a subset of
+/// every candidate reason, so the covered-by DFS always scans this
+/// group; a genuine reason headed by this literal simply shares the
+/// always-scanned group and is still filtered by the subset test.
+/// (Insert paths reject empty-reason candidates, so in practice the
+/// group only ever holds genuine sentinel-headed edges, if any.)
+const CROSS_REPLAY_EMPTY_REASON_HEAD: TheoryLit = TheoryLit {
+    term: TermId(u32::MAX),
+    value: false,
+};
+
+fn cross_replay_reason_head(replay: &CrossTheoryEqualityReplay) -> TheoryLit {
+    replay
+        .reason
+        .first()
+        .copied()
+        .unwrap_or(CROSS_REPLAY_EMPTY_REASON_HEAD)
+}
+
+/// Append `idx` under `endpoint` in the group for `replay`'s reason
+/// head, keeping groups sorted by head.
+fn cross_replay_index_push(
+    index: &mut CrossReplayEndpointIndex,
+    endpoint: TermId,
+    replay: &CrossTheoryEqualityReplay,
+    idx: usize,
+) {
+    let head = cross_replay_reason_head(replay);
+    let groups = index.entry(endpoint).or_default();
+    let pos = groups.partition_point(|(h, _)| (h.term.0, h.value) < (head.term.0, head.value));
+    if pos < groups.len() && groups[pos].0 == head {
+        groups[pos].1.push(idx);
+    } else {
+        groups.insert(pos, (head, vec![idx]));
+    }
+}
+
+/// Slots grouped under `head` at `endpoint`, if any.
+fn cross_replay_index_group<'a>(
+    index: &'a CrossReplayEndpointIndex,
+    endpoint: TermId,
+    head: TheoryLit,
+) -> Option<&'a [usize]> {
+    let groups = index.get(&endpoint)?;
+    let pos = groups.partition_point(|(h, _)| (h.term.0, h.value) < (head.term.0, head.value));
+    groups
+        .get(pos)
+        .filter(|(h, _)| *h == head)
+        .map(|(_, slots)| slots.as_slice())
+}
+
 /// Reusable, epoch-stamped DFS scratch for
 /// `cross_theory_equality_replay_covered_by_indexed`
 /// (#qfuflia-replay-cover-scratch). Transplants the exact pattern the
@@ -403,10 +469,12 @@ pub struct TheoryCombiner<'a> {
     /// instances from rediscovering the same propagation wave from scratch.
     pub(super) cross_theory_equality_replays: Vec<CrossTheoryEqualityReplay>,
     /// Persistent endpoint index over `cross_theory_equality_replays`
-    /// (#qfuflia-replay-index v3): term -> replay slots. Maintained
-    /// incrementally by `record_cross_theory_equalities`; any other mutation
+    /// (#qfuflia-replay-index v3, head-grouped by
+    /// #allinterval-replay-head-index): term -> reason-head groups of
+    /// replay slots. Maintained incrementally by
+    /// `record_cross_theory_equalities`; any other mutation
     /// of the replay vec must clear `cross_replay_index_valid`.
-    pub(super) cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>>,
+    pub(super) cross_replay_endpoint_index: CrossReplayEndpointIndex,
     /// Whether `cross_replay_endpoint_index` matches
     /// `cross_theory_equality_replays`.
     pub(super) cross_replay_index_valid: bool,
@@ -1448,7 +1516,7 @@ impl TheoryCombiner<'_> {
     /// order exactly like `Vec::retain`).
     fn insert_cross_theory_equality_replay_minimal_indexed(
         replays: &mut Vec<CrossTheoryEqualityReplay>,
-        by_endpoint: &mut ay_core::kani_compat::DetHashMap<TermId, Vec<usize>>,
+        by_endpoint: &mut CrossReplayEndpointIndex,
         removed: &mut Vec<bool>,
         cover_scratch: &mut CrossReplayCoverScratch,
         candidate: CrossTheoryEqualityReplay,
@@ -1467,23 +1535,31 @@ impl TheoryCombiner<'_> {
 
         // Tombstone same-pair replays whose reason is a superset of the
         // candidate's (the candidate strictly dominates them). Any same-pair
-        // replay is incident to `candidate.lhs`, so the lhs bucket finds all.
-        if let Some(indices) = by_endpoint.get(&candidate.lhs) {
-            for &idx in indices {
-                if removed[idx] {
-                    continue;
-                }
-                let existing = &replays[idx];
-                if existing.same_pair(&candidate)
-                    && Self::cross_theory_replay_reason_subset(&candidate.reason, &existing.reason)
-                {
-                    removed[idx] = true;
+        // replay is incident to `candidate.lhs`, so the lhs groups find all
+        // (a dominated edge's head need not occur in the candidate reason,
+        // so every group at the endpoint is scanned; marking is
+        // order-independent).
+        if let Some(groups) = by_endpoint.get(&candidate.lhs) {
+            for (_, indices) in groups {
+                for &idx in indices {
+                    if removed[idx] {
+                        continue;
+                    }
+                    let existing = &replays[idx];
+                    if existing.same_pair(&candidate)
+                        && Self::cross_theory_replay_reason_subset(
+                            &candidate.reason,
+                            &existing.reason,
+                        )
+                    {
+                        removed[idx] = true;
+                    }
                 }
             }
         }
         let new_idx = replays.len();
-        by_endpoint.entry(candidate.lhs).or_default().push(new_idx);
-        by_endpoint.entry(candidate.rhs).or_default().push(new_idx);
+        cross_replay_index_push(by_endpoint, candidate.lhs, &candidate, new_idx);
+        cross_replay_index_push(by_endpoint, candidate.rhs, &candidate, new_idx);
         replays.push(candidate);
         removed.push(false);
         true
@@ -1511,8 +1587,7 @@ impl TheoryCombiner<'_> {
         // candidate inside the non-indexed `insert_minimal` (that rebuild was
         // Θ(re-entries × persistent²) on QF_ALIA pointer-safe-N, ~82% of
         // on-CPU samples — 2026-07-12 profile).
-        let mut by_endpoint: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>> =
-            Default::default();
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
         let mut removed: Vec<bool> = Vec::new();
         let mut cover_scratch = CrossReplayCoverScratch::default();
         for replay in retained {
@@ -2040,14 +2115,18 @@ impl TheoryCombiner<'_> {
         if !self.cross_replay_index_valid {
             self.cross_replay_endpoint_index.clear();
             for (idx, replay) in self.cross_theory_equality_replays.iter().enumerate() {
-                self.cross_replay_endpoint_index
-                    .entry(replay.lhs)
-                    .or_default()
-                    .push(idx);
-                self.cross_replay_endpoint_index
-                    .entry(replay.rhs)
-                    .or_default()
-                    .push(idx);
+                cross_replay_index_push(
+                    &mut self.cross_replay_endpoint_index,
+                    replay.lhs,
+                    replay,
+                    idx,
+                );
+                cross_replay_index_push(
+                    &mut self.cross_replay_endpoint_index,
+                    replay.rhs,
+                    replay,
+                    idx,
+                );
             }
             self.cross_replay_index_valid = true;
         }
@@ -2105,32 +2184,40 @@ impl TheoryCombiner<'_> {
                 }
                 // Tombstone same-pair replays whose reason is a superset of
                 // the candidate's (the candidate strictly dominates them).
-                if let Some(indices) = self.cross_replay_endpoint_index.get(&replay.lhs) {
-                    for &idx in indices {
-                        if removed[idx] {
-                            continue;
-                        }
-                        let existing = &self.cross_theory_equality_replays[idx];
-                        if existing.same_pair(&replay)
-                            && Self::cross_theory_replay_reason_subset(
-                                &replay.reason,
-                                &existing.reason,
-                            )
-                        {
-                            removed[idx] = true;
-                            mutated = true;
+                // Every head group at `replay.lhs` is scanned: a dominated
+                // edge's head need not occur in the candidate reason.
+                if let Some(groups) = self.cross_replay_endpoint_index.get(&replay.lhs) {
+                    for (_, indices) in groups {
+                        for &idx in indices {
+                            if removed[idx] {
+                                continue;
+                            }
+                            let existing = &self.cross_theory_equality_replays[idx];
+                            if existing.same_pair(&replay)
+                                && Self::cross_theory_replay_reason_subset(
+                                    &replay.reason,
+                                    &existing.reason,
+                                )
+                            {
+                                removed[idx] = true;
+                                mutated = true;
+                            }
                         }
                     }
                 }
                 let new_idx = self.cross_theory_equality_replays.len();
-                self.cross_replay_endpoint_index
-                    .entry(replay.lhs)
-                    .or_default()
-                    .push(new_idx);
-                self.cross_replay_endpoint_index
-                    .entry(replay.rhs)
-                    .or_default()
-                    .push(new_idx);
+                cross_replay_index_push(
+                    &mut self.cross_replay_endpoint_index,
+                    replay.lhs,
+                    &replay,
+                    new_idx,
+                );
+                cross_replay_index_push(
+                    &mut self.cross_replay_endpoint_index,
+                    replay.rhs,
+                    &replay,
+                    new_idx,
+                );
                 self.cross_theory_equality_replays.push(replay);
                 removed.push(false);
             }
@@ -2148,10 +2235,13 @@ impl TheoryCombiner<'_> {
     /// `cross_theory_equality_replay_covered_by` over a prebuilt endpoint
     /// index with tombstones (#qfuflia-replay-index v3). Reason-subset
     /// eligibility is tested lazily, only for edges incident to BFS-visited
-    /// terms.
+    /// terms — and, since #allinterval-replay-head-index, only for edges in
+    /// head groups the candidate reason carries (plus the always-eligible
+    /// empty-reason group): an eligible edge's reason is a subset of the
+    /// candidate reason, so its head occurs in the candidate reason.
     fn cross_theory_equality_replay_covered_by_indexed(
         replays: &[CrossTheoryEqualityReplay],
-        by_endpoint: &ay_core::kani_compat::DetHashMap<TermId, Vec<usize>>,
+        by_endpoint: &CrossReplayEndpointIndex,
         removed: &[bool],
         scratch: &mut CrossReplayCoverScratch,
         candidate: &CrossTheoryEqualityReplay,
@@ -2227,7 +2317,16 @@ impl TheoryCombiner<'_> {
             if term == candidate.rhs {
                 checked_return!(true);
             }
-            if let Some(indices) = by_endpoint.get(&term) {
+            // Scan only the head groups this candidate can use: the
+            // empty-reason group (subset of every reason) plus one group
+            // per candidate reason literal. Edges in any other group have
+            // a head outside the candidate reason and fail the subset
+            // test, so skipping them changes no answer (the debug
+            // reference oracle above cross-checks exactly this).
+            let mut scan_group = |indices: &[usize],
+                                  eligible_epoch: &mut Vec<u32>,
+                                  eligible_value: &mut Vec<bool>,
+                                  stack: &mut Vec<TermId>| {
                 for &idx in indices {
                     if removed[idx] {
                         continue;
@@ -2252,6 +2351,19 @@ impl TheoryCombiner<'_> {
                     } else {
                         replay.lhs
                     });
+                }
+            };
+            if let Some(indices) =
+                cross_replay_index_group(by_endpoint, term, CROSS_REPLAY_EMPTY_REASON_HEAD)
+            {
+                scan_group(indices, eligible_epoch, eligible_value, stack);
+            }
+            for &lit in &candidate.reason {
+                if lit == CROSS_REPLAY_EMPTY_REASON_HEAD {
+                    continue;
+                }
+                if let Some(indices) = cross_replay_index_group(by_endpoint, term, lit) {
+                    scan_group(indices, eligible_epoch, eligible_value, stack);
                 }
             }
         }
@@ -2314,11 +2426,10 @@ impl TheoryCombiner<'_> {
         // each rebuilt an O(|replays|) endpoint map — the outer `covered_by`
         // was fully redundant with the identical check inside
         // `insert_minimal`, so dropping it changes nothing.
-        let mut by_endpoint: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>> =
-            Default::default();
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
         for (idx, replay) in replays.iter().enumerate() {
-            by_endpoint.entry(replay.lhs).or_default().push(idx);
-            by_endpoint.entry(replay.rhs).or_default().push(idx);
+            cross_replay_index_push(&mut by_endpoint, replay.lhs, replay, idx);
+            cross_replay_index_push(&mut by_endpoint, replay.rhs, replay, idx);
         }
         let mut removed: Vec<bool> = vec![false; replays.len()];
         let mut cover_scratch = CrossReplayCoverScratch::default();
@@ -2480,11 +2591,10 @@ impl TheoryCombiner<'_> {
         // ~82% of --no-proof on-CPU samples (2026-07-12 reprofile). Same
         // covered/not-covered answers; tombstoned removal compacted once at
         // the end preserves `Vec::retain` order exactly.
-        let mut by_endpoint: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>> =
-            Default::default();
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
         for (idx, replay) in self.cross_theory_equality_replays.iter().enumerate() {
-            by_endpoint.entry(replay.lhs).or_default().push(idx);
-            by_endpoint.entry(replay.rhs).or_default().push(idx);
+            cross_replay_index_push(&mut by_endpoint, replay.lhs, replay, idx);
+            cross_replay_index_push(&mut by_endpoint, replay.rhs, replay, idx);
         }
         let mut removed: Vec<bool> = vec![false; self.cross_theory_equality_replays.len()];
         let mut cover_scratch = CrossReplayCoverScratch::default();
@@ -3506,11 +3616,10 @@ mod cover_scratch_tests {
         // Chain 10 - 5000 - 20 with reason {r}; candidate 10 ~ 20 is
         // covered, candidate 10 ~ 30 is not.
         let replays = vec![replay(10, 5000, 900), replay(5000, 20, 900)];
-        let mut by_endpoint: ay_core::kani_compat::DetHashMap<TermId, Vec<usize>> =
-            Default::default();
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
         for (idx, r) in replays.iter().enumerate() {
-            by_endpoint.entry(r.lhs).or_default().push(idx);
-            by_endpoint.entry(r.rhs).or_default().push(idx);
+            cross_replay_index_push(&mut by_endpoint, r.lhs, r, idx);
+            cross_replay_index_push(&mut by_endpoint, r.rhs, r, idx);
         }
         let removed = vec![false; replays.len()];
         let mut scratch = CrossReplayCoverScratch::default();
@@ -3549,5 +3658,65 @@ mod cover_scratch_tests {
                 &covered,
             )
         );
+    }
+
+    /// Head-grouped index (#allinterval-replay-head-index): the DFS may
+    /// only traverse groups whose head occurs in the candidate reason
+    /// (plus the empty-reason group). Multi-literal reasons with mixed
+    /// heads must give the same covered/not-covered answers as the
+    /// naive scan — the debug reference oracle inside
+    /// `covered_by_indexed` independently re-derives each answer here
+    /// (replay count <= 32), so a grouping bug fails this test even
+    /// where the explicit expectation would coincidentally hold.
+    #[test]
+    fn covered_by_head_groups_match_naive_answers() {
+        let lit = |t: u32| TheoryLit::new(TermId(t), true);
+        let replay = |a: u32, b: u32, r: &[u32]| {
+            CrossTheoryEqualityReplay::new(
+                TermId(a),
+                TermId(b),
+                r.iter().map(|&t| lit(t)).collect(),
+            )
+        };
+        // Path 1-2-3-4 with reasons {900}, {901,902}, {900}; decoy path
+        // 1-5-4 with reason {999}; unconditional edge 4-6 (empty reason).
+        let replays = vec![
+            replay(1, 2, &[900]),
+            replay(2, 3, &[901, 902]),
+            replay(3, 4, &[900]),
+            replay(1, 5, &[999]),
+            replay(5, 4, &[999]),
+            replay(4, 6, &[]),
+        ];
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
+        for (idx, r) in replays.iter().enumerate() {
+            cross_replay_index_push(&mut by_endpoint, r.lhs, r, idx);
+            cross_replay_index_push(&mut by_endpoint, r.rhs, r, idx);
+        }
+        let removed = vec![false; replays.len()];
+        let mut scratch = CrossReplayCoverScratch::default();
+        let covered = |a: u32, b: u32, r: &[u32], scratch: &mut CrossReplayCoverScratch| {
+            TheoryCombiner::cross_theory_equality_replay_covered_by_indexed(
+                &replays,
+                &by_endpoint,
+                &removed,
+                scratch,
+                &replay(a, b, r),
+            )
+        };
+        // Full reason covers via 1-2-3-4 (heads 900, 901, 900 all carried).
+        assert!(covered(1, 4, &[900, 901, 902], &mut scratch));
+        // Dropping 902 breaks the {901,902} edge; decoy head 999 absent.
+        assert!(!covered(1, 4, &[900, 901], &mut scratch));
+        // Decoy path alone covers under {999}.
+        assert!(covered(1, 4, &[999], &mut scratch));
+        // 1~3 under {901,902} only: edge 1-2's head 900 is not carried.
+        assert!(!covered(1, 3, &[901, 902], &mut scratch));
+        // Empty-reason edge 4-6 is eligible under every candidate reason,
+        // including the empty one, but reaches nothing beyond 4.
+        assert!(covered(4, 6, &[555], &mut scratch));
+        assert!(covered(4, 6, &[], &mut scratch));
+        assert!(!covered(1, 6, &[], &mut scratch));
+        assert!(covered(1, 6, &[999], &mut scratch));
     }
 }

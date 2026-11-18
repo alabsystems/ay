@@ -31,9 +31,15 @@ fn ascribed_nullary_constructor(sexp: &SExpr) -> Option<&str> {
 
 /// Whether `ascribed` reads as `bare`: their
 /// `ay_core::bare_constructor_spelling` texts are equal, their lines give
-/// equal `ay_core::model_constant_definition` readings, and either the
-/// frontend parses neither text or it parses both and
-/// [`same_parsed_reading`] holds.
+/// equal `ay_core::model_constant_definition` readings, and
+/// `ay_frontend::sexp::parse_sexps` parses both texts with
+/// [`same_parsed_reading`] holding.
+///
+/// A text the frontend does not parse keeps no ascription: the text-only
+/// readings alone do not settle it. `bare_constructor_spelling` replaces an
+/// ascription inside a list headed `as`, where [`same_parsed_reading`]
+/// requires the two forms to be the same, and it reads a run such as `p|q`
+/// as one atom where the frontend opens a quoted symbol.
 pub(crate) fn reads_as_bare(bare: &str, ascribed: &str) -> bool {
     if ay_core::bare_constructor_spelling(ascribed) != ay_core::bare_constructor_spelling(bare) {
         return false;
@@ -45,25 +51,13 @@ pub(crate) fn reads_as_bare(bare: &str, ascribed: &str) -> bool {
     {
         return false;
     }
-    match (
+    let (Ok(bare), Ok(ascribed)) = (
         ay_frontend::sexp::parse_sexps(bare),
         ay_frontend::sexp::parse_sexps(ascribed),
-    ) {
-        (Ok(bare), Ok(ascribed)) => same_parsed_reading(&bare, &ascribed),
-        (Err(_), Err(_)) => true,
-        _ => false,
-    }
-}
-
-/// Whether `name`, written unquoted, is one term to `ay_core::smtlib_term_len`
-/// and parses (`ay_frontend::sexp::parse_sexps`) to the one symbol `name`.
-/// Names such as `x(y`, `a b`, `true` and `5` fail.
-pub(crate) fn reads_as_one_symbol(name: &str) -> bool {
-    ay_core::smtlib_term_len(name) == Some(name.len())
-        && matches!(
-            ay_frontend::sexp::parse_sexps(name).as_deref(),
-            Ok([SExpr::Symbol(symbol)]) if symbol.as_str() == name
-        )
+    ) else {
+        return false;
+    };
+    same_parsed_reading(&bare, &ascribed)
 }
 
 /// Where a term of the parsed form sits, for [`same_parsed_reading`].
@@ -141,12 +135,14 @@ pub struct AscriptionCase {
     pub label: String,
     /// Declarations and assertions; satisfiable.
     pub script: String,
-    /// The ascriptions this case's model may print, each with the name
+    /// The ascriptions this case's model may print, each with the token
     /// `AscriptionCase::bare` puts in its place.
     pub ascriptions: Vec<(String, String)>,
     /// Text `AscriptionCase::solve` requires in the printed model: the
     /// constructor, ascribed, in place.
     pub expected: Vec<String>,
+    /// The constructor's name, unquoted.
+    name: String,
 }
 
 impl AscriptionCase {
@@ -236,16 +232,15 @@ impl AscriptionCase {
                 label: format!("constructor {constructor} of {sort}, {position}"),
                 script: format!("{declarations}{body}"),
                 expected,
-                ascriptions: vec![
-                    (here.clone(), constructor.to_string()),
-                    (other.clone(), constructor.to_string()),
-                ],
+                ascriptions: vec![(here.clone(), c.clone()), (other.clone(), c.clone())],
+                name: constructor.to_string(),
             })
             .collect()
     }
 
     /// `printed` with each ascription of this case replaced by the
-    /// constructor's name, unquoted (`pop`).
+    /// constructor's `ay_core::quote_symbol` token (`|pop|`), the text a
+    /// value of it prints bare.
     pub fn bare(&self, printed: &str) -> String {
         self.ascriptions
             .iter()
@@ -254,9 +249,9 @@ impl AscriptionCase {
             })
     }
 
-    /// The name of the constructor this case ascribes.
+    /// The name of the constructor this case ascribes, unquoted.
     pub fn constructor(&self) -> &str {
-        &self.ascriptions[0].1
+        &self.name
     }
 
     /// Solve the script: the solver, holding the declarations, and the model
@@ -325,20 +320,14 @@ pub fn constructor_ascription_matrix() -> Vec<AscriptionCase> {
     cases
 }
 
-/// Constructor names that print ascribed at `top` in the [`OverloadPair`]
-/// scripts (counted by
+/// The constructor names of the [`OverloadPair`] scripts, unquoted: plain
+/// names, reserved words, and names that print quoted, such as `true` and
+/// `my nil`. Each prints ascribed at `top` (checked by
 /// `every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded`).
 #[doc(hidden)]
-pub const OVERLOAD_ASCRIBED_CONSTRUCTORS: [&str; 6] =
-    ["nil", "pop", "let", "const", "leaf", "exit"];
-
-/// Constructor names that do not print ascribed at `top` in the
-/// [`OverloadPair`] scripts although a second datatype shares them (checked
-/// by the same test), for example `true` and `my nil`.
-#[doc(hidden)]
-pub const OVERLOAD_BARE_CONSTRUCTORS: [&str; 15] = [
-    "true", "false", ":k", "a#b", "a;b", "a,b", "a'b", "a{b", "a[b", "a`b", "a|b", "|x", "y|",
-    "my nil", "x(y",
+pub const OVERLOAD_ASCRIBED_CONSTRUCTORS: [&str; 21] = [
+    "nil", "pop", "let", "const", "leaf", "exit", "true", "false", ":k", "a#b", "a;b", "a,b",
+    "a'b", "a{b", "a[b", "a`b", "a|b", "|x", "y|", "my nil", "x(y",
 ];
 
 /// The pairs [`overload_pairs`] makes for each constructor name: under two
@@ -497,26 +486,17 @@ impl OverloadPair {
             .map_err(|error| format!("{}: {error}", self.label))?;
         Ok((solver, model))
     }
-
-    /// Whether this pair's constructor is in
-    /// [`OVERLOAD_ASCRIBED_CONSTRUCTORS`].
-    pub fn ascribed(&self) -> bool {
-        OVERLOAD_ASCRIBED_CONSTRUCTORS.contains(&self.constructor.as_str())
-    }
 }
 
-/// Every name of [`OVERLOAD_ASCRIBED_CONSTRUCTORS`] and
-/// [`OVERLOAD_BARE_CONSTRUCTORS`], as the constructor of a list sort named
-/// plainly and with a space, in five variants: one per [`AsSecond`], beside
-/// the `Odd` names `|u` and `v|` or `p|q` and `c"d`, and function tables.
+/// Every name of [`OVERLOAD_ASCRIBED_CONSTRUCTORS`], as the constructor of a
+/// list sort named plainly and with a space, in five variants: one per
+/// [`AsSecond`], beside the `Odd` names `|u` and `v|` or `p|q` and `c"d`, and
+/// function tables.
 #[doc(hidden)]
 pub fn overload_pairs() -> Vec<OverloadPair> {
     debug_assert_eq!(OVERLOAD_PAIR_VARIANTS, 2 * (AsSecond::ALL.len() + 1));
     let mut pairs = Vec::new();
-    for constructor in OVERLOAD_ASCRIBED_CONSTRUCTORS
-        .into_iter()
-        .chain(OVERLOAD_BARE_CONSTRUCTORS)
-    {
+    for constructor in OVERLOAD_ASCRIBED_CONSTRUCTORS {
         for sort in ["L1", "|My List|"] {
             for as_second in AsSecond::ALL {
                 pairs.push(OverloadPair {
@@ -547,7 +527,7 @@ pub fn overload_pairs() -> Vec<OverloadPair> {
 }
 
 /// A script whose model holds the application of a constructor named `as`
-/// that prints as `(as Unit Unit)`, with nothing overloaded: `Unit` is a
+/// that prints as `(|as| Unit Unit)`, with nothing overloaded: `Unit` is a
 /// datatype and its only constructor.
 #[doc(hidden)]
 pub const AS_APPLICATION_UNIT: &str = "\
@@ -561,8 +541,8 @@ pub const AS_APPLICATION_UNIT: &str = "\
 (assert (= (f 1) p))
 ";
 
-/// The same, printing `(as nil L1)`: `L1` is the list datatype that declares
-/// `nil` and an enumerator of the second field's sort.
+/// The same, printing `(|as| nil L1)`: `L1` is the list datatype that
+/// declares `nil` and an enumerator of the second field's sort.
 #[doc(hidden)]
 pub const AS_APPLICATION_OWN_SORT: &str = "\
 (declare-datatypes ((L1 0)) (((nil) (cons (hd Int) (tl L1)))))
@@ -577,7 +557,7 @@ pub const AS_APPLICATION_OWN_SORT: &str = "\
 ";
 
 /// A script twice, as an [`OverloadPair`] holds one: the application of a
-/// constructor named `as` prints `(as nil Other)` in both, and `Other` is a
+/// constructor named `as` prints `(|as| nil Other)` in both, and `Other` is a
 /// datatype that declares `nil` in the first and `unshared` in the second.
 /// The function `f` returns that application.
 #[doc(hidden)]
@@ -689,8 +669,11 @@ mod tests {
                 "(model\n  (define-fun t () |My List| nil)\n)",
                 "(model\n  (define-fun t () |My List| (as nil |My List|))\n)",
             ),
-            // Neither text parses, and the text-only readings agree.
-            ("(rec p|q nil c\"d)", "(rec p|q (as nil L1) c\"d)"),
+            // Quoted tokens, as `Executor::dt_value_head` prints names that
+            // need quoting.
+            ("|true|", "(as |true| L1)"),
+            ("(w |a#b| ||)", "(w (as |a#b| L1) (as || L1))"),
+            (r"(rec |y\|| nil)", r"(rec |y\|| (as nil L1))"),
         ] {
             assert!(reads_as_bare(bare, ascribed), "{ascribed}");
         }
@@ -726,7 +709,42 @@ mod tests {
                 "(m (d y| L1 nil) (d t |My List| nil) (d z| L1 nil))",
                 "(m (d y| L1 nil) (d t |My List| (as nil |My List|)) (d z| L1 nil))",
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(UNPARSED_PAIRS)
+        {
+            assert!(!reads_as_bare(bare, ascribed), "{ascribed}");
+        }
+    }
+
+    /// Pairs of a bare text and an ascribed one, for example with the
+    /// unclosed bar of `p|q` or the token `a#b`, that
+    /// `a_text_the_frontend_does_not_parse_keeps_no_ascription` checks.
+    const UNPARSED_PAIRS: [(&str, &str); 3] = [
+        ("(rec p|q nil c\"d)", "(rec p|q (as nil L1) c\"d)"),
+        ("(as a#b nil)", "(as a#b (as nil L1))"),
+        (
+            "((a y|) (t nil) (b z|) (c a#b))",
+            "((a y|) (t (as nil |My List|)) (b z|) (c a#b))",
+        ),
+    ];
+
+    /// For each pair of `UNPARSED_PAIRS`, the `bare_constructor_spelling`
+    /// texts are equal and `parse_sexps` refuses both texts, and
+    /// `reads_as_bare` rejects the pair.
+    #[test]
+    fn a_text_the_frontend_does_not_parse_keeps_no_ascription() {
+        for (bare, ascribed) in UNPARSED_PAIRS {
+            assert_eq!(
+                ay_core::bare_constructor_spelling(bare),
+                ay_core::bare_constructor_spelling(ascribed),
+                "{ascribed}"
+            );
+            assert!(ay_frontend::sexp::parse_sexps(bare).is_err(), "{bare}");
+            assert!(
+                ay_frontend::sexp::parse_sexps(ascribed).is_err(),
+                "{ascribed}"
+            );
             assert!(!reads_as_bare(bare, ascribed), "{ascribed}");
         }
     }

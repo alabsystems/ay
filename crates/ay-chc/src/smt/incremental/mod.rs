@@ -369,12 +369,7 @@ impl IncrementalQueryContext {
 /// model uses the namespaced versions. This function enables reverse mapping.
 pub(crate) fn strip_namespace_suffix(name: &str) -> Option<&str> {
     // Only process internal auxiliary variable names (ITE/mod/div elimination).
-    let is_aux = name.starts_with("_ite_")
-        || name.starts_with("_mod_q_")
-        || name.starts_with("_mod_r_")
-        || name.starts_with("_div_q_")
-        || name.starts_with("_div_r_");
-    if !is_aux {
+    if !crate::expr::is_elimination_aux_var_name(name) {
         return None;
     }
     // Namespace suffixes follow the pattern `__<prefix><digits>`.

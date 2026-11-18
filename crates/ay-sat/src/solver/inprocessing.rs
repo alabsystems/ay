@@ -441,6 +441,9 @@ impl Solver {
         let mut delete_refused = false;
         let mut first_pass = true;
 
+        // Shadow L0-rebuild epoch (#l0-rebuild-epoch): mutations in
+        // this sweep are L0 GC's own; cleared on every exit below.
+        self.l0_gc_sweep_active = true;
         loop {
             // Bulk deletion window for this pass (see `defer_binary_unlink`);
             // closed before propagation and on every exit.
@@ -719,6 +722,7 @@ impl Solver {
                     // All literals false at level 0 → clause unsatisfied → UNSAT.
                     if new_lits.is_empty() {
                         self.end_deferred_binary_unlink();
+                        self.l0_gc_sweep_active = false;
                         return true;
                     }
                     // Per-clause BVE occ notification (#8364): snapshot old literals
@@ -748,6 +752,7 @@ impl Solver {
                     match result {
                         ReplaceResult::Empty => {
                             self.end_deferred_binary_unlink();
+                            self.l0_gc_sweep_active = false;
                             return true;
                         }
                         ReplaceResult::Unit | ReplaceResult::Replaced => {
@@ -770,6 +775,7 @@ impl Solver {
 
             self.end_deferred_binary_unlink();
             if self.propagate_check_unsat() {
+                self.l0_gc_sweep_active = false;
                 return true;
             }
 
@@ -788,6 +794,7 @@ impl Solver {
         // Close a bulk-deletion window left open by a `break` (the pass flushes
         // before propagating otherwise).
         self.end_deferred_binary_unlink();
+        self.l0_gc_sweep_active = false;
         // Flush deferred stale reason cleanup (#8140).
         self.defer_stale_reason_cleanup = false;
         self.clear_stale_reasons();

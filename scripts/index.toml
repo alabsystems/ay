@@ -1023,6 +1023,14 @@ entrypoint = "convention"
 cli_note = "declared in ay.msc"
 
 [[script]]
+name    = "ay-xcsp3"
+path    = "competition/xcsp3/ay-xcsp3"
+lang    = "sh"
+group   = "competition.xcsp3"
+summary = "XCSP3 competition entry for AY: CPMpy's XCSP3 reader in front of AY as a FlatZinc solver behind MiniZinc; prints the s and v lines the competition reads."
+publish = "public"
+
+[[script]]
 name    = "mzn-gen-community"
 path    = "benchmarks/minizinc/gen_community.py"
 lang    = "python"

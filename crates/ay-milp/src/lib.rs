@@ -225,6 +225,7 @@ pub use network_design_route::{
 mod ns;
 mod open_domain;
 mod open_domain_route;
+pub mod phase_hull;
 /// Source-model replay for artifacts from the four open-domain residual lanes.
 /// These entry points rebuild the exact monotone projection; callers must pass
 /// their original model rather than an artifact's embedded residual.

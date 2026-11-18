@@ -226,15 +226,15 @@ impl IndependentModelView<'_> {
                 if !super::super::recovery_admission::pay_current(
                     constructor
                         .len()
-                        .saturating_add(self.exec.dt_surface(constructor).len()),
+                        .saturating_add(self.exec.dt_value_head(constructor).len()),
                     constructor
                         .len()
-                        .saturating_add(self.exec.dt_surface(constructor).len()),
+                        .saturating_add(self.exec.dt_value_head(constructor).len()),
                 ) {
                     return values;
                 }
                 constructor_tokens.insert(constructor.clone());
-                constructor_tokens.insert(self.exec.dt_surface(constructor).to_string());
+                constructor_tokens.insert(self.exec.dt_value_head(constructor).into_owned());
             }
         }
         // Keep the compatibility import transactional. Authenticated W6 rows

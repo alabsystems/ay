@@ -7,8 +7,8 @@ use ay_core::Sort;
 
 use super::super::support::is_pure_fp_assertion;
 use super::super::to_real::{
-    build_fp_target_unit_clauses, extract_fp_to_real_targets, rational_to_f64,
-    rewrite_fp_to_real_with_vars, FpToRealSite,
+    build_fp_target_unit_clauses, extract_fp_to_real_targets, fp_to_real_target_name,
+    rational_to_f64, rewrite_fp_to_real_with_vars, FpToRealSite,
 };
 use super::*;
 
@@ -57,11 +57,9 @@ impl Executor {
         let mut fp_arg_to_real_var = HashMap::default();
         for (i, site) in sites.iter().enumerate() {
             self.fp_real_checkpoint(stop, observe, FpRealPhase::Rewrite)?;
-            fp_arg_to_real_var.entry(site.arg).or_insert_with(|| {
-                self.ctx
-                    .terms
-                    .mk_var(format!("__fp_target_{i}"), Sort::Real)
-            });
+            fp_arg_to_real_var
+                .entry(site.arg)
+                .or_insert_with(|| self.ctx.terms.mk_var(fp_to_real_target_name(i), Sort::Real));
             self.fp_real_checkpoint(stop, observe, FpRealPhase::Rewrite)?;
         }
 

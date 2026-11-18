@@ -179,6 +179,7 @@ impl Solver {
             watches_disconnected: false,
             defer_stale_reason_cleanup: false,
             defer_binary_unlink: false,
+            l0_gc_sweep_active: false,
             defer_proof_deletions: false,
             deferred_proof_deletions: Vec::new(),
             earliest_affected_trail_pos: None,

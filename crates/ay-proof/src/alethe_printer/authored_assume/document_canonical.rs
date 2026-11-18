@@ -8,9 +8,9 @@
 //! The planner's first schemas compare the authored text with
 //! `render_term_canonical`, the override-free rendering. That is the text the
 //! rest of the document prints only when no DESCENDANT of the assumed term
-//! carries its own override. Datatype flattening breaks it: `(len v)` is the
-//! internal variable `v!len`, printed back as `(len v)` by its own override,
-//! so the override-free text of `(not (= fill (select v!data k)))` names a
+//! carries its own override. Datatype flattening breaks it: `(len v)` is an
+//! internal field variable, printed back as `(len v)` by its own override,
+//! so the override-free text of `(not (= fill (select <data field> k)))` names a
 //! symbol the problem never declares and no bridge onto it can ever match the
 //! authored `(distinct (select (data v) k) fill)`.
 //!

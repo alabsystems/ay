@@ -205,11 +205,18 @@ fn tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
+    // Whether the previous character, inside a `|quoted|` symbol, is the `\`
+    // of a `\|` or `\\` escape.
+    let mut escaped = false;
     for c in text.chars() {
         match (quote, c) {
             (Some(q), c) => {
                 word.push(c);
-                if c == q {
+                if escaped {
+                    escaped = false;
+                } else if q == '|' && c == '\\' {
+                    escaped = true;
+                } else if c == q {
                     quote = None;
                 }
             }

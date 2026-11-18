@@ -648,6 +648,7 @@ pub(crate) struct SolverProgramCompilerService {
     config: SolverProgramCompilerConfig,
     next_request_id: u64,
     thread_handle: Option<thread::JoinHandle<()>>,
+    retired_workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl SolverProgramCompilerService {
@@ -796,22 +797,41 @@ impl SolverProgramCompilerService {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// Shut down the background compiler and wait for the worker to exit.
+    /// Shut down the background compiler and wait for all its workers to exit.
     pub(crate) fn shutdown(&mut self) {
-        self.cancellation.cancel_all();
-        let _ = self.tx.send(SolverProgramCompilerMessage::Shutdown);
-        if let Some(handle) = self.thread_handle.take() {
+        self.request_shutdown();
+        for handle in self
+            .thread_handle
+            .take()
+            .into_iter()
+            .chain(self.retired_workers.drain(..))
+        {
             let _ = handle.join();
         }
     }
 
     /// Drop queued/completed work, restore the compile budget, and start a fresh worker.
     pub(crate) fn reset(&mut self) {
-        let config = self.config;
+        self.request_shutdown();
+        let mut next = Self::new(self.config);
+        for handle in self
+            .thread_handle
+            .take()
+            .into_iter()
+            .chain(self.retired_workers.drain(..))
+        {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                next.retired_workers.push(handle);
+            }
+        }
+        *self = next;
+    }
+
+    fn request_shutdown(&self) {
         self.cancellation.cancel_all();
         let _ = self.tx.send(SolverProgramCompilerMessage::Shutdown);
-        drop(self.thread_handle.take());
-        *self = Self::new(config);
     }
 
     fn with_backend<B>(config: SolverProgramCompilerConfig, backend: B) -> Self
@@ -860,6 +880,7 @@ impl SolverProgramCompilerService {
             config,
             next_request_id: 0,
             thread_handle: Some(handle),
+            retired_workers: Vec::new(),
         }
     }
 
@@ -888,6 +909,7 @@ impl SolverProgramCompilerService {
             config,
             next_request_id: 0,
             thread_handle: None,
+            retired_workers: Vec::new(),
         }
     }
 }
@@ -1723,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_drops_queued_work_without_waiting_for_running_compile() {
+    fn reset_cancels_queued_work_and_shutdown_joins_the_running_compile() {
         let (started_tx, started_rx) = mpsc::channel();
         let (first_done_tx, first_done_rx) = mpsc::channel();
         let (second_started_tx, second_started_rx) = mpsc::channel();
@@ -1755,11 +1777,17 @@ mod tests {
         ));
 
         let (reset_done_tx, reset_done_rx) = mpsc::channel();
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
         let reset_handle = thread::spawn(move || {
+            service.reset();
             service.reset();
             reset_done_tx
                 .send(service.budget_remaining_us())
                 .expect("send reset budget");
+            service.shutdown();
+            shutdown_done_tx
+                .send(())
+                .expect("report shutdown completion");
         });
 
         match reset_done_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1771,10 +1799,15 @@ mod tests {
             }
         }
 
+        let shutdown_while_blocked = shutdown_done_rx.recv_timeout(Duration::from_millis(200));
         release_tx.send(()).expect("release first compile");
+        assert_eq!(shutdown_while_blocked, Err(mpsc::RecvTimeoutError::Timeout));
         first_done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first compile should finish after release");
+        shutdown_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown should finish after the retired worker exits");
         assert!(
             second_started_rx
                 .recv_timeout(Duration::from_millis(200))

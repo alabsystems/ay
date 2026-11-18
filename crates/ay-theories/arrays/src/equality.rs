@@ -254,6 +254,14 @@ impl ArraySolver<'_> {
         self.propagate_state_version = self.propagate_state_version.wrapping_add(1);
     }
 
+    /// The asserted-equality graph grew (a true equality assignment, a
+    /// new external edge, or newly registered terms): negative
+    /// `eq_explain_memo` answers may have become provable
+    /// (#s3-eq-explain-memo).
+    pub(crate) fn bump_eq_explain_version(&mut self) {
+        self.eq_explain_version = self.eq_explain_version.wrapping_add(1);
+    }
+
     fn merge_affine_terms(
         lhs: &mut HashMap<TermId, BigInt>,
         rhs: &HashMap<TermId, BigInt>,
@@ -1035,6 +1043,9 @@ impl ArraySolver<'_> {
                 self.trail.push((term, prev));
                 self.assigns.insert(term, value);
                 self.bump_propagate_state_version();
+                if value && self.is_equality_term(term) {
+                    self.bump_eq_explain_version();
+                }
                 // ROW2 dirty-entry scan: wake entries whose evaluation read
                 // this atom's assignment (entry skip condition or probes)
                 // and whose wake mask covers this transition.

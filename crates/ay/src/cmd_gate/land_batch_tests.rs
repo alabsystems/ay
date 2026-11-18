@@ -122,6 +122,36 @@ fn selection(target: &str, feature: Option<&str>, filter: &str, no_fail_fast: bo
 }
 
 #[test]
+fn quiet_test_build_compiles_without_running_the_selected_failure() {
+    let workspace = Workspace::new();
+    let markers = workspace.root().join("markers");
+    let mut runtime = selection("failure", Some("probe"), "selected", false);
+    runtime.args.insert(0, "--exclusive".into());
+    let build = runtime.quiet_test_compilation().unwrap();
+    // A compiler build for this fixture can use the containing test's admission.
+    let output = Command::new(&build.args[1])
+        .args(&build.args[2..])
+        .current_dir(workspace.root())
+        .env("AY_GATE_BATCH_MARKERS", &markers)
+        .output()
+        .expect("compile the selected Trust/Targo test fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!markers.exists());
+
+    // The fixture has no benchmark planner. Its selected body must fail even
+    // after a successful compilation while still honoring the feature/filter.
+    runtime.args.remove(0);
+    assert_eq!(
+        workspace.run(vec![runtime]),
+        (false, 1, vec!["failure:selected:probe".into()])
+    );
+}
+
+#[test]
 fn actual_multi_target_workspace_preserves_coverage_features_filters_and_failure() {
     let workspace = Workspace::new();
     let run = |steps| workspace.run(steps);

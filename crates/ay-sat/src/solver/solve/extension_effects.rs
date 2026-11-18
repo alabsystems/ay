@@ -94,7 +94,14 @@ impl Solver {
         self.cold.original_ledger.push_clause_global(&literals);
         self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
         self.cold.uniform_formula_cache = None;
-        let clause_ref = self.add_theory_lemma(literals)?;
+        let Some(clause_ref) = self.add_theory_lemma(literals) else {
+            // Census (#l0-rebuild-epoch): the definition is in the
+            // ledger but stored no arena clause (e.g. unit already
+            // true at root); the next rebuild materializes it.
+            self.cold.ledger_only_since_rebuild =
+                self.cold.ledger_only_since_rebuild.saturating_add(1);
+            return None;
+        };
         let idx = clause_ref.0 as usize;
         let clause_id = self.clause_id(clause_ref);
         self.cold

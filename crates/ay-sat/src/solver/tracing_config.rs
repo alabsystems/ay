@@ -155,6 +155,7 @@ impl Solver {
         self.cold.internal_lrat_enabled = true;
         self.cold.lrat_level0_unit_materialize_cursor = 0;
         self.cold.lrat_level0_unit_materialize_pinned.clear();
+        self.cold.lrat_pin_retry_memo_fingerprint.fill(0);
         self.refresh_proof_consumer_state();
         // unit_proof_id, level0_proof_id, and clause_ids are now allocated
         // unconditionally at construction (#8069: Phase 2a). No resizing needed.

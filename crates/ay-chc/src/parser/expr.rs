@@ -780,14 +780,21 @@ impl ChcParser {
                 // constructor, or ordinary-UF tables; otherwise a `let` or
                 // quantifier such as `(let ((c 0)) c)` silently denotes a
                 // global `(declare-fun c () Int)` instead of its local `c`.
-                let scoped_name = if self.active_renames.is_empty() {
-                    name.clone()
-                } else {
-                    self.active_renames
-                        .iter()
-                        .rev()
-                        .find(|(from, _)| *from == name)
-                        .map_or_else(|| name.clone(), |(_, to)| to.clone())
+                let active_rename = self
+                    .active_renames
+                    .iter()
+                    .rev()
+                    .find(|(from, _)| *from == name)
+                    .map(|(_, to)| to.clone());
+                // With no active binder rename and no local binding under the
+                // source name (a `let` binds under it), a name in an
+                // engine-reserved family denotes its file-scoped rename.
+                let scoped_name = match active_rename {
+                    Some(renamed) => renamed,
+                    None if self.variables.contains_key(&name) => name.clone(),
+                    None => self
+                        .reserved_variable_rename(&name)
+                        .unwrap_or_else(|| name.clone()),
                 };
                 if let Some(sort) = self.variables.get(&scoped_name).cloned() {
                     return Ok(ChcExpr::var(ChcVar::new(scoped_name, sort)));

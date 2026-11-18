@@ -211,8 +211,8 @@ fn rendered_bound(
                     .checked_mul(size_of::<String>())
                     .ok_or(QueryError::Exhausted)?,
             )?;
-            let surface = exec.dt_surface(ctor);
-            if !schema.charge_identifier(surface) {
+            let surface = exec.dt_value_head(ctor);
+            if !schema.charge_identifier(&surface) {
                 return Err(QueryError::Exhausted);
             }
             let mut children = 0;

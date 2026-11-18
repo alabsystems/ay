@@ -50,7 +50,7 @@ impl Executor {
         for (_, constructors) in self.ctx.datatype_iter() {
             for constructor in constructors {
                 constructor_tokens.insert(constructor.clone());
-                constructor_tokens.insert(self.dt_surface(constructor).to_string());
+                constructor_tokens.insert(self.dt_value_head(constructor).into_owned());
             }
         }
         let mut aggregate_work = 0usize;
@@ -217,6 +217,20 @@ impl Executor {
                 if !exact_datatype_carrier_token(guard, constructor_tokens, sort, carrier) {
                     continue;
                 }
+                // The equality holds in this EUF model only when its two sides
+                // share a class. When the literal tree has a class of its own,
+                // the model does not satisfy the equality, and the select's
+                // class (which can hold another constructor, such as `cd` in
+                // `(store ((as const (Array D E)) cd) ..)`) gets no tree from
+                // it: the class is poisoned.
+                if euf
+                    .term_values
+                    .get(&constructor)
+                    .is_some_and(|own| own != carrier)
+                {
+                    merge_datatype_cell_completion(completions, sort, carrier, None);
+                    continue;
+                }
                 let Some(rendered) = self.exact_concrete_datatype_literal(constructor, sort, guard)
                 else {
                     continue;
@@ -263,13 +277,20 @@ impl Executor {
                 let sort = self.ctx.terms.sort(term);
                 let candidate = completions.get(sort)?.get(carrier)?.as_deref()?;
                 let value = self.parse_rendered_dt_value_cached(candidate, sort, &guard)?;
-                Some((term, candidate.to_string(), value))
+                // The candidate is printed text, whose constructor tokens
+                // (`|pop|`) need not be the identities (`pop`) the evaluator
+                // compares; the pin reads it as `parse_model_value_string`
+                // reads a stored datatype value.
+                let pin = self
+                    .dt_value_respelled(candidate, sort, super::dt_model::DtSpelling::Identity)
+                    .unwrap_or_else(|| candidate.to_string());
+                Some((term, pin, value))
             })
             .collect();
         let changed = !assignments.is_empty();
-        for (term, candidate, value) in assignments {
+        for (term, pin, value) in assignments {
             model.dt_ground.insert(term, value);
-            model.dt_pins.insert(term, EvalValue::Element(candidate));
+            model.dt_pins.insert(term, EvalValue::Element(pin));
         }
         changed
     }
@@ -410,8 +431,7 @@ fn merge_datatype_cell_completion(
 /// it — a name that needs pipe-quoting on the SMT-LIB surface (deductive-checks's
 /// tuple datatype `(u32, u32)`, whose carrier is `@(u32, u32)!0`) is an
 /// ordinary registered datatype here. `RenderedDatatypeGuard` already admits
-/// such carrier names (only constructor HEADS must be bare-safe, because they
-/// are rendered raw); declining them here left every datatype-valued array
+/// such carrier names; declining them here left every datatype-valued array
 /// cell of such a sort spelled as an opaque carrier that no completion or
 /// gate pass could normalize to its class's constructor tree, and the
 /// independent gate fail-closed a genuine `sat` ("datatype sort requires a

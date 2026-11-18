@@ -23,6 +23,7 @@ impl CongruenceClosure {
                 checked_double(owner, num_vars)?,
                 |_| false,
             )?,
+            forward_subsume_irredundant_husks: 0,
             deterministic: crate::determinism::deterministic_inproc_enabled(),
         })
     }

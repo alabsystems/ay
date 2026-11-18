@@ -3831,6 +3831,51 @@ impl Executor {
                         .collect(),
                     None => ay_core::kani_compat::DetHashSet::default(),
                 };
+            // The atoms are evaluator values; a datatype one is stored in the
+            // printed spelling the array model's other writers use
+            // (`Executor::dt_value_respelled`). A stored key in the other
+            // spelling of the same value (`Executor::dt_value_texts_agree`)
+            // is that cell: the entry replaces it rather than adding a
+            // second store of the same index.
+            let base_entries: Vec<(TermId, String, String, Option<String>)> = base_entries
+                .iter()
+                .map(
+                    |(base, idx_atom, pin_atom)| match self.ctx.terms.sort(*base) {
+                        ay_core::Sort::Array(array_sort) => {
+                            let index = self.dt_value_printed(idx_atom, &array_sort.index_sort);
+                            let stored_key = self
+                                .datatype_sort_name(&array_sort.index_sort)
+                                .and_then(|_| {
+                                    self.last_model
+                                        .as_ref()?
+                                        .array_model
+                                        .as_ref()?
+                                        .array_values
+                                        .get(base)?
+                                        .stores
+                                        .iter()
+                                        .map(|(key, _)| key)
+                                        .find(|key| {
+                                            **key != index
+                                                && self.dt_value_texts_agree(
+                                                    key,
+                                                    &index,
+                                                    &array_sort.index_sort,
+                                                )
+                                        })
+                                        .cloned()
+                                });
+                            (
+                                *base,
+                                index,
+                                self.dt_value_printed(pin_atom, &array_sort.element_sort),
+                                stored_key,
+                            )
+                        }
+                        _ => (*base, idx_atom.clone(), pin_atom.clone(), None),
+                    },
+                )
+                .collect();
             self.stash_unrepaired_candidate_once();
             let model = self.last_model.as_mut().expect("checked above");
             // Harmonize pinned vars AND write-term demands everywhere.
@@ -3856,11 +3901,18 @@ impl Executor {
             }
             // Base entries + totals; drop alias interps.
             if let Some(am) = model.array_model.as_mut() {
-                for (base, idx_atom, pin_atom) in &base_entries {
-                    let interp = am.array_values.entry(*base).or_default();
-                    match interp.stores.iter_mut().find(|(k, _)| k == idx_atom) {
-                        Some((_, v)) => *v = pin_atom.clone(),
-                        None => interp.stores.push((idx_atom.clone(), pin_atom.clone())),
+                for (base, idx_atom, pin_atom, stored_key) in base_entries {
+                    let interp = am.array_values.entry(base).or_default();
+                    match interp
+                        .stores
+                        .iter_mut()
+                        .find(|(k, _)| *k == idx_atom || stored_key.as_ref() == Some(k))
+                    {
+                        Some((k, v)) => {
+                            *k = idx_atom;
+                            *v = pin_atom;
+                        }
+                        None => interp.stores.push((idx_atom, pin_atom)),
                     }
                     if interp.default.is_none() {
                         interp.default = Some("0".to_string());

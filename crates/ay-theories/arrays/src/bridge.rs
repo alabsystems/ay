@@ -279,7 +279,11 @@ impl ArraySolver<'_> {
 
         let is_new = self.external_diseqs.insert(key);
         self.diseq_set.insert(key);
-        let reasons_changed = if reasons.is_empty() {
+        let reasons_changed = if reasons.is_empty()
+            || Self::reasons_already_stored(
+                self.external_diseq_reasons.get(&key).map(Vec::as_slice),
+                &reasons,
+            ) {
             false
         } else {
             let stored = self.external_diseq_reasons.entry(key).or_default();
@@ -367,22 +371,47 @@ impl ArraySolver<'_> {
         })
     }
 
+    /// Whether every reason in `reasons` is already in the stored set
+    /// for `key` (stored sets are kept sorted by `(term, value)` and
+    /// deduplicated, so membership is a binary search). External facts
+    /// are re-recorded every check cycle; when nothing is new the
+    /// clone + sort + extend + dedup round-trip is pure work
+    /// (#s3-bridge-early-out). `false` when no entry exists yet, so
+    /// entry creation semantics are unchanged.
+    fn reasons_already_stored(stored: Option<&[TheoryLit]>, reasons: &[TheoryLit]) -> bool {
+        match stored {
+            Some(stored) => reasons.iter().all(|r| {
+                stored
+                    .binary_search_by_key(&(r.term.0, r.value), |lit| (lit.term.0, lit.value))
+                    .is_ok()
+            }),
+            None => false,
+        }
+    }
+
     /// Returns `true` when the call changed this solver's state: the edge is
     /// new, or the stored reasons for an existing edge grew.
     fn record_external_equality(&mut self, t1: TermId, t2: TermId, reasons: &[TheoryLit]) -> bool {
         let key = Self::ordered_pair(t1, t2);
 
-        // Persist so it survives rebuild_assign_indices() calls.
-        let edge_is_new = !self
-            .external_eqs
-            .iter()
-            .any(|&(lhs, rhs)| Self::ordered_pair(lhs, rhs) == key);
+        // Persist so it survives rebuild_assign_indices() calls. The
+        // ordered-pair mirror set makes the already-recorded test O(1)
+        // where a linear scan over `external_eqs` made every check
+        // cycle (facts are cleared on pop and re-recorded) quadratic
+        // (#s3-bridge-early-out).
+        let edge_is_new = self.external_eq_keys.insert(key);
         if edge_is_new {
             self.external_eqs.push((t1, t2));
+            self.bump_eq_explain_version();
         }
 
         let mut reasons_changed = false;
-        if !reasons.is_empty() {
+        if !reasons.is_empty()
+            && !Self::reasons_already_stored(
+                self.external_eq_reasons.get(&key).map(Vec::as_slice),
+                reasons,
+            )
+        {
             let mut reasons = reasons.to_vec();
             reasons.sort_by_key(|lit| (lit.term.0, lit.value));
             reasons.dedup_by_key(|lit| (lit.term, lit.value));

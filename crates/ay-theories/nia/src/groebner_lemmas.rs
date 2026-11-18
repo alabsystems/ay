@@ -10,8 +10,8 @@
 use num_traits::{One, Zero};
 
 use super::groebner::{
-    buchberger, integer_signature, mono_mul, GPoly, Mono, PolyTerms, MAX_DEGREE, MAX_EXTRACT_DEPTH,
-    MAX_INPUT_POLYS, MAX_TERMS,
+    buchberger, buchberger_seeded, integer_signature, mono_mul, GPoly, Mono, PolyTerms, MAX_DEGREE,
+    MAX_EXTRACT_DEPTH, MAX_INPUT_POLYS, MAX_TERMS,
 };
 use super::*;
 
@@ -25,33 +25,150 @@ impl NiaSolver<'_> {
     /// congruence and zero-bound lemmas, these are not approximations.
     pub(crate) fn add_groebner_equality_lemmas(&mut self) -> Option<Vec<TheoryLit>> {
         let inputs = self.collect_equality_polys()?;
+        // Memo: `buchberger` is a pure function of the ordered inputs
+        // (terms AND provenance), and consecutive checks under the lazy
+        // split loop re-present a near-identical asserted equality set
+        // thousands of times (measured on Certora 65782_8: ~3,200
+        // recomputations at ~3ms each in 20s, dominating the run). An
+        // exact input replay therefore reuses the stored outcome; cut
+        // emission is still re-attempted because monomial aux
+        // availability can have grown since the stored run.
+        if Self::groebner_inputs_eq(&inputs, &self.groebner_memo_inputs) {
+            self.groebner_memo_hits = self.groebner_memo_hits.saturating_add(1);
+            if let Some(conflict) = &self.groebner_memo_conflict {
+                return Some(conflict.clone());
+            }
+            let derived = std::mem::take(&mut self.groebner_memo_derived);
+            for (sig, provenance) in &derived {
+                if self.groebner_emitted.contains(sig) {
+                    continue;
+                }
+                if self.emit_groebner_cut(sig, provenance) {
+                    self.groebner_emitted.insert(sig.clone());
+                }
+            }
+            self.groebner_memo_derived = derived;
+            return None;
+        }
+        // Superset growth (the trail lengthened since the memoized
+        // run): a stored constant conflict still refutes, its
+        // provenance being a subset of the current inputs; otherwise
+        // seed Buchberger with the stored basis and queue only the
+        // new polynomials.
+        let seeded = self.groebner_superset_delta(&inputs);
+        if let Some(conflict) = &self.groebner_memo_conflict {
+            if seeded.is_some() {
+                self.groebner_memo_hits = self.groebner_memo_hits.saturating_add(1);
+                return Some(conflict.clone());
+            }
+        }
         let input_sigs: HashSet<Vec<(Mono, BigInt)>> = inputs
             .iter()
             .filter_map(|p| integer_signature(&p.terms))
             .collect();
-        let basis = buchberger(inputs);
+        let memo_key = inputs.clone();
+        let extended = seeded.and_then(|delta| {
+            let seed = std::mem::take(&mut self.groebner_memo_basis);
+            buchberger_seeded(seed, delta)
+        });
+        let basis = match extended {
+            Some(basis) => {
+                self.groebner_memo_seeded = self.groebner_memo_seeded.saturating_add(1);
+                basis
+            }
+            None => buchberger(inputs),
+        };
         for poly in &basis {
             if poly.is_constant() {
-                return Some(
-                    poly.provenance
-                        .iter()
-                        .map(|&(term, value)| TheoryLit { term, value })
-                        .collect(),
-                );
+                let conflict: Vec<TheoryLit> = poly
+                    .provenance
+                    .iter()
+                    .map(|&(term, value)| TheoryLit { term, value })
+                    .collect();
+                self.groebner_memo_inputs = memo_key;
+                self.groebner_memo_derived = Vec::new();
+                self.groebner_memo_basis = Vec::new();
+                self.groebner_memo_conflict = Some(conflict.clone());
+                return Some(conflict);
             }
         }
+        let mut derived: Vec<(Vec<(Mono, BigInt)>, Vec<(TermId, bool)>)> = Vec::new();
         for poly in &basis {
             let Some(sig) = integer_signature(&poly.terms) else {
                 continue;
             };
-            if input_sigs.contains(&sig) || self.groebner_emitted.contains(&sig) {
+            if input_sigs.contains(&sig) {
                 continue;
             }
-            if self.emit_groebner_cut(&sig, &poly.provenance) {
-                self.groebner_emitted.insert(sig);
+            derived.push((sig, poly.provenance.clone()));
+        }
+        for (sig, provenance) in &derived {
+            if self.groebner_emitted.contains(sig) {
+                continue;
+            }
+            if self.emit_groebner_cut(sig, provenance) {
+                self.groebner_emitted.insert(sig.clone());
             }
         }
+        self.groebner_memo_inputs = memo_key;
+        self.groebner_memo_derived = derived;
+        self.groebner_memo_basis = basis;
+        self.groebner_memo_conflict = None;
         None
+    }
+
+    /// When the memoized input list is a strict subset of `inputs`
+    /// (by exact terms+provenance key), the polynomials in `inputs`
+    /// beyond the memoized ones; `None` otherwise. Tries the common
+    /// append-only prefix shape first (asserted trails mostly grow by
+    /// appending), then falls back to multiset difference.
+    fn groebner_superset_delta(&self, inputs: &[GPoly]) -> Option<Vec<GPoly>> {
+        let memo = &self.groebner_memo_inputs;
+        if memo.is_empty() || inputs.len() <= memo.len() {
+            return None;
+        }
+        if Self::groebner_inputs_eq(&inputs[..memo.len()], memo) {
+            return Some(inputs[memo.len()..].to_vec());
+        }
+        let mut remaining: std::collections::HashMap<(Vec<(TermId, bool)>, PolyTerms), usize> =
+            std::collections::HashMap::new();
+        for p in memo {
+            *remaining
+                .entry((p.provenance.clone(), p.terms.clone()))
+                .or_insert(0) += 1;
+        }
+        let mut delta = Vec::new();
+        for p in inputs {
+            let key = (p.provenance.clone(), p.terms.clone());
+            match remaining.get_mut(&key) {
+                Some(n) if *n > 0 => *n -= 1,
+                _ => delta.push(p.clone()),
+            }
+        }
+        if remaining.values().all(|&n| n == 0) && !delta.is_empty() {
+            Some(delta)
+        } else {
+            None
+        }
+    }
+
+    /// Exact equality of two Groebner input lists (polynomial terms and
+    /// provenance, in order) — the memo key. `buchberger`'s result can
+    /// depend on input order, so the key is order-sensitive.
+    fn groebner_inputs_eq(a: &[GPoly], b: &[GPoly]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| x.terms == y.terms && x.provenance == y.provenance)
+    }
+
+    /// Drop the Groebner memo (scope discipline: called wherever
+    /// `groebner_emitted` is cleared).
+    pub(crate) fn clear_groebner_memo(&mut self) {
+        self.groebner_memo_inputs = Vec::new();
+        self.groebner_memo_derived = Vec::new();
+        self.groebner_memo_basis = Vec::new();
+        self.groebner_memo_conflict = None;
     }
 
     /// Polynomials of the true equality atoms, or `None` when the pass

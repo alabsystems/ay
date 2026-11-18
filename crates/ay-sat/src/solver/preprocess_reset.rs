@@ -250,6 +250,14 @@ impl Solver {
         // - BVE/BCE: deletes clauses WITH reconstruction entries
         // - Level-0 GC: deletes satisfied clauses permanently
         //
+        // Capture the elimination signal BEFORE the drain replaces
+        // the stack (DR-AY-SAT-L0-REBUILD-PRESERVE-DESIGN-20261117):
+        // a drained stack reads empty, but the elimination it
+        // witnessed still blocks learned preservation at the next
+        // rebuild. Cleared only when a rebuild executes.
+        if self.inproc.reconstruction.ever_pushed() {
+            self.cold.elimination_since_rebuild = true;
+        }
         // Drain reconstruction stack first (BVE/BCE witness clauses).
         if self.inproc.reconstruction.len() > 0 {
             let drain_result = self.inproc.reconstruction.drain_witness_entries();
@@ -331,6 +339,47 @@ impl Solver {
                 active_original_count != ledger_count || self.cold.inprocessing_modified_clause_db;
             let needs_l0_gc_rebuild =
                 !needs_destructive_rebuild && self.cold.l0_gc_modified_clause_db;
+            // Census cross-check (#l0-rebuild-epoch): once a rebuild
+            // has established the baseline, active originals plus
+            // pending originals must equal the materialized ledger
+            // prefix minus every counted deletion class plus derived
+            // adds and promotions. A nonzero residual names an
+            // uncounted mutation path and fails the preservation rule
+            // below closed; an epoch-clean reading with non-L0 events
+            // counted names a bump gap (diagnostic counter only).
+            let mut census_balances = false;
+            if self.cold.l0_epoch_snapshot_taken {
+                let census_expected = self.cold.incremental_original_boundary as i64
+                    - self.cold.ledger_only_since_rebuild as i64
+                    - self.cold.l0_gc_original_deletions_since_rebuild as i64
+                    - self.cold.original_deletions_since_rebuild as i64
+                    - self.cold.original_husks_since_rebuild as i64
+                    + self.cold.derived_irredundant_adds_since_rebuild as i64
+                    + self.cold.promotions_since_rebuild as i64;
+                let census_residual = active_original_count as i64
+                    + self.cold.pending_irredundant_count as i64
+                    - census_expected;
+                census_balances = census_residual == 0;
+                let epoch_clean =
+                    self.cold.irredundant_mutation_epoch == self.cold.irredundant_epoch_at_rebuild;
+                let non_l0_events = self.cold.original_deletions_since_rebuild
+                    + self.cold.original_husks_since_rebuild
+                    + self.cold.derived_irredundant_adds_since_rebuild
+                    + self.cold.promotions_since_rebuild;
+                if census_residual != 0 || (epoch_clean && non_l0_events > 0) {
+                    self.cold.l0_epoch_crosscheck_failures =
+                        self.cold.l0_epoch_crosscheck_failures.saturating_add(1);
+                }
+            }
+            // Learned-clause preservation across this rebuild
+            // (DR-AY-SAT-L0-REBUILD-PRESERVE-DESIGN-20261117): sound iff
+            // every clause since the last rebuild was a ledger
+            // consequence, which the census balance + class latches
+            // witness. Anything else keeps the destructive branch.
+            let preserve_learned_clauses = census_balances
+                && !self.cold.elimination_since_rebuild
+                && !self.cold.inprocessing_modified_clause_db
+                && !self.cold.ic3_mode;
             if needs_destructive_rebuild || needs_l0_gc_rebuild {
                 if !self.preflight_original_ledger_replay(0) {
                     return;
@@ -340,7 +389,7 @@ impl Solver {
                 // derived under the original clause set (L0 GC only removes
                 // satisfied clauses and false literals, never adds derived
                 // irredundant clauses or eliminates variables).
-                let saved_learned: Vec<Vec<Literal>> = if needs_l0_gc_rebuild {
+                let saved_learned: Vec<Vec<Literal>> = if preserve_learned_clauses {
                     // live_indices (husk adjudication #4): garbage-kept learned
                     // husks (eager-subsume, OTFS-subsumed) are logically
                     // deleted — re-adding them live across an incremental
@@ -428,6 +477,18 @@ impl Solver {
                 // run inprocessing don't trigger unnecessary rebuilds.
                 self.cold.inprocessing_modified_clause_db = false;
                 self.cold.l0_gc_modified_clause_db = false;
+                // Shadow L0-rebuild epoch (#l0-rebuild-epoch): the
+                // rebuilt arena is the new census baseline.
+                self.cold.irredundant_epoch_at_rebuild = self.cold.irredundant_mutation_epoch;
+                self.cold.l0_gc_original_deletions_since_rebuild = 0;
+                self.cold.original_deletions_since_rebuild = 0;
+                self.cold.original_husks_since_rebuild = 0;
+                self.cold.derived_irredundant_adds_since_rebuild = 0;
+                self.cold.promotions_since_rebuild = 0;
+                self.cold.pending_irredundant_count = 0;
+                self.cold.ledger_only_since_rebuild = 0;
+                self.cold.l0_epoch_snapshot_taken = true;
+                self.cold.elimination_since_rebuild = false;
                 self.inproc.bve.invalidate_occ_lists();
                 // The rebuilt arena keeps none or only the preserved learned
                 // clauses (`lower_reduction_retrigger_points`).

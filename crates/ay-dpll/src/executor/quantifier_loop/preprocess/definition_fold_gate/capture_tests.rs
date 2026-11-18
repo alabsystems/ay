@@ -22,10 +22,13 @@ const HEAD: &str = "(set-logic ALL) \
 const TAIL: &str = "(assert (= lens (store ((as const (Array Int Int)) 0) 0 2))) \
      (assert (= w (store ((as const (Array Int Int)) 0) 0 @B@)))";
 
-/// Elaborate [`HEAD`], then declare an Int constant and elaborate `tail` with
+/// Elaborate [`HEAD`], then register an Int constant and elaborate `tail` with
 /// `@B@` naming it. With `collide` the constant is spelled like the binder the
-/// frontend minted for the universal (a declaration made AFTER the universal
-/// is the only way to get that spelling); otherwise it is spelled `x`.
+/// frontend minted for the universal; otherwise it is spelled `x`. The
+/// constant is minted in the term store and registered with
+/// `Context::register_symbol`, as a native-API caller does: a `declare-const`
+/// of the binder's spelling takes a private identity instead, so a script
+/// does not build two identities of one spelling.
 /// Returns the executor, the authored universal and the constant.
 fn load(tail: &str, collide: bool) -> (Executor, TermId, TermId) {
     let mut exec = Executor::new();
@@ -40,19 +43,10 @@ fn load(tail: &str, collide: bool) -> (Executor, TermId, TermId) {
     } else {
         "x".to_string()
     };
-    let later = ay_frontend::parse(&format!(
-        "(declare-const {name} Int) {}",
-        tail.replace("@B@", &name)
-    ))
-    .expect("tail parses");
+    let constant = exec.ctx.terms.mk_var(name.clone(), Sort::Int);
+    exec.ctx.register_symbol(name.clone(), constant, Sort::Int);
+    let later = ay_frontend::parse(&tail.replace("@B@", &name)).expect("tail parses");
     exec.execute_all(&later).expect("tail elaborates");
-    let constant = exec
-        .ctx
-        .terms
-        .term_ids()
-        .filter(|&t| matches!(exec.ctx.terms.get(t), TermData::Var(n, _) if *n == name))
-        .max()
-        .expect("the tail declares the constant");
     let spelled_alike = exec
         .ctx
         .terms

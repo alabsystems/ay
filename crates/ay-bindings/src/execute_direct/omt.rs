@@ -110,7 +110,11 @@ fn interpret_executor_outputs(outputs: &[String]) -> Result<ExecuteTypedResult, 
 /// Parse simple model output into the values map.
 ///
 /// Handles the common `(define-fun name () Sort value)` pattern from
-/// get-model: each line is read by `ay_core::model_constant_definition`.
+/// get-model: each line is read by `ay_core::model_constant_definition`, and
+/// `parse_model_value` decides the `ModelValue` of the value text it gives.
+/// In that text `ay_core::bare_constructor_spelling` keeps each constructor
+/// token as printed, quotes included: for example `(as |pop| L1)` and
+/// `|pop|` both give `|pop|`.
 fn parse_model_into(values: &mut ExecuteValueMap<ModelValue>, model_text: &str) {
     for line in model_text.lines() {
         if let Some((name, value)) = ay_core::model_constant_definition(line) {
@@ -185,20 +189,19 @@ mod ascription_tests {
             assert_ne!(bare, printed, "{}", case.label);
             let values = read(&printed);
             assert_eq!(values, read(&bare), "{}:\n{printed}", case.label);
-            let constructor = case.constructor();
+            // The constructor's token, as its values print (`|pop|`).
+            let token = ay_core::quote_symbol(case.constructor());
             if let Some(top) = values.get("top") {
                 tops += 1;
                 assert_eq!(
                     top,
-                    &ModelValue::String(constructor.to_string()),
+                    &ModelValue::String(token.clone()),
                     "{}:\n{printed}",
                     case.label
                 );
                 assert_eq!(
                     values.get("nested"),
-                    Some(&ModelValue::String(format!(
-                        "(w {constructor} {constructor})"
-                    ))),
+                    Some(&ModelValue::String(format!("(w {token} {token})"))),
                     "{}:\n{printed}",
                     case.label
                 );
@@ -213,7 +216,9 @@ mod ascription_tests {
 
     /// For each name `k` below, the models a solver prints for
     /// `Op1 = {k, halt}` beside `Op2 = {k, stop}` and beside
-    /// `Op2 = {unshared, stop}` give this reader the same `a` and `c`.
+    /// `Op2 = {unshared, stop}` give this reader the same `a` and `c`, each
+    /// spelled with the `ay_core::quote_symbol` token of `k`, and the first
+    /// model prints `a` ascribed.
     #[test]
     fn a_constructor_reads_the_same_whether_or_not_its_name_is_overloaded() {
         let read = |constructor: &str, partner: &str| {
@@ -237,18 +242,16 @@ mod ascription_tests {
         for constructor in [
             "pop", "step", "reset", "exit", "let", "a#b", "a:b", "nil", "true", "false", ":k",
         ] {
+            let token = ay_core::quote_symbol(constructor);
             let (overloaded_text, overloaded) = read(constructor, constructor);
             let (plain_text, plain) = read(constructor, "unshared");
-            // In the overloaded model `a` prints ascribed for each name but
-            // those listed here.
-            assert_eq!(
-                overloaded_text.contains("(define-fun a () Op1 (as "),
-                !matches!(constructor, "a#b" | "a:b" | "true" | "false" | ":k"),
+            assert!(
+                overloaded_text.contains(&format!("(define-fun a () Op1 (as {token} Op1))")),
                 "{constructor}:\n{overloaded_text}"
             );
             assert!(
-                plain_text.contains(&format!("(define-fun a () Op1 {constructor})")),
-                "{constructor}: alone, the constructor prints as its name:\n{plain_text}"
+                plain_text.contains(&format!("(define-fun a () Op1 {token})")),
+                "{constructor}: alone, the constructor prints as its token:\n{plain_text}"
             );
             for name in ["a", "c"] {
                 assert_eq!(
@@ -257,17 +260,15 @@ mod ascription_tests {
                     "{constructor}, {name}:\n{overloaded_text}\n{plain_text}"
                 );
             }
-            // Here `a` reads as `parse_model_value` reads the name.
+            // Here `a` reads as `parse_model_value` reads the token.
             assert_eq!(
                 overloaded.get("a"),
-                Some(&parse_model_value(constructor)),
+                Some(&parse_model_value(&token)),
                 "{constructor}"
             );
             assert_eq!(
                 overloaded.get("c"),
-                Some(&ModelValue::String(format!(
-                    "(w {constructor} {constructor})"
-                ))),
+                Some(&ModelValue::String(format!("(w {token} {token})"))),
                 "{constructor}"
             );
         }
@@ -316,9 +317,7 @@ mod ascription_tests {
         }
         assert_eq!(
             records,
-            (ay_dpll::OVERLOAD_ASCRIBED_CONSTRUCTORS.len()
-                + ay_dpll::OVERLOAD_BARE_CONSTRUCTORS.len())
-                * (ay_dpll::OVERLOAD_PAIR_VARIANTS - 2)
+            ay_dpll::OVERLOAD_ASCRIBED_CONSTRUCTORS.len() * (ay_dpll::OVERLOAD_PAIR_VARIANTS - 2)
         );
     }
 
@@ -365,11 +364,11 @@ mod ascription_tests {
             assert_eq!(value_of(sort, value), value_of(sort, bare), "{value}");
             assert_eq!(value_of(sort, value), ModelValue::String(bare.to_string()));
         }
-        // Here each quoted name reads unquoted.
+        // Here each quoted name reads as written.
         for (value, bare) in [
-            ("(as |pop| |L#1|)", "pop"),
-            ("(as |a#b| |L#1|)", "a#b"),
-            ("(as |my nil| |L#1|)", "my nil"),
+            ("(as |pop| |L#1|)", "|pop|"),
+            ("(as |a#b| |L#1|)", "|a#b|"),
+            ("(as |my nil| |L#1|)", "|my nil|"),
         ] {
             assert_eq!(value_of("|L#1|", value), value_of("|L#1|", bare));
             assert_eq!(
@@ -518,14 +517,14 @@ mod ascription_tests {
     /// For each sort and constructor name below, this reader gives the same
     /// values for the model printed with the name overloaded as for the one
     /// printed with the partner renamed, apart from `o`, the partner itself.
+    /// The overloaded model is one the frontend parses, and it prints the
+    /// name ascribed at `top` and in the record.
     #[test]
     fn overloading_never_changes_a_value_under_any_sort_spelling() {
         let string = |text: &str| ModelValue::String(text.to_string());
         let read = |sort: &str, constructor: &str, partner: &str| {
             let c = ay_core::quote_symbol(constructor);
             let partner = ay_core::quote_symbol(partner);
-            // `Odd`'s constructors `p|q` and `c"d` print unquoted here
-            // (checked below).
             let script = format!(
                 "(declare-datatypes (({sort} 0)) ((({c}) (cons (hd Int) (tl {sort})))))\n\
                  (declare-datatypes ((Other 0)) ((({partner}) (omk (ofst Int)))))\n\
@@ -553,43 +552,50 @@ mod ascription_tests {
         };
         for sort in ["|My List|", "|My  List (1|", "|L#1|", "L1"] {
             for constructor in ["nil", "pop", "a#b", "my nil", "a|b", "x(y", "as"] {
+                // The constructor's token, as its values print.
+                let c = ay_core::quote_symbol(constructor);
                 let (overloaded_text, mut overloaded) = read(sort, constructor, constructor);
                 let (plain_text, mut plain) = read(sort, constructor, "unshared");
                 let context = format!("{sort} {constructor}:\n{overloaded_text}\n{plain_text}");
-                // Of these names only `nil`, `pop` and `as` print ascribed at
-                // `top` in the overloaded model.
-                let ascribed = matches!(constructor, "nil" | "pop" | "as");
-                assert_eq!(
-                    overloaded_text.contains(&format!("(define-fun top () {sort} (as ")),
-                    ascribed,
+                assert!(
+                    ay_frontend::sexp::parse_sexps(&overloaded_text).is_ok(),
+                    "{context}"
+                );
+                let ascribed = format!("(as {c} {sort})");
+                assert!(
+                    overloaded_text.contains(&format!("(define-fun top () {sort} {ascribed})")),
                     "{context}"
                 );
                 assert!(
-                    plain_text.contains(&format!("(define-fun top () {sort} {constructor})")),
-                    "alone, the constructor prints as its name: {context}"
+                    plain_text.contains(&format!("(define-fun top () {sort} {c})")),
+                    "alone, the constructor prints as its token: {context}"
                 );
-                // Both models print the record's constructor fields bare.
-                let record = format!(" p|q {constructor} c\"d {constructor} ");
+                // `Odd`'s constructors print quoted, and the record's fields
+                // of the list sort print ascribed where the name is shared.
                 assert!(
-                    overloaded_text.contains(&record) && plain_text.contains(&record),
-                    "the record beside the bare `p|q` prints unascribed: {context}"
+                    overloaded_text.contains(&format!(r#" |p\|q| {ascribed} |c"d| {ascribed} "#)),
+                    "{context}"
+                );
+                assert!(
+                    plain_text.contains(&format!(r#" |p\|q| {c} |c"d| {c} "#)),
+                    "{context}"
                 );
                 // `o` is the partner itself, which the two scripts name
                 // differently.
-                assert_eq!(overloaded.remove("o"), Some(string(constructor)));
+                assert_eq!(overloaded.remove("o"), Some(string(&c)));
                 assert_eq!(plain.remove("o"), Some(string("unshared")));
                 assert_eq!(overloaded, plain, "{context}");
                 assert_eq!(overloaded.len(), 4, "{context}");
-                assert_eq!(overloaded.get("top"), Some(&string(constructor)));
+                assert_eq!(overloaded.get("top"), Some(&string(&c)));
                 assert_eq!(
                     overloaded.get("two"),
-                    Some(&string(&format!("(cons 1 (cons -2 {constructor}))"))),
+                    Some(&string(&format!("(cons 1 (cons -2 {c}))"))),
                     "{context}"
                 );
                 assert_eq!(
                     overloaded.get("r"),
                     Some(&string(&format!(
-                        "(rec \"| (as nil L1) )\" p|q {constructor} c\"d {constructor} -7)"
+                        r#"(rec "| (as nil L1) )" |p\|q| {c} |c"d| {c} -7)"#
                     ))),
                     "{context}"
                 );

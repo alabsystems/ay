@@ -1108,15 +1108,16 @@ struct MacroExpansion {
 
 /// How to render one solver-invented single-constructor FIELD constant as
 /// SMT-LIB text an external proof checker can read: a selector application over
-/// the DECLARED parent constant (`s_!left` -> `(left s_)`).
+/// the DECLARED parent constant (the `left` field of `s_` -> `(left s_)`).
 ///
 /// WHY. Eager single-constructor datatype elimination (`build_const_term`,
 /// `declarations.rs`) replaces a declared constant `s_` of a product sort with
-/// `(Record_left_center_right s_!left s_!center s_!right)` over per-field
-/// constants it invents. Those names exist ONLY inside AY — the problem file
-/// declares `s_`, not `s_!left` — so an exported Alethe certificate that names
-/// them is unreadable to a checker, which builds its symbol table from the
-/// ORIGINAL `.smt2`. Measured on
+/// `(Record_left_center_right k_0 k_1 k_2)` over per-field constants `k_i` it
+/// invents (private `__ay_field_N` identities). Those names exist ONLY
+/// inside AY — the problem file declares `s_`, not its fields — so an exported
+/// Alethe certificate that names them is unreadable to a checker, which builds
+/// its symbol table from the ORIGINAL `.smt2`. Measured, when the fields were
+/// still spelled `<root>!<selector>`, on
 /// `QF_DT/20230720-blocksworld/blocksworld_from_0_0_8_to_1_3_4_negated_goal_bmc_2`:
 /// 14 distinct invented names in 26,366 occurrences, and a declaration preamble
 /// with ZERO `(declare-fun ...)` lines (the auxiliary-declaration pass computes
@@ -1326,7 +1327,8 @@ pub struct Context {
     symbols: HashMap<String, SymbolInfo>,
     /// Names in `symbols` that are SOLVER-INTERNAL, not user-declared: the
     /// fresh field constants introduced by the eager single-constructor
-    /// datatype elimination (`v!field`, see `build_const_term`). They must be
+    /// datatype elimination (private `__ay_field_N` identities, see
+    /// `build_const_term`) and the map-domain carriers. They must be
     /// solvable and `get-value`-resolvable, but `(get-model)` must NOT print
     /// them: model validators treat definitions of undeclared names as
     /// errors/garbage (observed: the pinned SMT-COMP 2025 Dolmen silently stops
@@ -1344,6 +1346,12 @@ pub struct Context {
     /// Never rewound by `pop`: an internal name cannot be reused while an old
     /// term bearing it may still exist in the term store.
     next_overload_identity: u64,
+    /// Monotonic source of single-constructor field identities
+    /// (`__ay_field_N`, minted by `Context::fresh_dt_field_identity`). Kept
+    /// apart from `next_overload_identity` so a field's identity does not
+    /// depend on how many overloads were declared before it. Never rewound by
+    /// `pop`, for the same reason as `next_overload_identity`.
+    next_field_identity: u64,
     /// Core spellings already assigned to declarations in this term store.
     /// Scope pop deliberately does not rewind this set: old native [`TermId`]
     /// handles may survive the pop, so a later ordinary function or datatype
@@ -1516,6 +1524,12 @@ pub struct Context {
     /// constant, keyed by the exact `TermId` `build_const_term` minted for it
     /// (see [`DtFieldSurface`] for why this exists and what it is read for).
     dt_field_surface: HashMap<TermId, DtFieldSurface>,
+    /// Core identity of every single-constructor FIELD constant
+    /// `build_const_term` minted, whether or not it has a rendering in
+    /// `dt_field_surface`. Append-only for the term store's lifetime, like the
+    /// private identities it holds: `pop` leaves the field terms in the store.
+    /// Read through [`Context::is_dt_field_identity`].
+    dt_field_identities: HashSet<String>,
     /// Current logic
     logic: Option<String>,
     /// Enforce the language declared by the 25 official SMT-LIB 2.7 logics.
@@ -1654,8 +1668,8 @@ pub struct Context {
     /// only successful expansions are recorded (so every diagnostic is still
     /// raised at every offending call site), only expansions that minted no
     /// fresh variable are recorded (so a body whose occurrences must each get
-    /// their OWN under-specified value — a quantifier binder, `pow_neg_at_zero`,
-    /// `map.empty`'s default — is never shared), and an entry is served only
+    /// their OWN variable — a quantifier or lambda binder — is never
+    /// shared), and an entry is served only
     /// where its recorded nested depth still clears
     /// [`MAX_FUN_EXPANSION_DEPTH`].
     macro_expansion_memo: HashMap<MacroExpansionKey, MacroExpansion>,
@@ -2020,6 +2034,7 @@ impl Context {
             internal_symbols: ay_core::kani_compat::DetHashSet::default(),
             overloaded_symbols: HashMap::default(),
             next_overload_identity: 0,
+            next_field_identity: 0,
             declaration_core_identities_used: HashSet::default(),
             next_sort_identity: 0,
             sort_core_identities_used: HashSet::default(),
@@ -2061,6 +2076,7 @@ impl Context {
             parametric_instance_sorts: HashMap::default(),
             dt_internal_surface: HashMap::default(),
             dt_field_surface: HashMap::default(),
+            dt_field_identities: HashSet::default(),
             logic: None,
             strict_logic_compliance: false,
             enforce_logic_sort_signatures: false,
@@ -3175,6 +3191,15 @@ impl Context {
     /// user-facing surface name.
     pub fn dt_surface_name(&self, internal: &str) -> Option<&str> {
         self.dt_internal_surface.get(internal).map(String::as_str)
+    }
+
+    /// Whether `name` is the core identity of a single-constructor field
+    /// constant minted by eager datatype elimination (`build_const_term`).
+    /// Membership is recorded at the mint, never inferred from a spelling, so
+    /// a user symbol is never a member however it is spelled.
+    #[must_use]
+    pub fn is_dt_field_identity(&self, name: &str) -> bool {
+        self.dt_field_identities.contains(name)
     }
 
     /// Record how a freshly minted single-constructor field constant should be

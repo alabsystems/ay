@@ -210,6 +210,40 @@ fn a_retry_in_a_solver_that_writes_no_proof_attempts_no_addition() {
     );
 }
 
+/// The stay-pinned memo has exactly the unmemoized short retry's effect:
+/// same pinned list, cursor, recorded proof ids, waste charge and return
+/// value after every call of every materializer, across the same script
+/// that reaches every retry branch — including the steps that must defeat
+/// the memo (a recorded proof id, a reason becoming a unit clause, a lost
+/// reason), so a stale memo would diverge here.
+#[test]
+fn the_stay_pinned_memo_has_the_unmemoized_retrys_effect() {
+    let mut memoized = trace_solver();
+    let mut plain = trace_solver();
+    let memoized_seen = script(&mut memoized);
+    let plain_seen = with_pin_memo_disabled(|| script(&mut plain));
+    assert_eq!(memoized_seen, plain_seen);
+
+    // Anti-vacuity: the memo actually engaged for the slots that stay
+    // pinned, and the slot the script resolves ends with no memo.
+    let last_pinned = memoized_seen
+        .last()
+        .and_then(|step| step.last())
+        .expect("steps")
+        .pinned
+        .clone();
+    assert_eq!(last_pinned, vec![4]);
+    let still_pinned_var = TARGETS[3];
+    assert_ne!(
+        memoized.cold.lrat_pin_retry_memo_fingerprint[still_pinned_var], 0,
+        "the permanently pinned slot carries a memo"
+    );
+    assert_eq!(
+        memoized.cold.lrat_pin_retry_memo_fingerprint[TARGETS[0]], 0,
+        "the slot that gained a proof id has no memo"
+    );
+}
+
 /// NEGATIVE TWIN: with a proof output a retry can succeed, so it stays the
 /// full retry. Once the support gains a visible unit id, the pinned targets
 /// are materialized as visible derived units on the next call.

@@ -636,6 +636,9 @@ impl Solver {
             .bve
             .update_occs_after_elimination(&result.to_delete, &self.arena);
         stats.total_eliminations += 1;
+        // Empty-witness eliminations exist (all parents satisfied):
+        // latch the elimination unconditionally, not via ever_pushed.
+        self.cold.elimination_since_rebuild = true;
         self.var_lifecycle.mark_eliminated(var.index());
         self.vsids.remove_from_heap(var);
         // Track eliminated variables for occ-guided post-elimination GC (#3521).

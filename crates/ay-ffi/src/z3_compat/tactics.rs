@@ -877,8 +877,10 @@ pub unsafe extern "C" fn Z3_tactic_par_or(
         let slice = unsafe { std::slice::from_raw_parts(ts, num as usize) };
         slice
             .iter()
-            // SAFETY: each element, when non-null, is a live `TacticHandle`.
             .map(|&h| {
+                // SAFETY: each element, when non-null, is a live
+                // `TacticHandle` per the caller's contract for `ts`;
+                // `as_ref` on a null element yields `None`.
                 unsafe { h.as_ref() }.map(|th| Tactic::Shared(std::sync::Arc::clone(&th.tactic)))
             })
             .collect()

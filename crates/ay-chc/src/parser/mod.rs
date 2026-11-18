@@ -89,6 +89,10 @@ pub struct ChcParser {
     /// the rest of the clause, and the binder gets a private name. This is the
     /// opposite of the earlier attempt, which REMOVED names from scope.
     declared_var_names: FxHashSet<String>,
+    /// File-scoped renames of input variables whose names lie in an
+    /// engine-reserved family (source name -> minted name); see
+    /// `reserved_variable_rename`.
+    reserved_var_renames: FxHashMap<String, String>,
     /// Active binder renames, innermost last: (source name -> minted name).
     ///
     /// Empty in every clause that has no capture, which is nearly all of them,
@@ -160,6 +164,7 @@ impl ChcParser {
             variables: FxHashMap::default(),
             clause_binder_names: FxHashSet::default(),
             declared_var_names: FxHashSet::default(),
+            reserved_var_renames: FxHashMap::default(),
             active_renames: Vec::new(),
             let_scope: Vec::new(),
             check_sat_seen: false,

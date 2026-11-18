@@ -490,7 +490,7 @@ impl Context {
                 let mut binder_ids: Vec<TermId> = Vec::with_capacity(bindings.len());
                 for (name, sort) in bindings {
                     let sort = self.elaborate_sort(sort)?;
-                    let var = self.terms.mk_fresh_var(name, sort.clone());
+                    let var = self.mint_fresh_var(name, sort.clone());
                     new_env.insert(name.clone(), var);
                     binder_ids.push(var);
                     let fresh_name = match self.terms.get(var) {
@@ -528,7 +528,7 @@ impl Context {
                 let mut binder_ids: Vec<TermId> = Vec::with_capacity(bindings.len());
                 for (name, sort) in bindings {
                     let sort = self.elaborate_sort(sort)?;
-                    let var = self.terms.mk_fresh_var(name, sort.clone());
+                    let var = self.mint_fresh_var(name, sort.clone());
                     new_env.insert(name.clone(), var);
                     binder_ids.push(var);
                     let fresh_name = match self.terms.get(var) {
@@ -607,7 +607,7 @@ impl Context {
                 let mut vars: Vec<TermId> = Vec::with_capacity(bindings.len());
                 for (name, parsed_sort) in bindings {
                     let sort = self.elaborate_sort(parsed_sort)?;
-                    let var = self.terms.mk_fresh_var(name, sort);
+                    let var = self.mint_fresh_var(name, sort);
                     new_env.insert(name.clone(), var);
                     vars.push(var);
                 }
@@ -1688,7 +1688,10 @@ fn alpha_equivalent_under(
         (TermData::Const(a), TermData::Const(b)) => a == b,
         (TermData::Var(a, _), TermData::Var(b, _)) => match (forward.get(a), backward.get(b)) {
             (Some(mapped), Some(back)) => mapped == b && back == a,
-            (None, None) => a == b,
+            // Two free variables are the same variable only as the same term.
+            // Their spellings do not decide it: a binder minted for another
+            // quantifier and a constant declared later can be spelled alike.
+            (None, None) => left == right,
             _ => false,
         },
         (TermData::App(sa, aa), TermData::App(sb, ab)) => {

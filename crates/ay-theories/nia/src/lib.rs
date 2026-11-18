@@ -395,6 +395,29 @@ pub struct NiaSolver<'a> {
     /// the then-current asserted equality literals.
     groebner_emitted: HashSet<Vec<(Vec<TermId>, BigInt)>>,
 
+    /// Memoized last Groebner computation in this scope: the exact
+    /// input polynomials it ran on, the derived (non-input) integer
+    /// signatures with provenance, and the constant-conflict literals
+    /// when the basis refuted the inputs outright. `buchberger` is a
+    /// pure function of the ordered inputs, so an identical input list
+    /// (terms AND provenance) replays the outcome without recomputing;
+    /// cut emission is re-attempted on replay because monomial aux
+    /// availability can grow. Cleared with `groebner_emitted` on
+    /// `pop`/`reset` — cuts asserted under a popped scope are
+    /// retracted by the inner LIA, so neither the dedup set nor the
+    /// memo may outlive the scope that justified them.
+    groebner_memo_inputs: Vec<groebner::GPoly>,
+    groebner_memo_derived: Vec<(Vec<(groebner::Mono, BigInt)>, Vec<(TermId, bool)>)>,
+    groebner_memo_conflict: Option<Vec<TheoryLit>>,
+    groebner_memo_hits: u64,
+    /// Basis of the memoized computation, used to seed Buchberger
+    /// when the next input list is a strict superset of the memoized
+    /// one (the common growth pattern under a lengthening trail:
+    /// measured 94% exact repeats, 5.4% supersets by ~1 polynomial,
+    /// no other relation, on Certora 65782_8).
+    groebner_memo_basis: Vec<groebner::GPoly>,
+    groebner_memo_seeded: u64,
+
     /// Zero-lower-bound product lemmas already emitted in this scope
     /// (#nia-zero-bound, see `zero_bound_lemmas.rs`). Keys are
     /// `(aux, aux, is_lower)` for product-sign cuts and `(m_lo, m_hi,
@@ -539,6 +562,12 @@ impl<'a> NiaSolver<'a> {
             contracted_bound_reasons: HashMap::default(),
             congruence_linked: HashSet::default(),
             groebner_emitted: HashSet::default(),
+            groebner_memo_inputs: Vec::new(),
+            groebner_memo_derived: Vec::new(),
+            groebner_memo_conflict: None,
+            groebner_memo_hits: 0,
+            groebner_memo_basis: Vec::new(),
+            groebner_memo_seeded: 0,
             zero_bound_emitted: HashSet::default(),
             box_bound_emitted: HashSet::default(),
             zero_product_emitted: HashSet::default(),

@@ -136,22 +136,21 @@ fn defined_and_adopted_heads_including_qualified_const_are_refused() {
 }
 
 #[test]
-fn fresh_producing_identical_occurrences_are_never_merged() {
+fn a_batch_that_mints_a_variable_is_refused_and_power_occurrences_share_one_witness() {
     let mut context = context("(declare-const x Real)");
     let term = source("(^ x (- (bv2nat #b1)))");
     let before = context.terms.var_counter();
+    // The first elaboration of the negative power interns its witness, a
+    // variable allocation, so the batch is refused.
+    let duplicate = Term::App("=".into(), vec![term.clone(), term.clone()]);
+    assert!(batch(&mut context, &duplicate).is_none());
+    assert!(context.shared_surface.0.is_none());
     let first = context
         .elaborate_surface_subterm(&term)
         .expect("negative integer power");
     let second = context.elaborate_surface_subterm(&term).unwrap();
-    assert_ne!(
-        first, second,
-        "ordinary occurrences mint independent underspecified values"
-    );
-    assert_eq!(context.terms.var_counter(), before + 2);
-    let duplicate = Term::App("=".into(), vec![term.clone(), term]);
-    assert!(batch(&mut context, &duplicate).is_none());
-    assert!(context.shared_surface.0.is_none());
+    assert_eq!(first, second);
+    assert_eq!(context.terms.var_counter(), before + 1);
 }
 
 #[test]

@@ -419,11 +419,13 @@ impl Context {
             return Ok(positive_power);
         }
 
-        // n < 0: (ite (= base 0) <fresh_uf> (/ 1 base^|n|))
+        // n < 0: (ite (= base 0) <0^n> (/ 1 base^|n|))
         //
-        // SMT-LIB leaves `0^n` for `n < 0` under-specified. A fresh
-        // uninterpreted constant in the base's sort captures any
-        // permissible interpretation the solver might assign.
+        // SMT-LIB leaves `0^n` for `n < 0` under-specified. `<0^n>` is the
+        // elaborator-private constant [`zero_power_of_negative`] of the base
+        // sort and exponent, shared by every `0^n` of that sort and exponent,
+        // so two occurrences of `(^ b n)` agree at `b = 0` and a later
+        // `get-value` of the term elaborates to the asserted term.
         let zero = match base_sort {
             Sort::Real => self.terms.mk_rational(BigRational::zero()),
             _ => self.terms.mk_int(BigInt::zero()),
@@ -432,7 +434,7 @@ impl Context {
 
         let undefined = self
             .terms
-            .mk_fresh_var("pow_neg_at_zero", base_sort.clone());
+            .mk_var(zero_power_of_negative(base_sort, &abs_n), base_sort.clone());
 
         // Division requires Real operands.
         let one_real = self.terms.mk_rational(BigRational::one());
@@ -508,6 +510,14 @@ impl Context {
 /// unknown, "all 2 assertions were skipped").
 fn zero_power_of_zero(sort: &Sort) -> String {
     format!("!ay.zero-power-of-zero.{sort}")
+}
+
+/// The name of the private constant standing for `0^(-magnitude)` over
+/// `sort` (`Int` or `Real`), `magnitude` being the positive absolute value of
+/// the exponent. Like [`zero_power_of_zero`] it is in the internal `!ay.`
+/// namespace, which source text cannot declare, and outside `__ay_`.
+fn zero_power_of_negative(sort: &Sort, magnitude: &BigInt) -> String {
+    format!("!ay.zero-power-of-negative.{sort}.{magnitude}")
 }
 
 #[cfg(test)]

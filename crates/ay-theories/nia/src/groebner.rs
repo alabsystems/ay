@@ -45,7 +45,7 @@ pub(crate) const MAX_TERMS: usize = 96;
 /// Most S-polynomial pairs formed per run.
 const MAX_PAIRS: usize = 1024;
 /// Largest basis retained per run.
-const MAX_BASIS: usize = 160;
+pub(crate) const MAX_BASIS: usize = 160;
 /// Deepest term walk during polynomial extraction.
 pub(crate) const MAX_EXTRACT_DEPTH: usize = 48;
 /// Most single-term reduction steps applied to one polynomial.
@@ -246,7 +246,27 @@ fn reduce(mut poly: GPoly, basis: &[GPoly]) -> Option<GPoly> {
 /// Budget-capped Buchberger completion. The result includes the inputs
 /// (reduced, monic) and every derived polynomial the budgets allowed.
 pub(crate) fn buchberger(inputs: Vec<GPoly>) -> Vec<GPoly> {
-    let mut basis: Vec<GPoly> = Vec::new();
+    complete_basis(Vec::new(), inputs)
+}
+
+/// Buchberger completion seeded with a basis computed for a SUBSET of
+/// the inputs (`seed`, as returned by an earlier `buchberger` call:
+/// reduced, monic, constant-free), queuing only the remaining inputs.
+///
+/// Every returned polynomial is still an exact ideal consequence of
+/// seed ∪ inputs, hence of the inputs alone when the seed derives
+/// from a subset of them. Seed-internal S-pairs are not retried —
+/// under the budget caps the result may therefore differ from a
+/// from-scratch run (fewer derivations when the earlier run spent
+/// its pair budget elsewhere); all emitted consequences remain
+/// valid with provenance intact. A full seed leaves no room for new inputs;
+/// the caller must run a fresh completion with all current inputs then.
+pub(crate) fn buchberger_seeded(seed: Vec<GPoly>, inputs: Vec<GPoly>) -> Option<Vec<GPoly>> {
+    (seed.len() < MAX_BASIS).then(|| complete_basis(seed, inputs))
+}
+
+fn complete_basis(seed: Vec<GPoly>, inputs: Vec<GPoly>) -> Vec<GPoly> {
+    let mut basis: Vec<GPoly> = seed;
     let mut queue: VecDeque<GPoly> = inputs.into_iter().collect();
     let mut pairs = 0usize;
     while let Some(candidate) = queue.pop_front() {

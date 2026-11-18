@@ -371,7 +371,7 @@ impl super::Solver {
         // next reduce_db/GC pass cleans it up.
         self.drain_pending_garbage_mark(subsumed_idx);
         self.stats.clear_bcp_learned_1963_blocker_cert(subsumed_idx);
-        self.arena.mark_garbage_keep_data(subsumed_idx);
+        self.mark_clause_garbage_counted(subsumed_idx);
 
         // Notify BVE occ lists of irredundant clause removal (#8363).
         // Must use the pre-garbage `subsumed_learned` flag captured above

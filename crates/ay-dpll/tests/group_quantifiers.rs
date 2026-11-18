@@ -85,6 +85,8 @@ mod instance_bool_argument_purification;
 mod left_inverse_attack_corpus;
 #[path = "group_quantifiers/mbqi_5971.rs"]
 mod mbqi_5971;
+#[path = "group_quantifiers/minted_name_capture.rs"]
+mod minted_name_capture;
 #[path = "group_quantifiers/model_based_instantiation_switch.rs"]
 mod model_based_instantiation_switch;
 #[path = "group_quantifiers/nested_skolem_functions_7150.rs"]

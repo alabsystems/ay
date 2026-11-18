@@ -474,11 +474,7 @@ pub(super) const MAX_CONVERSION_STRIKES: u32 = 3;
 
 impl SmtContext {
     fn is_internal_aux_var_name(name: &str) -> bool {
-        name.starts_with("_ite_")
-            || name.starts_with("_mod_q_")
-            || name.starts_with("_mod_r_")
-            || name.starts_with("_div_q_")
-            || name.starts_with("_div_r_")
+        crate::expr::is_elimination_aux_var_name(name)
     }
 
     /// Rename internal auxiliary variables with a namespace suffix.

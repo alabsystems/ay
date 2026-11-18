@@ -784,6 +784,36 @@ fn serialized_script_marks_datatype_sorts_fail_visible() {
     assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
 }
 
+/// A serialized script spells a single-constructor field constant with a
+/// declarable name that is none of the user's: here the user's own
+/// `ay!field_0` (the field's first candidate spelling) stays a separate
+/// constant, so the replay is `sat` like the original.
+#[test]
+fn serialized_script_keeps_field_constants_apart_from_user_symbols() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-logic ALL)
+            (declare-datatypes ((P 0)) (((mk (x Int)))))
+            (declare-const |ay!field_0| Int)
+            (declare-const p P)
+            (assert (= |ay!field_0| 1))
+            (assert (= (x p) 2))
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    let script = exec.to_smtlib2();
+    assert!(!script.contains("__ay_"), "{script}");
+    assert!(
+        script.contains("(declare-const ay!field_0!1 Int)"),
+        "{script}"
+    );
+    let replay = run_script_collect(&script);
+    assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
+}
+
 #[test]
 fn public_assertion_dump_disambiguates_reincarnated_datatype_carriers() {
     let mut exec = Executor::new();

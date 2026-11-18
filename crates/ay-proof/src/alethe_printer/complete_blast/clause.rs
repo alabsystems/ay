@@ -2,7 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! A MULTI-literal bit-vector lemma `(cl (not A_1) .. (not A_n))`.
+//! A multi-literal bit-vector lemma, refuted as the conjunction of its
+//! complements and opened with the checker's own Boolean rules.
 //!
 //! Reached ONLY where the wire rule is already the honest `hole`, after the
 //! named lowerings of the clause (the checked bit-blast dispatch, the ground
@@ -36,16 +37,15 @@
 //! (step tK (cl (not A_1) .. (not A_n)) :rule resolution :premises (tK.cban tK.cbu))
 //! ```
 //!
-//! Only NEGATIVE literals are admitted: a positive literal's complement is a
-//! printed `(not B)`, whose `and_neg` literal `(not (not B))` is a different
-//! term to carcara's rule layer than the `B` the lemma prints. Such a clause,
-//! a repeated atom (by term, by parsed spelling, or by circuit gate), or a
-//! literal that does not print as `(not <atom>)` declines and keeps the
-//! honest `hole`, like every other refusal here: the `and_neg` opening and its
-//! resolution sit outside the transported chain's self-replay, so they are
-//! printed only where each conjunct is one distinct term to the checker. The
-//! SAT gate in `finish` still refuses a satisfiable conjunction, so a clause
-//! that is not a theorem is never printed.
+//! For a positive literal `B`, its complement is `(not B)`. Opening the
+//! conjunction therefore produces `(not (not B))`, which is re-derived as
+//! `B` using `not_not` and binary resolution, exactly as in `normalize.rs`.
+//! The final step retains the lemma's original name and literal order. A
+//! repeated base term or parsed spelling declines; the mixed lane also
+//! requires distinct circuit gates so each normalization has one pivot.
+//! Surface disagreement, limits and a satisfiable complement conjunction
+//! retain the honest `hole`. The existing all-negative opening and the
+//! executor's wire-gap policy are unchanged.
 
 use super::super::surface_literal::same_printed_term;
 use super::*;
@@ -78,12 +78,13 @@ impl AlethePrinter<'_> {
         let mut atoms = Vec::with_capacity(clause.len());
         let mut atom_texts = Vec::with_capacity(clause.len());
         let mut literal_texts = Vec::with_capacity(clause.len());
+        let mut positive = Vec::with_capacity(clause.len());
         let mut seen = DetHashSet::default();
         for &literal in clause {
-            let TermData::Not(atom) = self.terms.get(literal) else {
-                return None;
+            let (atom, is_positive) = match self.terms.get(literal) {
+                TermData::Not(atom) => (*atom, false),
+                _ => (literal, true),
             };
-            let atom = *atom;
             if !seen.insert(atom)
                 || self.terms.sort(atom) != &Sort::Bool
                 || matches!(self.terms.get(atom), TermData::Not(_))
@@ -94,7 +95,12 @@ impl AlethePrinter<'_> {
             let printed = self.format_clause(std::slice::from_ref(&literal));
             let literal_text = printed.strip_prefix("(cl ")?.strip_suffix(')')?;
             let atom_text = self.format_term(atom);
-            if literal_text != format!("(not {atom_text})")
+            let expected = if is_positive {
+                atom_text.clone()
+            } else {
+                format!("(not {atom_text})")
+            };
+            if literal_text != expected
                 || atom_texts
                     .iter()
                     .any(|seen_text: &String| same_printed_term(seen_text, &atom_text))
@@ -104,6 +110,7 @@ impl AlethePrinter<'_> {
             atoms.push(atom);
             atom_texts.push(atom_text);
             literal_texts.push(literal_text.to_string());
+            positive.push(is_positive);
         }
         let prefix = self.fresh_complete_blast_prefix(id)?;
         for &literal in clause {
@@ -111,10 +118,41 @@ impl AlethePrinter<'_> {
         }
         let orient = |blaster: &mut Blaster<'_, '_>, conjuncts: &[SRef]| {
             let distinct_gates: DetHashSet<SRef> = conjuncts.iter().copied().collect();
-            (distinct_gates.len() == conjuncts.len())
-                .then(|| blaster.circuit.and(conjuncts.to_vec()))
+            if distinct_gates.len() != conjuncts.len() {
+                return None;
+            }
+            if !positive.iter().any(|value| *value) {
+                return Some(blaster.circuit.and(conjuncts.to_vec()));
+            }
+            let bases: DetHashSet<u32> = conjuncts.iter().map(|value| value.gate).collect();
+            if bases.len() != conjuncts.len() {
+                return None;
+            }
+            let complements = conjuncts
+                .iter()
+                .zip(&positive)
+                .map(|(&value, &is_positive)| {
+                    if is_positive {
+                        value.not()
+                    } else {
+                        Some(value)
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(blaster.circuit.and(complements))
         };
-        let conjunction = format!("(and {})", atom_texts.join(" "));
+        let conjuncts: Vec<String> = atom_texts
+            .iter()
+            .zip(&positive)
+            .map(|(atom, is_positive)| {
+                if *is_positive {
+                    format!("(not {atom})")
+                } else {
+                    atom.clone()
+                }
+            })
+            .collect();
+        let conjunction = format!("(and {})", conjuncts.join(" "));
         let unit = format!("{id}.cbu");
         let final_clause = format!("(cl (not {conjunction}))");
         let document = Blaster::lemma_document(
@@ -127,6 +165,15 @@ impl AlethePrinter<'_> {
             Some(&unit),
             None,
         )?;
+        if positive.iter().any(|value| *value) {
+            return self.open_mixed_blast_clause(
+                id,
+                document,
+                &conjunction,
+                &literal_texts,
+                &positive,
+            );
+        }
         let literals = literal_texts.join(" ");
         let opened = format!(
             "{document}\n(step {id}.cban (cl {conjunction} {literals}) :rule and_neg)\n\
@@ -135,6 +182,109 @@ impl AlethePrinter<'_> {
         self.charge(opened.len().saturating_sub(document.len()) as u64);
         (!self.work_budget_exhausted()).then_some(opened)
     }
+
+    fn append_blast_clause_parts(&self, output: &mut String, parts: &[&str]) -> Option<()> {
+        let bytes = parts
+            .iter()
+            .try_fold(0_usize, |sum, part| sum.checked_add(part.len()))?;
+        if output.len().checked_add(bytes)? > MAX_COUNTED_TEXT_BYTES {
+            return None;
+        }
+        self.charge(bytes as u64);
+        self.check_emission_progress(0).ok()?;
+        output.try_reserve(bytes).ok()?;
+        for part in parts {
+            output.push_str(part);
+        }
+        Some(())
+    }
+
+    fn open_mixed_blast_clause(
+        &self,
+        id: ProofId,
+        mut document: String,
+        conjunction: &str,
+        literals: &[String],
+        positive: &[bool],
+    ) -> Option<String> {
+        let positions: Vec<usize> = positive
+            .iter()
+            .enumerate()
+            .filter_map(|(at, value)| value.then_some(at))
+            .collect();
+        let mut current: Vec<String> = literals
+            .iter()
+            .zip(positive)
+            .map(|(literal, value)| {
+                if *value {
+                    format!("(not (not {literal}))")
+                } else {
+                    literal.clone()
+                }
+            })
+            .collect();
+        let text = joined_literals(&current)?;
+        let mut premise = format!("{id}.cbopen");
+        self.append_blast_clause_parts(
+            &mut document,
+            &[
+                &format!("\n(step {id}.cban (cl "),
+                conjunction,
+                " ",
+                &text,
+                ") :rule and_neg)",
+                &format!("\n(step {premise} (cl "),
+                &text,
+                &format!(") :rule resolution :premises ({id}.cban {id}.cbu))"),
+            ],
+        )?;
+        for (step, &position) in positions.iter().enumerate() {
+            let literal = &literals[position];
+            let tautology = format!("{id}.cbnn{position}");
+            let next = if step + 1 == positions.len() {
+                id.to_string()
+            } else {
+                format!("{id}.cbnorm{position}")
+            };
+            current[position] = literal.clone();
+            let text = joined_literals(&current)?;
+            self.append_blast_clause_parts(
+                &mut document,
+                &[
+                    &format!("\n(step {tautology} (cl (not (not (not "),
+                    literal,
+                    "))) ",
+                    literal,
+                    ") :rule not_not)",
+                    &format!("\n(step {next} (cl "),
+                    &text,
+                    &format!(") :rule resolution :premises ({premise} {tautology}))"),
+                ],
+            )?;
+            premise = next;
+        }
+        consumer_accepts(&document).then_some(document)
+    }
+}
+
+fn joined_literals(literals: &[String]) -> Option<String> {
+    let bytes = literals
+        .iter()
+        .try_fold(literals.len().saturating_sub(1), |sum, literal| {
+            sum.checked_add(literal.len())
+        })?;
+    if bytes > MAX_COUNTED_TEXT_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    text.try_reserve(bytes).ok()?;
+    for (index, literal) in literals.iter().enumerate() {
+        if index != 0 {
+            text.push(' ');
+        }
+        text.push_str(literal);
+    }
+    Some(text)
 }
 
 #[cfg(test)]

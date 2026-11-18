@@ -5,6 +5,7 @@
 //! Bitvector bitwise operations: not, neg, and, or, xor, nand, nor, xnor.
 
 use super::*;
+use ay_core::{Sort, Symbol};
 
 #[allow(clippy::panic, deprecated)]
 impl Solver {
@@ -142,6 +143,50 @@ impl Solver {
         self.expect_same_bitvec_width("bvxor", a, b)?;
         let result = self.terms_mut().mk_bvxor(vec![a_id, b_id]);
         Ok(self.wrap_term(result))
+    }
+
+    /// Construct the typed `bvand` application with its original operands.
+    /// Use this for a trigger pattern and for applications it should match.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign term or mismatched bitvector widths.
+    pub fn try_bvand_structural(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        self.try_bitwise_structural("bvand", a, b)
+    }
+
+    /// Construct the typed `bvor` application with its original operands.
+    /// Use this for a trigger pattern and for applications it should match.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign term or mismatched bitvector widths.
+    pub fn try_bvor_structural(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        self.try_bitwise_structural("bvor", a, b)
+    }
+
+    /// Construct the typed `bvxor` application with its original operands.
+    /// Use this for a trigger pattern and for applications it should match.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign term or mismatched bitvector widths.
+    pub fn try_bvxor_structural(&mut self, a: Term, b: Term) -> Result<Term, SolverError> {
+        self.try_bitwise_structural("bvxor", a, b)
+    }
+
+    fn try_bitwise_structural(
+        &mut self,
+        operation: &'static str,
+        a: Term,
+        b: Term,
+    ) -> Result<Term, SolverError> {
+        let width = self.expect_same_bitvec_width(operation, a, b)?;
+        let a = self.resolve_term(operation, a)?;
+        let b = self.resolve_term(operation, b)?;
+        let term = self.terms_mut().mk_app_structural(
+            Symbol::named(operation),
+            [a, b],
+            Sort::bitvec(width),
+        );
+        Ok(self.wrap_term(term))
     }
 
     /// Create a bitvector bitwise NAND

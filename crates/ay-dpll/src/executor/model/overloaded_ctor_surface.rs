@@ -14,15 +14,15 @@
 //! collects, spelled by `ay_core::ascribed_constructor_spelling`, at the
 //! positions whose sort [`Executor::ascribe_overloaded_ctors`] follows; in
 //! [`ValueSpelling::Sorted`] it adds no ascription.
-//! [`Executor::table_cell_surface`] gives the name, if any, to print for a
+//! [`Executor::table_cell_surface`] gives the token, if any, to print for a
 //! function-table cell.
 //!
-//! Printed text is not always read as it was meant: a name may print
-//! unquoted (for example the constructor `|p\|q|` as `p|q`), and the
-//! application of a constructor named `as` can have the text of an
-//! ascription. So [`Executor::ascribe_overloaded_ctors`] returns a rewritten
-//! value only where `crate::constructor_ascription::reads_as_bare` accepts
-//! each ascribed atom and, for a compound value, the whole value, and
+//! Printed text is not always read as it was meant: for example the
+//! frontend reads the application `(|as| x S)` of a constructor named `as`
+//! as it reads the ascription `(as x S)`. So
+//! [`Executor::ascribe_overloaded_ctors`] returns a rewritten value only
+//! where `crate::constructor_ascription::reads_as_bare` accepts each
+//! ascribed atom and, for a compound value, the whole value, and
 //! [`Executor::surface_response`] can fall back to the `Sorted` rendering of
 //! the whole response.
 
@@ -185,8 +185,11 @@ impl OverloadedCtors {
         self.names.is_empty()
     }
 
+    /// Whether `text` holds the `ay_core::symbol_token` of one of the names.
     fn mentioned_in(&self, text: &str) -> bool {
-        self.names.iter().any(|name| text.contains(name.as_str()))
+        self.names
+            .iter()
+            .any(|name| text.contains(&*ay_core::symbol_token(name)))
     }
 
     fn printed(&self, exec: &Executor) -> &PrintedCtors {
@@ -229,6 +232,22 @@ impl OverloadedCtors {
         let (owner, name) = self.printed(exec).renamed.get(identity)?;
         (owner == carrier).then_some(name.as_str())
     }
+
+    /// The name `DatatypeOutputNames::name` gives `identity` when it is a
+    /// constructor of `carrier`: [`Self::printed_name`], or `identity` itself
+    /// when that is the name it prints.
+    fn printed_constructor_name<'a>(
+        &'a self,
+        exec: &Executor,
+        carrier: &str,
+        identity: &'a str,
+    ) -> Option<&'a str> {
+        if let Some(name) = self.printed_name(exec, carrier, identity) {
+            return Some(name);
+        }
+        let printed = self.printed(exec).by_carrier.get(carrier)?;
+        (printed.get(identity).map(String::as_str) == Some(identity)).then_some(identity)
+    }
 }
 
 impl Executor {
@@ -261,33 +280,31 @@ impl Executor {
         OverloadedCtors::new(out)
     }
 
-    /// The name to print for the function-table cell `cell` of `sort`
+    /// The token to print for the function-table cell `cell` of `sort`
     /// (#overloaded-nil-surface), or `None` to keep the cell as it is.
     ///
-    /// A cell can hold a constructor's identity that is no symbol of the
-    /// script, for example `__ay_overload_N`. In both spellings this returns
-    /// the name `DatatypeOutputNames::name` gives `cell` in `sort`'s carrier
-    /// when the frontend records a surface name for `cell`, that name differs
-    /// from `cell`, and `crate::constructor_ascription::reads_as_one_symbol`
-    /// accepts it. Written unquoted into the `ite` chain, a refused name such
-    /// as `x(y` or `true` would not read back as the constructor.
+    /// A cell can hold a constructor's identity, which is not always the
+    /// token the constructor's values print: for example `__ay_overload_N`
+    /// for a constructor whose name was taken when it was declared, or `a b`
+    /// for the constructor `|a b|`, whose identity is its name. In both
+    /// spellings this returns the `ay_core::symbol_token` of the name
+    /// [`OverloadedCtors::printed_constructor_name`] gives `cell` as a
+    /// constructor of `sort`'s carrier, when that token differs from `cell`.
+    /// Any other cell, for example `apple` or `(as @Fruit!0 Fruit)`, is kept.
     pub(super) fn table_cell_surface(
         &self,
         cell: &str,
         sort: &Sort,
         overloaded: &OverloadedCtors,
     ) -> Option<String> {
-        // A cell with no surface name on record is left as it is.
-        self.ctx.dt_surface_name(cell)?;
         let carrier = match sort {
             Sort::Datatype(dt) => dt.name.as_str(),
             Sort::Uninterpreted(name) => name.as_str(),
             _ => return None,
         };
-        overloaded
-            .printed_name(self, carrier, cell)
-            .filter(|name| crate::constructor_ascription::reads_as_one_symbol(name))
-            .map(str::to_string)
+        let name = overloaded.printed_constructor_name(self, carrier, cell)?;
+        let token = ay_core::symbol_token(name);
+        (token != cell).then(|| token.into_owned())
     }
 
     /// The response `print` renders for a reader outside the solver: its
@@ -325,10 +342,11 @@ impl Executor {
 
     /// `value` as printed for a term of `sort`, either as is or with the
     /// spelling `ay_core::ascribed_constructor_spelling` gives under `S` in
-    /// place of each unquoted atom `c` of `overloaded` that, at a position
-    /// whose sort `S` the rewrite follows, is the printed name
-    /// ([`OverloadedCtors::printed`]) of a nullary constructor of `S`, where
-    /// `crate::constructor_ascription::reads_as_bare` accepts that spelling.
+    /// place of each atom that is the `ay_core::symbol_token` of a name `c`
+    /// of `overloaded` and, at a position whose sort `S` the rewrite follows,
+    /// `c` is the printed name ([`OverloadedCtors::printed`]) of a nullary
+    /// constructor of `S`, where `crate::constructor_ascription::reads_as_bare`
+    /// accepts that spelling.
     /// It is returned as is when, for example, it is no term or
     /// `reads_as_bare` rejects the rewritten value.
     pub(super) fn ascribe_overloaded_ctors(
@@ -503,10 +521,10 @@ impl Executor {
             Node::Atom { start, end } => {
                 let bare = &src[*start..*end];
                 let name = atom_symbol(bare)?;
-                // Only an unquoted atom: `ay_core::bare_constructor_spelling`
-                // takes an ascription back as the name unquoted, so a quoted
-                // atom (`|pop|`) would not read back as itself.
-                if name != bare || !overloaded.names.contains(&name) {
+                // Only the token the printer writes for the name
+                // (`Executor::dt_value_head`): `ay_core::bare_constructor_spelling`
+                // reads an ascription back as that token.
+                if ay_core::symbol_token(&name) != bare || !overloaded.names.contains(&name) {
                     return None;
                 }
                 let ctor = overloaded.constructor(self, carrier, &name)?;
@@ -815,6 +833,88 @@ mod tests {
                 ["c ay.model.partial omitted=1 symbols=[f]"],
                 "{second_red}"
             );
+        }
+    }
+
+    /// `L1` and `L2` both declare `nil`, `p` is the application of the
+    /// constructor `|as|` to `odd` and `(as nil L1)`, and `t` is
+    /// `(cons 1 (as nil L1))`. Here, with `odd` the constructor `|a#b|` and
+    /// with `odd` the constructor `ab`, `p` prints as `(|as| odd nil)`, its
+    /// fields bare, in the values and the model, and `t`'s `nil` is
+    /// ascribed; in the script whose `L2` declares `unshared` instead, `t`'s
+    /// `nil` is bare.
+    #[test]
+    #[timeout(60000)]
+    fn an_application_of_as_prints_its_head_quoted_and_its_fields_bare() {
+        let script = |odd: &str, partner: &str| {
+            format!(
+                "(set-logic ALL)\n\
+                (declare-datatypes ((L1 0)) (((nil) (cons (hd Int) (tl L1)))))\n\
+                (declare-datatypes ((L2 0)) ((({partner}) (c2 (h2 Int)))))\n\
+                (declare-datatypes ((Odd 0)) ((({odd}) (odd2))))\n\
+                (declare-datatypes ((P 0)) (((|as| (f1 Odd) (f2 L1)))))\n\
+                (declare-const p P) (declare-const t L1)\n\
+                (assert (= (f1 p) {odd})) (assert (= (f2 p) (as nil L1)))\n\
+                (assert (= t (cons 1 (as nil L1))))\n\
+                (check-sat)\n\
+                (get-value (p t))\n\
+                (get-model)\n"
+            )
+        };
+        for odd in ["|a#b|", "ab"] {
+            for (out, twin) in run_both(&script(odd, "nil"))
+                .into_iter()
+                .zip(run_both(&script(odd, "unshared")))
+            {
+                assert_eq!(out[0], "sat");
+                assert_eq!(
+                    out[1],
+                    format!("((p (|as| {odd} nil)) (t (cons 1 (as nil L1))))")
+                );
+                assert_eq!(twin[1], format!("((p (|as| {odd} nil)) (t (cons 1 nil)))"));
+                let p = format!("(define-fun p () P (|as| {odd} nil))");
+                assert!(out[2].contains(&p), "{}", out[2]);
+                assert!(twin[2].contains(&p), "{}", twin[2]);
+            }
+        }
+    }
+
+    /// `|My List|` and `L2` both declare `nil`, and `Odd` declares `|y\||`,
+    /// `|z\||` and `odd`, which `a`, `b` and `c` hold, beside
+    /// `t = (as nil |My List|)`. Here, with `odd` the constructor `|a#b|` and
+    /// with `odd` the constructor `ab`, the get-value response prints `a`,
+    /// `b` and `c` quoted as the script spells them and `t`'s `nil`
+    /// ascribed; in the script whose `L2` declares `unshared` instead, it
+    /// holds `(t nil)`.
+    #[test]
+    #[timeout(60000)]
+    fn a_response_holding_escaped_quoted_symbols_keeps_its_ascription() {
+        let script = |odd: &str, partner: &str| {
+            format!(
+                "(set-logic ALL)\n\
+                (declare-datatypes ((|My List| 0)) (((nil) (cons (hd Int) (tl |My List|)))))\n\
+                (declare-datatypes ((L2 0)) ((({partner}) (c2 (h2 Int)))))\n\
+                (declare-datatypes ((Odd 0)) (((|y\\||) (|z\\||) ({odd}))))\n\
+                (declare-const a Odd) (declare-const t |My List|)\n\
+                (declare-const b Odd) (declare-const c Odd)\n\
+                (assert (= a |y\\||)) (assert (= t (as nil |My List|)))\n\
+                (assert (= b |z\\||)) (assert (= c {odd}))\n\
+                (check-sat)\n\
+                (get-value (a t b c))\n"
+            )
+        };
+        for odd in ["|a#b|", "ab"] {
+            for (out, twin) in run_both(&script(odd, "nil"))
+                .into_iter()
+                .zip(run_both(&script(odd, "unshared")))
+            {
+                assert_eq!(out[0], "sat");
+                assert_eq!(
+                    out[1],
+                    format!(r"((a |y\||) (t (as nil |My List|)) (b |z\||) (c {odd}))")
+                );
+                assert_eq!(twin[1], format!(r"((a |y\||) (t nil) (b |z\||) (c {odd}))"));
+            }
         }
     }
 

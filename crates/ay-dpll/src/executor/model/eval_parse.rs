@@ -79,8 +79,15 @@ impl Executor {
                 // it back to the canonical bare token — otherwise one value
                 // masquerades as two and fabricates a phantom difference
                 // (#qfax-atom-spelling). Non-`@` ascriptions (datatype
-                // constructors) are preserved verbatim.
-                EvalValue::Element(crate::executor_format::canonical_internal_atom(s.trim()))
+                // constructors) are preserved verbatim. A datatype value in
+                // completion's printed spelling (`|pop|`) is written in the
+                // identity spelling (`pop`) the evaluator compares, by
+                // `dt_value_respelled`.
+                let atom = crate::executor_format::canonical_internal_atom(s.trim());
+                let identity = element_sort.and_then(|sort| {
+                    self.dt_value_respelled(&atom, sort, super::dt_model::DtSpelling::Identity)
+                });
+                EvalValue::Element(identity.unwrap_or(atom))
             }
             _ => {
                 // Sort is unknown — e.g. an array interpretation the theory

@@ -9,6 +9,7 @@ mod arithmetic_mul_dag;
 mod arithmetic_neg_dag;
 mod bitvector_array;
 mod boolean;
+mod fresh_var_spelling;
 
 /// The process-wide stamp source hands out each identity once, in increasing
 /// order, even across concurrent callers: `fetch_update` is the closure-CAS loop

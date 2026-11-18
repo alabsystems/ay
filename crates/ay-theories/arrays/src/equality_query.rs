@@ -539,7 +539,7 @@ impl ArraySolver<'_> {
     fn build_reason_forest(&self, start: TermId) -> eq_paths_cache::ReasonPredecessors {
         let mut prev: eq_paths_cache::ReasonPredecessors = HashMap::default();
         let mut queue = std::collections::VecDeque::new();
-        let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::default();
+        let mut seen: HashSet<TermId> = HashSet::default();
         seen.insert(start);
         queue.push_back(start);
         while let Some(current) = queue.pop_front() {
@@ -743,8 +743,48 @@ impl ArraySolver<'_> {
         if let Some(hit) = eq_paths_cache::get_equal(t1, t2) {
             return hit;
         }
+        // Cross-window memo (#s3-eq-explain-memo): a positive answer is
+        // reused only while every reason literal is still assigned as
+        // recorded (then the same conjunction still proves the
+        // equality); a negative answer only while the
+        // asserted-equality graph has not grown since it was computed
+        // (`eq_explain_version`). Both rechecks make a hit identical
+        // to the uncached answer in the current state.
+        let persistent = self.eq_explain_memo.borrow().get(&(t1, t2)).cloned();
+        if let Some((version, answer)) = persistent {
+            match &answer {
+                Some(path)
+                    if path
+                        .iter()
+                        .all(|lit| self.assigns.get(&lit.term) == Some(&lit.value)) =>
+                {
+                    propagation::prop_eq_stats::add(
+                        &propagation::prop_eq_stats::equal_persistent_hits,
+                        1,
+                    );
+                    eq_paths_cache::put_equal(t1, t2, &answer);
+                    return answer;
+                }
+                None if version == self.eq_explain_version => {
+                    propagation::prop_eq_stats::add(
+                        &propagation::prop_eq_stats::equal_persistent_hits,
+                        1,
+                    );
+                    eq_paths_cache::put_equal(t1, t2, &answer);
+                    return answer;
+                }
+                _ => {}
+            }
+        }
         propagation::prop_eq_stats::add(&propagation::prop_eq_stats::equal_uncached, 1);
         let reason = self.explain_equal_if_provable_uncached(t1, t2);
+        {
+            let mut memo = self.eq_explain_memo.borrow_mut();
+            if memo.len() >= 65_536 {
+                memo.clear();
+            }
+            memo.insert((t1, t2), (self.eq_explain_version, reason.clone()));
+        }
         eq_paths_cache::put_equal(t1, t2, &reason);
         reason
     }

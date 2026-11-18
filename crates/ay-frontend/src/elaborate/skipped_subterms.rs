@@ -379,7 +379,7 @@ impl Context {
     ) -> HashMap<String, TermId> {
         let mut env = env.clone();
         for (name, sort) in binders {
-            let var = self.terms.mk_fresh_var(name, sort.clone());
+            let var = self.mint_fresh_var(name, sort.clone());
             env.insert(name.clone(), var);
         }
         env

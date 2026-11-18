@@ -350,18 +350,62 @@ impl TermStore {
         id
     }
 
-    /// Create a fresh variable (guaranteed unique)
+    /// Create a variable spelled `{prefix}_{id}`, `id` being the variable id
+    /// it takes, whose spelling is not in the name table.
+    ///
+    /// The spelling is not entered in the name table, so [`Self::mk_var`] and
+    /// [`Self::find_var`] never return this variable. Whether the store holds
+    /// such a variable under a given spelling is answered by
+    /// [`Self::find_fresh_var_spelled`].
     pub fn mk_fresh_var(&mut self, prefix: &str, sort: Sort) -> TermId {
+        self.mk_fresh_var_avoiding(prefix, sort, |_| false)
+    }
+
+    /// [`Self::mk_fresh_var`], additionally skipping every spelling for which
+    /// `taken` answers `true`. A skipped spelling consumes its variable id and
+    /// interns no term.
+    pub fn mk_fresh_var_avoiding(
+        &mut self,
+        prefix: &str,
+        sort: Sort,
+        mut taken: impl FnMut(&str) -> bool,
+    ) -> TermId {
         loop {
             let var_id = self.next_var_id();
 
             let name = format!("{prefix}_{var_id}");
-            if self.names.contains_key(name.as_str()) {
+            if self.names.contains_key(name.as_str()) || taken(name.as_str()) {
                 continue;
             }
 
             return self.intern(TermData::Var(name, var_id), sort);
         }
+    }
+
+    /// The variable spelled `name` whose variable id is the decimal tail of
+    /// that spelling, if this store holds one.
+    ///
+    /// [`Self::mk_fresh_var`] spells its variables `{prefix}_{id}` and keeps
+    /// them out of the name table; this is the read-only lookup for them. It
+    /// reads `name` as `{prefix}_{id}` (the tail after the last `_`, in
+    /// canonical decimal) and returns the interned `Var(name, id)` of any
+    /// sort. A variable interned by name whose id happens to equal the tail of
+    /// its spelling is returned as well.
+    #[must_use]
+    pub fn find_fresh_var_spelled(&self, name: &str) -> Option<TermId> {
+        let (_, tail) = name.rsplit_once('_')?;
+        let canonical = tail == "0"
+            || (!tail.starts_with('0')
+                && !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_digit()));
+        if !canonical {
+            return None;
+        }
+        let var_id: u32 = tail.parse().ok()?;
+        if var_id >= self.var_counter {
+            return None;
+        }
+        self.find_interned(&TermData::Var(name.to_string(), var_id))
     }
 
     /// Create an internal symbol name guaranteed not to collide with user symbols.

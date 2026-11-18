@@ -553,9 +553,9 @@ impl Executor {
                     };
                     parts.push(part);
                 }
-                let surface = self.dt_surface(&ctor);
+                let surface = self.dt_value_head(&ctor);
                 Some(if parts.is_empty() {
-                    surface.to_string()
+                    surface.into_owned()
                 } else {
                     format!("({} {})", surface, parts.join(" "))
                 })
@@ -568,7 +568,8 @@ impl Executor {
 
     /// Project selector `sel` from the structural rendering of `operand`:
     /// when that rendering is a constructor application of the ctor owning
-    /// `sel`, return its corresponding top-level field rendering verbatim.
+    /// `sel`, return its corresponding top-level field rendering verbatim,
+    /// the fields as `ay_core::smtlib_application_parts` splits them.
     fn structural_dt_selector_projection(
         &self,
         model: &Model,
@@ -586,24 +587,8 @@ impl Executor {
                     .map(|idx| (ctor.clone(), idx))
             })?;
         let rendered = self.structural_dt_table_key(model, operand, depth.checked_sub(1)?)?;
-        let inner = rendered.strip_prefix('(')?.strip_suffix(')')?;
-        let mut fields: Vec<&str> = Vec::new();
-        let mut level = 0i32;
-        let mut start = 0usize;
-        for (i, ch) in inner.char_indices() {
-            match ch {
-                '(' => level += 1,
-                ')' => level -= 1,
-                ' ' if level == 0 => {
-                    fields.push(&inner[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        fields.push(&inner[start..]);
-        let (head, args) = fields.split_first()?;
-        if *head != self.dt_surface(&owner) && *head != owner.as_str() {
+        let (head, args) = ay_core::smtlib_application_parts(&rendered)?;
+        if self.dt_value_head(&owner) != head && owner.as_str() != head {
             return None;
         }
         args.get(idx).map(|field| (*field).to_string())
@@ -1224,9 +1209,28 @@ impl Executor {
         // here would let `(get-model)` disagree with validation and scalar
         // `select` evaluation.
         let default = interp.default.as_deref()?;
-        let base = format!("((as const {sort_str}) {default})");
-
-        Some(format_newest_first_store_chain(base, &interp.stores))
+        // The interpretation holds datatype values in either spelling of
+        // `dt_value_respelled`; each prints as its constructors' tokens.
+        let printed = |text: &str, sort: &Sort| self.dt_value_printed(text, sort);
+        let Sort::Array(array_sort) = sort else {
+            let base = format!("((as const {sort_str}) {default})");
+            return Some(format_newest_first_store_chain(base, &interp.stores));
+        };
+        let base = format!(
+            "((as const {sort_str}) {})",
+            printed(default, &array_sort.element_sort)
+        );
+        let stores: Vec<(String, String)> = interp
+            .stores
+            .iter()
+            .map(|(index, value)| {
+                (
+                    printed(index, &array_sort.index_sort),
+                    printed(value, &array_sort.element_sort),
+                )
+            })
+            .collect();
+        Some(format_newest_first_store_chain(base, &stores))
     }
 
     /// Format an evaluated array index/element value at `term_id`'s declared
@@ -1674,8 +1678,15 @@ impl Executor {
         // reuse an observed cell's value (folding a single-point array into a
         // plain const-array witness, #model-array-witness) instead of
         // inventing the canonical zero.
+        // The interpretation holds datatype values in either spelling of
+        // `dt_value_respelled`; the witness prints its constructors' tokens,
+        // the spelling of the direct reads it merges below.
+        let printed = |text: String, sort: &Sort| {
+            self.dt_value_respelled(&text, sort, super::dt_model::DtSpelling::Printed)
+                .unwrap_or(text)
+        };
         let default = match interp.and_then(|i| i.default.clone()) {
-            Some(default) if !default.contains('@') => Some(default),
+            Some(default) if !default.contains('@') => Some(printed(default, elem_sort)),
             // An `@Sort!n` atom of an UNINTERPRETED sort is a first-class
             // model value: the printer sort-ascribes it (`(as @E!k E)`) and
             // the output header declares it, so it must be KEPT — collapsing
@@ -1832,10 +1843,13 @@ impl Executor {
                         None => continue,
                     }
                 } else {
-                    idx_str.clone()
+                    match index_sort.as_ref() {
+                        Some(sort) => printed(idx_str.clone(), sort),
+                        None => idx_str.clone(),
+                    }
                 };
                 let val_str = match self.printable_reconstructed_cell(val_str, elem_sort) {
-                    Ok(Some(spelled)) => spelled,
+                    Ok(Some(spelled)) => printed(spelled, elem_sort),
                     Ok(None) => continue,
                     Err(()) => return None,
                 };
@@ -2521,7 +2535,7 @@ impl Executor {
                 if fields.len() != args.len() {
                     return None;
                 }
-                let surface = self.dt_surface(ctor).to_string();
+                let surface = self.dt_value_head(ctor).into_owned();
                 if args.is_empty() {
                     return Some(surface);
                 }

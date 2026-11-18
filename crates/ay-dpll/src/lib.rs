@@ -125,7 +125,7 @@ mod constructor_ascription;
 pub use constructor_ascription::{
     as_application_pair, constructor_ascription_matrix, overload_pairs, AscriptionCase,
     OverloadPair, AS_APPLICATION_OWN_SORT, AS_APPLICATION_UNIT, MATRIX_CONSTRUCTORS, MATRIX_SORTS,
-    OVERLOAD_ASCRIBED_CONSTRUCTORS, OVERLOAD_BARE_CONSTRUCTORS, OVERLOAD_PAIR_VARIANTS,
+    OVERLOAD_ASCRIBED_CONSTRUCTORS, OVERLOAD_PAIR_VARIANTS,
 };
 mod diagnostic_trace;
 mod dpll_error;

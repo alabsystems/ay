@@ -7,15 +7,16 @@
 //! back.
 //!
 //! [`ascribed_constructor_spelling`] gives the ascription and
-//! [`bare_constructor_spelling`] takes it back; both refuse what
-//! [`ascription_may_name_constructor`] refuses, for example
-//! `(as seq.empty (Seq Int))`. [`smtlib_term_len`] measures one term of
-//! printed text, and [`model_constant_definition`] reads one constant
-//! definition of a model.
+//! [`bare_constructor_spelling`] takes it back to the constructor's
+//! [`symbol_token`]; both refuse what [`ascription_may_name_constructor`]
+//! refuses, for example `(as seq.empty (Seq Int))`. [`smtlib_term_len`]
+//! measures one term of printed text, [`smtlib_application_parts`] splits
+//! one into its head and arguments, and [`model_constant_definition`] reads
+//! one constant definition of a model.
 
 use std::borrow::Cow;
 
-use crate::quote_symbol;
+use crate::symbol_token;
 
 /// Heads [`ascription_may_name_constructor`] refuses under any sort: theory
 /// constants, such as `seq.empty` in `(as seq.empty (Seq Int))`. `const` is
@@ -41,27 +42,25 @@ pub const ASCRIPTION_THEORY_SORT_HEADS: &[&str] =
 /// Whether `(as head S)` may be a constructor ascription, decided by syntax
 /// alone.
 ///
-/// `compound_sort_head` is the first symbol of `S` when `S` is a list (`List`
-/// of `(List Int)`), and `None` when `S` is a plain symbol. It is false
-/// exactly for:
+/// `head` is the name, unquoted (the empty name of the constructor `||` is
+/// admitted). `compound_sort_head` is the first symbol of `S` when `S` is a
+/// list (`List` of `(List Int)`), and `None` when `S` is a plain symbol. It
+/// is false exactly for:
 ///
-/// - an empty head;
 /// - a head starting with `@` (an abstract element such as `(as @S!0 S)`, or
 ///   a constructor a script named `|@a|`);
 /// - a head in [`ASCRIPTION_THEORY_VALUE_HEADS`];
 /// - any head under a sort constructor in [`ASCRIPTION_THEORY_SORT_HEADS`].
 pub fn ascription_may_name_constructor(head: &str, compound_sort_head: Option<&str>) -> bool {
-    !head.is_empty()
-        && !head.starts_with('@')
+    !head.starts_with('@')
         && !ASCRIPTION_THEORY_VALUE_HEADS.contains(&head)
         && compound_sort_head.is_none_or(|sort| !ASCRIPTION_THEORY_SORT_HEADS.contains(&sort))
 }
 
-/// `(as constructor sort)`, the name quoted where [`quote_symbol`] quotes
-/// it, or `None` exactly when `sort_len` does not span all of the trimmed
-/// `printed_sort`, when [`ascription_may_name_constructor`] refuses it, when
-/// [`bare_constructor_spelling`] changes the bare name itself, or when the
-/// spelling would not read back as exactly `constructor`.
+/// `(as c sort)`, `c` the [`symbol_token`] of `constructor`, or `None`
+/// exactly when `sort_len` does not span all of the trimmed `printed_sort`,
+/// when [`ascription_may_name_constructor`] refuses it, or when
+/// [`bare_constructor_spelling`] would not read the spelling back as `c`.
 ///
 /// `constructor` is the constructor's name, unquoted. `printed_sort` is a
 /// printed sort (`L1`, `|L#1|`, `(List Int)`).
@@ -73,15 +72,13 @@ pub fn ascribed_constructor_spelling(constructor: &str, printed_sort: &str) -> O
     {
         return None;
     }
-    if bare_constructor_spelling(constructor) != constructor {
-        return None;
-    }
-    let ascribed = format!("(as {} {sort})", quote_symbol(constructor));
-    (bare_constructor_spelling(&ascribed) == constructor).then_some(ascribed)
+    let token = symbol_token(constructor);
+    let ascribed = format!("(as {token} {sort})");
+    (bare_constructor_spelling(&ascribed) == token).then_some(ascribed)
 }
 
-/// `text` with each constructor ascription `(as c S)` replaced by the name
-/// `c` spells, its quotes removed (`(as |pop| L1)` gives `pop`).
+/// `text` with each constructor ascription `(as c S)` replaced by the token
+/// `c` as written (`(as |pop| L1)` gives `|pop|`, `(as || L1)` gives `||`).
 ///
 /// An ascription here is `(`, `as`, `c`, `S` and `)`, with whitespace after
 /// `as` and after `c` (and optionally after `(` and `S`): `c` is a `|quoted|`
@@ -117,7 +114,7 @@ pub fn bare_constructor_spelling(text: &str) -> Cow<'_, str> {
             b'(' => match ascription(rest).filter(|_| !at_head) {
                 Some((len, constructor)) => {
                     out.push_str(&text[copied..at]);
-                    out.push_str(&constructor);
+                    out.push_str(constructor);
                     copied = at + len;
                     len
                 }
@@ -142,10 +139,10 @@ pub fn bare_constructor_spelling(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// The byte length of the ascription `text` starts with and the name its `c`
-/// spells, when it has the shape and passes the test
-/// [`bare_constructor_spelling`] states.
-fn ascription(text: &str) -> Option<(usize, String)> {
+/// The byte length of the ascription `text` starts with and its token `c`,
+/// when it has the shape and passes the test [`bare_constructor_spelling`]
+/// states.
+fn ascription(text: &str) -> Option<(usize, &str)> {
     let after_as = text.strip_prefix("(")?.trim_start().strip_prefix("as")?;
     let rest = after_as.trim_start();
     if rest.len() == after_as.len() {
@@ -159,9 +156,8 @@ fn ascription(text: &str) -> Option<(usize, String)> {
     }
     let (sort_len, compound_sort_head) = sort_len(sort)?;
     let close = sort[sort_len..].trim_start().strip_prefix(')')?;
-    let name = unquoted(constructor);
-    ascription_may_name_constructor(&name, compound_sort_head.as_deref())
-        .then_some((text.len() - close.len(), name))
+    ascription_may_name_constructor(&unquoted(constructor), compound_sort_head.as_deref())
+        .then_some((text.len() - close.len(), constructor))
 }
 
 /// Byte length of the sort-shaped text `text` starts with: a symbol, or a
@@ -231,6 +227,34 @@ pub fn smtlib_term_len(text: &str) -> Option<usize> {
             return Some(at);
         }
     }
+}
+
+/// The head and the top-level arguments of the one term the trimmed `text`
+/// is, each one [`smtlib_term_len`] term: `(cons 1 (cons 2 nil))` gives
+/// `cons` with `1` and `(cons 2 nil)`, `(|a b| x)` gives `|a b|` with `x`,
+/// and an atom such as `nil` or `|a b|` gives itself with no arguments.
+/// `None` when the trimmed text is not one term, or is a list that is empty
+/// or headed by a list (`((as const A) 0)`).
+pub fn smtlib_application_parts(text: &str) -> Option<(&str, Vec<&str>)> {
+    let text = text.trim();
+    if smtlib_term_len(text)? != text.len() {
+        return None;
+    }
+    let Some(inner) = text.strip_prefix('(') else {
+        return Some((text, Vec::new()));
+    };
+    let mut parts = Vec::new();
+    let mut rest = inner.trim_start();
+    while !rest.starts_with(')') {
+        let len = smtlib_term_len(rest)?;
+        parts.push(&rest[..len]);
+        rest = rest[len..].trim_start();
+    }
+    if parts.first()?.starts_with('(') {
+        return None;
+    }
+    let head = parts.remove(0);
+    Some((head, parts))
 }
 
 /// The name and the value of the constant one model line defines,
@@ -346,7 +370,7 @@ mod tests {
 
     /// For the names and sorts below, every spelling
     /// `ascribed_constructor_spelling` returns reads back, alone and nested,
-    /// as the constructor's name.
+    /// as the constructor's `symbol_token`.
     #[test]
     fn a_printed_ascription_always_reads_back_as_the_bare_constructor() {
         let constructors = [
@@ -395,8 +419,7 @@ mod tests {
                     continue;
                 };
                 printed += 1;
-                // The bare text compared with is the name, unquoted.
-                let bare = constructor;
+                let bare = symbol_token(constructor);
                 assert_eq!(bare_constructor_spelling(&ascribed), bare, "{ascribed}");
                 let nested = format!("(w {ascribed} (cons 1 {ascribed}))");
                 assert_eq!(
@@ -406,9 +429,9 @@ mod tests {
                 );
             }
         }
-        // Fourteen of these names under nine of these sorts: not `seq.empty`,
-        // `re.none`, `@S!0` or the empty name, and not the last eight sorts.
-        assert_eq!(printed, 14 * 9);
+        // Fifteen of these names under nine of these sorts: not `seq.empty`,
+        // `re.none` or `@S!0`, and not the last eight sorts.
+        assert_eq!(printed, 15 * 9);
         for (constructor, sort) in [
             ("const", "L1"),
             ("bag.empty", "(Bag Int)"),
@@ -467,18 +490,65 @@ mod tests {
         assert_eq!(smtlib_term_len("a|b)"), Some(1));
     }
 
-    /// The names of the first list, which `bare_constructor_spelling`
-    /// changes, get no ascribed spelling under `L1`; those of the second get
-    /// one that reads back as the name.
+    /// Each text of the first list splits into the head and the arguments
+    /// paired with it; no text of the second list splits.
     #[test]
-    fn a_name_that_spells_an_ascription_stays_bare() {
-        for name in ["(as nil L)", "(w (as nil L) 1)", "(as |pop| (List Int))"] {
-            assert_ne!(bare_constructor_spelling(name), name);
-            assert_eq!(ascribed_constructor_spelling(name, "L1"), None, "{name}");
+    fn an_application_splits_at_its_term_boundaries() {
+        for (text, head, arguments) in [
+            ("nil", "nil", vec![]),
+            (" nil ", "nil", vec![]),
+            ("(cons A (cons B nil))", "cons", vec!["A", "(cons B nil)"]),
+            (
+                "(mk (cons A nil) false)",
+                "mk",
+                vec!["(cons A nil)", "false"],
+            ),
+            ("(|a b| x)", "|a b|", vec!["x"]),
+            ("|a b|", "|a b|", vec![]),
+            ("||", "||", vec![]),
+            ("(c1 4 ||)", "c1", vec!["4", "||"]),
+            (r"(|a\|b| |x y| (- 7))", r"|a\|b|", vec!["|x y|", "(- 7)"]),
+            ("(rec \"a ) b\" k)", "rec", vec!["\"a ) b\"", "k"]),
+            ("(as |a b| D)", "as", vec!["|a b|", "D"]),
+        ] {
+            assert_eq!(
+                smtlib_application_parts(text),
+                Some((head, arguments)),
+                "{text}"
+            );
         }
-        for name in ["(as @S!0 S)", "(as seq.empty (Seq Int))", "(as", "as nil L"] {
+        for text in [
+            "",
+            "a b",
+            "(cons A",
+            "()",
+            "((as const (Array Int Int)) 0)",
+            "|open",
+            "nil)",
+        ] {
+            assert_eq!(smtlib_application_parts(text), None, "{text}");
+        }
+    }
+
+    /// Each name below spells an ascription or a part of one. Its
+    /// `symbol_token` is a quoted symbol that `bare_constructor_spelling`
+    /// leaves as written, and its ascribed spelling under `L1` reads back as
+    /// that token.
+    #[test]
+    fn a_name_that_spells_an_ascription_reads_back_as_its_token() {
+        for name in [
+            "(as nil L)",
+            "(w (as nil L) 1)",
+            "(as |pop| (List Int))",
+            "(as @S!0 S)",
+            "(as seq.empty (Seq Int))",
+            "(as",
+            "as nil L",
+        ] {
+            let token = symbol_token(name);
+            assert_eq!(bare_constructor_spelling(&token), token, "{name}");
             let ascribed = ascribed_constructor_spelling(name, "L1").expect(name);
-            assert_eq!(bare_constructor_spelling(&ascribed), name);
+            assert_eq!(bare_constructor_spelling(&ascribed), token, "{ascribed}");
         }
     }
 
@@ -501,7 +571,7 @@ mod tests {
                 "r",
                 "(rec \"| (as nil L1) )\" nil (- 7))",
             ),
-            ("(define-fun |a b| () L1 (as |pop| L1))", "|a b|", "pop"),
+            ("(define-fun |a b| () L1 (as |pop| L1))", "|a b|", "|pop|"),
             ("(define-fun s () String \"a ) |\")", "s", "\"a ) |\""),
         ] {
             let (read_name, read_value) = model_constant_definition(line).expect(line);
@@ -572,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             bare_constructor_spelling("(mk (as  |my nil|   (|My List| Int) ) \"(as\")"),
-            "(mk my nil \"(as\")"
+            "(mk |my nil| \"(as\")"
         );
         // Atoms that hold a bar or a double quote, and the quoted symbol
         // `|a b|`, beside an ascription or a string literal.
@@ -585,13 +655,15 @@ mod tests {
         ] {
             assert_eq!(bare_constructor_spelling(ascribed), bare, "{ascribed}");
         }
-        // Here each quoted name reads unquoted.
+        // Here each quoted name keeps its quotes.
         for (ascribed, bare) in [
-            ("(as |pop| Op1)", "pop"),
-            ("(w (as |pop| Op1) (as |a#b| Op2))", "(w pop a#b)"),
-            ("(as |let| L)", "let"),
-            (r"(as |a\|b| L)", "a|b"),
-            (r"(as |a\\b| L)", r"a\b"),
+            ("(as |pop| Op1)", "|pop|"),
+            ("(w (as |pop| Op1) (as |a#b| Op2))", "(w |pop| |a#b|)"),
+            ("(as |let| L)", "|let|"),
+            (r"(as |a\|b| L)", r"|a\|b|"),
+            (r"(as |a\\b| L)", r"|a\\b|"),
+            ("(as || L)", "||"),
+            ("(cons 1 (as || L))", "(cons 1 ||)"),
         ] {
             assert_eq!(bare_constructor_spelling(ascribed), bare, "{ascribed}");
         }

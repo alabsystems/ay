@@ -1314,16 +1314,56 @@ impl Context {
         Some(candidate)
     }
 
-    /// Whether a core spelling has never denoted a declaration in this term
-    /// store and is not occupied by a live declaration. The sticky history is
-    /// load-bearing: scope pop removes live symbol metadata but retained terms
-    /// continue to carry their original core spellings.
+    /// Whether an incoming declaration may take `name` as its core spelling:
+    /// `name` has never denoted a declaration in this term store
+    /// ([`Self::core_spelling_denotes_declaration`]) and the term store holds
+    /// no variable minted under it (`TermStore::find_fresh_var_spelled`).
+    ///
+    /// The second condition is what keeps a declaration apart from an
+    /// elaborator- or engine-minted variable (a quantifier binder `x_0`, for
+    /// example): core terms name variables by spelling, so a declaration that
+    /// took a minted spelling would be a second variable of that name. Such a
+    /// declaration gets a private core identity from
+    /// [`Self::ordinary_source_binding_internal_name`] and keeps its surface
+    /// spelling.
     pub(super) fn declaration_core_identity_is_available(&self, name: &str) -> bool {
-        !self.declaration_core_identities_used.contains(name)
-            && !self.symbols.contains_key(name)
-            && !self.overloaded_symbols.contains_key(name)
-            && !self.constructors.contains_key(name)
-            && !self.dt_internal_surface.contains_key(name)
+        !self.core_spelling_denotes_declaration(name)
+            && self.terms.find_fresh_var_spelled(name).is_none()
+    }
+
+    /// Whether a core spelling denotes a live declaration or has denoted one
+    /// in this term store. The sticky history is load-bearing: scope pop
+    /// removes live symbol metadata but retained terms continue to carry
+    /// their original core spellings.
+    pub(super) fn core_spelling_denotes_declaration(&self, name: &str) -> bool {
+        self.declaration_core_identities_used.contains(name)
+            || self.symbols.contains_key(name)
+            || self.overloaded_symbols.contains_key(name)
+            || self.constructors.contains_key(name)
+            || self.dt_internal_surface.contains_key(name)
+    }
+
+    /// Mint an elaborator-private variable spelled `{prefix}_{id}` whose
+    /// spelling denotes no declaration
+    /// ([`Self::core_spelling_denotes_declaration`]) and no named variable of
+    /// the term store. With [`Self::declaration_core_identity_is_available`]
+    /// refusing a minted spelling to later declarations, a minted variable
+    /// and a declared symbol never share a core spelling in either order.
+    /// Every elaborator mint outside the reserved namespaces goes through
+    /// here.
+    pub(super) fn mint_fresh_var(&mut self, prefix: &str, sort: Sort) -> TermId {
+        let used = &self.declaration_core_identities_used;
+        let symbols = &self.symbols;
+        let overloaded = &self.overloaded_symbols;
+        let constructors = &self.constructors;
+        let internal_surface = &self.dt_internal_surface;
+        self.terms.mk_fresh_var_avoiding(prefix, sort, |name| {
+            used.contains(name)
+                || symbols.contains_key(name)
+                || overloaded.contains_key(name)
+                || constructors.contains_key(name)
+                || internal_surface.contains_key(name)
+        })
     }
 
     /// Reserve an exact declaration core spelling for the lifetime of this
@@ -1348,6 +1388,32 @@ impl Context {
             self.next_overload_identity = self.next_overload_identity.wrapping_add(1);
             if self.declaration_core_identity_is_available(&candidate) {
                 self.reserve_declaration_core_identity(&candidate);
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint, reserve and record the private core identity of one
+    /// single-constructor field constant: `__ay_field_N`, `N` from its own
+    /// counter. Source text cannot declare an `__ay_` name, and the identity
+    /// is reserved with the declaration identities, so no user symbol and no
+    /// other declaration can take it. The counter is separate from
+    /// [`Self::fresh_private_declaration_core_identity`]'s so the field
+    /// identities of a script do not shift with the number of overloads it
+    /// declares. The numeric tail is this counter, never a `TermId`
+    /// (`ay-dpll`'s `is_counter_only_internal_name` relies on it). Read back
+    /// through [`Context::is_dt_field_identity`].
+    pub(super) fn fresh_dt_field_identity(&mut self) -> String {
+        loop {
+            let candidate = format!(
+                "{}field_{}",
+                super::INTERNAL_SYMBOL_PREFIX,
+                self.next_field_identity
+            );
+            self.next_field_identity = self.next_field_identity.wrapping_add(1);
+            if self.declaration_core_identity_is_available(&candidate) {
+                self.reserve_declaration_core_identity(&candidate);
+                self.dt_field_identities.insert(candidate.clone());
                 return candidate;
             }
         }

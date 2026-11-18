@@ -3,7 +3,7 @@
 
 use super::{
     plan,
-    process::{Runner, Step},
+    process::{Runner, Step, StepKind},
 };
 use std::path::PathBuf;
 
@@ -270,7 +270,13 @@ fn grouped_integration_edits_keep_unchanged_checker_and_benchmark_modules_out() 
     let test = plan
         .steps
         .iter()
-        .find(|s| s.args.windows(2).any(|a| a == ["--test", "group_cli"]))
+        .find(|step| {
+            step.kind == StepKind::RustTests
+                && step
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--test", "group_cli"])
+        })
         .unwrap();
     assert!(test.args.windows(2).any(|a| a == ["--skip", "checker::"]));
     assert!(!test.args.windows(2).any(|a| a == ["--skip", "changed::"]));
@@ -330,9 +336,17 @@ fn documentation_and_grouped_tests_select_only_relevant_work() {
         &Default::default(),
     )
     .unwrap();
-    assert_eq!(tests.steps.len(), 1);
-    assert!(tests.steps[0].args.iter().any(|a| a == "group_cli"));
-    assert!(!tests.steps[0].args.iter().any(|a| a == "group_smt"));
+    let runtime: Vec<_> = tests
+        .steps
+        .iter()
+        .filter(|step| step.kind == StepKind::RustTests)
+        .collect();
+    assert_eq!(runtime.len(), 1);
+    assert!(runtime[0].args.iter().any(|arg| arg == "group_cli"));
+    assert!(tests
+        .steps
+        .iter()
+        .all(|step| !step.args.iter().any(|arg| arg == "group_smt")));
     let library = plan::select(
         "/repo".as_ref(),
         &metadata,

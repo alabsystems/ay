@@ -1998,9 +1998,14 @@ fn ctx_solver_simplify(terms: &mut TermStore, formulas: &mut Vec<TermId>) -> boo
         return false;
     };
 
-    // Declare every distinct free constant into the sub-solver so its symbol is
-    // registered, then graft each assertion's term DAG across. `mk_var` interns
-    // by name, so the grafted variable nodes reuse the declared ids.
+    // Declare one sub-solver constant per distinct free variable TERM of the
+    // goal, under a positional name of the sub-solver's own (`g<i>`), and map
+    // the goal's variable to it before grafting. The correspondence is by
+    // `TermId`, never by spelling: two goal variables that are spelled alike
+    // (an elaborator-minted variable and a later declaration, or a popped and
+    // a redeclared constant) stay two constants, and a goal variable whose
+    // core spelling is a reserved private identity needs no declaration under
+    // that spelling. A refused declaration leaves the goal unchanged.
     let mut var_ids: Vec<TermId> = Vec::new();
     let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
     for &f in formulas.iter() {
@@ -2010,18 +2015,18 @@ fn ctx_solver_simplify(terms: &mut TermStore, formulas: &mut Vec<TermId>) -> boo
             }
         });
     }
-    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for id in var_ids {
-        let (name, sort) = match terms.get(id) {
-            TermData::Var(name, _) => (name.clone(), terms.sort(id).clone()),
-            _ => continue,
-        };
-        if declared.insert(name.clone()) {
-            let _ = sub.declare_const(&name, sort);
+    let mut memo: std::collections::HashMap<TermId, TermId> = std::collections::HashMap::new();
+    for (position, id) in var_ids.into_iter().enumerate() {
+        if memo.contains_key(&id) {
+            continue;
         }
+        let sort = terms.sort(id).clone();
+        let Ok(constant) = sub.try_declare_const(&format!("g{position}"), sort) else {
+            return false;
+        };
+        memo.insert(id, constant.id());
     }
 
-    let mut memo: std::collections::HashMap<TermId, TermId> = std::collections::HashMap::new();
     let mut grafted: Vec<TermId> = Vec::with_capacity(formulas.len());
     for &f in formulas.iter() {
         grafted.push(graft_term(&*terms, sub.terms_mut(), f, &mut memo));

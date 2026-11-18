@@ -2075,7 +2075,18 @@ impl NraSolver<'_> {
 
     /// Convert an arithmetic term to a multivariate polynomial, or `None` for
     /// unsupported operators (/, div, mod, abs, transcendental, ...).
-    fn term_to_multipoly(&self, term: TermId) -> Option<MultiPoly> {
+    pub(crate) fn term_to_multipoly(&self, term: TermId) -> Option<MultiPoly> {
+        if let Some(hit) = self.multipoly_cache.borrow().get(&term) {
+            self.multipoly_cache_hits
+                .set(self.multipoly_cache_hits.get() + 1);
+            return hit.clone();
+        }
+        let out = self.term_to_multipoly_uncached(term);
+        self.multipoly_cache.borrow_mut().insert(term, out.clone());
+        out
+    }
+
+    fn term_to_multipoly_uncached(&self, term: TermId) -> Option<MultiPoly> {
         match self.terms.get(term) {
             TermData::Const(Constant::Int(n)) => {
                 Some(MultiPoly::constant(BigRational::from_integer(n.clone())))

@@ -36,6 +36,39 @@ pub(super) struct EliminationState {
     pub(super) budget: usize,
 }
 
+/// The name prefixes of the auxiliary variables [`EliminationState::fresh_var`]
+/// mints for ITE and mod/div elimination. Each elimination numbers its
+/// auxiliaries from 0, and a [`ChcVar`] is identified by its name and sort.
+const ELIMINATION_AUX_PREFIXES: [&str; 5] = ["_ite_", "_mod_q_", "_mod_r_", "_div_q_", "_div_r_"];
+
+/// Whether `name` carries one of the [`ELIMINATION_AUX_PREFIXES`].
+pub(crate) fn is_elimination_aux_var_name(name: &str) -> bool {
+    ELIMINATION_AUX_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// The name prefix of the variables the catamorphism abstraction mints
+/// (`__cata<N>_<tag>`, `__cata_opq<N>`).
+const CATAMORPHISM_VAR_PREFIX: &str = "__cata";
+
+/// Whether `name` lies in one of the two name families the parser keeps
+/// input variables out of: the elimination auxiliaries
+/// ([`is_elimination_aux_var_name`]) and the names starting with
+/// [`CATAMORPHISM_VAR_PREFIX`].
+///
+/// The parser renames apart every input variable with such a name
+/// (`ChcParser::binder_must_be_renamed` and
+/// `ChcParser::reserved_variable_rename`), so a variable of a parsed problem
+/// is never one of these. An input variable is bound by its clause, which
+/// makes the renaming an alpha-conversion.
+///
+/// Other `__`-prefixed spellings are not classified here and reach the
+/// engine as written.
+pub(crate) fn is_engine_reserved_var_name(name: &str) -> bool {
+    name.starts_with(CATAMORPHISM_VAR_PREFIX) || is_elimination_aux_var_name(name)
+}
+
 impl EliminationState {
     pub(super) fn new() -> Self {
         Self {

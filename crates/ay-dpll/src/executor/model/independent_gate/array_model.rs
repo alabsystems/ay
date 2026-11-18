@@ -188,7 +188,7 @@ impl IndependentModelView<'_> {
                         .flat_map(|constructor| {
                             [
                                 constructor.clone(),
-                                self.exec.dt_surface(constructor).to_string(),
+                                self.exec.dt_value_head(constructor).into_owned(),
                             ]
                         })
                         .collect();

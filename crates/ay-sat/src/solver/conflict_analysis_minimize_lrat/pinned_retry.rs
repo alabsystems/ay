@@ -54,6 +54,27 @@
 //! makes a retry able to succeed. Either one keeps the full retry. The test
 //! is made on every call, so a solver that gains a proof output later retries
 //! in full from then on.
+//!
+//! # The stay-pinned memo
+//!
+//! Even the short retry is re-run for every pinned slot on every
+//! materialize call, and materialize runs per clause mutation: measured
+//! on cruise-control (QF_LIRA, default proof posture) at ~255k calls
+//! re-walking 271 permanently pinned slots (69M slot visits in 12 s,
+//! ~25% of the busy thread in the lookup accessors). A slot that stayed
+//! pinned performed no writes, so its outcome is a pure function of the
+//! inputs the short retry reads. Those inputs split in two kinds: the
+//! variable's own proof-id state, which changes only through
+//! `record_level0_proof_id_for_lit` / `record_unit_proof_id_for_lit`
+//! (both clear the memo), and structural state the fingerprint below
+//! reads directly (trail literal, level, assignment values, reason,
+//! and the reason clause's length/id/head as consulted). Visibility is
+//! not an input kind here: with no proof manager,
+//! `lrat_hint_id_visible` is `id != 0`. If the fingerprint matches the
+//! stored one, the retry would keep the slot again, so it is skipped.
+//! A fingerprint collision can only keep a slot pinned until one of its
+//! inputs changes — the same state as today — never record a wrong id:
+//! the memo only ever answers "stays pinned".
 
 use super::super::*;
 
@@ -61,6 +82,21 @@ use super::super::*;
 thread_local! {
     /// Test-only: force the full retry, for the differential pins.
     static FORCE_FULL_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: disable the stay-pinned memo, for its differential pin.
+    static PIN_MEMO_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: run `f` with the stay-pinned memo disabled on this thread.
+#[cfg(test)]
+pub(in crate::solver) fn with_pin_memo_disabled<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PIN_MEMO_DISABLED.with(|force| force.set(self.0));
+        }
+    }
+    let _restore = Restore(PIN_MEMO_DISABLED.with(|force| force.replace(true)));
+    f()
 }
 
 /// Test-only: run `f` with the full pinned-slot retry forced on this thread.
@@ -89,10 +125,82 @@ impl Solver {
         self.proof_manager.is_none() && self.cold.forward_checker.is_none()
     }
 
+    /// Fingerprint of every structural input the short retry reads for
+    /// the slot at trail position `i`, in a solver that writes no proof
+    /// (so hint visibility is `id != 0` and needs no set probes). Zero
+    /// means "do not memoize" (variable out of memo range).
+    fn pin_retry_fingerprint(&self, i: usize) -> u64 {
+        #[cfg(test)]
+        if PIN_MEMO_DISABLED.with(std::cell::Cell::get) {
+            return 0;
+        }
+        let unit_lit = self.trail[i];
+        let var_idx = unit_lit.variable().index();
+        if var_idx >= self.num_vars
+            || var_idx >= self.cold.lrat_pin_retry_memo_fingerprint.len()
+            || var_idx * 2 + 1 >= self.vals.len()
+        {
+            return 0;
+        }
+        let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut mix = |v: u64| {
+            h ^= v.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 27;
+        };
+        mix(unit_lit.index() as u64);
+        let vd = self.var_data[var_idx];
+        mix(u64::from(vd.level));
+        mix(u64::from(vd.reason));
+        mix(u64::from(vd.flags));
+        mix(self.vals[var_idx * 2] as i64 as u64);
+        mix(self.vals[var_idx * 2 + 1] as i64 as u64);
+        match self.var_reason(var_idx) {
+            None => mix(0xA5A5_0001),
+            Some(reason_ref) => {
+                let clause_idx = reason_ref.0 as usize;
+                if clause_idx >= self.arena.len() {
+                    mix(0xA5A5_0002);
+                } else {
+                    let clause_len = self.arena.len_of(clause_idx);
+                    mix(clause_len as u64);
+                    if clause_len == 1 {
+                        mix(self.arena.literal(clause_idx, 0).index() as u64);
+                    }
+                    mix(self.clause_id(reason_ref));
+                }
+            }
+        }
+        // Never zero: zero is the empty memo slot.
+        h | 1
+    }
+
     /// Retry pinned root-trail slot `i` in a solver that writes no proof
     /// ([`Self::level0_retry_writes_no_proof`]), with exactly the effect of
     /// the full retry. Returns whether the slot stays pinned.
     pub(super) fn retry_pinned_level0_unit_without_proof(&mut self, i: usize) -> bool {
+        let fingerprint = self.pin_retry_fingerprint(i);
+        let var_idx = self.trail[i].variable().index();
+        if fingerprint != 0
+            && self
+                .cold
+                .lrat_pin_retry_memo_fingerprint
+                .get(var_idx)
+                .copied()
+                == Some(fingerprint)
+        {
+            return true;
+        }
+        let stays = self.retry_pinned_level0_unit_without_proof_inner(i);
+        if fingerprint != 0 {
+            if let Some(memo) = self.cold.lrat_pin_retry_memo_fingerprint.get_mut(var_idx) {
+                *memo = if stays { fingerprint } else { 0 };
+            }
+        }
+        stays
+    }
+
+    fn retry_pinned_level0_unit_without_proof_inner(&mut self, i: usize) -> bool {
         let unit_lit = self.trail[i];
         let var_idx = unit_lit.variable().index();
         if var_idx >= self.num_vars

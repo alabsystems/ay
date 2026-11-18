@@ -49,6 +49,7 @@ pub(crate) mod prop_eq_stats {
         suppressed_dup,
         distinct_uncached,
         equal_uncached,
+        equal_persistent_hits,
         paths_bfs,
         resolve_base_uncached,
         seed_empty,

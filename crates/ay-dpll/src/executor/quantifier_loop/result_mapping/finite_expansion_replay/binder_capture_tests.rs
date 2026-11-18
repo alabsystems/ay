@@ -5,19 +5,22 @@
 //! (#defn-fold-binder-capture) The certificate replay's source fold, and the
 //! public verdicts that fold and its producer twin feed.
 //!
-//! A constant declared AFTER a universal can be spelled like the binder the
+//! A constant registered AFTER a universal can be spelled like the binder the
 //! frontend minted for it, and is a different variable. Folding a definition
 //! that mentions it under the binder let the expander, which substitutes
-//! binders by name, read it as the binder. On ad60a0707 every `collide` case
-//! below published the verdict z3 refutes (`sat` sealed by the exact
-//! finite-expansion SAT grant, or `unsat`). Each twin differs only in the
-//! constant's spelling and keeps its decided verdict, so the fold's payoff
-//! (#defn-fold-under-forall, #source-derived-replay-bound) is kept.
+//! binders by name, read it as the binder. On ad60a0707 a `declare-const`
+//! built that state, and every `collide` case below then published the
+//! verdict z3 refutes (`sat` sealed by the exact finite-expansion SAT grant,
+//! or `unsat`). A `declare-const` of a binder's spelling now takes a private
+//! identity, so the fixtures register the constant as a native-API caller
+//! does (`Context::register_symbol` over `TermStore::mk_var`). Each twin
+//! differs only in the constant's spelling and keeps its decided verdict, so
+//! the fold's payoff (#defn-fold-under-forall, #source-derived-replay-bound)
+//! is kept.
 
 use super::*;
 
-const TAIL: &str = "(declare-const @B@ Int) \
-     (assert (= lens (store ((as const (Array Int Int)) 0) 0 2))) \
+const TAIL: &str = "(assert (= lens (store ((as const (Array Int Int)) 0) 0 2))) \
      (assert (= w (store ((as const (Array Int Int)) 0) 0 @B@)))";
 
 /// `(forall i) 0 <= i < lens[0] => i = w[0]` with `lens[0] = 2` and `w[0] =
@@ -40,15 +43,16 @@ fn load(exec: &mut Executor, source: &str) {
     exec.execute_all(&commands).expect("fixture elaborates");
 }
 
-/// Elaborate `head` (its FIRST assertion must be the universal), then run
-/// `tail` with `@B@` spelled like that universal's first binder (`collide`)
-/// or as `x`, returning `tail`'s output lines and the spelling used.
+/// Elaborate `head` (its FIRST assertion must be the universal), register an
+/// Int constant spelled like that universal's first binder (`collide`) or as
+/// `x`, then run `tail` with `@B@` naming it. Returns the executor, `tail`'s
+/// output lines, the spelling used and the constant.
 fn run(
     head: &str,
     tail: &str,
     collide: bool,
     configure: impl FnOnce(&mut Executor),
-) -> (Executor, Vec<String>, String) {
+) -> (Executor, Vec<String>, String, TermId) {
     let mut exec = Executor::new();
     configure(&mut exec);
     load(&mut exec, head);
@@ -60,6 +64,8 @@ fn run(
     } else {
         "x".to_string()
     };
+    let constant = exec.ctx.terms.mk_var(name.clone(), Sort::Int);
+    exec.ctx.register_symbol(name.clone(), constant, Sort::Int);
     let commands =
         ay_frontend::parse(&tail.replace("@B@", &name)).expect("the fixture's tail parses");
     let output = exec
@@ -75,11 +81,11 @@ fn run(
         !collide || spelled_alike >= 2,
         "the collision must hold two identities spelled `{name}`"
     );
-    (exec, output, name)
+    (exec, output, name, constant)
 }
 
 fn verdicts(head: &str, tail: &str, collide: bool, configure: fn(&mut Executor)) -> Vec<String> {
-    let (_, output, _) = run(head, tail, collide, configure);
+    let (_, output, _, _) = run(head, tail, collide, configure);
     output
         .into_iter()
         .filter(|line| matches!(line.as_str(), "sat" | "unsat" | "unknown"))
@@ -125,18 +131,9 @@ fn vars_of(terms: &TermStore, term: TermId) -> HashSet<TermId> {
 #[test]
 fn the_source_replay_never_folds_a_binder_spelling_under_the_binder() {
     for collide in [true, false] {
-        let (mut exec, _, name) = run(EQUAL_HEAD, TAIL, collide, plain);
+        let (mut exec, _, _, constant) = run(EQUAL_HEAD, TAIL, collide, plain);
         let source = exec.ctx.assertions.clone();
         let root = source[0];
-        // The declaration is elaborated after the universal's binder, so the
-        // newest identity with that spelling is the declared constant.
-        let constant = exec
-            .ctx
-            .terms
-            .term_ids()
-            .filter(|&t| matches!(exec.ctx.terms.get(t), TermData::Var(n, _) if *n == name))
-            .max()
-            .expect("the tail declares the constant");
         let w = exec
             .ctx
             .terms
@@ -258,8 +255,7 @@ fn a_captured_ematching_instance_never_publishes_unsat() {
          (assert (forall ((i Int)) (! (=> (and (P i) (< i (select lens 0))) \
                                           (distinct i (select w 0))) \
                                       :pattern ((P i)))))";
-    let tail = "(declare-const @B@ Int) \
-         (assert (= lens (store ((as const (Array Int Int)) 0) 0 10))) \
+    let tail = "(assert (= lens (store ((as const (Array Int Int)) 0) 0 10))) \
          (assert (= w (store ((as const (Array Int Int)) 0) 0 @B@))) \
          (assert (P 3)) (check-sat)";
     for (posture, configure) in POSTURES {
@@ -280,8 +276,7 @@ fn a_captured_ematching_instance_never_publishes_unsat() {
 /// Before the fix: `sat` in every posture.
 #[test]
 fn a_capture_through_check_sat_assuming_never_publishes_sat() {
-    let tail = "(declare-const @B@ Int) \
-         (assert (= lens (store ((as const (Array Int Int)) 0) 0 2))) \
+    let tail = "(assert (= lens (store ((as const (Array Int Int)) 0) 0 2))) \
          (check-sat-assuming ((= w (store ((as const (Array Int Int)) 0) 0 @B@))))";
     for (posture, configure) in POSTURES {
         assert_ne!(

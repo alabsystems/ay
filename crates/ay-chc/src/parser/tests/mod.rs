@@ -17,4 +17,5 @@ mod let_scope;
 mod nary;
 mod real;
 mod relation_positions;
+mod reserved_names;
 mod unmodelled_commands;

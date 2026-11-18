@@ -2041,6 +2041,7 @@ impl Solver {
                 if hbr_result.subsumes_original {
                     let off = clause_idx;
                     if !self.arena.is_pending_garbage(off) {
+                        self.note_pending_garbage_mark(off);
                         self.stats.clear_bcp_learned_1963_blocker_cert(off);
                         self.arena.set_pending_garbage(off, true);
                         self.pending_garbage_count += 1;

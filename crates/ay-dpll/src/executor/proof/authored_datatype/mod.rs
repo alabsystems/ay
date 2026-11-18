@@ -91,10 +91,13 @@ pub(super) fn projected_field(
 }
 
 impl Executor {
-    /// Whether any assume step's term tree mentions an elaboration-invented
-    /// variable (frontend field variables are spelled with `!`, e.g.
-    /// `x!f!case`). Bounded walk; oversized proofs answer false and keep
-    /// the incumbent.
+    /// Whether any assume step's term tree mentions a variable with no
+    /// authored spelling: a frontend single-constructor field constant
+    /// (`Context::is_dt_field_identity`, a private `__ay_field_N`
+    /// identity) or a `!`-spelled internal variable such as a Skolem
+    /// constant. A user symbol spelled with `!` also answers true; the
+    /// answer only decides whether to attempt the strictly checked rebuild.
+    /// Bounded walk; oversized proofs answer false and keep the incumbent.
     fn proof_assumes_invented_field_var(&self, proof: &Proof) -> bool {
         const MAX_VISITED: usize = 64 * 1024;
         let mut visited = ay_core::kani_compat::DetHashSet::default();
@@ -114,7 +117,7 @@ impl Executor {
                 continue;
             }
             if let TermData::Var(name, _) = self.ctx.terms.get(term) {
-                if name.contains('!') {
+                if name.contains('!') || self.ctx.is_dt_field_identity(name) {
                     return true;
                 }
                 continue;
@@ -253,13 +256,13 @@ impl Executor {
         }
         let authored = self.exact_concrete_authored_scope();
         // A proof can be native-strict complete yet assume elaborated
-        // field terms with no authored surface (`x!f!case`); term-scope
-        // validation passes on the elaborated provenance and the in-solve
-        // render succeeds, but final certification cannot restore an
-        // authored spelling for an invented field variable and withholds
-        // the verdict. Such a proof still needs rebuilding on raw
-        // authored roots. The `!` in an assume's variable name only
-        // decides whether to attempt the (strictly checked) rebuild.
+        // field terms with no authored surface; term-scope validation
+        // passes on the elaborated provenance and the in-solve render
+        // succeeds, but final certification cannot restore an authored
+        // spelling for an invented field variable and withholds the
+        // verdict. Such a proof still needs rebuilding on raw authored
+        // roots. `proof_assumes_invented_field_var` only decides whether
+        // to attempt the (strictly checked) rebuild.
         if !self.proof_assumes_invented_field_var(proof)
             && self.check_proof_strict_with_datatypes(proof).is_ok()
             && ay_proof::validate_reachable_assumes_in_problem_scope(proof, &authored).is_ok()

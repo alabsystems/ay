@@ -129,6 +129,30 @@ fn the_exempt_spellings_are_what_the_real_mints_produce() {
     assert!(!carries_name_encoded_term_ids(&executor.ctx.terms));
 }
 
+/// DRIFT GUARD for the single-constructor field identity: a declared
+/// constant of a one-constructor datatype mints a field constant spelled
+/// [`DT_FIELD_IDENTITY_PREFIX`] plus a counter, and the allow-list exempts it.
+#[test]
+fn the_field_identity_spelling_is_what_the_real_mint_produces() {
+    let commands = parse(
+        "(set-logic ALL)
+         (declare-datatype Rec ((mkRec (fld Int))))
+         (declare-const rec Rec)
+         (assert (= (fld rec) 1))",
+    )
+    .expect("fixture parses");
+    let mut executor = Executor::new();
+    executor.execute_all(&commands).expect("fixture executes");
+    let names = internal_names(&executor.ctx.terms);
+    let fields: Vec<&String> = names
+        .iter()
+        .filter(|name| executor.ctx.is_dt_field_identity(name))
+        .collect();
+    assert_eq!(fields.len(), 1, "{names:?}");
+    assert!(fields[0].starts_with(DT_FIELD_IDENTITY_PREFIX), "{names:?}");
+    assert!(is_counter_only_internal_name(fields[0]), "{names:?}");
+}
+
 /// THE RESTORED PRUNE: an overloaded datatype field no longer hands the probe
 /// the enclosing arena.
 #[test]

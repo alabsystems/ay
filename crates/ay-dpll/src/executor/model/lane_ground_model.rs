@@ -41,7 +41,6 @@
 //! invalidation). It decides no verdict.
 
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::quote_symbol;
 use ay_core::term::{Constant, TermData};
 use ay_core::TermId;
 use ay_frontend::DeclarationKind;
@@ -206,7 +205,7 @@ impl Executor {
             Ground::Bool(b) => Some(b.to_string()),
             Ground::Ctor { sort, ctor, args } => {
                 let name = model.sorts.get(*sort as usize)?.ctors.get(*ctor)?;
-                let head = quote_symbol(self.ctx.output_symbol_name(name));
+                let head = self.dt_value_head(name).into_owned();
                 if args.is_empty() {
                     return Some(head);
                 }
@@ -217,7 +216,7 @@ impl Executor {
                 Some(format!("({head} {})", parts.join(" ")))
             }
             Ground::Foreign { ctor, args } => {
-                let head = quote_symbol(self.ctx.output_symbol_name(ctor));
+                let head = self.dt_value_head(ctor).into_owned();
                 if args.is_empty() {
                     return Some(head);
                 }
@@ -400,12 +399,13 @@ impl GroundEval<'_> {
         })
     }
 
-    /// The internal constructor name a printed head spells: a lane
-    /// constructor by its surface name, else a constructor of that name.
+    /// The internal constructor name a printed head token spells: a lane
+    /// constructor whose `Executor::dt_value_head` it is, else a constructor
+    /// of that name.
     fn ctor_by_surface(&self, surface: &str) -> Option<String> {
         let mut found = None;
         for name in self.lane.ctor_of.keys() {
-            if self.exec.ctx.output_symbol_name(name) == surface {
+            if self.exec.dt_value_head(name) == surface {
                 if found.is_some() {
                     return None;
                 }

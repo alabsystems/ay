@@ -329,3 +329,6 @@ mod exact_division_admission;
 
 #[path = "group_cli/empty_datatype_identity.rs"]
 mod empty_datatype_identity;
+
+#[path = "group_cli/internal_name_capture.rs"]
+mod internal_name_capture;

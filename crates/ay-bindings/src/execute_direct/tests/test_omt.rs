@@ -234,28 +234,30 @@ fn omt_list_model(
 
 /// End to end through `execute_typed`, with `Other` sharing the list's
 /// constructor name: here `top`, `two`, `r`, `n` and `o` read as the values
-/// asserted below.
+/// asserted below, each constructor as its `ay_core::quote_symbol` token
+/// (`|pop|`, `|my nil|`, `|a\|b|`, and `Odd`'s `|\|x|` and `|y\||`).
 #[test]
 fn test_omt_quoted_sort_with_space_reads_at_token_boundaries() {
     let string = |text: &str| ModelValue::String(text.to_string());
     for sort in ["My List", "L1", "L (1"] {
         for constructor in ["nil", "pop", "a#b", "my nil", "a|b"] {
+            let token = ay_core::quote_symbol(constructor);
             let model = omt_list_model(sort, constructor, constructor, false);
-            assert_eq!(model.get("top"), Some(&string(constructor)), "{model:?}");
+            assert_eq!(model.get("top"), Some(&string(&token)), "{model:?}");
             assert_eq!(
                 model.get("two"),
-                Some(&string(&format!("(cons 1 (cons -2 {constructor}))"))),
+                Some(&string(&format!("(cons 1 (cons -2 {token}))"))),
                 "{model:?}"
             );
             assert_eq!(
                 model.get("r"),
                 Some(&string(&format!(
-                    "(rec \"| (as nil L1) )\" |x {constructor} y| {constructor} -7)"
+                    r#"(rec "| (as nil L1) )" |\|x| {token} |y\|| {token} -7)"#
                 ))),
                 "{model:?}"
             );
             assert_eq!(model.get("n"), Some(&ModelValue::Int((-5).into())));
-            assert_eq!(model.get("o"), Some(&string(constructor)), "{model:?}");
+            assert_eq!(model.get("o"), Some(&string(&token)), "{model:?}");
         }
     }
 }
@@ -288,17 +290,20 @@ fn test_omt_overloaded_constructor_reads_as_when_the_partner_is_renamed() {
 }
 
 /// End to end through `execute_typed`: a constructor named
-/// `x (as nil L1) y` reads back as that name, whole, whether or not a second
-/// datatype shares it.
+/// `x (as nil L1) y` reads back as that name's `ay_core::quote_symbol`
+/// token, `|x (as nil L1) y|`, whole, whether or not a second datatype
+/// shares it.
 #[test]
 fn test_omt_constructor_name_holding_ascription_text_is_returned_whole() {
     let name = "x (as nil L1) y";
+    let token = ay_core::quote_symbol(name);
+    assert_eq!(token, "|x (as nil L1) y|");
     for sort in ["L1", "My List"] {
         let mut overloaded = omt_list_model(sort, name, name, false);
         let mut renamed = omt_list_model(sort, name, "unshared", false);
         assert_eq!(
             overloaded.get("top"),
-            Some(&ModelValue::String(name.to_string())),
+            Some(&ModelValue::String(token.clone())),
             "{overloaded:?}"
         );
         assert_eq!(overloaded.remove("o"), overloaded.get("top").cloned());

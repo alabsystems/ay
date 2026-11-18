@@ -13,6 +13,35 @@ use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore};
 use ay_fp::FpModel;
 
+/// The name of the Real constant standing for `fp.to_real` of the non-finite
+/// FP value whose SMT-LIB text is `value` (`(_ NaN 8 24)`, `(_ +oo 5 11)`).
+///
+/// [`rewrite_fp_to_real_for_model`] interns it with `TermStore::mk_var`, which
+/// returns the existing variable of the same name and sort, so every
+/// occurrence of one value shares one constant. A spelling in the user's
+/// namespace made that call return a user's own Real constant: with
+/// `|__fp_undef_(__NaN_8_24)|` declared and pinned to 5, `(fp.to_real x)` at a
+/// NaN `x` was bound to 5 and the query asserting it equal to 7 answered
+/// `unknown` (z3: `sat`). The name is therefore in the internal `!ay.`
+/// namespace, which source text cannot declare. It is not in the `__ay_`
+/// namespace: model validation skips the assertions that mention an `__ay_`
+/// variable, and the child solve that reads this constant must validate them.
+pub(super) fn fp_to_real_undefined_name(value: &str) -> String {
+    format!("!ay.fp-to-real-undefined.{value}")
+}
+
+/// The name of the Real constant standing for `fp.to_real` of the `site`-th
+/// FP argument in the Real-guided target pre-solve
+/// (`compute_real_guided_fp_target_via_solver`).
+///
+/// Interned with `TermStore::mk_var` like [`fp_to_real_undefined_name`], and in
+/// the internal `!ay.` namespace for the same two reasons: a user Real
+/// constant spelled like it would otherwise be returned in its place, and the
+/// pre-solve's model validation must not skip the assertions holding it.
+pub(super) fn fp_to_real_target_name(site: usize) -> String {
+    format!("!ay.fp-to-real-target.{site}")
+}
+
 /// Rebuild an application term using sort-aware TermStore constructors.
 ///
 /// When rewriting changes a function's arguments, we must rebuild through
@@ -163,10 +192,7 @@ pub(super) fn rewrite_fp_to_real_for_model(
                     // - the mixed subproblem stays FP-free (no FP-sorted args)
                     let key = fp_val.to_smtlib();
                     *undef_vars.entry(key.clone()).or_insert_with(|| {
-                        // Use __fp_undef_ prefix (NOT __ay_) to avoid model
-                        // validation's internal-symbol skip heuristic (#6241).
-                        let name = format!("__fp_undef_{}", key.replace(' ', "_"));
-                        terms.mk_var(&name, Sort::Real)
+                        terms.mk_var(fp_to_real_undefined_name(&key), Sort::Real)
                     })
                 }
             } else {
@@ -316,3 +342,7 @@ fn is_closed_mode_formula(terms: &TermStore, root: TermId) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+#[path = "to_real_rewrite/tests.rs"]
+mod tests;

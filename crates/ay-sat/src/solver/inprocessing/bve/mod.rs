@@ -114,6 +114,10 @@ impl Solver {
         clause_idx: usize,
         lits: &[Literal],
     ) {
+        // Shadow L0-rebuild epoch (#l0-rebuild-epoch): promotion
+        // raises the active-original count without a ledger entry.
+        self.cold.promotions_since_rebuild = self.cold.promotions_since_rebuild.saturating_add(1);
+        self.note_irredundant_mutation();
         self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
         // When occ lists are live, add the newly-promoted clause so BVE
         // sees it in subsequent rounds (#8096, #8135).

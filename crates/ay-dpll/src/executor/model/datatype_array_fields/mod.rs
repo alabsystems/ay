@@ -272,7 +272,7 @@ impl Executor {
             .ctx
             .datatype_iter()
             .flat_map(|(_, ctors)| ctors)
-            .flat_map(|ctor| [ctor.clone(), self.dt_surface(ctor).to_string()])
+            .flat_map(|ctor| [ctor.clone(), self.dt_value_head(ctor).into_owned()])
             .collect();
         let mut carrier = None;
         let mut source_budget = SchemaSourceBudget::new();

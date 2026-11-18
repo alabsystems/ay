@@ -1500,7 +1500,9 @@ impl Executor {
                     candidate.default = Some(authority.clone());
                 }
                 ExistingArrayDefaultPolicy::Require
-                    if candidate.default.as_ref() != Some(authority) =>
+                    if !candidate.default.as_ref().is_some_and(|default| {
+                        self.dt_value_texts_agree(default, authority, &array_sort.element_sort)
+                    }) =>
                 {
                     return Err(());
                 }
@@ -1515,9 +1517,32 @@ impl Executor {
                 merged_stores.push((index.clone(), value.clone()));
             }
         }
+        // A datatype key or value may be written in either spelling of
+        // `dt_value_respelled`: the candidate prints constructor tokens, and
+        // other writers can store the evaluator's identities. Two spellings
+        // of one value agree, and the candidate's text is kept.
+        let index_is_datatype = self.datatype_sort_name(&array_sort.index_sort).is_some();
+        let element_is_datatype = self.datatype_sort_name(&array_sort.element_sort).is_some();
+        let agree = |lhs: &str, rhs: &str, sort: &Sort, datatype: bool| {
+            lhs == rhs || (datatype && self.dt_value_texts_agree(lhs, rhs, sort))
+        };
         for (index, value) in candidate.stores {
-            match merged_stores.iter_mut().find(|(key, _)| key == &index) {
-                Some((_, authority)) if authority != &value => {
+            match merged_stores
+                .iter_mut()
+                .find(|(key, _)| agree(key, &index, &array_sort.index_sort, index_is_datatype))
+            {
+                Some((key, authority))
+                    if agree(
+                        authority,
+                        &value,
+                        &array_sort.element_sort,
+                        element_is_datatype,
+                    ) =>
+                {
+                    *key = index;
+                    *authority = value;
+                }
+                Some((_, authority)) => {
                     if ay_core::misc_cli_flags().debug_completion_merge {
                         eprintln!(
                             "[completion-merge] cell conflict idx={index} existing={authority} candidate={value}"
@@ -1603,7 +1628,6 @@ impl Executor {
                     }
                     return Err(());
                 }
-                Some(_) => {}
                 None => merged_stores.push((index, value)),
             }
         }

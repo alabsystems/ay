@@ -66,8 +66,8 @@ pub mod verification;
 
 pub use constructor_ascription::{
     ascribed_constructor_spelling, ascription_may_name_constructor, bare_constructor_spelling,
-    model_constant_definition, smtlib_term_len, ASCRIPTION_THEORY_SORT_HEADS,
-    ASCRIPTION_THEORY_VALUE_HEADS,
+    model_constant_definition, smtlib_application_parts, smtlib_term_len,
+    ASCRIPTION_THEORY_SORT_HEADS, ASCRIPTION_THEORY_VALUE_HEADS,
 };
 pub use debug_channel::{
     captured_misc_cli_flags, chc_debug_env_flags, claim_trace_file, debug_channel_active,
@@ -94,7 +94,7 @@ pub use proof::{
     CLEAN_DIALECT_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 pub use smtlib::{
-    escape_string_contents, quote_symbol, string_literal, unescape_string_contents,
+    escape_string_contents, quote_symbol, string_literal, symbol_token, unescape_string_contents,
     SMTLIB_MAX_CODE_POINT,
 };
 pub use smtlib_char::{

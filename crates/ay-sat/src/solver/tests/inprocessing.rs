@@ -588,6 +588,177 @@ fn test_collect_level0_garbage_small_formula_skips_occ_rebuild() {
     );
 }
 
+/// #l0-rebuild-epoch (shadow): mutations performed by the L0 GC sweep
+/// itself must be classified as L0 deletions and leave the
+/// irredundant-mutation epoch untouched, while an irredundant
+/// mutation from anywhere else bumps it. This is the signal a future
+/// reset rule needs to preserve learned clauses across L0-only
+/// rebuilds (DR-AY-SAT-L0-REBUILD-EPOCH-AUDIT-20261117).
+#[test]
+fn test_l0_rebuild_epoch_classifies_sweep_and_external_mutations() {
+    let mut solver = Solver::new(3);
+    let a = Variable(0);
+    let y = Variable(1);
+    let b = Variable(2);
+
+    let satisfied_idx = solver.add_clause_db(&[Literal::positive(a), Literal::positive(b)], false);
+    let _shrinks_idx = solver.add_clause_db(&[Literal::positive(y), Literal::negative(a)], false);
+    solver.initialize_watches();
+
+    // Snapshot as a completed rebuild would: the initial-load adds
+    // above are the census baseline, not post-rebuild mutations.
+    solver.cold.irredundant_epoch_at_rebuild = solver.cold.irredundant_mutation_epoch;
+    assert_eq!(solver.cold.l0_gc_original_deletions_since_rebuild, 0);
+
+    solver.enqueue(Literal::positive(a), None);
+    solver.qhead = solver.trail.len();
+    solver.fixed_count = 1;
+    solver.cold.last_collect_fixed = 0;
+    solver.l0_gc_dirty[a.index()] = true;
+
+    assert!(!solver.collect_level0_garbage());
+    assert!(solver.arena.is_empty_clause(satisfied_idx));
+    assert_eq!(
+        solver.cold.l0_gc_original_deletions_since_rebuild, 1,
+        "the satisfied clause deletion is L0 GC's own",
+    );
+    assert_eq!(
+        solver.cold.irredundant_mutation_epoch, solver.cold.irredundant_epoch_at_rebuild,
+        "sweep mutations must not bump the epoch",
+    );
+    assert!(
+        !solver.l0_gc_sweep_active,
+        "sweep guard must be cleared on exit",
+    );
+
+    // An irredundant addition outside the sweep bumps the epoch.
+    let epoch_before = solver.cold.irredundant_mutation_epoch;
+    solver.add_clause_db(&[Literal::positive(y), Literal::positive(b)], false);
+    assert!(
+        solver.cold.irredundant_mutation_epoch > epoch_before,
+        "external irredundant add must bump the epoch",
+    );
+}
+
+/// Fixture for the learned-preservation flip
+/// (DR-AY-SAT-L0-REBUILD-PRESERVE-DESIGN-20261117): three ledger
+/// originals plus one learned clause over p/q, census snapshot taken
+/// as a completed rebuild would leave it, then a level-0 sweep that
+/// deletes the satisfied original (count mismatch → rebuild) and
+/// strengthens another. Returns the solver ready for
+/// `reset_search_state`.
+fn preserve_flip_fixture() -> Solver {
+    let a = Variable(0);
+    let y = Variable(1);
+    let b = Variable(2);
+    let p = Variable(3);
+    let q = Variable(4);
+    let mut solver = Solver::new(5);
+    solver.add_clause(vec![Literal::positive(a), Literal::positive(b)]);
+    solver.add_clause(vec![Literal::positive(y), Literal::negative(a)]);
+    solver.add_clause(vec![Literal::negative(p), Literal::positive(q)]);
+    solver.add_clause_db(&[Literal::negative(q), Literal::positive(p)], true);
+    solver.initialize_watches();
+    solver.cold.irredundant_epoch_at_rebuild = solver.cold.irredundant_mutation_epoch;
+    solver.cold.l0_epoch_snapshot_taken = true;
+    solver.enqueue(Literal::positive(a), None);
+    solver.qhead = solver.trail.len();
+    solver.fixed_count = 1;
+    solver.cold.last_collect_fixed = 0;
+    solver.l0_gc_dirty[a.index()] = true;
+    assert!(!solver.collect_level0_garbage());
+    assert_eq!(solver.cold.l0_gc_original_deletions_since_rebuild, 1);
+    solver
+}
+
+fn learned_clause_present(solver: &Solver) -> bool {
+    let want = {
+        let mut v = vec![
+            Literal::negative(Variable(4)),
+            Literal::positive(Variable(3)),
+        ];
+        v.sort_by_key(|lit| lit.0);
+        v
+    };
+    solver.arena.live_indices().any(|idx| {
+        if !solver.arena.is_learned(idx) {
+            return false;
+        }
+        let mut lits = solver.arena.literals(idx).to_vec();
+        lits.sort_by_key(|lit| lit.0);
+        lits == want
+    })
+}
+
+/// The flip: an L0-only round (deletions made the original count
+/// differ from the ledger, which used to force the destructive
+/// branch) now preserves learned clauses across the rebuild because
+/// the census balances and no elimination-class event occurred.
+#[test]
+fn test_l0_rebuild_preserves_learned_after_l0_deletions() {
+    let mut solver = preserve_flip_fixture();
+    solver.reset_search_state();
+    assert!(
+        learned_clause_present(&solver),
+        "learned clause must survive an L0-only rebuild",
+    );
+    assert_eq!(solver.cold.l0_epoch_crosscheck_failures, 0);
+    assert!(!solver.cold.elimination_since_rebuild);
+}
+
+/// An elimination witness pushed since the last rebuild (BCE here)
+/// must block preservation even though the census still balances.
+#[test]
+fn test_l0_rebuild_drops_learned_after_elimination() {
+    let mut solver = preserve_flip_fixture();
+    solver.inproc.reconstruction.push_bce(
+        Literal::positive(Variable(3)),
+        vec![
+            Literal::positive(Variable(3)),
+            Literal::positive(Variable(4)),
+        ],
+    );
+    solver.reset_search_state();
+    assert!(
+        !learned_clause_present(&solver),
+        "learned clause must NOT survive a rebuild after elimination",
+    );
+}
+
+/// An open user scope does NOT block preservation: selectors enter
+/// solving only as ordinary assumptions (negated selector prefix in
+/// `compose_scope_assumptions`, assigned above level 0), so learned
+/// clauses already materialize selector dependence. This is the
+/// DPLL(T) shape — one scope held open across rounds. After pop,
+/// the base formula must still solve SAT.
+#[test]
+fn test_l0_rebuild_preserves_learned_with_open_scope() {
+    let mut solver = preserve_flip_fixture();
+    solver.push();
+    solver.reset_search_state();
+    assert!(
+        learned_clause_present(&solver),
+        "learned clause must survive a rebuild under an open scope",
+    );
+    assert!(solver.pop(), "scope must pop");
+    assert!(
+        matches!(solver.solve().into_inner(), SatResult::Sat(_)),
+        "base formula must remain SAT after pop + preserved learned clauses",
+    );
+}
+
+/// The decompose/congruence flag independently blocks preservation.
+#[test]
+fn test_l0_rebuild_drops_learned_after_inprocessing_modification() {
+    let mut solver = preserve_flip_fixture();
+    solver.cold.inprocessing_modified_clause_db = true;
+    solver.reset_search_state();
+    assert!(
+        !learned_clause_present(&solver),
+        "learned clause must NOT survive a decompose-class rebuild",
+    );
+}
+
 /// #triage-lra-const-eq (CHC-COMP 2026 batch 3, `heap__findmax.array_000`):
 /// a queued theory conflict that a later ROOT unit satisfies must not make
 /// level-0 GC spin. The queue entry survives the DPLL(T) round (the solve

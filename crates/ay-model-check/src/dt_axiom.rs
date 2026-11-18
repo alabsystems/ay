@@ -740,6 +740,15 @@ mod norm {
         t
     }
 
+    /// The key spelling of a symbol, variable, constructor or datatype name:
+    /// the name's byte length, `:`, then the name. A name may contain any
+    /// character, spaces and parentheses included; the length prefix keeps a
+    /// key built from it from being read as a key built from a different
+    /// name and different arguments.
+    fn name_key(name: &str) -> String {
+        format!("{}:{name}", name.len())
+    }
+
     /// Faithful structural key of a (selector-reduced) term — atom identity.
     fn tkey(terms: &TermStore, t: TermId, resolve: &DtResolve<'_>, depth: u32) -> String {
         if depth == 0 {
@@ -747,14 +756,14 @@ mod norm {
         }
         let r = reduce(terms, t, resolve, depth);
         match terms.get(r) {
-            TermData::Var(name, id) => format!("V:{name}:{id}"),
+            TermData::Var(name, id) => format!("V:{}:{id}", name_key(name)),
             TermData::Const(c) => format!("K:{c:?}"),
             TermData::App(sym, args) => {
                 let parts: Vec<String> = args
                     .iter()
                     .map(|&a| tkey(terms, a, resolve, depth - 1))
                     .collect();
-                format!("({} {})", sym, parts.join(" "))
+                format!("({} {})", name_key(&sym.to_string()), parts.join(" "))
             }
             TermData::Not(x) => format!("(not {})", tkey(terms, *x, resolve, depth - 1)),
             TermData::Ite(c, a, b) => format!(
@@ -947,14 +956,14 @@ mod norm {
         }
         if n == 2 {
             let idx = dt.constructors.iter().position(|c| c.name == ctor);
-            let shared = format!("dt2:{}:{xkey}", dt.name);
+            let shared = format!("dt2:{}:{xkey}", name_key(&dt.name));
             return match idx {
                 Some(0) => NB::Atom(shared),
                 Some(1) => mk_not(NB::Atom(shared)),
-                _ => NB::Atom(format!("is:{ctor}:{xkey}")),
+                _ => NB::Atom(format!("is:{}:{xkey}", name_key(ctor))),
             };
         }
-        NB::Atom(format!("is:{ctor}:{xkey}"))
+        NB::Atom(format!("is:{}:{xkey}", name_key(ctor)))
     }
 
     /// Normalize a Boolean SIDE (a bool field or the synthetic `sel(X)` of a bool
@@ -1088,7 +1097,7 @@ mod norm {
             let fsort = c.fields[i].sort.clone();
             // Synthetic `(sel_i X)` — key format identical to `tkey` of the real
             // unary application, so it matches the encoder's `(sel_i X)` term.
-            let sel_path = Side::Path(format!("({sel} {xkey})"), fsort);
+            let sel_path = Side::Path(format!("({} {xkey})", name_key(sel)), fsort);
             conj.push(field_eq(terms, fi, &sel_path, resolve, depth)?);
         }
         Some(mk_and(conj))

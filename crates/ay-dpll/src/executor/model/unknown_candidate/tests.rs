@@ -496,3 +496,10 @@ fn a_definition_with_an_undeclared_quoted_value_is_left_out() {
     );
     assert_eq!(omitted, ["u"]);
 }
+
+/// The escaped bar of `|a\|b|` and the escaped backslash of `|c\\|` stay in
+/// their symbols, and the bars of the string literal `"|s|"` start none.
+#[test]
+fn a_quoted_symbol_reads_back_through_its_escapes() {
+    assert_eq!(quoted_tokens(r#"(f |a\|b| "|s|" |c\\| d)"#), ["a|b", "c\\"]);
+}

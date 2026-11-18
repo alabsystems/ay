@@ -56,6 +56,9 @@ impl Solver {
         self.min.minimize_flags.resize(num_vars, 0);
         self.cold.level0_proof_id.resize(num_vars, 0);
         self.cold.level0_proof_sign.resize(num_vars, 0);
+        self.cold
+            .lrat_pin_retry_memo_fingerprint
+            .resize(num_vars, 0);
         self.cold.freeze_counts.resize(num_vars, 0);
         self.cold.forced_phase.resize(num_vars, 0);
         // Grow external↔internal variable index mappings (identity mapping

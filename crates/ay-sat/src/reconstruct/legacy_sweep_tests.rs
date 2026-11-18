@@ -53,6 +53,7 @@ pub(crate) fn legacy_stack() -> ReconstructionStack {
                 clause: vec![pos(1), pos(3)],
             }),
         ],
+        ever_pushed: true,
     }
 }
 

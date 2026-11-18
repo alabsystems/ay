@@ -9,7 +9,7 @@ use crate::api::*;
 use crate::constructor_ascription::{
     as_application_pair, constructor_ascription_matrix, overload_pairs, AS_APPLICATION_OWN_SORT,
     AS_APPLICATION_UNIT, MATRIX_CONSTRUCTORS, MATRIX_SORTS, OVERLOAD_ASCRIBED_CONSTRUCTORS,
-    OVERLOAD_BARE_CONSTRUCTORS, OVERLOAD_PAIR_VARIANTS,
+    OVERLOAD_PAIR_VARIANTS,
 };
 
 fn list_dt(name: &str, head: Sort) -> DatatypeSort {
@@ -286,7 +286,8 @@ fn every_reader_takes_a_printed_ascription_as_the_bare_constructor() {
                 case.label
             );
         }
-        // The decoder text is `printed_bare`, with the name unquoted (`pop`).
+        // The decoder text is `printed_bare`, each ascription replaced by the
+        // constructor's token (`|pop|`).
         assert_eq!(
             solver.executor.model_for_decoder(),
             printed_bare,
@@ -315,13 +316,14 @@ fn every_reader_takes_a_printed_ascription_as_the_bare_constructor() {
 /// For each pair of `overload_pairs` (#overloaded-nil-surface), the readers
 /// below read `pair.overloaded` as they read `pair.renamed`, whose decoder
 /// text is its model text and whose model does not print the partner's name.
+/// `ay_frontend::sexp::parse_sexps` parses the model of `pair.overloaded`,
+/// and that model prints `top` ascribed.
 #[test]
 fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
     let pairs = overload_pairs();
     assert_eq!(
         pairs.len(),
-        (OVERLOAD_ASCRIBED_CONSTRUCTORS.len() + OVERLOAD_BARE_CONSTRUCTORS.len())
-            * OVERLOAD_PAIR_VARIANTS
+        OVERLOAD_ASCRIBED_CONSTRUCTORS.len() * OVERLOAD_PAIR_VARIANTS
     );
     let responses = |script: &str, queries: &str, z3_mode: bool| {
         let script = format!("{script}(check-sat)\n(get-model)\n(get-value ({queries}))\n");
@@ -330,17 +332,6 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
         executor
             .execute_all(&ay_frontend::parse(&script).expect("parse"))
             .expect("execute")
-    };
-    // The definitions of a text after `bare_constructor_spelling`, sorted:
-    // the two scripts may print the same definitions in another order.
-    let definitions = |text: &str| {
-        let text = ay_core::bare_constructor_spelling(text);
-        // The model's closer, on its own line, belongs to no definition.
-        let text = text.strip_suffix("\n)").unwrap_or(&text);
-        let mut definitions: Vec<String> =
-            text.split("\n  (define-fun ").map(str::to_string).collect();
-        definitions.sort();
-        definitions
     };
     let mut ascribed_tops = 0;
     let mut parsed = 0;
@@ -365,7 +356,7 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
         // A reader of the text alone.
         differs(
             "text only",
-            definitions(&overloaded) == definitions(&renamed),
+            bare_definitions(&overloaded) == bare_definitions(&renamed),
         );
         // The decoder text, which for the renamed script is its model text,
         // and the structured model.
@@ -390,6 +381,10 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
                     == typed_readings(&renamed_solver, &renamed),
             );
         }
+        differs(
+            "the frontend parses the model",
+            ay_frontend::sexp::parse_sexps(&overloaded).is_ok(),
+        );
 
         // The line of `p`, the application of `as`, is the same in both.
         let line_of = |text: &str, name: &str| {
@@ -407,11 +402,9 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
             line_of(&overloaded, "p") == line_of(&renamed, "p"),
         );
         let top = format!("(define-fun top () {} (as ", pair.sort);
-        if overloaded.contains(&top) {
-            differs(
-                "only a name the frontend reads bare is ascribed",
-                pair.ascribed(),
-            );
+        let top_ascribed = overloaded.contains(&top);
+        differs("`top` is ascribed", top_ascribed);
+        if top_ascribed {
             ascribed_tops += 1;
         }
 
@@ -426,7 +419,7 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
             for (overloaded, renamed) in overloaded.iter().zip(&renamed) {
                 differs(
                     "a response, text only",
-                    definitions(overloaded) == definitions(renamed),
+                    bare_definitions(overloaded) == bare_definitions(renamed),
                 );
                 let forms = |text: &str| ay_frontend::sexp::parse_sexps(text).ok();
                 differs(
@@ -442,9 +435,7 @@ fn every_reader_returns_the_same_whether_or_not_a_constructor_is_overloaded() {
         failures.len(),
         failures.join("\n----\n")
     );
-    // Not vacuous: each name of `OVERLOAD_ASCRIBED_CONSTRUCTORS` is ascribed
-    // at `top` in all of its scripts, and no name of
-    // `OVERLOAD_BARE_CONSTRUCTORS` is.
+    // Every model prints `top` ascribed.
     assert_eq!(
         ascribed_tops,
         OVERLOAD_ASCRIBED_CONSTRUCTORS.len() * OVERLOAD_PAIR_VARIANTS
@@ -755,20 +746,20 @@ fn as_application(first: &str, second: &str) -> ModelValue {
 }
 
 /// Here `p`, the application of a constructor named `as`, prints as
-/// `(as Unit Unit)` or `(as nil L1)` with nothing overloaded, and
+/// `(|as| Unit Unit)` or `(|as| nil L1)` with nothing overloaded, and
 /// [`Solver::try_get_model`] reads it as that application.
 #[test]
 fn try_get_model_reads_the_application_of_a_constructor_named_as() {
     for (script, line, first, second) in [
         (
             AS_APPLICATION_UNIT,
-            "(define-fun p () P (as Unit Unit))",
+            "(define-fun p () P (|as| Unit Unit))",
             "Unit",
             "Unit",
         ),
         (
             AS_APPLICATION_OWN_SORT,
-            "(define-fun p () P (as nil L1))",
+            "(define-fun p () P (|as| nil L1))",
             "nil",
             "L1",
         ),
@@ -798,12 +789,12 @@ fn try_get_model_reads_the_application_of_a_constructor_named_as() {
     }
 }
 
-/// The same application where its text is also the text of an ascription:
-/// `(as nil Other)`, `Other` being an enumerator of the second field's sort
-/// and a datatype that declares `nil` in one script and `unshared` in the
-/// other. Both scripts print that line, and [`Solver::try_get_model`]
-/// returns the application for both; the overloaded script ascribes the
-/// `nil` of `t`, and the two structured models are equal.
+/// The same application, `(|as| nil Other)`, `Other` being an enumerator of
+/// the second field's sort and a datatype that declares `nil` in one script
+/// and `unshared` in the other. Both scripts print that line, and
+/// [`Solver::try_get_model`] returns the application for both; the
+/// overloaded script ascribes the `nil` of `t`, and the two structured models
+/// are equal.
 #[test]
 fn try_get_model_reads_an_application_of_as_the_same_under_an_overload() {
     let (overloaded, renamed) = as_application_pair();
@@ -814,7 +805,7 @@ fn try_get_model_reads_an_application_of_as_the_same_under_an_overload() {
         solver
     };
     let (overloaded, renamed) = (solve(&overloaded), solve(&renamed));
-    let line = "(define-fun p () P (as nil Other))";
+    let line = "(define-fun p () P (|as| nil Other))";
     for solver in [&overloaded, &renamed] {
         let text = solver.try_get_model_str().expect("model text");
         assert!(text.contains(line), "{text}");
@@ -969,12 +960,14 @@ fn odd_enumeration_table(shared: &str, second: &str, fruit_shared: &str) -> Stri
     )
 }
 
-/// For each name below, shared by `Color` and `Fruit`: the model text and
-/// the decoder text each parse as one s-expression and do not hold the name
-/// unquoted after `(= x0 red)`, and `try_get_model` reads what it reads for
-/// the script whose `Fruit` declares `unsharedQ` instead.
+/// For each name below, shared by `Color` and `Fruit`, whose
+/// `ay_core::quote_symbol` token is `|name|`: the model text and the decoder
+/// text each parse as one s-expression, the cell of `pick` at `red` is
+/// `(as |name| Fruit)` in the model text and `|name|` in the decoder text,
+/// and `try_get_model` reads what it reads for the script whose `Fruit`
+/// declares `unsharedQ` instead.
 #[test]
-fn an_enumeration_table_keeps_a_cell_whose_constructor_is_not_one_token() {
+fn an_enumeration_table_quotes_a_cell_whose_constructor_is_not_one_token() {
     for name in ["x(y", "(", ")", "x)", "a\"b", "\"", "x \"y", "a;b", "a b"] {
         let solve = |script: &str| {
             let mut solver = Solver::new(Logic::All);
@@ -983,6 +976,7 @@ fn an_enumeration_table_keeps_a_cell_whose_constructor_is_not_one_token() {
             solver
         };
         let quoted = format!("|{name}|");
+        assert_eq!(ay_core::quote_symbol(name), quoted);
         let overloaded = solve(&odd_enumeration_table(
             &quoted,
             &quoted,
@@ -990,20 +984,23 @@ fn an_enumeration_table_keeps_a_cell_whose_constructor_is_not_one_token() {
         ));
         let renamed = solve(&odd_enumeration_table(&quoted, "unsharedQ", "unsharedQ"));
 
-        let unquoted_cell = format!("(= x0 red) {name} ");
-        for text in [
-            overloaded.try_get_model_str().expect("model text"),
-            overloaded
-                .try_get_model_str_for_decoder()
-                .expect("decoder text"),
+        let model = overloaded.try_get_model_str().expect("model text");
+        let decoder = overloaded
+            .try_get_model_str_for_decoder()
+            .expect("decoder text");
+        for (text, cell) in [
+            (&model, format!("(as {quoted} Fruit)")),
+            (&decoder, quoted.clone()),
         ] {
-            let parsed = ay_frontend::sexp::parse_sexps(&text);
+            let parsed = ay_frontend::sexp::parse_sexps(text);
             assert!(
                 matches!(parsed.as_deref(), Ok([_])),
                 "{name}: not one s-expression:\n{text}"
             );
-            assert!(!text.contains(&unquoted_cell), "{name}:\n{text}");
-            assert!(text.contains("(define-fun pick ("), "{name}:\n{text}");
+            assert!(
+                on_one_line(text).contains(&format!("Fruit (ite (= x0 red) {cell} apple))")),
+                "{name}:\n{text}"
+            );
         }
 
         let structured = |solver: &Solver| {
@@ -1024,17 +1021,22 @@ fn on_one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Each name below fails `constructor_ascription::reads_as_one_symbol`. Here,
-/// with `Color` and `Fruit` sharing it, the cell keeps `__ay_overload_0` in
-/// the model text and in the decoder text; in the decoder text of the twin
-/// whose `Color` declares `unsharedQ` instead, the cell holds the name.
+/// Each name below, written bare, is not read as the one symbol of that
+/// name (checked first), and its `ay_core::quote_symbol` token is `|name|`.
+/// Here, with `Color` and `Fruit` sharing it, the cell of `pick` at `red` is
+/// `(as |name| Fruit)` in the model text and `|name|` in the decoder text,
+/// each text one s-expression; in the decoder text of the twin whose `Color`
+/// declares `unsharedQ` instead, the cell is `|name|`.
 #[test]
-fn an_enumeration_table_keeps_a_cell_whose_constructor_reads_as_no_symbol() {
+fn an_enumeration_table_quotes_a_cell_whose_constructor_reads_as_no_symbol_bare() {
     for name in [
         "true", "false", ":k", "5", "-5", "#x0f", "\"a\"", "5.0", "a#b",
     ] {
         assert!(
-            !crate::constructor_ascription::reads_as_one_symbol(name),
+            !matches!(
+                ay_frontend::sexp::parse_sexps(name).as_deref(),
+                Ok([ay_frontend::SExpr::Symbol(symbol)]) if symbol.as_str() == name
+            ),
             "{name}"
         );
         let solve = |script: &str| {
@@ -1044,23 +1046,26 @@ fn an_enumeration_table_keeps_a_cell_whose_constructor_reads_as_no_symbol() {
             solver
         };
         let quoted = format!("|{name}|");
+        assert_eq!(ay_core::quote_symbol(name), quoted);
         let overloaded = solve(&odd_enumeration_table(
             &quoted,
             &quoted,
             &format!("(as {quoted} Fruit)"),
         ));
-        for text in [
-            overloaded.try_get_model_str().expect("model text"),
-            overloaded
-                .try_get_model_str_for_decoder()
-                .expect("decoder text"),
+        let model = overloaded.try_get_model_str().expect("model text");
+        let decoder = overloaded
+            .try_get_model_str_for_decoder()
+            .expect("decoder text");
+        for (text, cell) in [
+            (&model, format!("(as {quoted} Fruit)")),
+            (&decoder, quoted.clone()),
         ] {
             assert!(
-                on_one_line(&text).contains("Fruit (ite (= x0 red) __ay_overload_0 apple))"),
+                on_one_line(text).contains(&format!("Fruit (ite (= x0 red) {cell} apple))")),
                 "{name}:\n{text}"
             );
             assert!(
-                matches!(ay_frontend::sexp::parse_sexps(&text).as_deref(), Ok([_])),
+                matches!(ay_frontend::sexp::parse_sexps(text).as_deref(), Ok([_])),
                 "{name}: not one s-expression:\n{text}"
             );
         }
@@ -1068,7 +1073,7 @@ fn an_enumeration_table_keeps_a_cell_whose_constructor_reads_as_no_symbol() {
         let twin = solve(&odd_enumeration_table("unsharedQ", &quoted, &quoted));
         let text = twin.try_get_model_str_for_decoder().expect("text");
         assert!(
-            on_one_line(&text).contains(&format!("Fruit (ite (= x0 red) {name} apple))")),
+            on_one_line(&text).contains(&format!("Fruit (ite (= x0 red) {quoted} apple))")),
             "{name}:\n{text}"
         );
     }
@@ -1089,12 +1094,11 @@ fn parametric_enumeration_table(member: &str) -> String {
     )
 }
 
-/// Here the table cell names the member `xy` of `(PE Int)`, and holds the
-/// member's identity, for example `x(y@PE!{Int}`, for `x(y`, `a b` and
-/// `true`; for those three `try_get_model` reads no `apple`, and with `x(y`
-/// neither text is one s-expression.
+/// Here the table cell names the member of `(PE Int)` as the script quotes
+/// it: `xy`, and `|x(y|`, `|a b|` and `|true|`. Each text is one
+/// s-expression and `try_get_model` reads `apple`.
 #[test]
-fn a_parametric_enumeration_table_keeps_the_identity_of_a_member_that_is_no_symbol() {
+fn a_parametric_enumeration_table_names_a_member_that_needs_quoting() {
     let solve = |member: &str| {
         let mut solver = Solver::new(Logic::All);
         solver
@@ -1126,25 +1130,215 @@ fn a_parametric_enumeration_table_keeps_the_identity_of_a_member_that_is_no_symb
     }
     assert!(read(&named).contains("apple"), "{}", read(&named));
 
-    for (member, identity) in [
-        ("|x(y|", "x(y@PE!{Int}"),
-        ("|a b|", "a b@PE!{Int}"),
-        ("|true|", "true@PE!{Int}"),
-    ] {
+    for member in ["|x(y|", "|a b|", "|true|"] {
         let odd = solve(member);
         for text in texts(&odd) {
             assert!(
-                on_one_line(&text).contains(&format!("Fruit (ite (= x0 {identity}) kiwi apple))")),
+                on_one_line(&text).contains(&format!("Fruit (ite (= x0 {member}) kiwi apple))")),
+                "{member}:\n{text}"
+            );
+            assert!(
+                matches!(ay_frontend::sexp::parse_sexps(&text).as_deref(), Ok([_])),
                 "{member}:\n{text}"
             );
         }
-        assert!(!read(&odd).contains("apple"), "{member}: {}", read(&odd));
+        assert!(read(&odd).contains("apple"), "{member}: {}", read(&odd));
     }
-    let unbalanced = solve("|x(y|");
-    for text in texts(&unbalanced) {
-        assert!(
-            !matches!(ay_frontend::sexp::parse_sexps(&text).as_deref(), Ok([_])),
-            "{text}"
+}
+
+/// The enumeration `Color`, which declares `color_member`, and `Fruit`,
+/// which declares `apple` with its selector `w`, then `kiwi`, then `shared`
+/// (each as the script quotes it), with a constant, a function table and an
+/// application of `w` pinned on `fruit_ref` (the script's spelling of
+/// `Fruit`'s `shared`).
+fn member_named_tables(color_member: &str, shared: &str, fruit_ref: &str) -> String {
+    format!(
+        "(declare-datatypes ((Color 0)) (((red) ({color_member}) (blue))))\n\
+         (declare-datatypes ((Fruit 0)) (((apple (w Int)) (kiwi) ({shared}))))\n\
+         (declare-fun pick (Color) Fruit)\n\
+         (declare-const f Fruit)\n\
+         (assert (= f {fruit_ref}))\n\
+         (assert (= (w f) 5))\n\
+         (assert (= (pick red) {fruit_ref}))\n\
+         (assert (= (pick blue) kiwi))\n"
+    )
+}
+
+/// The definitions of a model text after `bare_constructor_spelling`, sorted,
+/// so that two texts holding the same definitions in another order give the
+/// same list.
+fn bare_definitions(text: &str) -> Vec<String> {
+    let text = ay_core::bare_constructor_spelling(text);
+    // The model's closer, on its own line, belongs to no definition.
+    let text = text.strip_suffix("\n)").unwrap_or(&text);
+    let mut definitions: Vec<String> = text.split("\n  (define-fun ").map(str::to_string).collect();
+    definitions.sort();
+    definitions
+}
+
+/// In each case below, `Fruit`'s constructor `shared` has the surface name
+/// of a member of `Fruit` of another kind: the tester of `kiwi` (`is-kiwi`,
+/// once with `Color` declaring a constructor `|is-kiwi|` too), the tester of
+/// `apple` (`is-apple`) or the selector `w`. Here no response holds `__ay_`,
+/// the model text holds the three cells below, the legacy reader and the
+/// typed decoder read `f` as `surface`, each text, after
+/// `bare_constructor_spelling`, holds the definitions of the twin whose
+/// `Fruit` declares `unshared` instead, `unshared` read as `surface`, and in
+/// both postures the response to `(get-value (f (pick red)))` is
+/// `((f (as S Fruit)) ((pick red) (as S Fruit)))`, `S` being `surface`.
+#[test]
+fn a_constructor_named_like_a_tester_or_selector_prints_its_name() {
+    for (color_member, shared, surface) in [
+        ("spare", "|is-kiwi|", "is-kiwi"),
+        ("|is-kiwi|", "|is-kiwi|", "is-kiwi"),
+        ("spare", "|is-apple|", "is-apple"),
+        ("spare", "w", "w"),
+    ] {
+        let overloaded_script =
+            member_named_tables(color_member, shared, &format!("(as {shared} Fruit)"));
+        let twin_script = member_named_tables(color_member, "unshared", "unshared");
+        let as_overloaded = |text: &str| text.replace("unshared", surface);
+        let solve = |script: &str| {
+            let mut solver = Solver::new(Logic::All);
+            solver.parse_smtlib2(script).expect("parse");
+            assert_eq!(solver.check_sat(), SolveResult::Sat, "{shared}");
+            solver
+        };
+        let overloaded = solve(&overloaded_script);
+        let twin = solve(&twin_script);
+
+        let model = overloaded.try_get_model_str().expect("model text");
+        let decoder = overloaded
+            .try_get_model_str_for_decoder()
+            .expect("decoder text");
+        for text in [&model, &decoder] {
+            assert!(!text.contains("__ay_"), "{shared}:\n{text}");
+        }
+        for cell in [
+            format!("(define-fun f () Fruit (as {surface} Fruit))"),
+            format!("(ite (= x0 red) (as {surface} Fruit) kiwi)"),
+            format!("(= @p0 (as {surface} Fruit))"),
+        ] {
+            assert!(
+                on_one_line(&model).contains(&cell),
+                "{shared}: {cell}:\n{model}"
+            );
+        }
+        let twin_model = twin.try_get_model_str().expect("twin model text");
+        let twin_decoder = twin
+            .try_get_model_str_for_decoder()
+            .expect("twin decoder text");
+        assert_eq!(
+            bare_definitions(&model),
+            bare_definitions(&as_overloaded(&twin_model)),
+            "{shared}:\n{model}"
         );
+        assert_eq!(
+            bare_definitions(&decoder),
+            bare_definitions(&as_overloaded(&twin_decoder)),
+            "{shared}:\n{decoder}"
+        );
+
+        let read = overloaded.try_get_model().expect("model");
+        assert_eq!(
+            read.model().uninterpreted_val("f"),
+            Some(surface),
+            "{shared}"
+        );
+        let typed_f = (
+            "f".to_string(),
+            Some(ModelValue::Datatype {
+                constructor: surface.to_string(),
+                args: vec![],
+            }),
+        );
+        assert!(
+            typed_readings(&overloaded, &model).contains(&typed_f),
+            "{shared}: {:?}",
+            typed_readings(&overloaded, &model)
+        );
+
+        // `(get-model)` and `(get-value)` as commands, in both postures.
+        for z3_mode in [true, false] {
+            let responses = |script: &str| {
+                let script =
+                    format!("{script}(check-sat)\n(get-model)\n(get-value (f (pick red)))\n");
+                let mut executor = Executor::new();
+                executor.set_competition_mode(z3_mode);
+                executor
+                    .execute_all(&ay_frontend::parse(&script).expect("parse"))
+                    .expect("execute")
+            };
+            let overloaded = responses(&overloaded_script);
+            let twin = responses(&twin_script);
+            assert_eq!(overloaded.len(), 3, "{shared}");
+            assert_eq!(twin.len(), 3, "{shared}");
+            for response in &overloaded {
+                assert!(!response.contains("__ay_"), "{shared}:\n{response}");
+            }
+            assert_eq!(
+                bare_definitions(&overloaded[1]),
+                bare_definitions(&as_overloaded(&twin[1])),
+                "{shared}:\n{}",
+                overloaded[1]
+            );
+            assert_eq!(
+                overloaded[2],
+                format!("((f (as {surface} Fruit)) ((pick red) (as {surface} Fruit)))")
+            );
+        }
+    }
+}
+
+/// `D`'s nullary constructor `c` has the surface name of `mk`'s selector, as
+/// the script quotes it: `val`, `|a b|`, then the empty symbol `||`. Here no
+/// text holds `__ay_`; the model text of `Solver::try_get_model_str` and, in
+/// both postures, the `(get-model)` response hold `x`'s definition and the
+/// selector's body with `c` ascribed, `(as c D)`; and the get-value response
+/// is `((x (as c D)) (y (mk 3)))`.
+#[test]
+fn a_constructor_named_like_a_selector_prints_ascribed() {
+    for c in ["val", "|a b|", "||"] {
+        let declarations = format!(
+            "(declare-datatype D ((mk ({c} Int)) ({c})))\n\
+             (declare-const x D) (declare-const y D)\n\
+             (assert (= x (as {c} D)))\n\
+             (assert (= y (mk 3)))\n"
+        );
+        let texts = [
+            format!("(define-fun x () D (as {c} D))"),
+            format!("(= @p0 (as {c} D))"),
+        ];
+
+        let mut solver = Solver::new(Logic::All);
+        solver.parse_smtlib2(&declarations).expect("parse");
+        assert_eq!(solver.check_sat(), SolveResult::Sat, "{c}");
+        let model = solver.try_get_model_str().expect("model text");
+        assert!(!model.contains("__ay_"), "{c}:\n{model}");
+        for text in &texts {
+            assert!(on_one_line(&model).contains(text), "{c}: {text}:\n{model}");
+        }
+
+        let script = format!("{declarations}(check-sat)\n(get-model)\n(get-value (x y))\n");
+        for z3_mode in [true, false] {
+            let mut executor = Executor::new();
+            executor.set_competition_mode(z3_mode);
+            let out = executor
+                .execute_all(&ay_frontend::parse(&script).expect("parse"))
+                .expect("execute");
+            assert_eq!(out.len(), 3, "{c}: {out:?}");
+            assert_eq!(out[0], "sat", "{c}");
+            for response in &out {
+                assert!(!response.contains("__ay_"), "{c}:\n{response}");
+            }
+            for text in &texts {
+                assert!(
+                    on_one_line(&out[1]).contains(text),
+                    "{c}: {text}:\n{}",
+                    out[1]
+                );
+            }
+            assert_eq!(out[2], format!("((x (as {c} D)) (y (mk 3)))"));
+        }
     }
 }

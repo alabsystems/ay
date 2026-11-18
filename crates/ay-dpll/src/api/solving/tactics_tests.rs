@@ -2188,6 +2188,58 @@ fn ctx_solver_simplify_drops_redundant_literal() {
 }
 
 #[test]
+fn ctx_solver_simplify_keeps_two_variables_of_one_spelling_apart() {
+    // `first` and `second` are two variables with one spelling and sort.
+    // {(= first 0), (= second 1)} is satisfiable and neither literal is
+    // redundant, so the goal is returned as given.
+    let mut s = Solver::new(Logic::QfLia);
+    let first = s.terms_mut().mk_fresh_var("c", Sort::Int);
+    let spelling = match s.terms().get(first) {
+        TermData::Var(name, _) => name.clone(),
+        other => panic!("expected a variable, got {other:?}"),
+    };
+    let second = s.terms_mut().mk_fresh_named_var(spelling, Sort::Int);
+    assert_ne!(first, second);
+    let zero = s.int_const(0).id();
+    let one = s.int_const(1).id();
+    let eq = ay_core::term::Symbol::named("=");
+    let first_is_zero = s
+        .terms_mut()
+        .mk_app(eq.clone(), vec![first, zero], Sort::Bool);
+    let second_is_one = s.terms_mut().mk_app(eq, vec![second, one], Sort::Bool);
+    let input = vec![first_is_zero, second_is_one];
+    let goals = Tactic::CtxSolverSimplify
+        .apply_goals(s.terms_mut(), root(input.clone()))
+        .expect("ctx-solver-simplify never fails");
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].formulas, input);
+}
+
+#[test]
+fn ctx_solver_simplify_handles_a_variable_with_a_reserved_core_spelling() {
+    // A goal variable whose core spelling is a private `__ay_` identity (a
+    // constant redeclared after `pop` has one) is simplified like any other:
+    // {(> c 3), (= c 5)} keeps only (= c 5).
+    let mut s = Solver::new(Logic::QfLia);
+    let c = s.terms_mut().mk_var("__ay_overload_0", Sort::Int);
+    let three = s.int_const(3).id();
+    let five = s.int_const(5).id();
+    let gt = s.terms_mut().mk_app(
+        ay_core::term::Symbol::named(">"),
+        vec![c, three],
+        Sort::Bool,
+    );
+    let eq = s
+        .terms_mut()
+        .mk_app(ay_core::term::Symbol::named("="), vec![c, five], Sort::Bool);
+    let goals = Tactic::CtxSolverSimplify
+        .apply_goals(s.terms_mut(), root(vec![gt, eq]))
+        .expect("ctx-solver-simplify never fails");
+    assert_eq!(goals.len(), 1);
+    assert_eq!(goals[0].formulas, vec![eq]);
+}
+
+#[test]
 fn ctx_solver_simplify_drops_later_redundant_literal_order_insensitive() {
     // {(= x 5), (> x 3)} : AY is order-insensitive and drops the (later)
     // redundant (> x 3) too (z3 4.15.4 keeps it in this order; both equivalent).

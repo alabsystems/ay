@@ -117,8 +117,8 @@ impl Executor {
         if key.contains('@') {
             return None;
         }
-        let (head, fields) = split_application(&key)?;
-        if let Some((_, index)) = owners.iter().find(|(c, _)| self.dt_surface(c) == head) {
+        let (head, fields) = ay_core::smtlib_application_parts(&key)?;
+        if let Some((_, index)) = owners.iter().find(|(c, _)| self.dt_value_head(c) == head) {
             if wrong_only {
                 return None;
             }
@@ -186,7 +186,7 @@ impl Executor {
         if !ctors.iter().any(|c| c == tested) {
             return None;
         }
-        let built = ctors.iter().find(|c| self.dt_surface(c) == head)?;
+        let built = ctors.iter().find(|c| self.dt_value_head(c) == head)?;
         Some(built == tested)
     }
 
@@ -213,10 +213,10 @@ impl Executor {
     }
 
     fn canonical_value_at(&self, value: &str, fuel: u32) -> bool {
-        if fuel == 0 || value.contains('@') || value.contains('|') {
+        if fuel == 0 || value.contains(['@', '|', '"']) {
             return false;
         }
-        let Some((head, fields)) = split_application(value) else {
+        let Some((head, fields)) = ay_core::smtlib_application_parts(value) else {
             return false;
         };
         if fields.is_empty() && !value.starts_with('(') {
@@ -241,7 +241,7 @@ impl Executor {
     fn is_constructor_surface(&self, name: &str) -> bool {
         self.ctx
             .datatype_iter()
-            .any(|(_, ctors)| ctors.iter().any(|c| self.dt_surface(c) == name))
+            .any(|(_, ctors)| ctors.iter().any(|c| self.dt_value_head(c) == name))
     }
 
     /// Every term reachable from the query's assertions and authored roots.
@@ -357,11 +357,12 @@ impl Executor {
     }
 }
 
-/// The constructor a rendered datatype value is built by: the head of an
-/// application, a bare nullary constructor, or the name inside an `(as C S)`
-/// qualification.
+/// The constructor token a rendered datatype value is built by: the head of
+/// an application, a bare nullary constructor, or the name inside an
+/// `(as C S)` qualification, as `ay_core::smtlib_application_parts` splits
+/// them.
 fn printed_head(value: &str) -> Option<&str> {
-    let (head, fields) = split_application(value)?;
+    let (head, fields) = ay_core::smtlib_application_parts(value)?;
     if head == "as" {
         return match fields.first() {
             Some(inner) => printed_head(inner),
@@ -371,75 +372,8 @@ fn printed_head(value: &str) -> Option<&str> {
     Some(head)
 }
 
-/// Split a rendered value into its head and top-level arguments:
-/// `(cons A (cons B nil))` -> `("cons", ["A", "(cons B nil)"])`, `nil` ->
-/// `("nil", [])`. `None` for anything this reader does not take apart
-/// exactly (quoted symbols, strings, unbalanced text).
-fn split_application(s: &str) -> Option<(&str, Vec<&str>)> {
-    let s = s.trim();
-    if s.contains('|') || s.contains('"') {
-        return None;
-    }
-    let Some(inner) = s.strip_prefix('(') else {
-        return (!s.is_empty() && !s.contains(char::is_whitespace)).then_some((s, Vec::new()));
-    };
-    let inner = inner.strip_suffix(')')?;
-    let mut parts = Vec::new();
-    let (mut depth, mut start) = (0usize, None);
-    for (i, c) in inner.char_indices() {
-        match c {
-            '(' => {
-                start.get_or_insert(i);
-                depth += 1;
-            }
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    parts.push(&inner[start.take()?..=i]);
-                }
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if let Some(b) = start.take() {
-                    parts.push(&inner[b..i]);
-                }
-            }
-            _ => {
-                start.get_or_insert(i);
-            }
-        }
-    }
-    if depth != 0 {
-        return None;
-    }
-    if let Some(b) = start {
-        parts.push(&inner[b..]);
-    }
-    let (head, fields) = parts.split_first()?;
-    if head.starts_with('(') {
-        return None;
-    }
-    Some((head, fields.to_vec()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::split_application;
-
-    #[test]
-    fn splits_rendered_applications() {
-        assert_eq!(split_application("nil"), Some(("nil", vec![])));
-        assert_eq!(
-            split_application("(cons A (cons B nil))"),
-            Some(("cons", vec!["A", "(cons B nil)"]))
-        );
-        assert_eq!(
-            split_application("(mk (cons A nil) false)"),
-            Some(("mk", vec!["(cons A nil)", "false"]))
-        );
-        assert_eq!(split_application("(|a b| x)"), None);
-        assert_eq!(split_application("(cons A"), None);
-        assert_eq!(split_application("((as const (Array Int Int)) 0)"), None);
-    }
     #[test]
     fn query_closure_polls_original_ledger_through_shared_dag_and_keeps_source() {
         use crate::executor::Executor;

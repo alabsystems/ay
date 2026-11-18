@@ -321,6 +321,9 @@ impl Executor {
 }
 
 /// The contents of the `|quoted|` symbols in `text`, skipping string literals.
+/// Inside a quoted symbol a `\` takes the next character, so the escapes
+/// `ay_core::quote_symbol` writes read back as the name: `|a\|b|` gives
+/// `a|b`.
 fn quoted_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = text.chars().peekable();
@@ -338,7 +341,17 @@ fn quoted_tokens(text: &str) -> Vec<String> {
                     }
                 }
             }
-            '|' => tokens.push(chars.by_ref().take_while(|&c| c != '|').collect()),
+            '|' => {
+                let mut token = String::new();
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '|' => break,
+                        '\\' => token.extend(chars.next()),
+                        other => token.push(other),
+                    }
+                }
+                tokens.push(token);
+            }
             _ => {}
         }
     }

@@ -41,6 +41,12 @@ impl Solver {
         if var_index < self.unit_proof_id.len() {
             self.unit_proof_id[var_index] = proof_id;
             self.unit_proof_sign[var_index] = if proof_id == 0 { 0 } else { lit.sign_i8() };
+            // A recording is the one event that can flip a pinned slot's
+            // no-proof retry outcome without changing the slot's own
+            // structural inputs; drop its memo (pinned_retry.rs).
+            if let Some(memo) = self.cold.lrat_pin_retry_memo_fingerprint.get_mut(var_index) {
+                *memo = 0;
+            }
             self.pin_lrat_level0_unit_materialize_for_var(var_index);
         }
     }
@@ -51,6 +57,9 @@ impl Solver {
         if var_index < self.cold.level0_proof_id.len() {
             self.cold.level0_proof_id[var_index] = proof_id;
             self.cold.level0_proof_sign[var_index] = if proof_id == 0 { 0 } else { lit.sign_i8() };
+            if let Some(memo) = self.cold.lrat_pin_retry_memo_fingerprint.get_mut(var_index) {
+                *memo = 0;
+            }
             self.pin_lrat_level0_unit_materialize_for_var(var_index);
         }
     }
@@ -89,6 +98,9 @@ impl Solver {
     pub(super) fn clamp_lrat_level0_unit_materialize_cursor(&mut self, pos: usize) {
         let cursor = self.cold.lrat_level0_unit_materialize_cursor.min(pos);
         self.cold.lrat_level0_unit_materialize_cursor = cursor;
+        // Positions may no longer describe the same literals (shrink or
+        // compaction), so every stay-pinned memo is suspect; drop them.
+        self.cold.lrat_pin_retry_memo_fingerprint.fill(0);
         let pinned = &mut self.cold.lrat_level0_unit_materialize_pinned;
         let keep = pinned.partition_point(|&p| p < cursor);
         pinned.truncate(keep);

@@ -25,8 +25,9 @@
 //!
 //! RECORD CONSTANTS are the one place a raw re-intern cannot be print
 //! faithful. A declared constant of a single-constructor datatype elaborates
-//! to its constructor over solver-invented field constants (`a` interns as
-//! `(mkVec a!ptr a!len ..)`, `(len a)` as `a!len`), and each field prints back
+//! to its constructor over solver-invented field constants `k_i` with private
+//! identities (`a` interns as `(mkVec k_ptr k_len ..)`, `(len a)` as `k_len`),
+//! and each field prints back
 //! as `(len a)` only through the frontend's validated field renderings
 //! (`dt_field_surface_overrides`). A selector read over such a constant fails
 //! raw interning, which dropped the whole assertion, and a record equality

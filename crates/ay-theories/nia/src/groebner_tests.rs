@@ -112,7 +112,7 @@ fn groebner_cancels_shared_bilinear_lead() {
 
 // Pure Buchberger tests (no solver state), against `groebner.rs`.
 
-use super::groebner::{buchberger, integer_signature, GPoly, Mono, PolyTerms};
+use super::groebner::{buchberger, integer_signature, GPoly, Mono, PolyTerms, MAX_BASIS};
 
 fn gpoly(terms: &[(Mono, i64)]) -> GPoly {
     GPoly {
@@ -219,4 +219,114 @@ fn groebner_derived_interval_excludes_zero() {
         unsat_lits(&result).is_some(),
         "w*(z-x)=0 has interval [8,22] under the boxes: {result:?}"
     );
+}
+
+/// Memoized Groebner outcome: identical asserted equality sets replay
+/// the stored basis consequences instead of recomputing Buchberger,
+/// without changing any verdict. `x*x = x ∧ x*y = 1` alone is sat
+/// (x = y = 1) with the derived cut `x = 1` emitted on the first
+/// check; a second identical check must hit the memo and stay sat.
+/// Asserting `x <= 0` under a push (equality inputs unchanged, so the
+/// memo still hits) must still refute through the surviving cut, and
+/// after pop (memo cleared with the dedup set) the same refutation
+/// must be re-derivable from scratch.
+#[test]
+fn groebner_memo_replays_identical_inputs() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let zero = int(&mut terms, 0);
+    let one = int(&mut terms, 1);
+    let xx = terms.mk_mul(vec![x, x]);
+    let xy = terms.mk_mul(vec![x, y]);
+    let yy = terms.mk_mul(vec![y, y]);
+    let xx_eq_x = terms.mk_eq(xx, x);
+    let xy_eq_1 = terms.mk_eq(xy, one);
+    let yy_eq_y = terms.mk_eq(yy, y);
+    let x_le_0 = terms.mk_le(x, zero);
+
+    let mut solver = NiaSolver::new(&terms);
+    for atom in [xx_eq_x, xy_eq_1] {
+        solver.assert_literal(atom, true);
+    }
+    let first = solver.check();
+    assert!(
+        matches!(first, TheoryResult::Sat),
+        "x=y=1 model must be found: {first:?}"
+    );
+    assert_eq!(solver.groebner_memo_hits, 0, "first check computes");
+
+    let second = solver.check();
+    assert!(
+        matches!(second, TheoryResult::Sat),
+        "memo replay must keep the sat verdict: {second:?}"
+    );
+    assert!(
+        solver.groebner_memo_hits >= 1,
+        "identical second check must hit the Groebner memo"
+    );
+
+    // Superset growth: one more asserted equality seeds Buchberger
+    // with the stored basis instead of recomputing from scratch. The
+    // new equality reuses existing terms (y*y = y) so no term-store
+    // mutation is needed after solver construction.
+    solver.assert_literal(yy_eq_y, true);
+    let grown = solver.check();
+    assert!(
+        matches!(grown, TheoryResult::Sat),
+        "superset growth must keep the sat verdict: {grown:?}"
+    );
+    assert!(
+        solver.groebner_memo_seeded >= 1,
+        "grown input set must take the seeded Buchberger path"
+    );
+
+    solver.push();
+    solver.assert_literal(x_le_0, true);
+    let third = solver.check();
+    assert!(
+        unsat_lits(&third).is_some(),
+        "derived x=1 cut must still refute x<=0 under the memo: {third:?}"
+    );
+    solver.pop();
+
+    solver.push();
+    solver.assert_literal(x_le_0, true);
+    let fourth = solver.check();
+    assert!(
+        unsat_lits(&fourth).is_some(),
+        "post-pop recomputation must still refute: {fourth:?}"
+    );
+}
+
+#[test]
+fn groebner_memo_restarts_when_the_cached_basis_is_full() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let xx = terms.mk_mul(vec![x, x]);
+    let yy = terms.mk_mul(vec![y, y]);
+    let zz = terms.mk_mul(vec![z, z]);
+    let xx_eq_x = terms.mk_eq(xx, x);
+    let yy_eq_y = terms.mk_eq(yy, y);
+    let zz_eq_z = terms.mk_eq(zz, z);
+    let mut solver = NiaSolver::new(&terms);
+
+    solver.assert_literal(xx_eq_x, true);
+    solver.assert_literal(yy_eq_y, true);
+    assert!(solver.add_groebner_equality_lemmas().is_none());
+    // Fill the memo to the capacity boundary with valid old polynomials.
+    // The next independent equality cannot reduce to zero with this seed.
+    let cached = solver.groebner_memo_basis[0].clone();
+    solver.groebner_memo_basis.resize(MAX_BASIS, cached);
+    solver.assert_literal(zz_eq_z, true);
+    assert!(solver.add_groebner_equality_lemmas().is_none());
+
+    let basis = &solver.groebner_memo_basis;
+    assert!(basis.len() <= MAX_BASIS);
+    assert_eq!(solver.groebner_memo_seeded, 0);
+    assert!(has_signature(basis, &[(vec![x, x], 1), (vec![x], -1)]));
+    assert!(has_signature(basis, &[(vec![y, y], 1), (vec![y], -1)]));
+    assert!(has_signature(basis, &[(vec![z, z], 1), (vec![z], -1)]));
 }

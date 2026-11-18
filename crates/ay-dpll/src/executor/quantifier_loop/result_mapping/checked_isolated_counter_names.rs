@@ -10,6 +10,9 @@ use crate::executor::theories::bv_lia_aux_vars::is_bv_lia_aux_var_name;
 /// Private declaration identity: `Context::fresh_private_declaration_core_identity`.
 pub(super) const PRIVATE_DECLARATION_IDENTITY_PREFIX: &str = "__ay_overload_";
 
+/// Single-constructor field identity: `Context::fresh_dt_field_identity`.
+pub(super) const DT_FIELD_IDENTITY_PREFIX: &str = "__ay_field_";
+
 /// Array-extensionality witness: `ArrayExtWitnessCache::mint` via
 /// `TermStore::mk_internal_symbol("ext_diff")`. Test builds pin it equal to
 /// `theories::ARRAY_EXT_WITNESS_PREFIX`, which exists only under `cfg(test)`.
@@ -32,6 +35,9 @@ pub(super) const EQ_DIFF_VARIABLE_SPELLING: &str = "__ay_eqdv!";
 ///    datatypes that both declare `fld_len` give the second one this identity).
 ///    `api::solving::native_replay` already reads the same grammar as an
 ///    allocator identity (`is_allocator_private_declaration_identity`).
+///  * `__ay_field_{n}`: `n` is `Context::next_field_identity`, the per-context
+///    counter of single-constructor field constants
+///    (`Context::fresh_dt_field_identity` is the one producer).
 ///  * `__ay_ext_diff!{n}`: `n` is `TermStore::var_counter` (`mk_internal_symbol`
 ///    formats `__ay_{purpose}!{next_var_id}`), which `mark_and_compact` does not
 ///    relabel.
@@ -65,6 +71,7 @@ pub(super) fn is_counter_only_internal_name(name: &str) -> bool {
         |tail: &str| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit());
     [
         PRIVATE_DECLARATION_IDENTITY_PREFIX,
+        DT_FIELD_IDENTITY_PREFIX,
         ARRAY_EXT_WITNESS_SPELLING,
         EQ_DIFF_VARIABLE_SPELLING,
     ]

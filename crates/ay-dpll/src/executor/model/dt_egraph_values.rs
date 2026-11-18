@@ -536,7 +536,7 @@ impl Executor {
                 && !raw.contains(['(', ' '])
                 && self.ctx.is_constructor(raw).is_some()
             {
-                return Some(self.dt_surface(raw).to_string());
+                return Some(self.dt_value_head(raw).into_owned());
             }
             None
         };
@@ -750,7 +750,7 @@ impl Executor {
                 // A nullary constructor constant is its own value.
                 self.ctx
                     .is_constructor(name)
-                    .map(|(_dt, ctor)| self.dt_surface(&ctor).to_string())
+                    .map(|(_dt, ctor)| self.dt_value_head(&ctor).into_owned())
             }
             TermData::App(sym, args) => {
                 if let Some((_dt, ctor)) = self.ctx.is_constructor(sym.name()) {
@@ -771,7 +771,7 @@ impl Executor {
                         };
                         parts.push(part?);
                     }
-                    return Some(render_ctor(self.dt_surface(&ctor), &parts));
+                    return Some(render_ctor(&self.dt_value_head(&ctor), &parts));
                 }
                 // Selector application on a right-constructor class: project.
                 if args.len() == 1 {
@@ -1140,7 +1140,7 @@ impl Executor {
                         };
                         parts.push(part?);
                     }
-                    return Some(render_ctor(self.dt_surface(&ctor), &parts));
+                    return Some(render_ctor(&self.dt_value_head(&ctor), &parts));
                 }
                 // Right-constructor selector application: the validator
                 // computes it STRUCTURALLY — the matching field of the
@@ -1194,7 +1194,7 @@ impl Executor {
             }
             if let TermData::Var(name, _) = self.ctx.terms.get(term) {
                 if let Some((_dt, ctor)) = self.ctx.is_constructor(name) {
-                    return Some(self.dt_surface(&ctor).to_string());
+                    return Some(self.dt_value_head(&ctor).into_owned());
                 }
             }
             let rep = asg.dtm.rep(term);
@@ -1244,7 +1244,7 @@ impl Executor {
                             else {
                                 return false;
                             };
-                            let is_c = value_head(&v) == self.dt_surface(ctor);
+                            let is_c = value_head(&v) == self.dt_value_head(ctor);
                             overrides.insert(term, EvalValue::Bool(is_c));
                             return true;
                         }
@@ -1293,9 +1293,9 @@ impl Executor {
     }
 }
 
-/// Render a constructor value: nullary as the bare (surface) name, otherwise
-/// `(name part…)` — matching the legacy printer's rendering so downstream
-/// head-matching and Dolmen round-trips are unchanged.
+/// Render a constructor value from its head token
+/// (`Executor::dt_value_head`): nullary as the token, otherwise
+/// `(token part…)`, the legacy printer's rendering.
 fn render_ctor(surface: &str, parts: &[String]) -> String {
     if parts.is_empty() {
         surface.to_string()
@@ -1429,7 +1429,7 @@ impl AsgBuilder<'_> {
                 for &arg in &args {
                     parts.push(self.field_part(arg, depth - 1)?);
                 }
-                let v = render_ctor(self.exec.dt_surface(&ctor), &parts);
+                let v = render_ctor(&self.exec.dt_value_head(&ctor), &parts);
                 if self.avoid_hit(rep, &v) {
                     // Fully committed value under an avoid constraint: the
                     // repair should have picked the other side; fail closed.
@@ -1462,7 +1462,7 @@ impl AsgBuilder<'_> {
                         parts.push(self.exec.canonical_default_value(fsort));
                     }
                 }
-                let mut v = render_ctor(self.exec.dt_surface(&ctor), &parts);
+                let mut v = render_ctor(&self.exec.dt_value_head(&ctor), &parts);
                 if self.avoid_hit(rep, &v) {
                     // Bump the free datatype field through generated values
                     // until the composed value clears the avoid set.
@@ -1473,7 +1473,7 @@ impl AsgBuilder<'_> {
                             break;
                         };
                         parts[idx] = cand;
-                        v = render_ctor(self.exec.dt_surface(&ctor), &parts);
+                        v = render_ctor(&self.exec.dt_value_head(&ctor), &parts);
                         if !self.avoid_hit(rep, &v) {
                             ok = true;
                             break;
@@ -1496,32 +1496,33 @@ impl AsgBuilder<'_> {
                     }
                     if let Some(ruled) = self.ruled_out.get(&rep) {
                         let head = value_head(&pinned);
-                        if ruled.iter().any(|c| self.exec.dt_surface(c) == head) {
+                        if ruled.iter().any(|c| self.exec.dt_value_head(c) == head) {
                             return None;
                         }
                     }
-                    if let Some(ctor) = self.ctor_from_head(&pinned) {
-                        // Field view of the pinned value
-                        // (#dt-egraph-pinned-fields): the validator computes a
-                        // selector on this class STRUCTURALLY (the matching
-                        // field of the rendered value), so the owner rule and
-                        // the self-check's owner recheck must see the pinned
-                        // value's fields exactly like a rendered one's —
-                        // without this, a selector application on a pinned
-                        // constructor-headed class fell to the wrong-ctor
-                        // canonicalization table (validator-unfaithful) and
-                        // the owner recheck was blind to the projection.
-                        if let Some(parts) = split_value_parts(&pinned) {
+                    if let Some((head, parts)) = ay_core::smtlib_application_parts(&pinned) {
+                        if let Some(ctor) = self.ctor_printed_as(rep, head) {
+                            // Field view of the pinned value
+                            // (#dt-egraph-pinned-fields): the validator computes a
+                            // selector on this class STRUCTURALLY (the matching
+                            // field of the rendered value), so the owner rule and
+                            // the self-check's owner recheck must see the pinned
+                            // value's fields exactly like a rendered one's —
+                            // without this, a selector application on a pinned
+                            // constructor-headed class fell to the wrong-ctor
+                            // canonicalization table (validator-unfaithful) and
+                            // the owner recheck was blind to the projection.
                             if self
                                 .exec
                                 .ctx
                                 .constructor_selectors(&ctor)
                                 .is_some_and(|sels| sels.len() == parts.len())
                             {
-                                self.fields_memo.insert(rep, parts);
+                                self.fields_memo
+                                    .insert(rep, parts.into_iter().map(str::to_string).collect());
                             }
+                            self.ctor_memo.insert(rep, ctor);
                         }
-                        self.ctor_memo.insert(rep, ctor);
                     }
                     return Some(pinned);
                 }
@@ -1571,10 +1572,22 @@ impl AsgBuilder<'_> {
         }
     }
 
-    /// Constructor of the class's datatype whose surface name heads `value`.
-    fn ctor_from_head(&self, value: &str) -> Option<String> {
-        let head = value_head(value);
-        self.exec.ctx.is_constructor(head).map(|(_dt, ctor)| ctor)
+    /// The constructor of `rep`'s datatype whose head token
+    /// (`Executor::dt_value_head`) is `head`, for example `lf#` for the
+    /// token `|lf#|`. `None` when `rep` has no datatype or when no
+    /// constructor of it, or more than one, prints `head`.
+    fn ctor_printed_as(&self, rep: TermId, head: &str) -> Option<String> {
+        let dt_name = self.class_sort.get(&rep)?;
+        let mut found = None;
+        for ctor in self.exec.ctx.datatype_constructors(dt_name)? {
+            if self.exec.dt_value_head(ctor) == head {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(ctor.clone());
+            }
+        }
+        found
     }
 
     /// Rendered value of a constructor-argument / selector-application term:
@@ -1702,7 +1715,7 @@ impl AsgBuilder<'_> {
                 .iter()
                 .map(|(_, fsort)| self.exec.canonical_default_value(fsort))
                 .collect();
-            let v = render_ctor(self.exec.dt_surface(ctor), &parts);
+            let v = render_ctor(&self.exec.dt_value_head(ctor), &parts);
             return Some((ctor.clone(), parts, v));
         }
         let mut j = k - base.len() as u64;
@@ -1724,7 +1737,7 @@ impl AsgBuilder<'_> {
                         .map(|(_, s)| self.exec.canonical_default_value(s))
                         .collect();
                     parts[idx] = value;
-                    let v = render_ctor(self.exec.dt_surface(&ctor), &parts);
+                    let v = render_ctor(&self.exec.dt_value_head(&ctor), &parts);
                     return Some((ctor, parts, v));
                 }
                 None => {
@@ -1766,7 +1779,7 @@ impl AsgBuilder<'_> {
                 .map(|(_, fsort)| self.exec.canonical_default_value(fsort))
                 .collect();
             parts[bool_idx] = if j == 0 { "true" } else { "false" }.to_string();
-            let v = render_ctor(self.exec.dt_surface(&pump), &parts);
+            let v = render_ctor(&self.exec.dt_value_head(&pump), &parts);
             return Some((pump, parts, v));
         };
         let dt_idx = fields
@@ -1779,7 +1792,7 @@ impl AsgBuilder<'_> {
             .collect();
         let (_, _, nested) = self.gen_value(&nested_sort, j, &[], depth - 1)?;
         parts[dt_idx] = nested;
-        let v = render_ctor(self.exec.dt_surface(&pump), &parts);
+        let v = render_ctor(&self.exec.dt_value_head(&pump), &parts);
         Some((pump, parts, v))
     }
 
@@ -1926,7 +1939,7 @@ impl AsgBuilder<'_> {
                                 && !b.avoid_hit(rep, val)
                                 && !b.ruled_out.get(&rep).is_some_and(|ruled| {
                                     let head = value_head(val);
-                                    ruled.iter().any(|c| b.exec.dt_surface(c) == head)
+                                    ruled.iter().any(|c| b.exec.dt_value_head(c) == head)
                                 })
                         };
                         let app_point = (*arg_rep, sel.clone());
@@ -2017,7 +2030,7 @@ impl AsgBuilder<'_> {
             && !self.avoid_hit(rep, &value)
             && !self.ruled_out.get(&rep).is_some_and(|ruled| {
                 let head = value_head(&value);
-                ruled.iter().any(|c| self.exec.dt_surface(c) == head)
+                ruled.iter().any(|c| self.exec.dt_value_head(c) == head)
             });
         if pinnable {
             match self.pins.get(&rep) {
@@ -2278,92 +2291,11 @@ impl AsgBuilder<'_> {
     }
 }
 
-/// Top-level argument parts of a rendered constructor value:
-/// `(cons (node null) null)` -> `["(node null)", "null"]`; a nullary value
-/// (`null`) has no parts. Paren depth plus SMT-LIB string literals (`"…"`,
-/// `""` escape) and `|…|`-quoted symbols are respected so scalar parts
-/// containing spaces or parentheses never split. `None` on malformed input
-/// (callers fail closed — no field view is populated).
-fn split_value_parts(s: &str) -> Option<Vec<String>> {
-    let t = s.trim();
-    if !t.starts_with('(') {
-        // Nullary rendering: bare head, no parts.
-        return Some(Vec::new());
-    }
-    let inner = t.strip_prefix('(')?.strip_suffix(')')?;
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut depth: u32 = 0;
-    let mut in_str = false;
-    let mut in_sym = false;
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_str {
-            cur.push(c);
-            if c == '"' {
-                if chars.peek() == Some(&'"') {
-                    cur.push(chars.next()?);
-                } else {
-                    in_str = false;
-                }
-            }
-            continue;
-        }
-        if in_sym {
-            cur.push(c);
-            if c == '|' {
-                in_sym = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                cur.push(c);
-            }
-            '|' => {
-                in_sym = true;
-                cur.push(c);
-            }
-            '(' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                cur.push(c);
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    parts.push(std::mem::take(&mut cur));
-                }
-            }
-            c => cur.push(c),
-        }
-    }
-    if depth != 0 || in_str || in_sym {
-        return None;
-    }
-    if !cur.is_empty() {
-        parts.push(cur);
-    }
-    // The first token is the constructor head, not a field.
-    if parts.is_empty() {
-        return None;
-    }
-    parts.remove(0);
-    Some(parts)
-}
-
-/// Head symbol of a rendered constructor value: `(cons a b)` -> `cons`,
-/// `null` -> `null`.
+/// Head token of a rendered constructor value, as
+/// `ay_core::smtlib_application_parts` gives it: `(cons a b)` -> `cons`,
+/// `null` -> `null`, `(|a b| 1)` -> `|a b|`; empty when it gives none.
 fn value_head(s: &str) -> &str {
-    let t = s.trim();
-    let t = t.strip_prefix('(').unwrap_or(t).trim_start();
-    let end = t
-        .find(|c: char| c.is_whitespace() || c == ')' || c == '(')
-        .unwrap_or(t.len());
-    &t[..end]
+    ay_core::smtlib_application_parts(s).map_or("", |(head, _)| head)
 }
 
 #[cfg(test)]

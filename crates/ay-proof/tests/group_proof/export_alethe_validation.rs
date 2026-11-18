@@ -121,6 +121,9 @@ include!("export_alethe_validation/equality_lattice.rs");
 include!("export_alethe_validation/let_bridge_resolution.rs");
 include!("export_alethe_validation/pinned_carcara_refusal.rs");
 
+#[path = "export_alethe_validation/mixed_bv_clause.rs"]
+mod mixed_bv_clause;
+
 const QF_EQ_TRANS_DISTINCT_UNSAT: &str = r#"
 (set-logic QF_UFLIA)
 (declare-const i0 Int)

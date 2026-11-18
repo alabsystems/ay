@@ -421,11 +421,14 @@ pub(super) fn select(
         });
     }
     let mut steps = batch::compatible(steps);
-    // Drain all selected ordinary compiler/test work before reserving the
-    // machine for benchmark-bearing controls. An early exclusive waiter
-    // otherwise blocks both these later checks and unrelated admitted work.
-    // Stable ordering preserves artifact-build/consumer dependencies and every
-    // selected validation; the quiet leg still acquires its original lease.
+    // Build the benchmark-bearing harnesses under ordinary admission before
+    // requesting the host-wide runtime window. The quiet invocations still
+    // run their original Targo commands, including filters and freshness.
+    let test_builds = steps
+        .iter()
+        .filter_map(Step::quiet_test_compilation)
+        .collect::<Vec<_>>();
+    steps.extend(test_builds);
     steps.sort_by_key(Step::needs_quiet_host);
     Ok(Plan {
         changed_paths: paths,

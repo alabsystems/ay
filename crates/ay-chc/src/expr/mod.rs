@@ -24,6 +24,7 @@ mod structural;
 mod types;
 
 pub(crate) use array_lambda::ChcArrayLambda;
+pub(crate) use eliminate::{is_elimination_aux_var_name, is_engine_reserved_var_name};
 pub use types::{
     ChcDtConstructor, ChcDtConstructors, ChcDtId, ChcDtSelector, ChcExpr, ChcOp, ChcSort, ChcVar,
 };

@@ -71,12 +71,25 @@ pub(crate) enum ReconstructionStep {
 pub(crate) struct ReconstructionStack {
     /// Steps in order they were applied (reconstruction reverses this)
     steps: Vec<ReconstructionStep>,
+    /// Latched when any step has ever been pushed, even if the steps
+    /// were later drained (#l0-rebuild-epoch): a drained stack reads
+    /// empty, but the elimination it witnessed still happened.
+    ever_pushed: bool,
 }
 
 impl ReconstructionStack {
     /// Create an empty reconstruction stack.
     pub(crate) fn new() -> Self {
-        Self { steps: Vec::new() }
+        Self {
+            steps: Vec::new(),
+            ever_pushed: false,
+        }
+    }
+
+    /// Whether any reconstruction step was ever pushed on this stack
+    /// (survives drains; cleared only by replacing the stack).
+    pub(crate) fn ever_pushed(&self) -> bool {
+        self.ever_pushed
     }
 
     /// Number of reconstruction steps.
@@ -233,6 +246,7 @@ impl ReconstructionStack {
             !clause.is_empty(),
             "BUG: empty clause in reconstruction entry"
         );
+        self.ever_pushed = true;
         self.steps.push(ReconstructionStep::Witness(WitnessClause {
             witness,
             clause,

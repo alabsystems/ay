@@ -441,7 +441,7 @@ impl Context {
                     )
                 })?;
                 if let Some((params, result_sort, body)) = self.fun_defs.get(func_name).cloned() {
-                    let index = self.terms.mk_fresh_var("array_map_index", idx_sort.clone());
+                    let index = self.mint_fresh_var("array_map_index", idx_sort.clone());
                     let point_args = arg_ids
                         .iter()
                         .map(|&array| self.terms.mk_select(array, index))
@@ -503,9 +503,7 @@ impl Context {
                             params.len()
                         )));
                     }
-                    let index = self
-                        .terms
-                        .mk_fresh_var("as_array_index", params[0].1.clone());
+                    let index = self.mint_fresh_var("as_array_index", params[0].1.clone());
                     let body = self.elaborate_defined_array_function_body(
                         func_name,
                         &params,

@@ -126,11 +126,7 @@ fn model_name(view: &ModelView<'_>, t: TermId) -> Option<String> {
 /// The prefixes `SmtContext::rename_internal_aux_vars` namespaces
 /// (`smt/context.rs`; mirrored by `smt/incremental/mod.rs::strip_namespace_suffix`).
 fn is_normalisation_aux(name: &str) -> bool {
-    name.starts_with("_ite_")
-        || name.starts_with("_mod_q_")
-        || name.starts_with("_mod_r_")
-        || name.starts_with("_div_q_")
-        || name.starts_with("_div_r_")
+    crate::expr::is_elimination_aux_var_name(name)
 }
 
 /// `SmtValue` for a theory value under the variable's sort: Real => `Real`;

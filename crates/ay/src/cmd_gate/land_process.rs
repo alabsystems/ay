@@ -19,6 +19,7 @@ pub(super) enum StepKind {
     Command,
     /// Workspace resolution with the checked-in lockfile and no network.
     Metadata,
+    RustTestBuild,
     RustTests,
     FfiArtifactBuild,
     FfiArtifactTests,
@@ -60,6 +61,26 @@ impl Step {
         self.kind == StepKind::RustTests
             && self.program == "build-slot"
             && self.args.first().is_some_and(|arg| arg == "--exclusive")
+    }
+
+    /// Prepare the same test targets and feature graph under shared admission.
+    /// The quiet step still lets Targo check freshness and run its own harnesses.
+    pub(super) fn quiet_test_compilation(&self) -> Option<Self> {
+        if !self.needs_quiet_host() {
+            return None;
+        }
+        let mut args = self.args[1..].to_vec();
+        // The first separator belongs to build-slot. The next starts arguments
+        // for the test executable and must be left to the runtime step.
+        if let Some(harness_start) = args.iter().skip(1).position(|arg| arg == "--") {
+            args.truncate(harness_start + 1);
+        }
+        args.push("--no-run".into());
+        Some(Self {
+            program: self.program.clone(),
+            args,
+            kind: StepKind::RustTestBuild,
+        })
     }
 
     pub(super) fn compiler(args: Vec<String>) -> Self {

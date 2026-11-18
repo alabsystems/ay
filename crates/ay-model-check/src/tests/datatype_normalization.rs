@@ -275,3 +275,25 @@ fn norm_two_ctor_exclusivity_is_not_overreaching() {
         "is-None ∨ is-Some IS a tautology (exhaustive)"
     );
 }
+
+#[test]
+fn norm_keeps_apart_applications_whose_symbol_spells_another_application() {
+    // (= (g true x) (|g K:Bool(true)| x)) is not a tautology: `g` and
+    // `g K:Bool(true)` are different symbols, the second one's name spelling
+    // the first one's name followed by the key of the argument `true`.
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("x", Sort::Int);
+    let yes = ts.mk_bool(true);
+    let binary = app(&mut ts, "g", &[yes, x], Sort::Bool);
+    let unary = app(&mut ts, "g K:Bool(true)", &[x], Sort::Bool);
+    let iff = app(&mut ts, "=", &[binary, unary], Sort::Bool);
+    assert!(!is_taut(&ts, iff));
+
+    // The same application on both sides still is one.
+    let same = app(&mut ts, "=", &[binary, binary], Sort::Bool);
+    let again = app(&mut ts, "g", &[yes, x], Sort::Bool);
+    let or_not = app(&mut ts, "not", &[again], Sort::Bool);
+    let excluded_middle = app(&mut ts, "or", &[binary, or_not], Sort::Bool);
+    assert!(is_taut(&ts, excluded_middle));
+    let _ = same;
+}

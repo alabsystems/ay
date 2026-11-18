@@ -7,6 +7,7 @@
 //! Translates DT-sorted variable values from opaque UF representative names
 //! (`@SortName!N`) to proper constructor expressions (`Green`, `(Some #x42)`).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -25,6 +26,15 @@ mod array_field_hazard;
 pub(in crate::executor::model) mod census_values;
 
 const CEGAR_DISTINCT_OPERAND_LIMIT: usize = 256;
+
+/// The spelling [`Executor::dt_value_respelled`] writes each constructor in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DtSpelling {
+    /// The constructor's identity, which the evaluator compares.
+    Identity,
+    /// The constructor's head token, [`Executor::dt_value_head`].
+    Printed,
+}
 
 /// Shared array-census result. `complete` records whether the authored closure
 /// stayed within the ground fragment the exact datatype-array certificate can
@@ -421,10 +431,335 @@ impl Executor {
         self.ctx.exact_datatype_member_info(identity).is_some()
     }
 
-    /// User-facing surface name of a (possibly instance-mangled) datatype
-    /// constructor/selector internal name, for model / `get-value` output.
-    pub(super) fn dt_surface<'a>(&'a self, name: &'a str) -> &'a str {
-        self.ctx.output_symbol_name(name)
+    /// The token a datatype value prints for the constructor `identity`
+    /// (possibly instance-mangled): the `ay_core::symbol_token` of
+    /// `Context::output_symbol_name`, so that, for example, the constructors
+    /// `|a b|` and `||` print as `|a b|` and `||`.
+    pub(super) fn dt_value_head<'a>(&'a self, identity: &'a str) -> Cow<'a, str> {
+        ay_core::symbol_token(self.ctx.output_symbol_name(identity))
+    }
+
+    /// `text`, a value of the datatype `sort`, with each constructor written
+    /// as `spelling` asks, or `None` when that changes no constructor.
+    ///
+    /// The model keeps two spellings of one datatype value: the identity
+    /// spelling the evaluator compares (`pop`, `(__ay_overload_0 4)`), and the
+    /// printed one [`Self::dt_value_head`] gives, which model completion also
+    /// stores (`|pop|`, `(|\|x| 4)`). [`Self::dt_value_application`] names
+    /// the constructor and cuts out the fields of `text` in either spelling,
+    /// so `my nil` names the constructor `|my nil|` and `(wrap a b)` is
+    /// `wrap` applied to the constructor `|a b|`.
+    /// Fields of a datatype sort are respelled the same way; any other field,
+    /// and a field this does not respell (for example an `@`-representative),
+    /// is kept as written. `None` also when `text` names no constructor, for
+    /// example the ascription `(as nil L1)`.
+    pub(super) fn dt_value_respelled(
+        &self,
+        text: &str,
+        sort: &Sort,
+        spelling: DtSpelling,
+    ) -> Option<String> {
+        let mut changed = false;
+        let respelled = self.dt_value_respelled_at(text, sort, spelling, &mut changed, 0)?;
+        changed.then_some(respelled)
+    }
+
+    /// `text` in the printed spelling of [`Self::dt_value_respelled`], or
+    /// `text` itself when that changes nothing or cannot read it.
+    pub(super) fn dt_value_printed(&self, text: &str, sort: &Sort) -> String {
+        self.dt_value_respelled(text, sort, DtSpelling::Printed)
+            .unwrap_or_else(|| text.to_string())
+    }
+
+    /// Whether the texts `lhs` and `rhs` of a value of `sort` are equal, or
+    /// have equal identity spellings ([`Self::dt_value_respelled`]).
+    pub(super) fn dt_value_texts_agree(&self, lhs: &str, rhs: &str, sort: &Sort) -> bool {
+        let identity = |text: &str| {
+            self.dt_value_respelled(text, sort, DtSpelling::Identity)
+                .unwrap_or_else(|| text.to_string())
+        };
+        lhs == rhs || identity(lhs) == identity(rhs)
+    }
+
+    fn dt_value_respelled_at(
+        &self,
+        text: &str,
+        sort: &Sort,
+        spelling: DtSpelling,
+        changed: &mut bool,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > super::rendered_dt_limits::MAX_RENDERED_DT_DEPTH {
+            return None;
+        }
+        let dt_name = self.datatype_sort_name(sort)?;
+        // An identity can begin or end with whitespace (`| lead|`).
+        let text = match self.ctx.is_constructor(text) {
+            Some((carrier, _)) if carrier == dt_name => text,
+            _ => text.trim(),
+        };
+        if text.starts_with('@') {
+            return None;
+        }
+        let (head, ctor, fields) = self.dt_value_application(text, &dt_name)?;
+        let ctor = &ctor;
+        let field_sorts = self.ctx.constructor_selector_info(ctor).unwrap_or(&[]);
+        let written = match spelling {
+            DtSpelling::Identity => Cow::Borrowed(ctor.as_str()),
+            DtSpelling::Printed => self.dt_value_head(ctor),
+        };
+        *changed |= written != head;
+        if fields.is_empty() {
+            return Some(written.into_owned());
+        }
+        let mut out = format!("({written}");
+        for (field, (_, field_sort)) in fields.iter().zip(field_sorts) {
+            out.push(' ');
+            let respelled = if self.datatype_sort_name(field_sort).is_some() {
+                self.dt_value_respelled_at(field, field_sort, spelling, changed, depth + 1)
+            } else {
+                None
+            };
+            out.push_str(respelled.as_deref().unwrap_or(field));
+        }
+        out.push(')');
+        Some(out)
+    }
+
+    /// The head `text` writes, the constructor of the datatype `dt_name` it
+    /// names, and the texts of its fields, or `None`.
+    ///
+    /// A `text` that is the identity of a nullary constructor of `dt_name` is
+    /// that constructor (for example `as` and ` lead`, the identities of the
+    /// constructors `|as|` and `| lead|`). Any other `text` is first cut into
+    /// SMT-LIB terms (`ay_core::smtlib_application_parts`), and one that is
+    /// not one term is its own head. A head that is the identity of a
+    /// constructor of `dt_name` names that constructor; any other head names
+    /// the constructor of `dt_name` whose head token it is, and `None` when
+    /// two constructors' is. When that head names no constructor, or the
+    /// number of terms after it is not its constructor's field count,
+    /// [`Self::dt_value_identity_cut`] reads `text`. It also reads `text`
+    /// first when a term that is the field of a datatype sort is an atom
+    /// other than an `@`-representative and names no constructor of that
+    /// sort, and the terms stand when it has no reading. `None` also when the
+    /// terms are `as` and two more, the shape of an ascription.
+    fn dt_value_application<'t>(
+        &self,
+        text: &'t str,
+        dt_name: &str,
+    ) -> Option<(&'t str, String, Vec<&'t str>)> {
+        let arity = |ctor: &str| {
+            self.ctx
+                .constructor_selector_info(ctor)
+                .map_or(0, <[_]>::len)
+        };
+        if let Some((carrier, ctor)) = self.ctx.is_constructor(text) {
+            if carrier == dt_name && arity(&ctor) == 0 {
+                return Some((text, ctor, Vec::new()));
+            }
+        }
+        let (head, fields) = ay_core::smtlib_application_parts(text).unwrap_or((text, Vec::new()));
+        // An ascription, `(as nil L1)`.
+        if head == "as" && fields.len() == 2 {
+            return None;
+        }
+        let named = match self.ctx.is_constructor(head) {
+            // A head that is the identity of a constructor of `dt_name` names
+            // that constructor, whether or not it is also another one's head
+            // token. The frontend gives a private identity to a constructor
+            // whose name is the quoted token of another constructor of its
+            // declaration (`Context::datatype_constructor_internal_names`),
+            // for example `|\|a b\||` beside `|a b|`. A bare token is a
+            // constructor's output name, which can also be another
+            // constructor's identity, for example when two constructors of
+            // `dt_name` share a name (`((a) (a))`).
+            Some((carrier, ctor)) if carrier == dt_name => Some(ctor),
+            _ => {
+                let mut named = None;
+                for ctor in self.ctx.datatype_constructors(dt_name)? {
+                    if ctor == head || self.dt_value_head(ctor) == head {
+                        if named.is_some_and(|found: &String| found != ctor) {
+                            return None;
+                        }
+                        named = Some(ctor);
+                    }
+                }
+                named.cloned()
+            }
+        };
+        if let Some(ctor) = named {
+            if arity(&ctor) == fields.len() {
+                // The terms cut `(wrap  lead)` into `wrap` and `lead`, where
+                // the field is the constructor `| lead|`.
+                let field_sorts = self.ctx.constructor_selector_info(&ctor).unwrap_or(&[]);
+                let names_no_constructor = |(field, (_, field_sort)): (&&str, &(String, Sort))| {
+                    !field.starts_with(['(', '@'])
+                        && self.datatype_sort_name(field_sort).is_some_and(|field_dt| {
+                            !matches!(
+                                self.ctx.is_constructor(field),
+                                Some((carrier, _)) if carrier == field_dt
+                            ) && !self
+                                .ctx
+                                .datatype_constructors(&field_dt)
+                                .unwrap_or(&[])
+                                .iter()
+                                .any(|ctor| self.dt_value_head(ctor) == **field)
+                        })
+                };
+                if fields.iter().zip(field_sorts).any(names_no_constructor) {
+                    if let Some(cut) = self.dt_value_identity_cut(text, dt_name) {
+                        return Some(cut);
+                    }
+                }
+                return Some((head, ctor, fields));
+            }
+        }
+        self.dt_value_identity_cut(text, dt_name)
+    }
+
+    /// The reading of `text` as a value of the datatype `dt_name` whose
+    /// constructors are written as their identities, when exactly one exists:
+    /// the identity, the constructor, and the field texts.
+    ///
+    /// An identity is not always one SMT-LIB token: the constructor `|a b|`
+    /// has the identity `a b` and `|a(b|` the identity `a(b`, so the
+    /// identity spelling of `(wrap |a b|)` is `(wrap a b)` and that of
+    /// `(wrap (|a(b| c))` is `(wrap (a(b c))`. A reading is a nullary
+    /// constructor whose identity is all of `text`, or a constructor with
+    /// fields whose identity follows the opening parenthesis at once, whose
+    /// fields [`Self::dt_value_field_cuts`] cuts out of the text after that
+    /// identity, and whose closing parenthesis ends `text`. `None` when no
+    /// reading or more than one exists, for example `(pair a a a)` where the
+    /// field sort has the constructors `a` and `|a a|`, or when the cut runs
+    /// out of its budget.
+    fn dt_value_identity_cut<'t>(
+        &self,
+        text: &'t str,
+        dt_name: &str,
+    ) -> Option<(&'t str, String, Vec<&'t str>)> {
+        let mut budget = super::rendered_dt_limits::MAX_RENDERED_DT_NODES;
+        let mut reading = None;
+        for ctor in self.ctx.datatype_constructors(dt_name)? {
+            let field_sorts = self.ctx.constructor_selector_info(ctor).unwrap_or(&[]);
+            let applied = text
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_prefix(ctor.as_str()));
+            let cuts = match applied {
+                _ if field_sorts.is_empty() => {
+                    if text == ctor {
+                        vec![(text, Vec::new())]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Some(rest) => self
+                    .dt_value_field_cuts(rest, field_sorts, &mut budget, 0)?
+                    .into_iter()
+                    .filter(|(_, end)| &rest[*end..] == ")")
+                    .map(|(fields, _)| (&text[1..=ctor.len()], fields))
+                    .collect(),
+                None => Vec::new(),
+            };
+            for (head, fields) in cuts {
+                if reading.is_some() {
+                    return None;
+                }
+                reading = Some((head, ctor.clone(), fields));
+            }
+        }
+        reading
+    }
+
+    /// Every way to cut one field text per sort of `field_sorts`, in order,
+    /// from the start of `text`, each field after one whitespace character:
+    /// the field texts and the offset in `text` where the last one ends.
+    /// `None` when `budget` runs out or [`Self::dt_value_field_lens`] gives
+    /// `None`.
+    fn dt_value_field_cuts<'t>(
+        &self,
+        text: &'t str,
+        field_sorts: &[(String, Sort)],
+        budget: &mut usize,
+        depth: usize,
+    ) -> Option<Vec<(Vec<&'t str>, usize)>> {
+        let mut open = vec![(Vec::new(), 0)];
+        for (_, field_sort) in field_sorts {
+            let mut next = Vec::new();
+            for (fields, at) in open {
+                let mut after_separator = text[at..].chars();
+                if !after_separator.next().is_some_and(char::is_whitespace) {
+                    continue;
+                }
+                let rest = after_separator.as_str();
+                let start = text.len() - rest.len();
+                for len in self.dt_value_field_lens(rest, field_sort, budget, depth)? {
+                    *budget = budget.checked_sub(1)?;
+                    let mut fields: Vec<&'t str> = fields.clone();
+                    fields.push(&rest[..len]);
+                    next.push((fields, start + len));
+                }
+            }
+            open = next;
+        }
+        Some(open)
+    }
+
+    /// The byte length of each reading of one field of `sort` at the start
+    /// of `text`; `None` when `budget` runs out or `depth` is over
+    /// `MAX_RENDERED_DT_DEPTH`.
+    ///
+    /// A field is one SMT-LIB term (`ay_core::smtlib_term_len`) or, for a
+    /// datatype `sort`, the identity of one of its nullary constructors,
+    /// which can be empty or hold whitespace (`||`, `| lead|`), or a
+    /// parenthesised identity of one of its other constructors with that
+    /// constructor's fields ([`Self::dt_value_field_cuts`]). Whitespace, a
+    /// closing parenthesis or the end of `text` follows each field.
+    fn dt_value_field_lens(
+        &self,
+        text: &str,
+        sort: &Sort,
+        budget: &mut usize,
+        depth: usize,
+    ) -> Option<Vec<usize>> {
+        if depth > super::rendered_dt_limits::MAX_RENDERED_DT_DEPTH {
+            return None;
+        }
+        let ends_a_field = |rest: &str| {
+            rest.is_empty() || rest.starts_with(|ch: char| ch.is_whitespace() || ch == ')')
+        };
+        let mut lens = Vec::new();
+        if let Some(len) = ay_core::smtlib_term_len(text) {
+            if ends_a_field(&text[len..]) {
+                lens.push(len);
+            }
+        }
+        let Some(field_dt) = self.datatype_sort_name(sort) else {
+            return Some(lens);
+        };
+        for ctor in self.ctx.datatype_constructors(&field_dt).unwrap_or(&[]) {
+            let field_sorts = self.ctx.constructor_selector_info(ctor).unwrap_or(&[]);
+            let applied = text
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_prefix(ctor.as_str()));
+            if field_sorts.is_empty() {
+                if text.strip_prefix(ctor.as_str()).is_some_and(ends_a_field)
+                    && !lens.contains(&ctor.len())
+                {
+                    lens.push(ctor.len());
+                }
+            } else if let Some(rest) = applied {
+                for (_, end) in self.dt_value_field_cuts(rest, field_sorts, budget, depth + 1)? {
+                    let len = 1 + ctor.len() + end + 1;
+                    if rest[end..].starts_with(')')
+                        && ends_a_field(&text[len..])
+                        && !lens.contains(&len)
+                    {
+                        lens.push(len);
+                    }
+                }
+            }
+        }
+        Some(lens)
     }
 
     /// The NULLARY constructor the EUF model puts in `term`'s OWN equivalence
@@ -490,9 +825,10 @@ impl Executor {
     /// 1. SAT model: Check tester proposition truth values (works for pure DT solver)
     /// 2. EUF model: Check equivalence classes (works for combined DT+UF solvers)
     ///
-    /// For nullary constructors (e.g., `Green`), returns the constructor name.
-    /// For non-nullary constructors (e.g., `Some`), evaluates selector arguments
-    /// to produce e.g. `(Some #x42)`.
+    /// For nullary constructors (e.g., `Green`), returns the constructor's
+    /// head token (`Self::dt_value_head`, e.g. `|a b|` for the constructor
+    /// `|a b|`). For non-nullary constructors (e.g., `Some`), evaluates
+    /// selector arguments to produce e.g. `(Some #x42)`.
     pub(super) fn resolve_dt_value(
         &self,
         sort_name: &str,
@@ -582,8 +918,10 @@ impl Executor {
             // first: that class is an incoherent model either way, and
             // declining falls through to the strategies below rather than
             // committing to an arbitrary one of two contradictory values.
+            // The class match is a constructor identity; the value prints its
+            // head token (`Self::dt_value_head`).
             if let Some(ctor_name) = self.dt_euf_class_constructor(model, var_term_id) {
-                return Some(ctor_name);
+                return Some(self.dt_value_head(&ctor_name).into_owned());
             }
 
             // Strategy 3: Single-constructor DTs always use that constructor.
@@ -601,7 +939,7 @@ impl Executor {
                 self.extract_value_from_asserted_equalities(model, var_term_id)
             {
                 if constructors.iter().any(|c| c == elem) {
-                    return Some(elem.clone());
+                    return Some(self.dt_value_head(elem).into_owned());
                 }
             }
 
@@ -671,7 +1009,7 @@ impl Executor {
     fn format_dt_ctor_value(&self, ctor_name: &str, var_term_id: TermId, model: &Model) -> String {
         let selectors = self.ctx.constructor_selectors(ctor_name).unwrap_or(&[]);
         if selectors.is_empty() {
-            return self.dt_surface(ctor_name).to_string();
+            return self.dt_value_head(ctor_name).into_owned();
         }
         // Non-nullary: find selector application terms and look up their values
         // directly in the theory models. evaluate_term doesn't handle unrecognized
@@ -825,7 +1163,7 @@ impl Executor {
                 }
             }
         }
-        format!("({} {})", self.dt_surface(ctor_name), arg_strs.join(" "))
+        format!("({} {})", self.dt_value_head(ctor_name), arg_strs.join(" "))
     }
 
     /// Evaluate a constructor-argument TERM (the term that supplies a field's
@@ -1223,7 +1561,7 @@ impl Executor {
                 .constructor_selector_info(ctor)
                 .map_or(true, |fields| fields.is_empty())
             {
-                return Some(self.dt_surface(ctor).to_string());
+                return Some(self.dt_value_head(ctor).into_owned());
             }
         }
 
@@ -1231,7 +1569,9 @@ impl Executor {
         // (a non-well-founded / degenerate datatype): best-effort first
         // constructor name to terminate without looping.
         if visited.iter().any(|s| s == sort_name) {
-            return constructors.first().map(|c| self.dt_surface(c).to_string());
+            return constructors
+                .first()
+                .map(|c| self.dt_value_head(c).into_owned());
         }
         visited.push(sort_name.to_string());
 
@@ -1255,7 +1595,7 @@ impl Executor {
         let result = choice.map(|ctor| {
             let fields = self.ctx.constructor_selector_info(ctor).unwrap_or(&[]);
             if fields.is_empty() {
-                self.dt_surface(ctor).to_string()
+                self.dt_value_head(ctor).into_owned()
             } else {
                 let args: Vec<String> = fields
                     .iter()
@@ -1263,7 +1603,7 @@ impl Executor {
                         self.canonical_default_value_guarded(field_sort, visited)
                     })
                     .collect();
-                format!("({} {})", self.dt_surface(ctor), args.join(" "))
+                format!("({} {})", self.dt_value_head(ctor), args.join(" "))
             }
         });
         visited.pop();
@@ -2912,7 +3252,7 @@ impl Executor {
                     els = format!("(ite (= @p0 {arg}) {val} {els})");
                 }
             }
-            let tester = |c: &String| format!("((_ is {}) @p0)", quote_symbol(self.dt_surface(c)));
+            let tester = |c: &String| format!("((_ is {}) @p0)", self.dt_value_head(c));
             let cond = if info.ctors.len() == 1 {
                 tester(&info.ctors[0])
             } else {
@@ -3152,7 +3492,7 @@ impl Executor {
         // Legacy owning-constructor detection by rendered head (kept as a
         // backstop for the non-e-graph path).
         let head = sexpr_head(&arg_str);
-        if info.ctors.iter().any(|c| self.dt_surface(c) == head) {
+        if info.ctors.iter().any(|c| self.dt_value_head(c) == head) {
             return;
         }
         let app_val = if let Some(lane) = self.dt_fd_ground_value(model, tid) {
@@ -3242,15 +3582,11 @@ pub(super) struct SelectorTables {
     pub(super) dropped: HashSet<String>,
 }
 
-/// Head symbol of a rendered s-expression value: `(cons a b)` -> `cons`,
-/// `null` -> `null`. Only used to recognize owning-constructor heads (a
-/// mis-parse is shadowed by the tester arm, see
-/// [`Executor::total_selector_definitions`]).
+/// Head token of a rendered s-expression value, as
+/// `ay_core::smtlib_application_parts` gives it: `(cons a b)` -> `cons`,
+/// `null` -> `null`, `(|a b| 1)` -> `|a b|`; empty when it gives none. Only
+/// used to recognize owning-constructor heads (a mis-parse is shadowed by the
+/// tester arm, see [`Executor::total_selector_definitions`]).
 fn sexpr_head(s: &str) -> &str {
-    let t = s.trim();
-    let t = t.strip_prefix('(').unwrap_or(t).trim_start();
-    let end = t
-        .find(|c: char| c.is_whitespace() || c == ')' || c == '(')
-        .unwrap_or(t.len());
-    &t[..end]
+    ay_core::smtlib_application_parts(s).map_or("", |(head, _)| head)
 }

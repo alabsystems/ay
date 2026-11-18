@@ -363,10 +363,19 @@ pub(super) fn rendered_sexp_within_limits(input: &str) -> bool {
                     return false;
                 }
                 index += 1;
-                let Some(end) = bytes[index..].iter().position(|&byte| byte == b'|') else {
-                    return false;
-                };
-                index += end + 1;
+                // The symbol ends at the first `|` no `\` takes, so the
+                // escapes `ay_core::quote_symbol` writes (`|mk\|x|`) stay
+                // inside it, as `datatype_array_fields::parser::sexpr_items`
+                // and `independent_gate`'s `parse_atom` read them.
+                loop {
+                    match bytes.get(index) {
+                        None => return false,
+                        Some(b'|') => break,
+                        Some(b'\\') => index += 2,
+                        Some(_) => index += 1,
+                    }
+                }
+                index += 1;
             }
             _ => {
                 if !in_bare_atom {
@@ -407,6 +416,15 @@ mod tests {
             model_value_work(&value).is_some(),
             "bounded Array/Seq fields are valid structured datatype payloads"
         );
+    }
+
+    /// `|\|x|` is one symbol, `|a\\|` ends at its last bar, and in `|\|` the
+    /// only closing bar is escaped.
+    #[test]
+    fn an_escaped_bar_stays_inside_its_quoted_symbol() {
+        assert!(rendered_sexp_within_limits(r"(cons 1 |\|x|)"));
+        assert!(rendered_sexp_within_limits(r"(cons 1 |a\\|)"));
+        assert!(!rendered_sexp_within_limits(r"|\|"));
     }
 
     #[test]

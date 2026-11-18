@@ -1365,6 +1365,52 @@ fn test_overloaded_nullary_constructor_binds_the_right_datatype() {
     );
 }
 
+/// `D` declares the constructors named `|a b|`, `a b`, `||`, the empty name,
+/// `|x|` and `plain`; `E` declares `|c d|` and `e`. The names `|a b|` and
+/// `||` are the `ay_core::symbol_token` of `a b` and of the empty name, which
+/// `D` also declares: each of those two constructors has a private identity
+/// and prints its name. Every other constructor has its name as identity:
+/// `D` declares no `x`, and `E` no `c d`.
+#[test]
+fn a_constructor_named_as_a_sibling_token_gets_a_private_identity() {
+    let ctx = elaborate_script(
+        "(declare-datatypes ((D 0)) \
+         (((|\\|a b\\||) (|a b|) (|\\|\\||) (||) (|\\|x\\||) (plain))))\n\
+         (declare-datatypes ((E 0)) (((|\\|c d\\||) (e))))",
+    );
+    let identity = |carrier: &str, name: &str| {
+        let sort = ctx.sort_definition(carrier).expect("carrier").clone();
+        let info = ctx
+            .symbol_info_with_signature(name, &[], &sort)
+            .unwrap_or_else(|| panic!("missing constructor {name:?} of {carrier}"));
+        ctx.symbol_identity_name(name, info).to_string()
+    };
+    for (name, sibling) in [("|a b|", "a b"), ("||", "")] {
+        assert_eq!(ay_core::symbol_token(sibling), name);
+        let identity = identity("D", name);
+        assert_ne!(identity, name);
+        assert_eq!(ctx.dt_surface_name(&identity), Some(name));
+        assert_eq!(ctx.output_symbol_name(&identity), name, "{identity}");
+        assert_eq!(
+            ctx.is_constructor(&identity),
+            Some(("D".to_string(), identity.clone())),
+            "{name}"
+        );
+        assert_eq!(ctx.is_constructor(name), None, "{name}");
+    }
+    for (carrier, name) in [
+        ("D", "a b"),
+        ("D", ""),
+        ("D", "|x|"),
+        ("D", "plain"),
+        ("E", "|c d|"),
+        ("E", "e"),
+    ] {
+        assert_eq!(identity(carrier, name), name, "{carrier}");
+    }
+    assert_output_name_census_matches(&ctx);
+}
+
 #[test]
 fn test_as_ascription_selects_the_ascribed_datatype_either_way() {
     // Both ascriptions must be accepted, and each must denote its OWN
@@ -1413,9 +1459,9 @@ fn test_non_overloaded_nullary_constructor_still_binds_its_inhabitant() {
 // --- constants (`Context::dt_field_surface_overrides`, `DtFieldSurface`).
 //
 // Eager single-constructor elimination rewrites `(declare-fun s_ () Record)`
-// into `(Record s_!left s_!center s_!right)`. Those field names are minted by
-// AY and appear in NO problem file, so an exported proof that spells them is
-// unreadable to an external checker: on
+// into `(Record k_0 k_1 k_2)` over invented field constants. Their names are
+// minted by AY and appear in NO problem file, so an exported proof that spells
+// them is unreadable to an external checker: on
 // `QF_DT/20230720-blocksworld/..._bmc_2` they were 14 distinct names in 26,366
 // occurrences under an EMPTY declaration preamble, and carcara 1.1.0 stopped in
 // the PARSER — `identifier 's_tmp___!left' is not defined` — before checking a
@@ -1457,9 +1503,9 @@ fn test_dt_field_surface_renders_depth_one_field_as_selector_application() {
 #[test]
 fn test_dt_field_surface_composes_recursively_at_depth_two() {
     // `build_const_term` recurses when a field's sort is itself a
-    // single-constructor datatype, minting `s!right!top`. The rendering must
-    // compose through the whole chain: `(top s!right)` would just name another
-    // symbol the problem never declared.
+    // single-constructor datatype, minting a field of a field. The rendering
+    // must compose through the whole chain: `top` applied to the invented
+    // `right` field would name a symbol the problem never declared.
     let ctx = elaborate_script(
         "(declare-datatypes ((Inner 0)) (((mkI (top Int) (bot Int)))))\n\
          (declare-datatypes ((Outer 0)) (((mkO (right Inner) (lft Int)))))\n\
@@ -1484,8 +1530,10 @@ fn test_dt_field_surface_composes_recursively_at_depth_two() {
         Some("(lft s)")
     );
     assert!(
-        !overrides.values().any(|rendering| rendering.contains('!')),
-        "no rendering may leak an invented `parent!field` name: {overrides:?}"
+        !overrides
+            .values()
+            .any(|rendering| rendering.contains(INTERNAL_SYMBOL_PREFIX)),
+        "no rendering may leak an invented field identity: {overrides:?}"
     );
 }
 
@@ -1632,10 +1680,69 @@ fn output_name_census_matches_per_identity_spelling() {
         (declare-datatype S ((nil) (mk (f S))))
         (declare-const s S)
         (pop 1)
-        (declare-datatype S ((nil) (mk (f S))))";
+        (declare-datatype S ((nil) (mk (f S))))
+        (declare-datatype Fr ((apple (w Int)) (kiwi) (|is-kiwi|) (w)))";
     let mut ctx = Context::new();
     for command in parse(script).expect("parse") {
         ctx.process_command(&command).expect("declare");
     }
+    assert_output_name_census_matches(&ctx);
+}
+
+#[test]
+fn a_member_sharing_its_surface_with_another_kind_prints_that_surface() {
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Color 0)) (((red) (|is-kiwi|))))\n\
+         (declare-datatypes ((Fruit 0)) \
+         (((apple (w Int)) (|is-kiwi|) (kiwi) (|is-apple|) (w))))",
+    );
+    let fruit = ctx.sort_definition("Fruit").expect("Fruit carrier").clone();
+    // The four members below share their surface, inside Fruit, with a
+    // member of another kind: the constructor `|is-kiwi|` and the tester of
+    // `kiwi` with each other, the constructor `|is-apple|` with the tester
+    // of `apple`, and the constructor `w` with the selector `w`.
+    let cases = [
+        ("is-kiwi", Vec::new(), fruit.clone()),
+        ("is-kiwi", vec![fruit.clone()], Sort::Bool),
+        ("is-apple", Vec::new(), fruit.clone()),
+        ("w", Vec::new(), fruit.clone()),
+    ];
+    for (surface, args, result) in cases {
+        let info = ctx
+            .symbol_info_with_signature(surface, &args, &result)
+            .unwrap_or_else(|| panic!("missing datatype member {surface} {args:?}"));
+        let identity = ctx.symbol_identity_name(surface, info).to_string();
+        assert_ne!(
+            identity, surface,
+            "{surface} {args:?} must have a private identity for this case"
+        );
+        assert_eq!(ctx.dt_surface_name(&identity), Some(surface));
+        assert_eq!(
+            ctx.output_symbol_name(&identity),
+            surface,
+            "{surface} {args:?} ({identity})"
+        );
+    }
+    assert_output_name_census_matches(&ctx);
+}
+
+#[test]
+fn a_member_sharing_its_surface_with_a_popped_member_of_another_kind_prints_that_surface() {
+    let ctx = elaborate_script(
+        "(push 1)\n\
+         (declare-datatype Fruit ((mk (s Int)) (u)))\n\
+         (pop 1)\n\
+         (declare-datatype Fruit ((s) (t)))",
+    );
+    let fruit = ctx.sort_definition("Fruit").expect("Fruit carrier").clone();
+    // The constructor `s` of the second `Fruit` shares its surface with the
+    // selector `s` of the popped one.
+    let info = ctx
+        .symbol_info_with_signature("s", &[], &fruit)
+        .expect("constructor s");
+    let identity = ctx.symbol_identity_name("s", info).to_string();
+    assert_ne!(identity, "s", "s must have a private identity");
+    assert_eq!(ctx.dt_surface_name(&identity), Some("s"));
+    assert_eq!(ctx.output_symbol_name(&identity), "s", "{identity}");
     assert_output_name_census_matches(&ctx);
 }

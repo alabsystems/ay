@@ -132,6 +132,8 @@ impl TheorySolver for NiaSolver<'_> {
             ("nia_feasible_set_computations", self.feasible_set_count),
             ("nia_blocked_vars", self.blocked_vars.len() as u64),
             ("nia_fixed_vars", self.fixed_vars.len() as u64),
+            ("nia_groebner_memo_hits", self.groebner_memo_hits),
+            ("nia_groebner_memo_seeded", self.groebner_memo_seeded),
         ];
         stats.extend(self.lia.collect_statistics());
         stats
@@ -224,6 +226,7 @@ impl TheorySolver for NiaSolver<'_> {
         self.zero_product_emitted.clear();
         // #nia-groebner: same discipline for the derived-equality dedup set.
         self.groebner_emitted.clear();
+        self.clear_groebner_memo();
         self.lia.pop();
         // Reset feasible sets on pop — stale sets from the previous level
         // would include constraints that have been retracted.
@@ -257,6 +260,7 @@ impl TheorySolver for NiaSolver<'_> {
         self.box_bound_emitted.clear();
         self.zero_product_emitted.clear();
         self.groebner_emitted.clear();
+        self.clear_groebner_memo();
         self.lia.reset();
     }
 

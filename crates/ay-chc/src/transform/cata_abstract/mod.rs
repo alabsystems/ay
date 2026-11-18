@@ -1284,11 +1284,19 @@ impl<'a> ClauseCtx<'a> {
         }
     }
 
+    /// Mint a stem `{base}{n}` such that no used name is the stem or the stem
+    /// followed by `_`. [`Self::tuple_for`] spells its tuple variables
+    /// `{stem}_{tag}`, so a clause variable already spelled that way must
+    /// rule the stem out.
     fn fresh_name(&mut self, base: &str) -> String {
         loop {
             let candidate = format!("{base}{}", self.fresh_counter);
             self.fresh_counter += 1;
-            if !self.used_names.contains(&candidate) {
+            let taken = self.used_names.iter().any(|used| {
+                used.strip_prefix(candidate.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+            });
+            if !taken {
                 self.used_names.push(candidate.clone());
                 return candidate;
             }

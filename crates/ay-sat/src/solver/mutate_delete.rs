@@ -243,6 +243,66 @@ impl Solver {
         true
     }
 
+    /// Record an irredundant clause mutation for the shadow
+    /// L0-rebuild epoch (#l0-rebuild-epoch). Mutations performed by
+    /// `collect_level0_garbage` itself (under `l0_gc_sweep_active`)
+    /// are exempt: they are the simplifications whose rebuild cost
+    /// the epoch exists to classify. Everything else — BVE,
+    /// subsumption, vivify, decompose, derived-clause additions —
+    /// must pass through here so a future reset rule can distinguish
+    /// L0-only database changes from destructive ones.
+    /// Classify a direct `arena.delete` that bypasses
+    /// `delete_clause_observed` (pop/scope GC, compaction, extension
+    /// cleanup) for the shadow census (#l0-rebuild-epoch). No-op for
+    /// learned or already-dead entries, which do not move the
+    /// active-original count. An L0-sweep-classified delete here would
+    /// be a bug (the sweep uses the checked funnel), so direct deletes
+    /// always count as non-L0.
+    #[inline]
+    pub(super) fn note_direct_arena_delete(&mut self, clause_idx: usize) {
+        if !self.arena.is_learned(clause_idx) && !self.arena.is_dead(clause_idx) {
+            self.cold.original_deletions_since_rebuild =
+                self.cold.original_deletions_since_rebuild.saturating_add(1);
+            self.note_irredundant_mutation();
+        }
+    }
+
+    /// Classify a pending-garbage mark (#l0-rebuild-epoch): the mark
+    /// drops the clause from `live_indices` immediately, while the
+    /// eventual checked delete only retires the husk, so the census
+    /// counts the transition here and the delete funnel skips
+    /// already-pending clauses. Husk-class event.
+    #[inline]
+    pub(super) fn note_pending_garbage_mark(&mut self, clause_idx: usize) {
+        if !self.arena.is_learned(clause_idx) && !self.arena.is_dead(clause_idx) {
+            self.cold.original_husks_since_rebuild =
+                self.cold.original_husks_since_rebuild.saturating_add(1);
+            self.note_irredundant_mutation();
+        }
+    }
+
+    #[inline]
+    pub(super) fn note_irredundant_mutation(&mut self) {
+        if !self.l0_gc_sweep_active {
+            self.cold.irredundant_mutation_epoch =
+                self.cold.irredundant_mutation_epoch.saturating_add(1);
+        }
+    }
+
+    /// Mark a clause garbage (husk) with census classification
+    /// (#l0-rebuild-epoch): a live irredundant clause leaving
+    /// `live_indices` is a husk event; learned/already-dead targets
+    /// do not move the active-original count.
+    #[inline]
+    pub(super) fn mark_clause_garbage_counted(&mut self, clause_idx: usize) {
+        if !self.arena.is_learned(clause_idx) && !self.arena.is_dead(clause_idx) {
+            self.cold.original_husks_since_rebuild =
+                self.cold.original_husks_since_rebuild.saturating_add(1);
+            self.note_irredundant_mutation();
+        }
+        self.arena.mark_garbage_keep_data(clause_idx);
+    }
+
     #[inline]
     pub(super) fn delete_clause_observed(
         &mut self,
@@ -277,6 +337,10 @@ impl Solver {
         stop_policy: DeleteStopPolicy,
         proof_policy: ProofDeletePolicy,
     ) -> bool {
+        // Census (#l0-rebuild-epoch): a pending-garbage clause was
+        // already counted at mark time; its drain below clears the
+        // bit, so capture it before any mutation of the flags.
+        let was_pending_garbage = self.arena.is_pending_garbage(clause_idx);
         let clause_id = self.clause_id(ClauseRef(clause_idx as u32));
         // Fix #6270: re-derive unit proofs that reference this clause's ID
         // before the delete is emitted (see helper doc).
@@ -362,7 +426,22 @@ impl Solver {
             gc_occ.remove_clause(clause_idx, lits);
         }
         self.record_clause_retirement(clause_idx);
+        // Shadow L0-rebuild epoch (#l0-rebuild-epoch): classify the
+        // deletion before the arena entry is retired.
+        let was_irredundant = !self.arena.is_learned(clause_idx);
         self.arena.delete(clause_idx);
+        if was_irredundant && !was_pending_garbage {
+            if self.l0_gc_sweep_active {
+                self.cold.l0_gc_original_deletions_since_rebuild = self
+                    .cold
+                    .l0_gc_original_deletions_since_rebuild
+                    .saturating_add(1);
+            } else {
+                self.cold.original_deletions_since_rebuild =
+                    self.cold.original_deletions_since_rebuild.saturating_add(1);
+                self.note_irredundant_mutation();
+            }
+        }
         self.cold.clause_db_changes += 1; // BVE dual-signal fixpoint guard (#3416)
         true
     }
@@ -810,6 +889,13 @@ impl Solver {
                     self.drain_pending_garbage_mark(*clause_idx);
                     self.stats.clear_bcp_learned_1963_blocker_cert(*clause_idx);
                     self.record_clause_retirement(*clause_idx);
+                    // Shadow L0-rebuild epoch (#l0-rebuild-epoch):
+                    // decompose deletes bypass delete_clause_observed.
+                    if !self.arena.is_learned(*clause_idx) {
+                        self.cold.original_deletions_since_rebuild =
+                            self.cold.original_deletions_since_rebuild.saturating_add(1);
+                        self.note_irredundant_mutation();
+                    }
                     self.arena.delete(*clause_idx);
                 }
             }
@@ -856,6 +942,11 @@ impl Solver {
                         }
                     }
 
+                    // Shadow L0-rebuild epoch (#l0-rebuild-epoch):
+                    // decompose replacement bypasses replace_clause_impl.
+                    if was_irredundant {
+                        self.note_irredundant_mutation();
+                    }
                     // Incremental watch maintenance (#8093): detach old watches
                     // before replacement. The old watched literals may not appear
                     // in the replacement clause.

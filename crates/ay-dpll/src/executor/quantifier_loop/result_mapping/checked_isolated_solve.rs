@@ -16,7 +16,8 @@ use crate::executor_types::SolveResult;
 use counter_names::is_counter_only_internal_name;
 #[cfg(test)]
 use counter_names::{
-    ARRAY_EXT_WITNESS_SPELLING, EQ_DIFF_VARIABLE_SPELLING, PRIVATE_DECLARATION_IDENTITY_PREFIX,
+    ARRAY_EXT_WITNESS_SPELLING, DT_FIELD_IDENTITY_PREFIX, EQ_DIFF_VARIABLE_SPELLING,
+    PRIVATE_DECLARATION_IDENTITY_PREFIX,
 };
 
 #[path = "checked_isolated_counter_names.rs"]

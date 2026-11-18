@@ -10,6 +10,8 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
+use std::borrow::Cow;
+
 use crate::smtlib_char::{smtlib_char, smtlib_code_point};
 
 pub mod admitted;
@@ -48,74 +50,106 @@ pub fn quote_symbol(name: &str) -> String {
     quote_symbol_owned(name, None)
 }
 
-fn quote_symbol_owned(name: &str, owner: admitted::Owner<'_>) -> String {
-    // Reserved words in SMT-LIB that need quoting
-    // This includes:
-    // - `true` and `false` (dedicated tokens in the lexer)
-    // - Core keywords and command names
-    const RESERVED: &[&str] = &[
-        // Boolean literals (lexer tokens)
-        "true",
-        "false",
-        // Binding keywords
-        "let",
-        "forall",
-        "exists",
-        "match",
-        "par",
-        "_",
-        "!",
-        "as",
-        // Spec constants
-        "BINARY",
-        "DECIMAL",
-        "HEXADECIMAL",
-        "NUMERAL",
-        "STRING",
-        // Commands
-        "assert",
-        "check-sat",
-        "check-sat-assuming",
-        "declare-const",
-        "declare-datatype",
-        "declare-datatypes",
-        "declare-fun",
-        "declare-sort",
-        "declare-sort-parameter",
-        "define-fun",
-        "define-fun-rec",
-        "define-funs-rec",
-        "define-sort",
-        "echo",
-        "exit",
-        "get-assertions",
-        "get-assignment",
-        "get-info",
-        "get-model",
-        "get-option",
-        "get-proof",
-        "get-unsat-assumptions",
-        "get-unsat-core",
-        "get-value",
-        "pop",
-        "push",
-        "reset",
-        "reset-assertions",
-        "set-info",
-        "set-logic",
-        "set-option",
-        // Alethe proof-language reserved words. Quoting these is also valid
-        // SMT-LIB, and prevents proof variables from being tokenized as
-        // structural syntax by external checkers such as Carcara.
-        "choice",
-        "lambda",
-        "cl",
-        "assume",
-        "step",
-        "anchor",
-        "declare-rare-rule",
-    ];
+/// Reserved words in SMT-LIB that need quoting. This includes:
+/// - `true` and `false` (dedicated tokens in the lexer)
+/// - Core keywords and command names
+const RESERVED: &[&str] = &[
+    // Boolean literals (lexer tokens)
+    "true",
+    "false",
+    // Binding keywords
+    "let",
+    "forall",
+    "exists",
+    "match",
+    "par",
+    "_",
+    "!",
+    "as",
+    // Spec constants
+    "BINARY",
+    "DECIMAL",
+    "HEXADECIMAL",
+    "NUMERAL",
+    "STRING",
+    // Commands
+    "assert",
+    "check-sat",
+    "check-sat-assuming",
+    "declare-const",
+    "declare-datatype",
+    "declare-datatypes",
+    "declare-fun",
+    "declare-sort",
+    "declare-sort-parameter",
+    "define-fun",
+    "define-fun-rec",
+    "define-funs-rec",
+    "define-sort",
+    "echo",
+    "exit",
+    "get-assertions",
+    "get-assignment",
+    "get-info",
+    "get-model",
+    "get-option",
+    "get-proof",
+    "get-unsat-assumptions",
+    "get-unsat-core",
+    "get-value",
+    "pop",
+    "push",
+    "reset",
+    "reset-assertions",
+    "set-info",
+    "set-logic",
+    "set-option",
+    // Alethe proof-language reserved words. Quoting these is also valid
+    // SMT-LIB, and prevents proof variables from being tokenized as
+    // structural syntax by external checkers such as Carcara.
+    "choice",
+    "lambda",
+    "cl",
+    "assume",
+    "step",
+    "anchor",
+    "declare-rare-rule",
+];
 
+/// Whether [`quote_symbol`] quotes `name`: it is empty, starts with a digit,
+/// reads as a signed number, is one of `RESERVED`, or holds a character
+/// `is_symbol_char` refuses.
+fn needs_quoting(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || reads_as_signed_number(name)
+        || RESERVED.contains(&name)
+        || name.contains(|c: char| !is_symbol_char(c))
+}
+
+/// `name` as one SMT-LIB symbol token: `name` itself, borrowed, when
+/// [`quote_symbol`] leaves it bare, and otherwise the `|...|` spelling
+/// [`quote_symbol`] gives.
+///
+/// # Examples
+/// ```
+/// use ay_core::symbol_token;
+///
+/// assert_eq!(symbol_token("nil"), "nil");
+/// assert_eq!(symbol_token(""), "||");
+/// assert_eq!(symbol_token("a b"), "|a b|");
+/// assert_eq!(symbol_token("let"), "|let|");
+/// assert_eq!(symbol_token("||"), r"|\|\||");
+/// ```
+pub fn symbol_token(name: &str) -> Cow<'_, str> {
+    if needs_quoting(name) {
+        Cow::Owned(quote_symbol(name))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+fn quote_symbol_owned(name: &str, owner: admitted::Owner<'_>) -> String {
     if owner.is_some() {
         let comparison_work = RESERVED.iter().fold(0usize, |work, word| {
             work.saturating_add(if word.len() == name.len() {
@@ -132,13 +166,7 @@ fn quote_symbol_owned(name: &str, owner: admitted::Owner<'_>) -> String {
             return String::new();
         }
     }
-    let needs_quoting = name.is_empty()
-        || name.starts_with(|c: char| c.is_ascii_digit())
-        || reads_as_signed_number(name)
-        || RESERVED.contains(&name)
-        || name.contains(|c: char| !is_symbol_char(c));
-
-    if needs_quoting {
+    if needs_quoting(name) {
         // Z3 5.0.0 accepts `\|` and `\\` inside quoted symbols. Escaping is
         // lossless; underscore substitution conflates distinct user symbols.
         let mut quoted = admitted::Buffer::with_capacity(

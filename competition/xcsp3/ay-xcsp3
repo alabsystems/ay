@@ -1,0 +1,61 @@
+#!/bin/sh
+# ay-script: ay-xcsp3
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# XCSP3 competition entry for AY.
+#
+#   ay-xcsp3 <instance.xml> [-l SECONDS] [-c CORES] [-s SEED] [-m MiB]
+#
+# AY has no XCSP3 reader of its own yet. This entry reads the instance with
+# CPMpy's XCSP3 front end (`cpmpy.tools.xcsp3.xcsp3_cpmpy`, the runner CPMpy
+# itself enters with) and solves it with AY as a FlatZinc solver behind
+# MiniZinc: CPMpy builds a MiniZinc model, MiniZinc flattens it with AY's own
+# library (../minizinc/mznlib) and starts ../minizinc/fzn-exec. The runner
+# prints the competition's lines: `s SATISFIABLE`, `s OPTIMUM FOUND`,
+# `s UNSATISFIABLE` or `s UNKNOWN`, and the `v <instantiation>` of every
+# variable with its cost. The options are the runner's and are passed on.
+#
+# Needs on PATH or by variable (see README.md): a Python with cpmpy 1.1.1 and
+# the `minizinc` package (AY_XCSP3_PYTHON, default python3), MiniZinc 2.9.x
+# (`minizinc`), and the ay binary (next to ../minizinc/fzn-exec, or on PATH,
+# or named by AY).
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "${DIR}/../.." && pwd)
+PYTHON=${AY_XCSP3_PYTHON:-python3}
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: ay-xcsp3 <instance.xml> [-l SECONDS] [-c CORES] [-s SEED] [-m MiB]" >&2
+    exit 2
+fi
+if ! command -v minizinc >/dev/null 2>&1; then
+    echo "ay-xcsp3: minizinc is not on PATH" >&2
+    exit 2
+fi
+# fzn-exec takes an ay beside itself, else `ay` from PATH: a binary named by
+# AY is put first on PATH.
+if [ -n "${AY:-}" ]; then
+    PATH="$(CDPATH= cd -- "$(dirname -- "${AY}")" && pwd):${PATH}"
+    export PATH
+fi
+
+# MiniZinc finds a solver through a descriptor with the paths of its
+# executable and library. The repository's ay.msc names them relative to the
+# repository root; a copy with absolute paths is written for this job, so the
+# entry works from any directory and without a registered solver.
+SOLVERS=$(mktemp -d "${TMPDIR:-/tmp}/ay-xcsp3.XXXXXX")
+"${PYTHON}" - "${ROOT}/ay.msc" "${SOLVERS}/ay.msc" "${DIR}/../minizinc" <<'PY'
+import json, os, sys
+src, dst, mzn = sys.argv[1:4]
+msc = json.load(open(src))
+msc["executable"] = os.path.join(os.path.abspath(mzn), "fzn-exec")
+msc["mznlib"] = os.path.join(os.path.abspath(mzn), "mznlib")
+json.dump(msc, open(dst, "w"))
+PY
+MZN_SOLVER_PATH="${SOLVERS}"
+export MZN_SOLVER_PATH
+
+exec "${PYTHON}" -m cpmpy.tools.xcsp3.xcsp3_cpmpy "$@" --solver minizinc:org.ay.ay

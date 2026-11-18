@@ -3995,11 +3995,12 @@ impl Executor {
     /// Term overrides handed to the Alethe printer: the surface-syntax
     /// spellings collected from the parsed input during solving, extended with
     /// renderings for the frontend's invented single-constructor field
-    /// constants — the `v!field` names eager datatype elimination mints, which
-    /// NO problem-file text ever names (see `Context::dt_field_surface_over-
-    /// rides`; measured on QF_DT blocksworld: 14 such names in 26,366
-    /// occurrences left carcara 1.1.0 failing in the PARSER with
-    /// `identifier 's_tmp___!left' is not defined`, before any rule ran).
+    /// constants — the private identities eager datatype elimination mints,
+    /// which NO problem-file text ever names (see `Context::dt_field_surface_over-
+    /// rides`; measured on QF_DT blocksworld while they were still spelled
+    /// `<root>!<selector>`: 14 such names in 26,366 occurrences left carcara
+    /// 1.1.0 failing in the PARSER with `identifier 's_tmp___!left' is not
+    /// defined`, before any rule ran).
     ///
     /// The SOURCE-derived entry WINS on a key present in both. It is derived
     /// from bytes that literally appear in the `.smt2` the checker reads, so it

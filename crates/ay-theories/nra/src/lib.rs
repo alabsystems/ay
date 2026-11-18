@@ -279,6 +279,17 @@ pub struct NraSolver<'a> {
     /// Count of feasible-set computations for statistics.
     feasible_set_count: u64,
 
+    /// Per-instance memo of `term_to_multipoly` conversions. The
+    /// conversion is a pure function of the immutable term structure,
+    /// so entries never need invalidation; measured on 40f50 the
+    /// uncached recursion ran 33M top-level conversions (56M calls,
+    /// zero repeats within one conversion) in 12s because every ICP
+    /// pass re-converts the same constraint terms. Interior
+    /// mutability because conversion takes `&self`.
+    multipoly_cache:
+        std::cell::RefCell<std::collections::HashMap<TermId, Option<univariate::MultiPoly>>>,
+    multipoly_cache_hits: std::cell::Cell<u64>,
+
     /// Assertion-derived fixed values and identities emitted in the current scope.
     pub(crate) fixed_factor_values: HashMap<TermId, BigRational>,
     pub(crate) fixed_lin_emitted: HashSet<TermId>,
@@ -431,6 +442,8 @@ impl<'a> NraSolver<'a> {
             blocked_vars: Vec::new(),
             fixed_vars: Vec::new(),
             feasible_set_count: 0,
+            multipoly_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
+            multipoly_cache_hits: std::cell::Cell::new(0),
             fixed_factor_values: HashMap::default(),
             fixed_lin_emitted: HashSet::default(),
             registered_atoms: Vec::new(),

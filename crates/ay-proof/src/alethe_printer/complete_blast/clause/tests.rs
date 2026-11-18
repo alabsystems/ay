@@ -85,9 +85,9 @@ fn a_negative_conflict_clause_is_the_refuted_conjunction_opened_by_and_neg() {
     );
 }
 
-/// NEGATIVE TWIN: a clause that is not a theorem, a positive literal, a
-/// repeated atom, or a single literal outside the unit lowering's shape never
-/// reaches the conjunction lowering's output.
+/// NEGATIVE TWIN: a false negative or mixed clause, a repeated atom, or a
+/// single literal outside the unit lowering's shape never reaches the
+/// conjunction lowering's output.
 #[test]
 fn non_theorems_and_unsupported_literals_decline() {
     let mut f = fixture();

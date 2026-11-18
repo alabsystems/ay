@@ -104,8 +104,11 @@ impl Executor {
         // Charge the expanded result again before recursive rendering. Each
         // ground subtree was already checked before cloning into this value.
         self.check_constructor_value(&value, sort, 0, &mut budget)?;
-        self.format_gate_model_value(&value, sort)
-            .map(EvalValue::Element)
+        // The value as a pin of it reads (`dt_construct::mv_to_eval`, each
+        // constructor written as its identity, for example `__ay_overload_0`
+        // where the model prints `nil`): `=` compares datatype values in that
+        // spelling.
+        Some(super::dt_construct::mv_to_eval(&value))
     }
 
     fn constructor_sort_matches(sort: &Sort, datatype: &str) -> bool {
@@ -131,16 +134,28 @@ impl Executor {
             return None;
         }
         let fields = self.ctx.constructor_selector_info(&constructor)?;
-        let surface = self.dt_surface(&constructor);
+        // A constructor whose output name `ay_core::symbol_token` quotes
+        // (`Executor::dt_value_head` differs from `Context::output_symbol_name`;
+        // for example `pop`, `step`, `|a b|`, `|C C|`) has no shape here, so no
+        // value holding it is read structurally and its applications keep the
+        // evaluator's other paths. The structural value stands in for the
+        // application's EUF class label, and `=` compares it with the label
+        // the other side may still evaluate to: with `(= (prog 0) (seq pop pop))`
+        // asserted, `(prog 0)` evaluates to its class label, `(seq pop pop)`
+        // to the structure, the assertion to false, and the model is refused.
+        // This refusal keeps that comparison from these constructors only. A
+        // constructor printed bare still meets it: with `popx` in place of
+        // `pop`, the script above answers `unknown`.
+        let head = self.dt_value_head(&constructor);
         if fields.len() != count
-            || surface.len() > MAX_NAME_BYTES
-            || ay_core::quote_symbol(surface) != surface
+            || head.len() > MAX_NAME_BYTES
+            || *head != *self.ctx.output_symbol_name(&constructor)
         {
             return None;
         }
         let bytes = constructor
             .len()
-            .checked_add(surface.len())?
+            .checked_add(head.len())?
             .checked_add(count)?
             .checked_add(3)?;
         Some((constructor, fields, bytes))

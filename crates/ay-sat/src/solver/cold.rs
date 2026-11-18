@@ -1267,6 +1267,11 @@ pub(crate) struct ColdState {
     /// (`next_cursor.min(i)`) that re-walked the whole suffix after the oldest
     /// unresolved entry on every call.
     pub(super) lrat_level0_unit_materialize_pinned: Vec<usize>,
+    /// Per-variable memo of the last no-proof pinned-slot retry that kept
+    /// the slot: a fingerprint of every input the short retry reads in
+    /// clause-trace mode (see `pinned_retry.rs`). Zero means no memo.
+    /// Cleared whenever a proof id is recorded for the variable.
+    pub(super) lrat_pin_retry_memo_fingerprint: Vec<u64>,
     /// Remaining deterministic work budget for search-time proof bookkeeping
     /// (level-0 LRAT unit materialization rescans; #A2b construction budget).
     /// `None` = unbudgeted (explicit `--proof`/`--strict-proofs`/
@@ -1607,6 +1612,50 @@ pub(crate) struct ColdState {
     /// the original (non-BVE-simplified) clause set. The rebuild triggered
     /// by this flag restores original clauses AND re-adds learned clauses.
     pub(super) l0_gc_modified_clause_db: bool,
+    /// Shadow irredundant-mutation epoch (#l0-rebuild-epoch,
+    /// DR-AY-SAT-L0-REBUILD-EPOCH-AUDIT-20261117). Bumped at the
+    /// delete/replace/add choke points for every irredundant clause
+    /// mutation NOT performed by `collect_level0_garbage`'s sweep
+    /// (which runs under `l0_gc_sweep_active`). Compared against
+    /// `irredundant_epoch_at_rebuild` so a future reset rule can tell
+    /// "only L0 GC touched originals since the last rebuild" apart
+    /// from BVE/subsumption/vivify mutations, which today only the
+    /// clause-count guard catches. Shadow mode: no behavior depends
+    /// on it yet.
+    pub(super) irredundant_mutation_epoch: u64,
+    /// Epoch snapshot taken when an arena rebuild completes.
+    pub(super) irredundant_epoch_at_rebuild: u64,
+    /// Irredundant clauses deleted by L0 GC since the last rebuild;
+    /// the census cross-check at reset.
+    pub(super) l0_gc_original_deletions_since_rebuild: u64,
+    /// Full event census since the last rebuild (shadow): every
+    /// arena-side event that changes the active-original count, so
+    /// the reset can verify no mutation path went uncounted.
+    pub(super) original_deletions_since_rebuild: u64,
+    pub(super) original_husks_since_rebuild: u64,
+    pub(super) derived_irredundant_adds_since_rebuild: u64,
+    pub(super) promotions_since_rebuild: u64,
+    /// Irredundant clauses currently marked pending-garbage: excluded
+    /// from `live_indices` but not yet deleted or revived, so the
+    /// census carries them as a separate term.
+    pub(super) pending_irredundant_count: u64,
+    /// Ledger clauses with no arena entry yet (a theory definition
+    /// pushed to the ledger whose lemma add stored nothing, e.g. a
+    /// unit already true at root). Materialized by the next rebuild.
+    pub(super) ledger_only_since_rebuild: u64,
+    /// Whether any rebuild has established the census baseline.
+    pub(super) l0_epoch_snapshot_taken: bool,
+    /// A variable elimination/substitution (BVE/BCE/sweep witness)
+    /// happened since the last executed rebuild, captured from the
+    /// reconstruction stack at every reset entry before its drain
+    /// (DR-AY-SAT-L0-REBUILD-PRESERVE-DESIGN-20261117). Blocks
+    /// learned-clause preservation across the next rebuild.
+    pub(super) elimination_since_rebuild: bool,
+    /// Shadow cross-check failures: the census residual is nonzero
+    /// (an uncounted path mutated originals), or the epoch is clean
+    /// while non-L0 events were counted. Must stay 0 on validated
+    /// workloads before the reset rule may flip.
+    pub(super) l0_epoch_crosscheck_failures: u64,
     // Lookahead scheduling state (#8087, #8322)
     /// Conflict count when the last lookahead round completed.
     /// Used for interval gating (LOOKAHEAD_INTERVAL).
@@ -2649,6 +2698,7 @@ impl ColdState {
             level0_proof_sign: a.filled(num_vars, 0)?,
             lrat_level0_unit_materialize_cursor: 0,
             lrat_level0_unit_materialize_pinned: Vec::new(),
+            lrat_pin_retry_memo_fingerprint: a.filled(num_vars, 0)?,
             proof_bookkeeping_budget: None,
             proof_exhaustion_keeps_proof_inprocessing: false,
             next_clause_id: 1,
@@ -2713,6 +2763,18 @@ impl ColdState {
             root_satisfied_saved: Vec::new(),
             inprocessing_modified_clause_db: false,
             l0_gc_modified_clause_db: false,
+            irredundant_mutation_epoch: 0,
+            irredundant_epoch_at_rebuild: 0,
+            l0_gc_original_deletions_since_rebuild: 0,
+            original_deletions_since_rebuild: 0,
+            original_husks_since_rebuild: 0,
+            derived_irredundant_adds_since_rebuild: 0,
+            promotions_since_rebuild: 0,
+            pending_irredundant_count: 0,
+            ledger_only_since_rebuild: 0,
+            l0_epoch_snapshot_taken: false,
+            elimination_since_rebuild: false,
+            l0_epoch_crosscheck_failures: 0,
             last_lookahead_conflict: 0,
             next_lookahead_conflict: 0,
             lookahead_decision: None,

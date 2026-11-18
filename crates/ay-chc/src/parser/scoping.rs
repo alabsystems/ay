@@ -22,9 +22,14 @@ pub(super) struct LetScopeMark {
 }
 
 impl ChcParser {
-    /// A quantifier binder is renamed apart when its name collides with
-    /// another binder of the clause, a file-scoped declare-var, a global
+    /// A quantifier binder is renamed apart when its name lies in an
+    /// engine-reserved family (`is_engine_reserved_var_name`) or collides
+    /// with another binder of the clause, a file-scoped declare-var, a global
     /// function/relation symbol, or the name of an enclosing `let`.
+    ///
+    /// The first case: the engine identifies a clause variable by its name
+    /// and sort, so a binder named like a variable the engine mints (the mod
+    /// elimination's `_mod_q_0`, for example) would be that variable.
     ///
     /// The last case: a `let` is expanded by substituting its value for the
     /// bound name after its body is parsed, so an unrenamed binder of the same
@@ -32,11 +37,31 @@ impl ChcParser {
     /// (`(let ((y 5)) (exists ((y Int)) (= y (+ x 10))))` read as
     /// `5 = x + 10`).
     pub(super) fn binder_must_be_renamed(&self, name: &str) -> bool {
-        self.clause_binder_names.contains(name)
+        crate::expr::is_engine_reserved_var_name(name)
+            || self.clause_binder_names.contains(name)
             || self.declared_var_names.contains(name)
             || self.functions.contains_key(name)
             || self.predicates.contains_key(name)
             || self.let_scope.iter().any(|bound| bound == name)
+    }
+
+    /// The name a file-scoped or undeclared input variable `name` is renamed
+    /// to when `name` lies in an engine-reserved family
+    /// (`is_engine_reserved_var_name`), minted on first request with
+    /// [`Self::fresh_binder_name`] and kept for the rest of the file; `None`
+    /// for any other name. Quantifier binders are renamed by
+    /// [`Self::binder_must_be_renamed`] instead.
+    pub(super) fn reserved_variable_rename(&mut self, name: &str) -> Option<String> {
+        if !crate::expr::is_engine_reserved_var_name(name) {
+            return None;
+        }
+        if let Some(renamed) = self.reserved_var_renames.get(name) {
+            return Some(renamed.clone());
+        }
+        let renamed = self.fresh_binder_name(name);
+        self.reserved_var_renames
+            .insert(name.to_string(), renamed.clone());
+        Some(renamed)
     }
 
     /// Open the scope of a `let` body (the values were parsed in the

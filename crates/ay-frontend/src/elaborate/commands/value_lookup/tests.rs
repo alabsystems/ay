@@ -60,7 +60,16 @@ fn eager_records_and_unit_constants_keep_the_actual_declaration_term() {
     assert_eq!(Some(record), context.symbol_info("v").unwrap().term);
     let (unit, _) = context.source_constant_for_value("u").unwrap();
     assert_eq!(Some(unit), context.symbol_info("unit").unwrap().term);
-    for internal in ["v!child", "v!child!cells", "outer", "row", "unit"] {
+    let field_identities: Vec<String> = context
+        .symbol_iter()
+        .map(|(name, _)| name.clone())
+        .filter(|name| context.is_dt_field_identity(name))
+        .collect();
+    assert_eq!(field_identities.len(), 2, "{field_identities:?}");
+    let internal_names = ["outer", "row", "unit"]
+        .into_iter()
+        .chain(field_identities.iter().map(String::as_str));
+    for internal in internal_names {
         assert!(
             context.source_constant_for_value(internal).is_none(),
             "{internal}"

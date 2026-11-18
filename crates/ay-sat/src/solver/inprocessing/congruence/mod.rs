@@ -200,7 +200,7 @@ impl Solver {
                     }
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(off_header);
-                self.arena.mark_garbage_keep_data(off_header);
+                self.mark_clause_garbage_counted(off_header);
                 continue;
             }
             let htr_kind = if htr_hints.is_empty() {
@@ -616,18 +616,32 @@ impl Solver {
                     self.cold.clause_ids[idx] = 0;
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(idx);
-                self.arena.mark_garbage_keep_data(idx);
+                self.mark_clause_garbage_counted(idx);
                 count += 1;
             }
             count
         } else {
             self.stats.clear_bcp_learned_1963_blocker_certs();
-            self.inproc.congruence.forward_subsume_with_equivalences(
+            let subsumed = self.inproc.congruence.forward_subsume_with_equivalences(
                 &mut self.arena,
                 applied_edges
                     .as_deref()
                     .unwrap_or(&result.equivalence_edges),
-            )
+            );
+            // Census (#l0-rebuild-epoch): the engine husks clauses in
+            // the arena directly; take its irredundant-husk count.
+            let engine_husks = self
+                .inproc
+                .congruence
+                .take_forward_subsume_irredundant_husks();
+            if engine_husks > 0 {
+                self.cold.original_husks_since_rebuild = self
+                    .cold
+                    .original_husks_since_rebuild
+                    .saturating_add(engine_husks);
+                self.note_irredundant_mutation();
+            }
+            subsumed
         };
         if subsumed > 0 {
             self.cold.inprocessing_modified_clause_db = true;

@@ -1197,7 +1197,7 @@ impl ArraySolver<'_> {
 
         // (3) eq_select_entries_sorted: a pure function of the structural
         // equality_cache/select_cache, revalidated here for completeness.
-        let select_sorts: std::collections::HashSet<&Sort> = self
+        let select_sorts: HashSet<&Sort> = self
             .select_cache
             .keys()
             .map(|&sel| self.terms.sort(sel))
@@ -1229,6 +1229,13 @@ impl ArraySolver<'_> {
 
         let registered_new_terms = self.populated_terms < self.terms.len();
         let mut array_merge_replay_needed = false;
+        if was_dirty || registered_new_terms {
+            // Newly registered terms can complete a previously
+            // unprovable equality (a direct atom appears); a dirty
+            // rebuild re-derives the equality caches. Negative
+            // eq-explain answers are stale in both cases.
+            self.bump_eq_explain_version();
+        }
         if registered_new_terms {
             self.cache_rebuild.term_registrations +=
                 (self.terms.len() - self.populated_terms) as u64;
@@ -1302,7 +1309,7 @@ impl ArraySolver<'_> {
         // ascending by eq term id — the exact order propagate_impl's
         // per-call sort used (#3060 determinism).
         if was_dirty || registered_new_terms {
-            let select_sorts: std::collections::HashSet<&Sort> = self
+            let select_sorts: HashSet<&Sort> = self
                 .select_cache
                 .keys()
                 .map(|&sel| self.terms.sort(sel))

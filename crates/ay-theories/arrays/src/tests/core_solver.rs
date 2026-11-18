@@ -583,6 +583,59 @@ fn test_warm_cache_true_equalities_update_assignment_indices_incrementally() {
     );
 }
 
+/// Cross-window eq-explain memo (#s3-eq-explain-memo): a negative
+/// answer must expire when the asserted-equality graph grows, and a
+/// positive answer must survive a pop only while its reason literals
+/// are still assigned as recorded.
+#[test]
+fn test_eq_explain_memo_negative_expires_and_positive_rechecks_reasons() {
+    let mut store = TermStore::new();
+    let a = store.mk_var("a", Sort::Int);
+    let b = store.mk_var("b", Sort::Int);
+    let c = store.mk_var("c", Sort::Int);
+    let d = store.mk_var("d", Sort::Int);
+    let eq_ab = store.mk_eq(a, b);
+    let eq_bc = store.mk_eq(b, c);
+    let eq_cd = store.mk_eq(c, d);
+
+    let mut solver = ArraySolver::new(&store);
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+
+    // Nothing asserted: not provable (negative memo entry).
+    assert_eq!(solver.explain_equal_if_provable(a, c), None);
+    solver.assert_literal(eq_ab, true);
+    assert_eq!(
+        solver.explain_equal_if_provable(a, c),
+        None,
+        "one edge is not a path yet"
+    );
+    solver.assert_literal(eq_bc, true);
+    let path_ac = vec![TheoryLit::new(eq_ab, true), TheoryLit::new(eq_bc, true)];
+    assert_eq!(
+        solver.explain_equal_if_provable(a, c),
+        Some(path_ac.clone()),
+        "graph growth must expire the memoized negative answer"
+    );
+
+    solver.push();
+    solver.assert_literal(eq_cd, true);
+    let mut path_ad = path_ac.clone();
+    path_ad.push(TheoryLit::new(eq_cd, true));
+    assert_eq!(solver.explain_equal_if_provable(a, d), Some(path_ad));
+    solver.pop();
+
+    assert_eq!(
+        solver.explain_equal_if_provable(a, d),
+        None,
+        "positive memo must not outlive its reasons' assignments"
+    );
+    assert_eq!(
+        solver.explain_equal_if_provable(a, c),
+        Some(path_ac),
+        "positive memo survives while its reasons stay assigned"
+    );
+}
+
 #[test]
 fn test_warm_cache_disequalities_update_assignment_indices_incrementally() {
     let mut store = TermStore::new();

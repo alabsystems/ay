@@ -17,6 +17,7 @@ mod bv_lia_indep_final_assignment;
 mod bv_lia_indep_model_graft;
 mod dt_array_field_proxy;
 mod dt_array_quoted_carrier;
+mod dt_quoted_constructor_heads;
 mod qf_auflia;
 mod qf_auflia_l3_propagation;
 mod qf_auflra_and_regression;

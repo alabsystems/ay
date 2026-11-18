@@ -258,7 +258,10 @@ impl ChcParser {
         // file-scoped declare-var apart from another binder. Both kinds capture;
         // both are fixed by renaming the BINDER, never by touching this binding.
         self.declared_var_names.insert(name.clone());
-        self.variables.insert(name, sort);
+        // A name in an engine-reserved family is bound under its rename; its
+        // uses resolve through the same rename in `parse_symbol_expr`.
+        let bound_name = self.reserved_variable_rename(&name).unwrap_or(name);
+        self.variables.insert(bound_name, sort);
         Ok(())
     }
 

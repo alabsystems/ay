@@ -615,7 +615,7 @@ impl Solver {
                     self.note_eagerly_subsumed_duplicate_binary(cand_off);
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(cand_off);
-                self.arena.mark_garbage_keep_data(cand_off);
+                self.mark_clause_garbage_counted(cand_off);
                 self.cold.num_eager_subsumptions += 1;
             }
         }

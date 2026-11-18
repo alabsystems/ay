@@ -171,6 +171,10 @@ pub(crate) struct CongruenceClosure {
     forward_subsumption_matchable: Vec<bool>,
     /// Reused representative-literal marks for equivalence-aware forward subsumption.
     forward_subsumption_marked: Vec<bool>,
+    /// Irredundant clauses husked by `forward_subsume_with_equivalences`
+    /// since the last take, for the solver's shadow census
+    /// (#l0-rebuild-epoch).
+    forward_subsume_irredundant_husks: u64,
     /// The owning solver's `--sat-deterministic-inproc`: gate extraction's
     /// wall is off and its counted budgets alone bound it
     /// (`set_deterministic`).
@@ -190,6 +194,7 @@ impl CongruenceClosure {
             cached_binary_adj: Vec::new(),
             forward_subsumption_matchable: vec![false; num_vars],
             forward_subsumption_marked: vec![false; num_vars * 2],
+            forward_subsume_irredundant_husks: 0,
             deterministic: crate::determinism::deterministic_inproc_enabled(),
         }
     }

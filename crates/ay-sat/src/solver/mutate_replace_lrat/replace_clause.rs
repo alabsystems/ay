@@ -19,6 +19,13 @@ impl Solver {
         else {
             return ReplaceResult::Skipped;
         };
+        // Shadow L0-rebuild epoch (#l0-rebuild-epoch): an irredundant
+        // replacement outside the L0 GC sweep is a destructive-class
+        // mutation. Bumping before the remaining skip paths over-counts
+        // refused replacements, which is the fail-closed direction.
+        if was_irredundant {
+            self.note_irredundant_mutation();
+        }
 
         if new_lits.is_empty() {
             return self.replace_with_empty_clause_lrat(

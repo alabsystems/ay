@@ -1239,6 +1239,7 @@ impl Solver {
 
             self.stats.clear_bcp_learned_1963_blocker_cert(offset);
             self.record_clause_retirement(offset);
+            self.note_direct_arena_delete(offset);
             self.arena.delete(offset);
             self.cold.clause_db_changes += 1;
             deleted += 1;
@@ -1295,6 +1296,7 @@ impl Solver {
             return false;
         }
         // Mark as pending-garbage. BCP will skip it; reduce_db will delete it.
+        self.note_pending_garbage_mark(clause_ref);
         self.stats.clear_bcp_learned_1963_blocker_cert(clause_ref);
         self.arena.set_pending_garbage(clause_ref, true);
         self.pending_garbage_count += 1;
@@ -1503,6 +1505,7 @@ impl Solver {
             // that derivation chains referencing them remain valid.
             self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
             self.record_clause_retirement(clause_idx);
+            self.note_direct_arena_delete(clause_idx);
             self.arena.delete(clause_idx);
             self.cold.clause_db_changes += 1;
             reclaimed += 1;
@@ -1633,6 +1636,7 @@ impl Solver {
 
             self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
             self.record_clause_retirement(clause_idx);
+            self.note_direct_arena_delete(clause_idx);
             self.arena.delete(clause_idx);
             self.cold.clause_db_changes += 1;
             reclaimed += 1;

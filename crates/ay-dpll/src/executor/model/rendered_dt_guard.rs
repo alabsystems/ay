@@ -32,11 +32,12 @@ pub(super) struct RenderedDatatypeGuard {
 
 struct DatatypeSchema {
     constructors: Vec<GuardConstructor>,
-    render_safe: bool,
 }
 
 struct GuardConstructor {
     internal: String,
+    /// The head token the constructor's values print
+    /// (`Executor::dt_value_head`).
     surface: String,
     field_sorts: Vec<Sort>,
 }
@@ -59,14 +60,10 @@ impl RenderedDatatypeGuard {
                 _ => return Self::invalid(),
             };
             let mut guarded_constructors = Vec::with_capacity(constructors.len());
-            // Carrier names are not emitted in constructor values and may
-            // legitimately require quoting (the target ABI contains a space).
-            // Constructor heads are emitted raw and must remain bare-safe.
-            let mut render_safe = true;
             for constructor in constructors {
-                let surface = exec.dt_surface(constructor);
+                let surface = exec.dt_value_head(constructor);
                 if !source_budget.charge_identifier(constructor)
-                    || !source_budget.charge_identifier(surface)
+                    || !source_budget.charge_identifier(&surface)
                 {
                     return Self::invalid();
                 }
@@ -82,11 +79,9 @@ impl RenderedDatatypeGuard {
                         return Self::invalid();
                     }
                 }
-                let surface = surface.to_string();
-                render_safe &= ay_core::quote_symbol(&surface) == surface;
                 guarded_constructors.push(GuardConstructor {
                     internal: constructor.clone(),
-                    surface,
+                    surface: surface.into_owned(),
                     field_sorts: fields.iter().map(|(_, sort)| sort.clone()).collect(),
                 });
             }
@@ -95,7 +90,6 @@ impl RenderedDatatypeGuard {
                     name.to_string(),
                     DatatypeSchema {
                         constructors: guarded_constructors,
-                        render_safe,
                     },
                 )
                 .is_some()
@@ -231,9 +225,6 @@ impl RenderedDatatypeGuard {
             let Some(schema) = schemas.get(&name) else {
                 return false;
             };
-            if !schema.render_safe {
-                return false;
-            }
             let mut datatype_child_constructors = 0usize;
             for constructor in &schema.constructors {
                 let Some(has_datatype_child) = check_constructor(

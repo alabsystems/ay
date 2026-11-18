@@ -36,9 +36,9 @@
 //! 2. **Errors are never cached.** Only a successful expansion is recorded, so a
 //!    malformed body keeps raising its diagnostic at every call site.
 //! 3. **Purity.** An expansion that minted a fresh variable is not recorded. A
-//!    quantifier or lambda binder, `pow_neg_at_zero`, and `map.empty`'s default
-//!    are all minted per occurrence; sharing one across call sites would equate
-//!    values the un-memoized elaboration leaves independent.
+//!    quantifier or lambda binder is minted per occurrence; sharing one across
+//!    call sites would equate variables the un-memoized elaboration leaves
+//!    independent.
 //! 4. **Depth.** An entry records how deep BELOW itself its expansion reached,
 //!    and is served only where every skipped nested expansion would still have
 //!    cleared [`MAX_FUN_EXPANSION_DEPTH`] — so a replay can never stand in for a

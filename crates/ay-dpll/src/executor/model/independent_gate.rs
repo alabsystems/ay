@@ -3008,14 +3008,14 @@ fn parse_atom(cur: &mut &str) -> String {
         return atom;
     }
     if bytes[0] == b'|' {
-        // Quoted symbol: scan to the closing '|'.
+        // Quoted symbol: scan to the closing '|', past the `\|` and `\\`
+        // escapes `ay_core::quote_symbol` writes.
         let mut i = 1;
         while i < bytes.len() && bytes[i] != b'|' {
-            i += 1;
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
         }
-        if i < bytes.len() {
-            i += 1; // include closing '|'
-        }
+        // Include the closing '|'; an unterminated symbol runs to the end.
+        let i = (i + 1).min(bytes.len());
         let atom = cur[..i].to_string();
         *cur = &cur[i..];
         return atom;
@@ -3342,7 +3342,7 @@ impl Executor {
         let internal = constructors
             .iter()
             .find(|constructor| {
-                self.dt_surface(constructor) == head || constructor.as_str() == head
+                self.dt_value_head(constructor) == head || constructor.as_str() == head
             })?
             .clone();
         let fields = self.ctx.constructor_selector_info(&internal)?;
@@ -11919,6 +11919,30 @@ mod sexpr_items_tests {
             ])
         );
         assert_eq!(sexpr_items("(store a |unterminated 0)"), None);
+    }
+
+    /// A quoted symbol holding `\|` or `\\` is one item: here `|mk\|x|`, the
+    /// `ay_core::quote_symbol` token of `mk|x`, and `|a\\b|`.
+    #[test]
+    fn an_escaped_bar_stays_inside_its_quoted_symbol() {
+        assert_eq!(ay_core::quote_symbol("mk|x"), r"|mk\|x|");
+        assert_eq!(
+            sexpr_items(r"(store a (|mk\|x| 5 |a\\b|) 0)"),
+            Some(vec![
+                "store".to_string(),
+                "a".to_string(),
+                r"(|mk\|x| 5 |a\\b|)".to_string(),
+                "0".to_string(),
+            ])
+        );
+        assert_eq!(
+            sexpr_items(r"(|mk\|x| 5 9)"),
+            Some(vec![
+                r"|mk\|x|".to_string(),
+                "5".to_string(),
+                "9".to_string()
+            ])
+        );
     }
 
     /// Anything not a single balanced parenthesized form is refused, so an

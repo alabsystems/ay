@@ -35,6 +35,8 @@ mod dt_stack_safety_8414;
 mod dt_uf_bridge_congruence;
 #[path = "group_datatypes/dt_value_eq_congruence_soundness.rs"]
 mod dt_value_eq_congruence_soundness;
+#[path = "group_datatypes/field_name_capture.rs"]
+mod field_name_capture;
 #[path = "group_datatypes/lazy_dt_deep_case_split.rs"]
 mod lazy_dt_deep_case_split;
 #[path = "group_datatypes/match_desugar_soundness.rs"]

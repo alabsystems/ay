@@ -1307,10 +1307,10 @@ fn a_function_table_of_applications_of_as_is_skipped_as_before() {
     };
     let (overloaded, renamed) = ay_dpll::as_application_pair();
     for (script, cell) in [
-        (ay_dpll::AS_APPLICATION_UNIT, "(as Unit Unit)"),
-        (ay_dpll::AS_APPLICATION_OWN_SORT, "(as nil L1)"),
-        (overloaded.as_str(), "(as nil Other)"),
-        (renamed.as_str(), "(as nil Other)"),
+        (ay_dpll::AS_APPLICATION_UNIT, "(|as| Unit Unit)"),
+        (ay_dpll::AS_APPLICATION_OWN_SORT, "(|as| nil L1)"),
+        (overloaded.as_str(), "(|as| nil Other)"),
+        (renamed.as_str(), "(|as| nil Other)"),
     ] {
         let solver = solve(script);
         let text = solver.model_str_for_decoder().expect("captured text");

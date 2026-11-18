@@ -18,7 +18,8 @@ use crate::executor::model::MaterializedScalarFunctions;
 use crate::executor_types::SolveResult;
 
 pub(super) use super::to_real_rewrite::{
-    collect_child_mode_dependencies, rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars,
+    collect_child_mode_dependencies, fp_to_real_target_name, rewrite_fp_to_real_for_model,
+    rewrite_fp_to_real_with_vars,
 };
 
 /// A site where `fp.to_real` is applied to an FP term in the mixed assertions.

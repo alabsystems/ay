@@ -259,10 +259,11 @@ impl Executor {
                 continue;
             }
             declared.insert(name.to_string());
+            let name = self.script_symbol_spelling(name);
             if info.arg_sorts.is_empty() {
                 out.push_str(&format!(
                     "(declare-const {} {})\n",
-                    quote_symbol(name),
+                    quote_symbol(&name),
                     format_sort_surface(&self.ctx, &info.sort)
                 ));
             } else {
@@ -273,7 +274,7 @@ impl Executor {
                     .collect();
                 out.push_str(&format!(
                     "(declare-fun {} ({}) {})\n",
-                    quote_symbol(name),
+                    quote_symbol(&name),
                     args.join(" "),
                     format_sort_surface(&self.ctx, &info.sort)
                 ));
@@ -1927,8 +1928,37 @@ impl Executor {
                 crate::executor_format::format_sort_surface_owned(&self.ctx, result_sort, owner);
             output::format(owner, format_args!("(as {name} {sort})"))
         } else {
-            output::quote(owner, self.ctx.output_symbol_name(identity))
+            output::quote(owner, &self.script_symbol_spelling(identity))
         }
+    }
+
+    /// The spelling serialized SMT-LIB text gives the core symbol identity
+    /// `identity`, outside an overload's `(as ...)` ascription.
+    ///
+    /// A single-constructor field constant (`Context::is_dt_field_identity`)
+    /// has a private `__ay_field_N` identity that source text cannot declare,
+    /// so text that declared or used it would not re-parse. It is spelled
+    /// `ay!field_N`, extended with `!1`, `!2`, ... until the spelling is the
+    /// name of no variable in the term store and of no symbol binding in the
+    /// context, so it names no other symbol the text can mention. Distinct
+    /// identities get distinct spellings: every candidate for `__ay_field_N`
+    /// is `ay!field_N` followed by nothing or by `!`, and `N` holds no `!`.
+    /// Every other identity takes `Context::output_symbol_name`.
+    fn script_symbol_spelling<'a>(&'a self, identity: &'a str) -> std::borrow::Cow<'a, str> {
+        if !self.ctx.is_dt_field_identity(identity) {
+            return std::borrow::Cow::Borrowed(self.ctx.output_symbol_name(identity));
+        }
+        let tail = identity.strip_prefix("__ay_").unwrap_or(identity);
+        let base = format!("ay!{tail}");
+        let taken =
+            |name: &str| self.ctx.terms.has_var_name(name) || self.ctx.has_symbol_binding(name);
+        let mut candidate = base.clone();
+        let mut suffix: u64 = 0;
+        while taken(&candidate) {
+            suffix += 1;
+            candidate = format!("{base}!{suffix}");
+        }
+        std::borrow::Cow::Owned(candidate)
     }
 }
 

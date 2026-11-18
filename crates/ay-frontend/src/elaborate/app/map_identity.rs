@@ -49,9 +49,7 @@ impl Context {
         if let Some(&existing) = self.map_empty_values.get(&map_sort) {
             return existing;
         }
-        let values = self
-            .terms
-            .mk_fresh_var(MAP_EMPTY_VALUES_PREFIX, map_sort.clone());
+        let values = self.mint_fresh_var(MAP_EMPTY_VALUES_PREFIX, map_sort.clone());
         self.map_empty_values.insert(map_sort, values);
         values
     }

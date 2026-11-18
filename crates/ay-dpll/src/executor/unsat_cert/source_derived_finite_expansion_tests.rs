@@ -140,15 +140,16 @@ fn explicit_proof_modes_decline() {
         .is_none());
 }
 
-/// Load `head` (which must start with the universal), then declare a constant
+/// Load `head` (which must start with the universal), then register a constant
 /// spelled like that universal's first binder and assert `tail`, with `@B@`
 /// naming the constant.
 ///
-/// The frontend mints every binder a fresh name that no declaration holds YET;
-/// a later declaration can still take that spelling and gets a different
-/// identity. The fold then moves ground terms mentioning it under the binder,
-/// where the expander, which substitutes binders BY NAME, would read it as the
-/// binder.
+/// The constant is minted in the term store and registered with
+/// `Context::register_symbol`, as a native-API caller does, and is a
+/// different identity from the binder; a `declare-const` of that spelling
+/// takes a private identity instead. The fold then moves ground terms
+/// mentioning the constant under the binder, where the expander, which
+/// substitutes binders BY NAME, would read it as the binder.
 fn load_with_binder_spelled_constant(head: &str, tail: &str) -> Executor {
     let mut executor = load(head);
     let TermData::Forall(vars, _, _) = executor.ctx.terms.get(executor.ctx.assertions[0]).clone()
@@ -156,14 +157,17 @@ fn load_with_binder_spelled_constant(head: &str, tail: &str) -> Executor {
         panic!("fixture starts with the universal");
     };
     let binder = vars[0].0.clone();
-    let later = ay_frontend::parse(&format!(
-        "(declare-const {binder} (_ BitVec 8)) {}",
-        tail.replace("@B@", &binder)
-    ))
-    .expect("the colliding declaration must parse");
+    let constant = executor
+        .ctx
+        .terms
+        .mk_var(binder.clone(), ay_core::Sort::bitvec(8));
+    executor
+        .ctx
+        .register_symbol(binder.clone(), constant, ay_core::Sort::bitvec(8));
+    let later = ay_frontend::parse(&tail.replace("@B@", &binder)).expect("the tail must parse");
     executor
         .execute_all(&later)
-        .expect("the colliding declaration must elaborate");
+        .expect("the tail must elaborate");
     let spelled_like_binder = executor
         .ctx
         .terms

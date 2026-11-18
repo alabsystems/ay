@@ -243,3 +243,38 @@ fn selector_of_cell_contradicting_pinned_constant_is_unsat() {
         &["unsat"],
     );
 }
+
+/// With `:produce-proofs` set, `arr` maps `D` to `E` and is asserted equal
+/// to the store chain over the constant array of `cd` that maps `W` to `cd`
+/// and `other` to `(wrap other)`; `x` is `arr` at `y` and is `(wrap other)`.
+/// `W` is each constructor name below. Here the answer is `sat` and the
+/// get-value response is the one below.
+#[test]
+fn a_cell_equality_outside_the_class_of_its_tree_pins_no_constructor() {
+    for name in ["plain", "pop", "|pop|"] {
+        let input = format!(
+            "(set-option :produce-proofs true)\n\
+             (set-logic ALL)\n\
+             (declare-datatypes ((D 0)) ((({name}) (other))))\n\
+             (declare-datatypes ((E 0)) (((cd) (e2) (wrap (un D)))))\n\
+             (declare-const arr (Array D E))\n\
+             (declare-const x E)\n\
+             (declare-const y D)\n\
+             (assert (= (select arr other) (wrap other)))\n\
+             (assert (= x (select arr y)))\n\
+             (assert (= arr (store (store ((as const (Array D E)) cd) {name} cd) \
+             other (wrap other))))\n\
+             (assert (= x (wrap other)))\n\
+             (check-sat)\n\
+             (get-value (x y (select arr other)))\n"
+        );
+        assert_eq!(
+            verdict(&input),
+            [
+                "sat",
+                "((x (wrap other)) (y other) ((select arr other) (wrap other)))"
+            ],
+            "{name}"
+        );
+    }
+}

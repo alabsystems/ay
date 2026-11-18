@@ -214,15 +214,18 @@ fn canonical_array_select_rejects_wrong_sort_and_indexed_lookalikes() {
     assert!(!executor.dt_completion_array_select_application(symbol, args, indexed_select));
 }
 
+/// `datatype_value_is_exactly_roundtrippable` holds for `QuotedCell`, whose
+/// one constructor is `|true|`, and for `Quoted Cell`, and not for
+/// `UnsupportedCell`, `BranchCell` or the foreign inline `GuardCell`.
 #[test]
-fn exact_fragment_rejects_unsupported_quoted_and_foreign_inline_schemas() {
+fn exact_fragment_admits_quoted_heads_and_rejects_unsupported_and_foreign_inline_schemas() {
     let executor = loaded_fixture();
     assert!(
         !executor.datatype_value_is_exactly_roundtrippable(&Sort::Uninterpreted(
             "UnsupportedCell".to_string()
         ))
     );
-    assert!(!executor
+    assert!(executor
         .datatype_value_is_exactly_roundtrippable(&Sort::Uninterpreted("QuotedCell".to_string())));
     assert!(executor
         .datatype_value_is_exactly_roundtrippable(&Sort::Uninterpreted("Quoted Cell".to_string())));

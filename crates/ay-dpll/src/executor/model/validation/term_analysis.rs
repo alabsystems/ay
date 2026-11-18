@@ -25,11 +25,16 @@ impl Executor {
     ///
     /// The frontend deliberately assigns `__ay_overload_*` identities to
     /// builtin-colliding declarations. Prefix-only classification would then
-    /// skip the user's assertion from model validation. Require both the
-    /// allocator's narrow namespace and positive live declaration metadata;
-    /// arbitrary `__ay_*` witnesses remain internal.
+    /// skip the user's assertion from model validation. The same holds for a
+    /// single-constructor field constant (`__ay_field_*`, recorded by
+    /// `Context::is_dt_field_identity`): it stands for the user's selector
+    /// application, so an assertion over it is the user's. Require both the
+    /// allocator's narrow namespace (or the recorded field identity) and
+    /// positive live declaration metadata; arbitrary `__ay_*` witnesses remain
+    /// internal.
     fn is_live_private_binding_identity(&self, name: &str) -> bool {
-        name.starts_with("__ay_overload_") && self.ctx.symbol_info_by_identity(name).is_some()
+        (name.starts_with("__ay_overload_") || self.ctx.is_dt_field_identity(name))
+            && self.ctx.symbol_info_by_identity(name).is_some()
     }
 
     /// Check whether a term tree contains an internal encoding symbol.

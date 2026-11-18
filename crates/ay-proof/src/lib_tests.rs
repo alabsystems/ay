@@ -1090,9 +1090,9 @@ fn test_problem_scope_reports_internal_symbols_outside_the_prefix_allowlist() {
     let mut terms = TermStore::new();
     let user = terms.mk_var("s_", Sort::Int);
     let other = terms.mk_var("t_", Sort::Int);
-    // A field-split symbol as the frontend mints them for a datatype-sorted
-    // constant (`declarations.rs`, `format!("{name}!{sel_name}")`): no
-    // recognizable prefix, and absent from the problem scope.
+    // A symbol with no recognizable prefix, absent from the problem scope
+    // (spelled as the frontend's field-split symbols were before they took
+    // private identities).
     let field = terms.mk_var("s_tmp___!left", Sort::Int);
     // NOTE: must be `(= s_ t_)`, not `(= s_ s_)` — the term store folds a
     // reflexive equality to `true`, which would leave the problem scope EMPTY

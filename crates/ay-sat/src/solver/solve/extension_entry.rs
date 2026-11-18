@@ -490,6 +490,7 @@ impl Solver {
 
                 self.stats.clear_bcp_learned_1963_blocker_cert(*idx);
                 self.record_clause_retirement(*idx);
+                self.note_direct_arena_delete(*idx);
                 self.arena.delete(*idx);
                 self.cold.clause_db_changes += 1;
                 flushed += 1;

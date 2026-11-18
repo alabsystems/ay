@@ -140,7 +140,9 @@ fn canonical_sexpr(text: &str) -> Option<String> {
 }
 
 /// Split one parenthesised s-expression into top-level items while respecting
-/// nesting and SMT-LIB string/quoted-symbol delimiters.
+/// nesting and SMT-LIB string/quoted-symbol delimiters. Inside a quoted
+/// symbol a `\` takes the next character with it, so the escapes
+/// `ay_core::quote_symbol` writes (`|mk\|x|`) stay in one item.
 pub(in crate::executor::model) fn sexpr_items(text: &str) -> Option<Vec<String>> {
     let body = text.trim().strip_prefix('(')?.strip_suffix(')')?;
     let mut items = Vec::new();
@@ -163,7 +165,9 @@ pub(in crate::executor::model) fn sexpr_items(text: &str) -> Option<Vec<String>>
         }
         if in_symbol {
             current.push(character);
-            if character == '|' {
+            if character == '\\' {
+                current.push(chars.next()?);
+            } else if character == '|' {
                 in_symbol = false;
             }
             continue;

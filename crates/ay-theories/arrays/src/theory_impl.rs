@@ -191,6 +191,7 @@ impl TheorySolver for ArraySolver<'_> {
         self.external_diseqs.clear();
         self.external_diseq_reasons.clear();
         self.external_eqs.clear();
+        self.external_eq_keys.clear();
         self.external_eq_reasons.clear();
         self.sent_equalities.clear();
         self.sent_equality_replays.clear();
@@ -282,6 +283,10 @@ impl TheorySolver for ArraySolver<'_> {
         self.prop_eq_snapshot = None;
         self.final_check_snapshot = None;
         if eq_graph_changed {
+            // Conservative: a restored true equality assignment could
+            // complete a previously unprovable equality
+            // (#s3-eq-explain-memo).
+            self.bump_eq_explain_version();
             self.note_eq_graph_changed();
         }
     }
@@ -297,6 +302,7 @@ impl TheorySolver for ArraySolver<'_> {
         self.external_diseqs.clear();
         self.external_diseq_reasons.clear();
         self.external_eqs.clear();
+        self.external_eq_keys.clear();
         self.external_eq_reasons.clear();
         self.sent_equalities.clear();
         self.sent_equality_replays.clear();
@@ -325,6 +331,10 @@ impl TheorySolver for ArraySolver<'_> {
         self.shadow_uf_stale = true;
         self.prop_eq_snapshot = None;
         self.final_check_snapshot = None;
+        // Full teardown: the eq-explain memo restarts empty
+        // (#s3-eq-explain-memo).
+        self.eq_explain_memo.borrow_mut().clear();
+        self.bump_eq_explain_version();
         if eq_graph_changed {
             self.note_eq_graph_changed();
         }

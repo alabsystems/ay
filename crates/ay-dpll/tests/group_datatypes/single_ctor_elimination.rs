@@ -7,9 +7,9 @@
 //!
 //! A single-constructor datatype `D = C(f_0: T_0, ..., f_{n-1}: T_{n-1})` is
 //! isomorphic to the tuple of its fields. A freshly declared constant of such a
-//! sort is bound at elaboration to `C(v!f_0, ..., v!f_{n-1})` over fresh field
-//! constants, so:
-//!   * `sel_i(v)` reduces to `v!f_i` (selector-over-constructor fold), and
+//! sort is bound at elaboration to `C(k_0, ..., k_{n-1})` over fresh field
+//! constants `k_i` with private identities, so:
+//!   * `sel_i(v)` reduces to `k_i` (selector-over-constructor fold), and
 //!   * `v = w` decomposes into field equalities (constructor injectivity),
 //! discharging with only the underlying scalar/UF theories — no datatype
 //! decision procedure required.
