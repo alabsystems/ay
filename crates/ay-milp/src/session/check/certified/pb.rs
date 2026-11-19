@@ -44,10 +44,14 @@ fn try_single_row(session: &mut BabSession, state: &mut CheckState) -> SingleRow
     let decision = deadline.and_then(|trial_deadline| {
         crate::pb_route::try_prove_single_row_infeasibility(&session.model, trial_deadline)
     });
+    // Diagnostic formatting and output are not work on this model. Sample
+    // before tracing so a trace cannot buy the later arms a larger slice.
+    let single_row_cost = probe_clock().saturating_sub(cpu_started);
     if structure_trace_enabled() {
         eprintln!(
-            "--trace infeasibility-probe single_row={:.6}s hit={}",
+            "--trace infeasibility-probe single_row={:.6}s cpu={:.6}s hit={}",
             started.elapsed().as_secs_f64(),
+            single_row_cost.as_secs_f64(),
             decision.is_some(),
         );
     }
@@ -70,7 +74,7 @@ fn try_single_row(session: &mut BabSession, state: &mut CheckState) -> SingleRow
     // from it.
     SingleRowProbe::Declined(ProbeBudget {
         deadline,
-        single_row_cost: probe_clock().saturating_sub(cpu_started),
+        single_row_cost,
     })
 }
 

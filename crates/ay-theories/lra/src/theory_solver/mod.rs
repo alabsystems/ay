@@ -547,6 +547,10 @@ impl TheorySolver for LraSolver {
                 self.stats.implied_round_best_suppressed,
             ),
             (
+                "lra_implied_zeno_predicted_skips",
+                self.stats.implied_zeno_predicted_skips,
+            ),
+            (
                 "lra_max_outer_fixpoint_iters",
                 u64::from(self.stats.max_outer_fixpoint_iters),
             ),

@@ -43,6 +43,9 @@ thread_local! {
     /// Confirms the replay-canonicalization fast paths actually cut the
     /// per-round O(n^2) scan volume on grinding AUFLIA split loops.
     static REPLAY_COVERED_BY_CALLS: Cell<u64> = const { Cell::new(0) };
+    /// Replay-insert tombstone scans skipped because the candidate's
+    /// ordered pair was never inserted (#allinterval-replay-pair-set).
+    static REPLAY_TOMBSTONE_SCANS_SKIPPED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Process-wide totals that are never drained (`smt.*_total`). The drained
@@ -157,6 +160,12 @@ pub(crate) fn inc_replay_covered_by_calls() {
     REPLAY_COVERED_BY_CALLS.with(|c| c.set(c.get() + 1));
 }
 
+/// Increment the pair-gated tombstone-scan skip counter.
+#[inline]
+pub(crate) fn inc_replay_tombstone_scans_skipped() {
+    REPLAY_TOMBSTONE_SCANS_SKIPPED.with(|c| c.set(c.get() + 1));
+}
+
 /// Snapshot of all theory observability counters.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TheoryObservabilityStats {
@@ -176,6 +185,7 @@ pub(crate) struct TheoryObservabilityStats {
     pub(crate) props_euf: u64,
     pub(crate) partial_clauses: u64,
     pub(crate) replay_covered_by_calls: u64,
+    pub(crate) replay_tombstone_scans_skipped: u64,
 }
 
 /// Read all counters and reset them to zero.
@@ -197,6 +207,7 @@ pub(crate) fn drain_stats() -> TheoryObservabilityStats {
         props_euf: PROPS_EUF.with(|c| c.replace(0)),
         partial_clauses: PARTIAL_CLAUSES.with(|c| c.replace(0)),
         replay_covered_by_calls: REPLAY_COVERED_BY_CALLS.with(|c| c.replace(0)),
+        replay_tombstone_scans_skipped: REPLAY_TOMBSTONE_SCANS_SKIPPED.with(|c| c.replace(0)),
     }
 }
 

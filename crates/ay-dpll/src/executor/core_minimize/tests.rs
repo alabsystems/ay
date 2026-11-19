@@ -255,11 +255,9 @@ fn without_check_sat(script: &str) -> String {
 /// #uc-minimize-entry-cost, probe-undecided stop: when the FIRST attempt of
 /// non-array content runs its whole budget without deciding its subset, the
 /// pass stops after that one attempt and restores the entry's core
-/// bookkeeping. The budget is pinned to one millisecond through the
-/// test-only override so the outcome does not depend on this machine's
-/// speed: the bit-blasted subset solve cannot decide in a millisecond, and a
-/// subset UNSAT that does arrive has its strict re-verification declined at
-/// the same expired deadline.
+/// bookkeeping. The test-only override installs an already-expired first
+/// probe deadline, so the stop and restoration assertions do not race the
+/// subset solver against the machine's speed.
 #[test]
 fn undecided_probe_stops_the_pass_after_one_attempt() {
     let (mut executor, named) =
@@ -268,7 +266,7 @@ fn undecided_probe_stops_the_pass_after_one_attempt() {
     assert!(entry.is_unsat());
     let entry_core = executor.last_assumption_core.clone();
     let entry_assumptions = executor.last_assumptions.clone();
-    let _override = ProbeBudgetOverride::install(Duration::from_millis(1));
+    let _override = ProbeBudgetOverride::install(Duration::ZERO);
     let result = executor
         .minimize_assumption_core(&named, Ok(entry), None, Duration::ZERO)
         .expect("minimizer never alters the verdict");

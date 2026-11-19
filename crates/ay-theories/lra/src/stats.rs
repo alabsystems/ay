@@ -183,6 +183,11 @@ pub(crate) struct LraStats {
     /// bound at least as tight for the same variable side
     /// (#allinterval-round-best); the apply loop would discard them.
     pub(crate) implied_round_best_suppressed: u64,
+    /// Derivations dropped before explanation construction because the
+    /// Zeno accept test is guaranteed to reject them at apply time
+    /// (occupied slot, tighten streak at the cap, no unassigned atom
+    /// crossed) (#allinterval-zeno-predict).
+    pub(crate) implied_zeno_predicted_skips: u64,
 
     // ----- Snapshot telemetry (#8255) -----
     /// Number of `save_feasible_snapshot` calls skipped because simplex did

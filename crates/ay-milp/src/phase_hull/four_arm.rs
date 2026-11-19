@@ -9,6 +9,7 @@ use super::{
 use crate::ns::mul_up;
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
 struct Column {
     index: usize,
     arms: [f64; 4],
@@ -96,6 +97,101 @@ fn polish(offsets: [f64; 4], columns: &[Column], order: &[usize], slopes: &mut [
     }
 }
 
+fn search_slopes(arms: [AffineArm<'_>; 4], columns: &[Column], point: &[f64]) -> Option<Vec<f64>> {
+    let offsets = arms.map(|arm| arm.offset);
+    let mut best = paired_slope(arms, columns, point);
+    let mut lowest = best
+        .as_ref()
+        .map(|v| objective(offsets, columns, v, point))
+        .filter(|v| v.is_finite())
+        .unwrap_or(f64::INFINITY);
+    for mask in 1..16 {
+        let slopes: Vec<_> = columns
+            .iter()
+            .map(|col| quantile(col, mask, point[col.index]))
+            .collect();
+        let val = objective(offsets, columns, &slopes, point);
+        if val.is_finite() && val < lowest {
+            lowest = val;
+            best = Some(slopes);
+        }
+    }
+    let mut slopes = best?;
+    let mut order: Vec<_> = (0..columns.len()).collect();
+    let spread = |j: usize| {
+        let col = &columns[j];
+        col.arms[col.sorted[3]] - col.arms[col.sorted[0]]
+    };
+    order.sort_unstable_by(|&j, &k| spread(k).total_cmp(&spread(j)).then(j.cmp(&k)));
+    let mut trial = slopes.clone();
+    polish(offsets, columns, &order, &mut trial);
+    if objective(offsets, columns, &trial, point) < lowest {
+        slopes = trial;
+    }
+
+    Some(slopes)
+}
+
+fn fixed_slope(column: &Column, x: f64) -> Option<f64> {
+    let lo = column.arms[column.sorted[0]];
+    let hi = column.arms[column.sorted[3]];
+    if x == 1.0 || lo == hi {
+        Some(lo)
+    } else if x == -1.0 {
+        Some(hi)
+    } else {
+        None
+    }
+}
+
+// At x = +1, s + |a - s| >= a with equality at s = min_i a_i
+// for every arm. At x = -1 choose max_i a_i by the same argument.
+// A coefficient common to all arms is also optimal for every x in the box.
+// Fix those slopes and search only directions where a trade-off remains.
+// Dropping their common point dot product changes no slope comparison.
+fn face_slopes(arms: [AffineArm<'_>; 4], columns: &[Column], point: &[f64]) -> Option<Vec<f64>> {
+    if !columns
+        .iter()
+        .any(|col| fixed_slope(col, point[col.index]).is_some())
+    {
+        return None;
+    }
+    let mut reduced = Vec::new();
+    let mut offsets = arms.map(|a| a.offset);
+    let mut terms: [Vec<(usize, f64)>; 4] = Default::default();
+    for col in columns {
+        if let Some(s) = fixed_slope(col, point[col.index]) {
+            for (offset, a) in offsets.iter_mut().zip(col.arms) {
+                *offset += (a - s).abs();
+            }
+        } else {
+            reduced.push(col.clone());
+            for (row, a) in terms.iter_mut().zip(col.arms) {
+                if a != 0.0 {
+                    row.push((col.index, a));
+                }
+            }
+        }
+    }
+    if offsets.iter().any(|a| !a.is_finite()) {
+        return None;
+    }
+    let mut free = if reduced.is_empty() {
+        Vec::new()
+    } else {
+        let reduced_arms = std::array::from_fn(|i| AffineArm {
+            offset: offsets[i],
+            terms: &terms[i],
+        });
+        search_slopes(reduced_arms, &reduced, point)?
+    }
+    .into_iter();
+    columns
+        .iter()
+        .map(|col| fixed_slope(col, point[col.index]).or_else(|| free.next()))
+        .collect()
+}
+
 /// Separate a common upper plane for four affine arms on the same unit box.
 ///
 /// For example, the sum of two two-way disjunctions has four joint arms.
@@ -129,37 +225,22 @@ pub fn separate_four_arm_unit_box_hull(
             }
         })
         .collect();
-    let offsets = arms.map(|arm| arm.offset);
-    let mut best = paired_slope(arms, &columns, point);
-    let mut lowest = best
-        .as_ref()
-        .map(|v| objective(offsets, &columns, v, point))
-        .filter(|v| v.is_finite())
-        .unwrap_or(f64::INFINITY);
-    for mask in 1..16 {
-        let slopes: Vec<_> = columns
-            .iter()
-            .map(|col| quantile(col, mask, point[col.index]))
-            .collect();
-        let val = objective(offsets, &columns, &slopes, point);
-        if val.is_finite() && val < lowest {
-            lowest = val;
-            best = Some(slopes);
-        }
-    }
-    let mut slopes = best?;
-    let mut order: Vec<_> = (0..columns.len()).collect();
-    let spread = |j: usize| {
-        let col = &columns[j];
-        col.arms[col.sorted[3]] - col.arms[col.sorted[0]]
-    };
-    order.sort_unstable_by(|&j, &k| spread(k).total_cmp(&spread(j)).then(j.cmp(&k)));
-    let mut trial = slopes.clone();
-    polish(offsets, &columns, &order, &mut trial);
-    if objective(offsets, &columns, &trial, point) < lowest {
-        slopes = trial;
-    }
+    let certify =
+        |slopes| certified_cut(arms.map(|arm| arm.offset), &columns, slopes, point, value);
+    // Changing the search space changes the heuristic on its remaining
+    // coordinates. A failed face proposal must not hide a previous separation.
+    face_slopes(arms, &columns, point)
+        .and_then(&certify)
+        .or_else(|| search_slopes(arms, &columns, point).and_then(certify))
+}
 
+fn certified_cut(
+    offsets: [f64; 4],
+    columns: &[Column],
+    slopes: Vec<f64>,
+    point: &[f64],
+    value: f64,
+) -> Option<BoxHullCut> {
     // Discard every search intercept. Each source arm is enclosed for the
     // exact binary64 coefficients that will be returned to the LP solver.
     let mut upper = offsets;

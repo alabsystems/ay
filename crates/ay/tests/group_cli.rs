@@ -37,6 +37,8 @@ mod dimacs_sat_exit_codes;
 mod kernel_route_cli;
 #[path = "group_cli/proof_staging_abnormal_exit.rs"]
 mod proof_staging_abnormal_exit;
+#[path = "group_cli/qbf_solve_cli.rs"]
+mod qbf_solve_cli;
 #[path = "group_cli/reexec_supervisor_gate.rs"]
 mod reexec_supervisor_gate;
 #[path = "group_cli/uncertifiable_symmetry_refusal.rs"]
@@ -110,6 +112,9 @@ mod competition_jit_cli;
 
 #[path = "group_cli/cube_and_conquer_8244.rs"]
 mod cube_and_conquer_8244;
+
+#[path = "group_cli/parallel_sequential_member.rs"]
+mod parallel_sequential_member;
 
 #[path = "group_cli/diagnose_wrong_answer.rs"]
 mod diagnose_wrong_answer;

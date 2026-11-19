@@ -50,16 +50,139 @@ pub(crate) fn claim_unanswered_outcome() -> UnansweredClaim {
     claim_unanswered_in(&RUN_OUTCOME)
 }
 
+/// What an unanswered exit on a solving thread (a DIMACS timeout, unknown or
+/// failure exit, `settle_unanswered_dimacs_exit`) does once it has tried to
+/// claim the run.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SolvingThreadExit {
+    /// This exit owns the run: it discards the proofs and answers unknown.
+    Discard,
+    /// Another unanswered exit owns the run and is ending it.
+    YieldToUnansweredExit,
+    /// The other member of the parallel DIMACS race holds a decisive verdict
+    /// with this exit code and is publishing it. This exit prints nothing and
+    /// never leaves with its own code: it gives that member the time to
+    /// finish, then leaves with the verdict's code
+    /// ([`leave_with_claimed_verdict`]), as the hard exits do.
+    YieldToVerdict(i32),
+    /// This thread claimed the decisive verdict itself and is publishing it;
+    /// the exit leaves the verdict's proof alone. Outside a race every
+    /// decisive claim a solving thread meets is its own (2026-09-13).
+    OwnVerdict,
+}
+
+/// Claim the run for an unanswered exit on a solving thread; see
+/// [`SolvingThreadExit`].
+pub(crate) fn claim_unanswered_solving_exit() -> SolvingThreadExit {
+    let race_owner = verdict_race_active().then_some(&VERDICT_RACE_OWNER);
+    solving_thread_exit_in(&RUN_OUTCOME, race_owner, std::thread::current().id())
+}
+
+/// Inside the race every decisive claim is made by the race's owner
+/// ([`claim_decisive_verdict_or_yield`] claims the race first), so a decisive
+/// claim meets an exit on another thread exactly when the race is owned by a
+/// thread other than `caller`. The two threads' claims are ordered by
+/// [`RUN_OUTCOME`] alone, so the decision does not depend on whether the
+/// owner has marked its verdict printed yet: an exit that finds the verdict
+/// claimed never answers unknown, and a verdict that finds the run claimed
+/// unanswered never prints.
+fn solving_thread_exit_in(
+    outcome: &std::sync::atomic::AtomicI32,
+    race_owner: Option<&std::sync::Mutex<Option<std::thread::ThreadId>>>,
+    caller: std::thread::ThreadId,
+) -> SolvingThreadExit {
+    match claim_unanswered_in(outcome) {
+        UnansweredClaim::Won => SolvingThreadExit::Discard,
+        UnansweredClaim::AlreadyUnanswered => SolvingThreadExit::YieldToUnansweredExit,
+        UnansweredClaim::Decisive(exit_code) => {
+            let held_by_other_member = race_owner.is_some_and(|owner| {
+                owner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some_and(|owner| owner != caller)
+            });
+            if held_by_other_member {
+                SolvingThreadExit::YieldToVerdict(exit_code)
+            } else {
+                SolvingThreadExit::OwnVerdict
+            }
+        }
+    }
+}
+
+/// End an unanswered exit that found a decisive verdict owning the run: the
+/// verdict's thread prints it and exits with its own code. Give it
+/// [`OTHER_EXIT_GRACE`] to, then leave with that code, never the exit's own.
+pub(crate) fn leave_with_claimed_verdict(exit_code: i32) -> ! {
+    std::thread::sleep(OTHER_EXIT_GRACE);
+    std::process::exit(exit_code);
+}
+
 /// Claim the run for the decisive verdict about to be printed, which exits
 /// with `exit_code`, and record that verdict. Returns only when the claim
 /// holds: a run an unanswered exit already owns has discarded its proofs, so
 /// this thread never prints the verdict and yields to the exiting thread.
 pub(crate) fn claim_decisive_verdict_or_yield(exit_code: i32) {
+    // Backstop for the parallel DIMACS race: whichever publication path gets
+    // here, only the member that owns the race may print a decisive verdict.
+    claim_verdict_race_or_yield();
     if !claim_decisive_in(&RUN_OUTCOME, exit_code) {
         yield_to_exiting_thread();
     }
     mark_verdict_printed();
     mark_decisive_verdict_printed();
+}
+
+/// The parallel DIMACS race (`ay solve <cnf> --parallel N` without a proof):
+/// the sequential default route runs as one member beside the portfolio, each
+/// on its own thread, and each publishes through its own, unchanged path. Two
+/// members can reach a decisive answer at almost the same moment, and
+/// [`RUN_OUTCOME`] does not referee two decisive claims, so the race does:
+/// the first member thread to claim owns the verdict, and the other parks
+/// until the owner's `process::exit` takes the process down. Nothing is
+/// recorded while no race is running, so every other route is untouched.
+static VERDICT_RACE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static VERDICT_RACE_OWNER: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+/// Start the parallel DIMACS race. Called once, before either member runs.
+pub(crate) fn begin_verdict_race() {
+    VERDICT_RACE_ACTIVE.store(true, Ordering::SeqCst);
+}
+
+/// Whether the parallel DIMACS race is running in this process.
+pub(crate) fn verdict_race_active() -> bool {
+    VERDICT_RACE_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Claim the race's verdict for the calling member thread. Returns only when
+/// this thread owns it (claiming again is a no-op); a thread that finds the
+/// verdict owned by the other member never returns. Outside a race it returns
+/// at once.
+pub(crate) fn claim_verdict_race_or_yield() {
+    if !verdict_race_active() {
+        return;
+    }
+    if !claim_verdict_race_in(&VERDICT_RACE_OWNER, std::thread::current().id()) {
+        yield_to_exiting_thread();
+    }
+}
+
+/// True when `claimant` owns the race after this call.
+fn claim_verdict_race_in(
+    owner: &std::sync::Mutex<Option<std::thread::ThreadId>>,
+    claimant: std::thread::ThreadId,
+) -> bool {
+    let mut owner = owner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *owner {
+        None => {
+            *owner = Some(claimant);
+            true
+        }
+        Some(current) => current == claimant,
+    }
 }
 
 fn claim_unanswered_in(outcome: &std::sync::atomic::AtomicI32) -> UnansweredClaim {
@@ -113,10 +236,7 @@ pub(crate) fn run_claimed_unanswered() -> bool {
 /// only then leave: with the verdict's code, or after a discard of its own.
 fn settle_proofs_before_unanswered_exit() {
     match claim_unanswered_outcome() {
-        UnansweredClaim::Decisive(exit_code) => {
-            std::thread::sleep(OTHER_EXIT_GRACE);
-            std::process::exit(exit_code);
-        }
+        UnansweredClaim::Decisive(exit_code) => leave_with_claimed_verdict(exit_code),
         UnansweredClaim::AlreadyUnanswered => {
             std::thread::sleep(OTHER_EXIT_GRACE);
             dimacs::discard_unanswered_dimacs_proofs();
@@ -245,6 +365,107 @@ fn verdict_stands_note(unsat_fields: &str, mut write: impl FnMut(&[u8])) {
 mod run_outcome_tests {
     use super::*;
     use std::sync::atomic::AtomicI32;
+
+    /// The parallel race's referee: the first member thread owns the verdict,
+    /// claiming again is a no-op for it, and the other member never owns it.
+    #[test]
+    fn the_verdict_race_has_one_owner() {
+        let owner = std::sync::Mutex::new(None);
+        let first = std::thread::current().id();
+        let second = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("thread id");
+        assert!(claim_verdict_race_in(&owner, first));
+        assert!(claim_verdict_race_in(&owner, first));
+        assert!(!claim_verdict_race_in(&owner, second));
+        assert!(claim_verdict_race_in(&owner, first));
+    }
+
+    /// The id of a thread other than the calling one.
+    fn other_thread_id() -> std::thread::ThreadId {
+        std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("thread id")
+    }
+
+    /// The race's deadline defect (review of 2026-11-13): the sequential
+    /// member claimed the race and the run's outcome (SAT, exit 10) and is
+    /// printing its model when the portfolio thread's timeout exit runs. That
+    /// exit must yield to the verdict and leave with 10, not discard, print
+    /// `s UNKNOWN` or leave 124. The member's claim was made on another
+    /// thread, exactly as in the race; whether it has marked its verdict
+    /// printed yet does not enter the decision.
+    #[test]
+    fn an_unanswered_exit_yields_to_a_verdict_the_other_race_member_holds() {
+        let outcome = Arc::new(AtomicI32::new(RUN_OUTCOME_OPEN));
+        let owner = Arc::new(std::sync::Mutex::new(None));
+        let member = {
+            let (outcome, owner) = (Arc::clone(&outcome), Arc::clone(&owner));
+            std::thread::spawn(move || {
+                assert!(claim_verdict_race_in(&owner, std::thread::current().id()));
+                assert!(claim_decisive_in(&outcome, 10));
+            })
+        };
+        member.join().expect("member");
+        assert_eq!(
+            solving_thread_exit_in(&outcome, Some(&owner), std::thread::current().id()),
+            SolvingThreadExit::YieldToVerdict(10)
+        );
+        assert_eq!(
+            outcome.load(Ordering::SeqCst),
+            10,
+            "the verdict still owns the run"
+        );
+    }
+
+    /// The owner's own exit after its decisive claim leaves its proof alone
+    /// and keeps its path, inside the race and out of it.
+    #[test]
+    fn an_exit_on_the_verdicts_own_thread_keeps_its_path() {
+        let me = std::thread::current().id();
+        let outcome = AtomicI32::new(RUN_OUTCOME_OPEN);
+        let owner = std::sync::Mutex::new(Some(me));
+        assert!(claim_decisive_in(&outcome, 20));
+        assert_eq!(
+            solving_thread_exit_in(&outcome, Some(&owner), me),
+            SolvingThreadExit::OwnVerdict
+        );
+    }
+
+    /// Outside the race the decision is what it was before the race existed:
+    /// a decisive claim is the exiting thread's own, so nothing changes for
+    /// sequential ay.
+    #[test]
+    fn outside_the_race_a_decisive_claim_keeps_the_old_path() {
+        let outcome = AtomicI32::new(RUN_OUTCOME_OPEN);
+        assert!(claim_decisive_in(&outcome, 10));
+        assert_eq!(
+            solving_thread_exit_in(&outcome, None, other_thread_id()),
+            SolvingThreadExit::OwnVerdict
+        );
+    }
+
+    /// An exit that claims an open run first owns it, and the other member's
+    /// later verdict never prints (it yields before writing anything); an
+    /// exit that finds another unanswered exit owning the run yields to it.
+    #[test]
+    fn an_unanswered_exit_that_claims_first_keeps_the_race_unanswered() {
+        let outcome = AtomicI32::new(RUN_OUTCOME_OPEN);
+        let owner = std::sync::Mutex::new(Some(other_thread_id()));
+        let me = std::thread::current().id();
+        assert_eq!(
+            solving_thread_exit_in(&outcome, Some(&owner), me),
+            SolvingThreadExit::Discard
+        );
+        assert!(
+            !claim_decisive_in(&outcome, 10),
+            "the verdict must not print"
+        );
+        assert_eq!(
+            solving_thread_exit_in(&outcome, Some(&owner), me),
+            SolvingThreadExit::YieldToUnansweredExit
+        );
+    }
 
     /// [`settle_memory_ceiling_in`] on test-local cells, armed exit code 0.
     fn settle(

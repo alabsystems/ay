@@ -68,8 +68,11 @@ fn tester_subject(terms: &TermStore, term: TermId) -> Option<TermId> {
     let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
         return None;
     };
+    // `then_some` evaluates its argument eagerly, so take the subject before
+    // the test: a 0-ary application has none and is not a tester.
+    let subject = *args.first()?;
     (name.starts_with("is-") && args.len() == 1 && terms.sort(term) == &Sort::Bool)
-        .then_some(args[0])
+        .then_some(subject)
 }
 
 /// The constructor argument the declaration-backed registry says

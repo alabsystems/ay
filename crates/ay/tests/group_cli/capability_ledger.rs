@@ -368,6 +368,9 @@ fn probe_drat_clamp_ignores_default_only_substitution_env() {
 
 #[path = "capability_ledger/auto_route_provenance_tests.rs"]
 mod auto_route_provenance_tests;
+/// The stderr note of a `--parallel` run answered by its sequential member.
+const SEQUENTIAL_MEMBER_ANSWER: &str = "c parallel: answer from the sequential-route member";
+
 #[test]
 #[timeout(60_000)]
 fn multiworker_routes_report_startup_plan_unavailable() {
@@ -393,13 +396,23 @@ fn multiworker_routes_report_startup_plan_unavailable() {
             matches!(output.status.code(), Some(0 | 10 | 20)),
             "unexpected route failure; stderr={stderr}"
         );
-        assert!(
-            stderr.contains(&format!(
-                "c startup_capability_plan: unavailable route={route}"
-            )),
-            "{stderr}"
-        );
-        assert!(capability_lines(&stderr).is_empty(), "{stderr}");
+        // Without a proof, `--parallel` races the sequential default route
+        // against the portfolio. An answer from that member is a sequential
+        // solve's answer and carries its startup plan; an answer from the
+        // portfolio has none to report.
+        let from_sequential_member = stderr.contains(SEQUENTIAL_MEMBER_ANSWER);
+        if from_sequential_member {
+            assert_eq!(route, "parallel-portfolio", "{stderr}");
+            assert!(!capability_lines(&stderr).is_empty(), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains(&format!(
+                    "c startup_capability_plan: unavailable route={route}"
+                )),
+                "{stderr}"
+            );
+            assert!(capability_lines(&stderr).is_empty(), "{stderr}");
+        }
 
         let json_output = ay_command()
             .arg("--stats-json")
@@ -418,6 +431,11 @@ fn multiworker_routes_report_startup_plan_unavailable() {
             "{json_stderr}"
         );
         let json = stats_json(&json_stderr);
+        if json_stderr.contains(SEQUENTIAL_MEMBER_ANSWER) {
+            assert_eq!(route, "parallel-portfolio", "{json_stderr}");
+            assert_eq!(json["sat.capability_plan.available"], 1);
+            continue;
+        }
         assert_eq!(json["sat.capability_plan.available"], 0);
         assert_eq!(json["sat.capability_plan.status"], "unavailable");
         assert_eq!(json["sat.capability_plan.route"], route);

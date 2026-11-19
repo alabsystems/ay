@@ -110,6 +110,30 @@ impl QbfSolver {
         self.solve_with_limit(1_000_000)
     }
 
+    /// Solve with the clausal-abstraction engine until a verdict or the
+    /// deadline (`None`: no deadline).
+    ///
+    /// This is the strongest sound engine in the crate and the one the CLI
+    /// uses; see `solver/abstraction.rs` for why each verdict is right. It
+    /// returns `Unknown` when the deadline passes or the SAT back end gives
+    /// up. Definite results carry [`Certificate::None`].
+    pub fn solve_until(&mut self, deadline: Option<std::time::Instant>) -> QbfResult {
+        self.assignments.fill(Assignment::Unassigned);
+        self.trail.clear();
+        if !self.input_valid {
+            return QbfResult::Unknown;
+        }
+        let verdict = match abstraction::Abstraction::prepare(&self.formula, deadline) {
+            abstraction::Prepared::Decided(verdict) => verdict,
+            abstraction::Prepared::Engine(mut engine) => engine.solve(deadline),
+        };
+        match verdict {
+            abstraction::AbstractionVerdict::True => QbfResult::Sat(Certificate::None),
+            abstraction::AbstractionVerdict::False => QbfResult::Unsat(Certificate::None),
+            abstraction::AbstractionVerdict::Unknown => QbfResult::Unknown,
+        }
+    }
+
     /// Solve with an exact-QDPLL node limit.
     ///
     /// Matrix work is bounded by a fixed multiple of the node limit so a small

@@ -71,3 +71,4 @@ pub(super) use divisibility::{discover_divisibility_patterns, extract_variable_v
 #[cfg(test)]
 pub(super) use parity::parity_mod2_opposite_blocking;
 pub(super) use parity::{extract_negated_parity_constraint, extract_parity_constraint};
+pub(super) use propagation::PropagationIndexes;

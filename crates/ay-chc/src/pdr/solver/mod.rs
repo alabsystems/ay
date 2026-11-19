@@ -895,6 +895,14 @@ pub struct PdrSolver {
     /// blocking loop is guaranteed real budget. `None` = full discovery
     /// (algebraic/accumulator classes, unbounded solves).
     pub(in crate::pdr) startup_deadline: Option<ay_core::time::Instant>,
+    /// Deadline of the #5877 BV range-invariant discovery pass, armed by its
+    /// first call and shared by every later call in this solve, so the pass
+    /// costs its budget once per solve rather than once per startup fixpoint
+    /// iteration (of which there can be one per predicate).
+    pub(in crate::pdr) bv_range_discovery_deadline: Option<ay_core::time::Instant>,
+    /// Clause-derived propagation indexes, built on first use; the clause set
+    /// and canonical variables they read are fixed for the solver's lifetime.
+    propagation_indexes: std::sync::OnceLock<std::sync::Arc<invariants::PropagationIndexes>>,
 
     // --- Telemetry counters (#2450, #3301) ---
     pub(super) telemetry: PdrTelemetry,

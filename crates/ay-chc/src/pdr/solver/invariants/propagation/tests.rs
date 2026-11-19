@@ -1238,3 +1238,50 @@ fn test_no_fact_target_keeps_propagated_lemma_clause_scoped() {
         "transition-only target should not receive propagated lemmas in its frame"
     );
 }
+
+/// The propagation indexes read only the clause set and canonical variables,
+/// which are fixed for a solve, so they are built once and shared: rebuilding
+/// them per propagation call cost ~100 ms per admitted lemma on 355-predicate
+/// CHC-COMP BV tasks (60% of PDR startup).
+#[test]
+fn propagation_indexes_are_built_once_per_solver() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Int, ChcSort::Int]);
+    let q = problem.declare_predicate("Q", vec![ChcSort::Int, ChcSort::Int]);
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let y = ChcExpr::var(ChcVar::new("y", ChcSort::Int));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![], Some(ChcExpr::eq(x.clone(), y.clone()))),
+        ClauseHead::Predicate(p, vec![x.clone(), y.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(p, vec![x.clone(), y.clone()])], None),
+        ClauseHead::Predicate(q, vec![y.clone(), x.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(q, vec![x.clone(), y.clone()])], None),
+        ClauseHead::Predicate(p, vec![y.clone(), x.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(q, vec![x.clone(), y])],
+            Some(ChcExpr::lt(x, ChcExpr::int(0))),
+        ),
+        ClauseHead::False,
+    ));
+    let solver = PdrSolver::new(problem, PdrConfig::default());
+
+    let first = solver.propagation_indexes();
+    let second = solver.propagation_indexes();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+    let fresh = solver.build_propagation_candidate_index();
+    assert_eq!(first.candidates.len(), fresh.len());
+    assert_eq!(
+        first.candidates.get(&p).map(Vec::len),
+        fresh.get(&p).map(Vec::len)
+    );
+    let fresh_shared = solver.build_shared_variable_pattern_index(&fresh);
+    assert_eq!(first.shared_patterns, fresh_shared);
+    assert_eq!(first.shared_patterns.get(&p), Some(&vec![q]));
+}

@@ -9,7 +9,7 @@
 //! re-derives the bounds it already produced leaves the stored bounds alone.
 
 use super::*;
-use crate::types::ColEntry;
+use crate::types::{AtomRef, ColEntry};
 
 fn implied(value: i64, strict: bool) -> ImpliedBound {
     ImpliedBound {
@@ -320,5 +320,142 @@ fn same_round_looser_and_equal_derivations_are_suppressed_before_explanation() {
     assert_eq!(
         expl.contributing_vars[0].var, 2,
         "explanation is the tighter second row's, as without suppression"
+    );
+}
+
+/// The Zeno prediction mirrors `accept_replacing_tighten`'s rejecting
+/// path exactly: an occupied slot (replacing), streak at the cap, and
+/// no unassigned atom crossed. Every other shape must be admitted.
+#[test]
+fn zeno_prediction_matches_the_accept_tests_rejecting_path() {
+    let terms = TermStore::new();
+    let mut solver = LraSolver::new(&terms);
+    solver.implied_bounds = vec![(Some(implied(0, false)), None), (None, None)];
+    solver.implied_tighten_streak = vec![8, 8];
+    solver.atom_index.insert(
+        0,
+        vec![AtomRef {
+            term: TermId::new(900),
+            bound_value: Rational::from(3),
+            is_upper: false,
+            strict: false,
+        }],
+    );
+    let r = Rational::from;
+
+    assert!(
+        solver.would_reject_zeno(0, false, &r(2)),
+        "at cap, replacing, crosses no atom: the accept test rejects"
+    );
+    assert!(
+        !solver.would_reject_zeno(0, false, &r(5)),
+        "crosses the unassigned x >= 3 atom: the accept test stores"
+    );
+    assert!(
+        !solver.would_reject_zeno(1, false, &r(2)),
+        "empty slot is a first bound: always stored"
+    );
+    solver.implied_tighten_streak[0] = 7;
+    assert!(
+        !solver.would_reject_zeno(0, false, &r(2)),
+        "below the cap the accept test stores (and counts the streak)"
+    );
+}
+
+/// Row `y = x`: pass 1 stores `x >= 0`. With `x`'s tighten streak at
+/// the cap and no atoms to cross, the tighter `x >= 5` derivation is
+/// predicted Zeno-rejected and dropped before its explanation is
+/// built (slot and trail untouched). Below the cap the same
+/// derivation is stored, exactly as the apply loop would.
+#[test]
+fn zeno_predicted_derivation_is_suppressed_and_below_cap_is_kept() {
+    let terms = TermStore::new();
+    let mut solver = LraSolver::new(&terms);
+    let bound = |value: i64| {
+        Bound::new(
+            BigRational::from(BigInt::from(value)).into(),
+            vec![TermId::new(900)],
+            vec![true],
+            vec![Rational::one()],
+            false,
+        )
+    };
+    solver.vars = vec![
+        VarInfo {
+            value: InfRational::from_rational(BigRational::zero()),
+            lower: None,
+            upper: None,
+            status: Some(VarStatus::NonBasic),
+        },
+        VarInfo {
+            value: InfRational::from_rational(BigRational::zero()),
+            lower: Some(bound(0)),
+            upper: None,
+            status: Some(VarStatus::Basic(0)),
+        },
+    ];
+    solver.rows = vec![TableauRow::new(
+        1,
+        vec![(0, BigRational::from(BigInt::from(1)))],
+        BigRational::zero(),
+    )];
+    solver.col_index = vec![Vec::new(); 2];
+    solver.col_index[0].push(ColEntry::new(0, 0));
+    solver.basic_var_to_row.insert(1, 0);
+    solver.touched_rows.insert(0);
+
+    solver.compute_implied_bounds();
+    assert_eq!(
+        solver.implied_bounds[0]
+            .0
+            .clone()
+            .expect("x >= 0 derived")
+            .value,
+        Rational::from(0)
+    );
+    let trail_after_first = solver.implied_trail.len();
+
+    // Strengthen y to >= 5 with x's streak at the cap: the x >= 5
+    // derivation would be Zeno-rejected at apply, so it is dropped
+    // at derivation time instead.
+    solver.vars[1].lower = Some(bound(5));
+    solver.direct_bounds_changed_since_implied = true;
+    solver.direct_bounds_changed_vars.push(1);
+    solver.touched_rows.insert(0);
+    solver.implied_tighten_streak[0] = 8;
+    solver.compute_implied_bounds();
+    assert_eq!(
+        solver.stats.implied_zeno_predicted_skips, 1,
+        "exactly the doomed x >= 5 derivation is predicted and dropped"
+    );
+    assert_eq!(
+        solver.implied_trail.len(),
+        trail_after_first,
+        "no slot replaced"
+    );
+    assert_eq!(
+        solver.implied_bounds[0]
+            .0
+            .clone()
+            .expect("x >= 0 kept")
+            .value,
+        Rational::from(0)
+    );
+
+    // Below the cap the same derivation must be stored.
+    solver.implied_tighten_streak[0] = 0;
+    solver.stamp_var_for_rederivation(1);
+    solver.compute_implied_bounds();
+    assert_eq!(
+        solver.stats.implied_zeno_predicted_skips, 1,
+        "below the cap nothing further is predicted"
+    );
+    assert_eq!(
+        solver.implied_bounds[0]
+            .0
+            .clone()
+            .expect("x >= 5 derived")
+            .value,
+        Rational::from(5)
     );
 }

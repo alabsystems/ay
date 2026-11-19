@@ -263,3 +263,115 @@ fn fails_closed_without_registry_entries() {
         &[]
     ));
 }
+
+/// Single-constructor `B { f1: Bool, f2: Int }` registries.
+fn record_registries() -> (Registry, Registry) {
+    (
+        vec![("B".to_string(), vec!["B".to_string()])],
+        vec![("B".to_string(), vec!["f1".to_string(), "f2".to_string()])],
+    )
+}
+
+/// `(= (= x (B <f1_arg> 0)) (and (is-B x) <f1_conjunct> (= 0 (f2 x))))`,
+/// with the Bool field conjunct supplied by the caller.
+fn record_biconditional(
+    terms: &mut TermStore,
+    f1_arg: TermId,
+    f1_conjunct: impl FnOnce(&mut TermStore, TermId) -> Option<TermId>,
+) -> TermId {
+    let record_sort = Sort::Uninterpreted("B".to_string());
+    let x = terms.mk_var("x", record_sort.clone());
+    let zero = terms.mk_int(0.into());
+    let ctor = terms.mk_app(Symbol::named("B"), vec![f1_arg, zero], record_sort);
+    let is_b = tester(terms, "B", x);
+    let f2 = terms.mk_app(Symbol::named("f2"), vec![x], Sort::Int);
+    let f2_eq = eq(terms, zero, f2);
+    let f1 = terms.mk_app(Symbol::named("f1"), vec![x], Sort::Bool);
+    let mut conjuncts = vec![is_b];
+    if let Some(conjunct) = f1_conjunct(terms, f1) {
+        conjuncts.push(conjunct);
+    }
+    conjuncts.push(f2_eq);
+    let expansion = terms.mk_app(Symbol::named("and"), conjuncts, Sort::Bool);
+    let eq_x_ctor = eq(terms, x, ctor);
+    eq(terms, eq_x_ctor, expansion)
+}
+
+/// POSITIVE: `(= (f1 x) false)` folded to `(not (f1 x))` — the exact shape
+/// of the Creusot `syntax/05_pearlite::struct_order` refutation.
+#[test]
+fn accepts_folded_false_bool_field() {
+    let (decls, selectors) = record_registries();
+    let mut terms = TermStore::new();
+    let false_c = terms.mk_bool(false);
+    let bic = record_biconditional(&mut terms, false_c, |terms, f1| Some(terms.mk_not(f1)));
+    assert!(recognize_datatype_value_eq_congruence(
+        &terms,
+        &[bic],
+        &decls,
+        &selectors
+    ));
+}
+
+/// POSITIVE: `(= (f1 x) true)` folded to the bare `(f1 x)`.
+#[test]
+fn accepts_folded_true_bool_field() {
+    let (decls, selectors) = record_registries();
+    let mut terms = TermStore::new();
+    let true_c = terms.mk_bool(true);
+    let bic = record_biconditional(&mut terms, true_c, |_, f1| Some(f1));
+    assert!(recognize_datatype_value_eq_congruence(
+        &terms,
+        &[bic],
+        &decls,
+        &selectors
+    ));
+}
+
+/// NEGATIVE: wrong polarity — the constructor carries `false` but the
+/// expansion claims `(f1 x)`. Not valid; must be refused.
+#[test]
+fn rejects_bool_field_literal_with_wrong_polarity() {
+    let (decls, selectors) = record_registries();
+    let mut terms = TermStore::new();
+    let false_c = terms.mk_bool(false);
+    let bic = record_biconditional(&mut terms, false_c, |_, f1| Some(f1));
+    assert!(!recognize_datatype_value_eq_congruence(
+        &terms,
+        &[bic],
+        &decls,
+        &selectors
+    ));
+}
+
+/// NEGATIVE: a NON-CONSTANT Bool argument `p` with the bare literal `(f1 x)`.
+/// `(f1 x)` is not `(= (f1 x) p)`; the folded form is licensed only for the
+/// literal constants.
+#[test]
+fn rejects_bool_field_literal_for_non_constant_argument() {
+    let (decls, selectors) = record_registries();
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let bic = record_biconditional(&mut terms, p, |_, f1| Some(f1));
+    assert!(!recognize_datatype_value_eq_congruence(
+        &terms,
+        &[bic],
+        &decls,
+        &selectors
+    ));
+}
+
+/// NEGATIVE: the Bool field is missing entirely — coverage must stay exact.
+#[test]
+fn rejects_expansion_missing_the_bool_field() {
+    let (decls, selectors) = record_registries();
+    let mut terms = TermStore::new();
+    let false_c = terms.mk_bool(false);
+    let bic = record_biconditional(&mut terms, false_c, |_, _| None);
+    assert!(!recognize_datatype_value_eq_congruence(
+        &terms,
+        &[bic],
+        &decls,
+        &selectors
+    ));
+}

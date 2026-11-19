@@ -18,7 +18,6 @@ license.workspace = true
 description = "Library backing the unified ay flatzinc CLI and MiniZinc solving flow"
 readme.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/ay-fzn2smt"
 
 [lints]

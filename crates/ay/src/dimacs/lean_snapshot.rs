@@ -209,6 +209,14 @@ fn exit_with_circuit_multiplier22_retained_sat_model(
     stats_cfg: stats_output::StatsConfig,
 ) -> ! {
     reject_dimacs_decision_trace_or_exit();
+    // Inside the parallel race this runs on the sequential member's thread;
+    // it reports only if the portfolio has not already claimed the verdict,
+    // and it claims the run's outcome as well, so an unanswered exit on the
+    // portfolio's thread waits for this verdict instead of ending the run
+    // under it. Outside a race this path keeps its sequential behaviour.
+    if crate::verdict_race_active() {
+        crate::claim_decisive_verdict_or_yield(crate::dimacs_verdict_exit_code(10));
+    }
     safe_eprintln!("c Circuit_multiplier22 retained original-DIMACS SAT model authority admitted");
     if stats_cfg.any() {
         let route = "retained-model-authority";
@@ -324,16 +332,26 @@ fn dimacs_exit_if_timed_out(solver: Option<&mut SatSolver>, proof: Option<&Proof
     }
 }
 
-/// Settle the run as unanswered before a main-thread exit that prints no
+/// Settle the run as unanswered before a solving thread's exit that prints no
 /// decisive verdict: if a hard exit already owns the run, leave the exit to
 /// it; otherwise discard every proof generation the run still holds.
+///
+/// In the parallel DIMACS race (`run_dimacs_parallel.rs`) the other member
+/// may hold a decisive verdict and be printing it when this thread's timeout,
+/// SIGTERM or unknown exit runs. That exit never prints `s UNKNOWN` or leaves
+/// with its own code over the verdict: it waits for the member to finish and
+/// leaves with the verdict's code, like the hard exits (2026-11-13; before,
+/// a run could end 124 with `s SATISFIABLE` and its model on stdout).
 fn settle_unanswered_dimacs_exit() {
-    match crate::claim_unanswered_outcome() {
-        crate::UnansweredClaim::AlreadyUnanswered => crate::yield_to_exiting_thread(),
-        crate::UnansweredClaim::Won => discard_unanswered_dimacs_proofs(),
-        // Unreachable from a main-thread unanswered exit: the thread that
-        // claimed the verdict is the one publishing it. Never discard its proof.
-        crate::UnansweredClaim::Decisive(_) => {}
+    match crate::claim_unanswered_solving_exit() {
+        crate::SolvingThreadExit::YieldToUnansweredExit => crate::yield_to_exiting_thread(),
+        crate::SolvingThreadExit::Discard => discard_unanswered_dimacs_proofs(),
+        crate::SolvingThreadExit::YieldToVerdict(exit_code) => {
+            crate::leave_with_claimed_verdict(exit_code)
+        }
+        // This thread claimed the verdict and is publishing it. Never discard
+        // its proof.
+        crate::SolvingThreadExit::OwnVerdict => {}
     }
 }
 use ay_sat::auto::DecisionSource;

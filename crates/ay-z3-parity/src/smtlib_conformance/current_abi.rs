@@ -298,8 +298,9 @@ fn measure_with_timeout(
         .map_err(|error| error.to_string())?;
     }
     let root = locate_repo_root()?;
-    let resources = PlannedResources::plan(&root, 1, "current Z3 ABI execution")
+    let mut resources = PlannedResources::plan(&root, 1, "current Z3 ABI execution")
         .map_err(|error| error.to_string())?;
+    resources.plan = abi_execution_plan(&resources.plan)?;
     let staged_ay_headers = directory.path().join("ay-headers");
     let (header_sha256, header_git_blob) =
         snapshot_ay_headers(&root.join("crates/ay-ffi/include"), &staged_ay_headers)?;
@@ -499,6 +500,24 @@ fn measure_with_timeout(
     };
     validate_report(&report)?;
     Ok(report)
+}
+
+fn abi_execution_plan(plan: &ay_bench::ResourcePlan) -> Result<ay_bench::ResourcePlan, String> {
+    // These finite C controls are sequential. Preserve admission and its host
+    // headroom, then enforce one fixed, smaller child budget. A few MiB of
+    // changing free RAM must not change an otherwise identical fresh replay.
+    const MEMORY_MIB: usize = 2048;
+    if plan.requested_jobs != 1
+        || plan.jobs != 1
+        || plan.memlimit_mb_per_child < MEMORY_MIB
+        || plan.nbcore_per_child == 0
+    {
+        return Err("current ABI requires admission for one 2048-MiB child".to_string());
+    }
+    let mut bounded = plan.clone();
+    bounded.memlimit_mb_per_child = MEMORY_MIB;
+    bounded.nbcore_per_child = 1;
+    Ok(bounded)
 }
 
 pub(super) struct StagingPaths {
@@ -1029,6 +1048,44 @@ fn validate_header_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_abi_replay_keeps_the_same_enforced_budget_when_free_ram_changes() {
+        let plan = ay_bench::ResourcePlan {
+            requested_jobs: 1,
+            jobs: 1,
+            memlimit_mb_per_child: 31630,
+            nbcore_per_child: 32,
+            headroom_mb: 32768,
+            planner: "/repo/scripts/_oom_guard.py".into(),
+        };
+        let mut later = plan.clone();
+        later.memlimit_mb_per_child = 31583;
+        let first = abi_execution_plan(&plan).unwrap();
+        let fresh = abi_execution_plan(&later).unwrap();
+        assert_eq!(
+            effective_execution_envelope(&first, ENFORCEMENT_RSS_WATCHDOG_V1, 30.0).unwrap(),
+            effective_execution_envelope(&fresh, ENFORCEMENT_RSS_WATCHDOG_V1, 30.0).unwrap()
+        );
+        assert_eq!(first.headroom_mb, plan.headroom_mb);
+        assert_eq!(first.planner, plan.planner);
+        assert_eq!(first.memlimit_mb_per_child, 2048);
+        assert_eq!(first.nbcore_per_child, 1);
+        assert!(first.memlimit_mb_per_child <= later.memlimit_mb_per_child);
+        assert!(first.nbcore_per_child <= later.nbcore_per_child);
+
+        later.memlimit_mb_per_child = 1024;
+        assert!(
+            abi_execution_plan(&later).is_err(),
+            "never enlarge admission"
+        );
+        later = plan.clone();
+        later.nbcore_per_child = 0;
+        assert!(abi_execution_plan(&later).is_err());
+        later = plan.clone();
+        later.jobs = 2;
+        assert!(abi_execution_plan(&later).is_err());
+    }
 
     fn complete_capture() -> Capture {
         Capture {

@@ -489,6 +489,8 @@ struct ThreadResult {
     /// The forward LRAT proof is complete (unlike backward reconstruction
     /// which may miss clauses derived during BCP at level 0).
     raw_proof_bytes: Option<Vec<u8>>,
+    /// Index of the worker (into `PortfolioSolver::configs`) that produced it.
+    worker_id: usize,
 }
 
 /// Parallel portfolio SAT solver
@@ -511,6 +513,10 @@ pub struct PortfolioSolver {
     /// Without this the portfolio could only stop when a worker won or gave
     /// up, so a slow-but-productive worker had no deadline (#parallel-bv).
     external_cancel: Option<Arc<AtomicBool>>,
+    /// One name per entry of `configs`, for [`Self::last_winner`].
+    labels: Vec<String>,
+    /// The worker whose result the last multi-threaded solve returned.
+    last_winner: Mutex<Option<usize>>,
 }
 
 impl PortfolioSolver {
@@ -520,6 +526,7 @@ impl PortfolioSolver {
     pub fn new(num_threads: usize) -> Self {
         let num_threads = num_threads.max(1);
         let strategies = Strategy::recommended(num_threads);
+        let labels = worker_labels(&strategies, num_threads);
         let configs = strategies_to_configs(strategies, num_threads);
 
         Self {
@@ -528,6 +535,8 @@ impl PortfolioSolver {
             cached_features: None,
             proof_mode: false,
             external_cancel: None,
+            labels,
+            last_winner: Mutex::new(None),
         }
     }
 
@@ -545,6 +554,7 @@ impl PortfolioSolver {
         let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
         let class = InstanceClass::classify(&features);
         let strategies = Strategy::recommended_for_instance(num_threads, &features);
+        let labels = worker_labels(&strategies, num_threads);
         let configs = strategies_to_configs(strategies, num_threads);
 
         Self {
@@ -553,6 +563,8 @@ impl PortfolioSolver {
             cached_features: Some((features, class)),
             proof_mode: false,
             external_cancel: None,
+            labels,
+            last_winner: Mutex::new(None),
         }
     }
 
@@ -573,6 +585,17 @@ impl PortfolioSolver {
     /// [`solve()`](Self::solve).
     pub fn set_external_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.external_cancel = Some(flag);
+    }
+
+    /// The worker whose result the last multi-threaded solve returned, as
+    /// `"<index>/<workers> <strategy>"`; `None` before a solve, after a solve
+    /// no worker answered, and for the single-threaded fast path. Diagnostic
+    /// only: it names which configuration earned an answer.
+    #[must_use]
+    pub fn last_winner(&self) -> Option<String> {
+        let worker_id = (*self.last_winner.lock())?;
+        let label = self.labels.get(worker_id).map_or("worker", String::as_str);
+        Some(format!("{}/{} {label}", worker_id + 1, self.configs.len()))
     }
 
     /// Solve a CNF formula in parallel
@@ -776,6 +799,7 @@ impl PortfolioSolver {
                                 *guard = Some(ThreadResult {
                                     result: solve_result,
                                     raw_proof_bytes,
+                                    worker_id,
                                 });
                                 if is_definitive {
                                     // Signal other workers to stop.
@@ -808,6 +832,10 @@ impl PortfolioSolver {
 
         // Extract result
         let guard = result.lock();
+        *self.last_winner.lock() = guard
+            .as_ref()
+            .filter(|r| portfolio_result_is_definitive(&r.result))
+            .map(|r| r.worker_id);
         match guard.as_ref() {
             Some(r) => (r.result.clone(), r.raw_proof_bytes.clone()),
             None => (SatResult::Unknown, None), // All threads were interrupted
@@ -818,11 +846,23 @@ impl PortfolioSolver {
     #[cfg(test)]
     fn with_configs(mut self, configs: Vec<SolverConfig>) -> Self {
         self.configs = configs;
+        self.labels = vec!["test-config".to_string(); self.configs.len()];
         self.num_threads = self.configs.len().max(1);
         self.cached_features = None;
         // proof_mode is preserved from the outer constructor.
         self
     }
+}
+
+/// Names for the workers [`strategies_to_configs`] builds from the same
+/// arguments: the base strategies, then the extended templates in order.
+fn worker_labels(strategies: &[Strategy], num_threads: usize) -> Vec<String> {
+    let mut labels: Vec<String> = strategies.iter().map(|s| format!("{s:?}")).collect();
+    for thread_idx in labels.len()..num_threads {
+        let template_idx = (thread_idx - strategies.len()) % NUM_EXTENDED_TEMPLATES;
+        labels.push(format!("ExtendedTemplate{template_idx}"));
+    }
+    labels
 }
 
 /// Convert a list of strategies to solver configs with sequential seeds.

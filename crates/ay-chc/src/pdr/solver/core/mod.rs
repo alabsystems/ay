@@ -847,6 +847,8 @@ impl PdrSolver {
             solve_deadline: None,
             // Total-startup-discovery deadline (set by run_startup_discovery, inc-12)
             startup_deadline: None,
+            bv_range_discovery_deadline: None,
+            propagation_indexes: std::sync::OnceLock::new(),
             // Telemetry counters (#2450, #3301)
             telemetry: PdrTelemetry::default(),
             // Convergence monitor for stagnation detection

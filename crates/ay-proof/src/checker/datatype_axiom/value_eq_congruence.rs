@@ -4,7 +4,7 @@
 
 //! Strict validation for datatype value-equality congruence biconditionals.
 
-use ay_core::{ProofId, Symbol, TermData, TermId, TermStore};
+use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::{
     constructor_head, equality_sides, flatten_clause_literals, sort_matches_datatype,
@@ -137,6 +137,12 @@ impl<'decls> Validator<'_, 'decls> {
         ctor_args: &[TermId],
         covered: &mut [bool],
     ) -> bool {
+        if let Some(index) =
+            self.match_bool_field_literal(conjunct, subject, selectors, ctor_args, covered)
+        {
+            covered[index] = true;
+            return true;
+        }
         let Some((first, second)) = equality_sides(self.terms, conjunct) else {
             return false;
         };
@@ -153,6 +159,48 @@ impl<'decls> Validator<'_, 'decls> {
             }
         }
         false
+    }
+
+    /// A Boolean field conjunct in its FOLDED form.
+    ///
+    /// The term store's `mk_eq` folds `(= (sel x) false)` to `(not (sel x))`
+    /// and `(= (sel x) true)` to `(sel x)` when the producer builds the field
+    /// equality. Those pairs denote the same truth value in every structure,
+    /// so a Bool-sorted selector literal is accepted for
+    /// field `index` exactly when the constructor's argument at `index` is the
+    /// literal constant of the matching polarity — `true` for the bare
+    /// application, `false` for its negation. Any other argument (a variable,
+    /// a non-constant Bool term, the opposite constant) declines, and so does
+    /// a field already covered, so coverage stays exact.
+    fn match_bool_field_literal(
+        &self,
+        conjunct: TermId,
+        subject: TermId,
+        selectors: &[String],
+        ctor_args: &[TermId],
+        covered: &[bool],
+    ) -> Option<usize> {
+        let (atom, positive) = match self.terms.get(conjunct) {
+            TermData::Not(inner) => (*inner, false),
+            _ => (conjunct, true),
+        };
+        if self.terms.sort(atom) != &Sort::Bool {
+            return None;
+        }
+        let selector = self.selector_app(atom, subject)?;
+        let index = selectors.iter().position(|name| *name == selector)?;
+        if covered[index] {
+            return None;
+        }
+        let argument = *ctor_args.get(index)?;
+        if self.terms.sort(argument) != &Sort::Bool {
+            return None;
+        }
+        let constant_matches = match self.terms.get(argument) {
+            TermData::Const(ay_core::Constant::Bool(value)) => *value == positive,
+            _ => false,
+        };
+        constant_matches.then_some(index)
     }
 
     fn accepts_value_expansion(&self, x: TermId, y: TermId, expansion: TermId) -> bool {
@@ -358,6 +406,11 @@ impl<'decls> Validator<'_, 'decls> {
 ///    (and (= (is-C1 x) (is-C1 y)) ..
 ///         (or (not (is-Ci s)) (= (sel_ik x) (sel_ik y))) ..))
 /// ```
+///
+/// In a constructor-application expansion, a field equality against a
+/// literal Bool argument may appear in the term store's folded spelling:
+/// `(sel_i t)` for `(= (sel_i t) true)` and `(not (sel_i t))` for
+/// `(= (sel_i t) false)`.
 ///
 /// The bridge follows from tester evaluation and nullary reconstruction. A
 /// constructor-application expansion follows from tester evaluation, selector

@@ -44,6 +44,12 @@ fn bound_not_tighter_than(
     !tighter
 }
 
+/// Maximum replacing tightenings stored per variable (between direct
+/// bound changes) before the Zeno accept test requires an
+/// atom-threshold crossing (#8857). Shared by the accept test and
+/// its derivation-time prediction (#allinterval-zeno-predict).
+const IMPLIED_TIGHTEN_STREAK_CAP: u32 = 8;
+
 /// Per-variable tightest proposals of one cascade round:
 /// `(lower, upper)`, each `(value, strict)`.
 type RoundBest = (Option<(Rational, bool)>, Option<(Rational, bool)>);
@@ -914,6 +920,12 @@ impl LraSolver {
                                 self.stats.implied_round_best_suppressed += 1;
                                 continue;
                             }
+                            // #allinterval-zeno-predict: guaranteed
+                            // Zeno rejection at apply; same argument.
+                            if self.would_reject_zeno(vi, is_upper, &bound_val) {
+                                self.stats.implied_zeno_predicted_skips += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // Z3's bound_analyzer_on_row stores ALL derived bounds and
                             // only checks interest at the propagation level (arith_solver.cpp:363).
@@ -985,6 +997,9 @@ impl LraSolver {
                             ) {
                                 // #allinterval-round-best (see site above).
                                 self.stats.implied_round_best_suppressed += 1;
+                            } else if self.would_reject_zeno(target_vi, is_upper, &bound_val) {
+                                // #allinterval-zeno-predict (see LB site).
+                                self.stats.implied_zeno_predicted_skips += 1;
                             } else {
                                 let derived_strict = lb_any_strict;
                                 // #6617: Build eager explanation -- all other variables.
@@ -1322,6 +1337,12 @@ impl LraSolver {
                                 self.stats.implied_round_best_suppressed += 1;
                                 continue;
                             }
+                            // #allinterval-zeno-predict: guaranteed
+                            // Zeno rejection at apply; same argument.
+                            if self.would_reject_zeno(vi, is_upper, &bound_val) {
+                                self.stats.implied_zeno_predicted_skips += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // (See LB direction comment above for full rationale.)
                             let interesting =
@@ -1374,6 +1395,13 @@ impl LraSolver {
                             ) {
                                 // #allinterval-round-best (see LB site).
                                 self.stats.implied_round_best_suppressed += 1;
+                            } else if self.would_reject_zeno(
+                                target_vi,
+                                !eq_c.is_positive(),
+                                &bound_val,
+                            ) {
+                                // #allinterval-zeno-predict (see LB site).
+                                self.stats.implied_zeno_predicted_skips += 1;
                             } else {
                                 let derived_strict = ub_any_strict;
                                 // #6617: Build eager explanation for UB single-unbounded.
@@ -1707,6 +1735,35 @@ impl LraSolver {
         }
     }
 
+    /// Read-only prediction of `accept_replacing_tighten`'s rejecting
+    /// path (#allinterval-zeno-predict), evaluated at derivation time:
+    /// true exactly when a candidate that reaches the apply loop is
+    /// guaranteed to be rejected there with no side effect. The slot
+    /// is occupied now and slots only fill during a cascade round, so
+    /// `replacing` still holds at apply; the streak is at the cap now
+    /// and never decreases inside a round (resets happen in the
+    /// direct-bound overlay before the cascade, or between calls),
+    /// and the at-cap accept path mutates nothing; atom crossing
+    /// reads only the frozen asserted set. Measured on
+    /// AllInterval-011: 10.43M of 23.87M proposals in 20s died at
+    /// apply through this rejection after their explanations were
+    /// already built.
+    #[inline]
+    pub(crate) fn would_reject_zeno(&self, vi: usize, is_upper: bool, value: &Rational) -> bool {
+        let slot = &self.implied_bounds[vi];
+        let occupied = if is_upper { &slot.1 } else { &slot.0 }.is_some();
+        if !occupied {
+            return false;
+        }
+        if vi >= self.implied_tighten_streak.len() {
+            return false;
+        }
+        if self.implied_tighten_streak[vi] < IMPLIED_TIGHTEN_STREAK_CAP {
+            return false;
+        }
+        !self.bound_crosses_unassigned_atom(vi as u32, is_upper, value)
+    }
+
     /// Decide whether a "tighter" implied-bound update may be stored (#8857).
     ///
     /// First bounds on a previously-unbounded side (`replacing == false`) are
@@ -1731,9 +1788,6 @@ impl LraSolver {
         is_upper: bool,
         new_ib: &ImpliedBound,
     ) -> bool {
-        /// Maximum replacing tightenings stored per variable (between direct
-        /// bound changes) before requiring atom-threshold crossings.
-        const IMPLIED_TIGHTEN_STREAK_CAP: u32 = 8;
         if !replacing {
             return true;
         }

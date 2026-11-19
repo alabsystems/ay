@@ -19,7 +19,21 @@ use ay_sat::Literal;
 /// Parsed inputs reject larger formulas. Native construction remains
 /// infallible for API compatibility, but uses canonical-prefix lookup instead
 /// of dense metadata and is rejected fail-closed by [`crate::QbfSolver`].
-pub(crate) const MAX_QBF_VARS: usize = 1 << 20;
+///
+/// The dense state costs about 60 bytes per variable in all (formula
+/// metadata, the exact evaluator's arrays and the abstraction engine's
+/// indexes), so this ceiling keeps the worst case near 4 GB, inside the
+/// QBF Gallery's 8 GB. It was `1 << 20` until 2026-11-18, which refused
+/// gallery inputs with 2.2 million variables (`c1_BMC_p1_k2048`, the Tseitin
+/// form of `hyperprop_1.3`). Below the ceiling, the dense state of a parsed
+/// input is sized by the largest variable it actually names. For QDIMACS
+/// that variable is at most the header's declared count: the parser refuses
+/// prefix variables above it, and `ay_sat::dimacs_core` refuses clause
+/// variables above it. A header that declares a
+/// count near the ceiling can still make the parser allocate near 4 GB. For
+/// QCIR it is the number of declared inputs plus the gates in the output's
+/// cone, each of which takes a line of the input.
+pub(crate) const MAX_QBF_VARS: usize = 1 << 26;
 
 /// Quantifier type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

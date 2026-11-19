@@ -681,3 +681,33 @@ fn discover_loop_exit_bounds_handles_bv_unsigned_guard_8739() {
             .collect::<Vec<_>>()
     );
 }
+
+/// The #5877 BV discovery budget is armed by the first call and shared by
+/// every later call in the solve. The startup fixpoint calls the pass once
+/// per iteration (up to one per predicate); a deadline re-armed per call let
+/// a 355-predicate CHC-COMP BV task spend 3 s per iteration and never reach
+/// the blocking loop.
+#[test]
+#[timeout(30_000)]
+fn bv_range_discovery_budget_is_armed_once_per_solve() {
+    let input = r#"(set-logic HORN)
+(declare-fun inv ((_ BitVec 8)) Bool)
+(assert (forall ((x (_ BitVec 8))) (=> (= x #x00) (inv x))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (inv x) (bvult x #x0a) (= y (bvadd x #x01))) (inv y))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (inv x) (bvugt x #x14)) false)))
+(check-sat)
+"#;
+    let mut solver = solver_from_str(input);
+    assert!(solver.bv_range_discovery_deadline.is_none());
+    solver.discover_bv_range_invariants();
+    let first = solver
+        .bv_range_discovery_deadline
+        .expect("a BV problem arms the discovery budget");
+    solver.discover_bv_range_invariants();
+    assert_eq!(
+        solver.bv_range_discovery_deadline,
+        Some(first),
+        "a later call must reuse the solve's deadline, not re-arm it"
+    );
+}

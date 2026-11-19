@@ -826,6 +826,10 @@ pub(crate) fn collect_theory_stats_incremental(stats: &mut Statistics, ts: Incre
     stats.set_int("smt.props.euf", obs.props_euf);
     stats.set_int("smt.partial_clauses", obs.partial_clauses);
     stats.set_int("smt.replay_covered_by_calls", obs.replay_covered_by_calls);
+    stats.set_int(
+        "smt.replay_tombstone_scans_skipped",
+        obs.replay_tombstone_scans_skipped,
+    );
     // Process-wide totals across every executor invocation (the drained
     // counters above are the last invocation's only).
     {

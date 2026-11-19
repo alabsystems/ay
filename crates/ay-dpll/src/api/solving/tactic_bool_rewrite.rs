@@ -332,8 +332,20 @@ mod tests {
         }
         let before = solver.executor.format_term(root);
         let after = solver.executor.format_term(rewritten);
+        // Z3 has no finite-field sort. This rewrite treats theory predicates as
+        // opaque atoms, so quantify over both truth values of the exact field
+        // atom. The native evaluator above still checks its field semantics.
+        let field_atom = solver.executor.format_term(roots[2].id());
+        assert_eq!(before.matches(&field_atom).count(), 1);
+        assert_eq!(after.matches(&field_atom).count(), 1);
+        let before = before.replace(&field_atom, "field_atom");
+        let after = after.replace(&field_atom, "field_atom");
+        let declarations = DECLARATIONS.replace(
+            "(declare-const f (_ FiniteField 5))",
+            "(declare-const field_atom Bool)",
+        );
         let input = tempfile::NamedTempFile::new().unwrap();
-        let script = format!("{DECLARATIONS}\n(assert (xor {before} {after}))\n(check-sat)\n");
+        let script = format!("{declarations}\n(assert (xor {before} {after}))\n(check-sat)\n");
         use sha2::Digest;
         eprintln!(
             "AY-TEST-INPUT suite=parameterized-simplify-theory-atoms sha256={:x}",
@@ -348,7 +360,9 @@ mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "Z3 exited {}: stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "unsat");

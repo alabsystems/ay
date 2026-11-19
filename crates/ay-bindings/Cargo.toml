@@ -10,7 +10,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/ay-bindings"
 readme.workspace = true
 

@@ -101,6 +101,21 @@ fn test_parse_error_var_out_of_range() {
 }
 
 #[test]
+fn test_parse_error_clause_var_above_header() {
+    // A clause variable above the declared count is refused (by
+    // `dimacs_core`) like a prefix one, so the header bounds the dense state
+    // that `formula.rs` describes.
+    assert!(matches!(
+        parse_qdimacs("p cnf 2 1\ne 1 2 0\n1 -3 0\n"),
+        Err(QdimacsError::VariableOutOfRange(3, 2))
+    ));
+    assert!(matches!(
+        parse_qdimacs("p cnf 1 1\n67000000 0\n"),
+        Err(QdimacsError::VariableOutOfRange(67_000_000, 1))
+    ));
+}
+
+#[test]
 fn test_parse_preserves_empty_clause() {
     let formula = parse_qdimacs("p cnf 0 1\n0\n").unwrap();
 
@@ -137,4 +152,25 @@ fn test_parse_rejects_variable_above_dense_solver_cap() {
 
     assert!(matches!(error, QdimacsError::InvalidClause(_)));
     assert!(error.to_string().contains("maximum supported"), "{error}");
+}
+
+#[test]
+fn test_parse_accepts_gallery_sized_variable_indices() {
+    // c1_BMC_p1_k2048 (QBF Gallery 2023) declares 2,202,779 variables; the
+    // old dense cap of 2^20 refused it at parse time.
+    let input = "p cnf 2202779 3\ne 7 0\na 1100000 0\ne 2200000 0\n\
+                 7 1100000 2200000 0\n-2200000 -1100000 0\n-7 2200000 0\n";
+    let formula = parse_qdimacs(input).expect("a declared 2.2M-variable formula parses");
+    assert_eq!(formula.num_vars(), 2_200_000);
+    assert!(formula.is_universal(1_100_000));
+    // ∃x ∀u ∃y. (x ∨ u ∨ y)(¬y ∨ ¬u)(¬x ∨ y) is true: x = false, y = ¬u.
+    // Both engines agree on it.
+    assert!(matches!(
+        crate::QbfSolver::new(formula.clone()).solve_until(None),
+        crate::QbfResult::Sat(_)
+    ));
+    assert!(matches!(
+        crate::QbfSolver::new(formula).solve(),
+        crate::QbfResult::Sat(_)
+    ));
 }

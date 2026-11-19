@@ -7,7 +7,6 @@ description = "C FFI bindings for AY SMT solver"
 license = "Apache-2.0"
 readme.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation = "https://docs.rs/ay-ffi"
 
 [lib]

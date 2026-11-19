@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use ay_qbf::{parse_qdimacs, QbfResult, QbfSolver};
+use ay_qbf::{is_qcir, parse_qcir, parse_qdimacs, QbfResult, QbfSolver};
 
 fn main() -> ExitCode {
     // FIRST statement of main: arm() re-execs this process under a kernel-held
@@ -49,11 +49,15 @@ fn usage() -> String {
 fn solve(path: &Path) -> Result<u8, String> {
     let input = fs::read_to_string(path)
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
-    let formula = parse_qdimacs(&input)
-        .map_err(|err| format!("failed to parse '{}': {err}", path.display()))?;
+    let formula = if is_qcir(&input) {
+        parse_qcir(&input).map_err(|err| format!("failed to parse '{}': {err}", path.display()))?
+    } else {
+        parse_qdimacs(&input)
+            .map_err(|err| format!("failed to parse '{}': {err}", path.display()))?
+    };
     let mut solver = QbfSolver::new(formula);
 
-    match solver.solve() {
+    match solver.solve_until(None) {
         QbfResult::Sat(_) => {
             println!("s TRUE");
             Ok(10)

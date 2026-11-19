@@ -6,24 +6,21 @@
 
 //! AY QBF - Quantified Boolean Formula Solver
 //!
-//! A QCDCL (Quantified Conflict-Driven Clause Learning) solver for QBF.
+//! A QBF solver for prenex CNF.
 //!
 //! ## Features
-//! - QDIMACS parser for standard QBF benchmarks
-//! - Budgeted exact QDPLL verdict authority with partial-matrix pruning
-//! - Fail-closed `Unknown` on node-budget exhaustion
-//! - Experimental QCDCL machinery retained internally for continued work
+//! - QDIMACS parser for standard QBF benchmarks, and a prenex QCIR-G14
+//!   reader that translates the circuit to prenex CNF in the crate
+//! - [`QbfSolver::solve_until`]: clausal-abstraction search (CAQE / QESTO
+//!   style, one incremental CDCL solver per quantifier level) that runs to a
+//!   verdict or a deadline; this is what `ay qbf solve` uses
+//! - [`QbfSolver::solve`] / [`QbfSolver::solve_with_limit`]: budgeted exact
+//!   QDPLL with partial-matrix pruning, fail-closed `Unknown` on budget
+//!   exhaustion (the tests' independent reference)
+//! - Experimental QCDCL machinery retained internally, not used for verdicts
 //!
-//! Strategy-certificate extraction is not yet part of the authoritative path;
-//! definite results currently carry [`Certificate::None`].
-//!
-//! ## Algorithm Overview
-//!
-//! QCDCL extends CDCL to handle quantified formulas:
-//! - Variables are partitioned into existential (∃) and universal (∀) quantifier blocks
-//! - Universal reduction removes universal literals that cannot affect satisfiability
-//! - Conflict analysis respects quantifier dependencies
-//! - Learned clauses must be "dependency-valid"
+//! Strategy-certificate extraction is not yet part of either path; definite
+//! results carry [`Certificate::None`].
 //!
 //! ## Example
 //!
@@ -48,13 +45,17 @@
 //! ## References
 //! - Lonsing & Biere, "DepQBF: A Dependency-Aware QBF Solver"
 //! - Zhang & Malik, "Conflict Driven Learning in a Quantified Boolean Satisfiability Solver"
+//! - Rabe & Tentrup, "CAQE: A Certifying QBF Solver", FMCAD 2015
+//! - Janota & Marques-Silva, "Solving QBF by Clause Selection", IJCAI 2015
 
 #![warn(clippy::all)]
 
 pub(crate) mod formula;
 pub(crate) mod parser;
+pub(crate) mod qcir;
 pub(crate) mod solver;
 
 pub use formula::{QbfFormula, Quantifier, QuantifierBlock};
 pub use parser::{parse_qdimacs, QdimacsError};
+pub use qcir::{is_qcir, parse_qcir, QcirError};
 pub use solver::{Certificate, HerbrandFunction, QbfResult, QbfSolver, QbfStats, SkolemFunction};

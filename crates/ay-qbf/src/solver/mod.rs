@@ -21,10 +21,16 @@
 //!
 //! ## Current implementation status
 //!
-//! Public verdicts come from a budgeted, exact QDPLL evaluator. It follows the
-//! prenex prefix directly (existential nodes are disjunctions; universal nodes
-//! are conjunctions), prunes decided CNF matrices, and returns `Unknown` when
-//! its node budget is exhausted.
+//! [`QbfSolver::solve_until`] (used by `ay qbf solve`) runs the
+//! clausal-abstraction engine in `abstraction.rs` (CAQE / QESTO style: one
+//! incremental CDCL solver, `cdcl.rs`, per quantifier level) until a verdict or a
+//! deadline. Its module comment gives the argument for each verdict.
+//!
+//! [`QbfSolver::solve`] and [`QbfSolver::solve_with_limit`] keep the budgeted,
+//! exact QDPLL evaluator. It follows the prenex prefix directly (existential
+//! nodes are disjunctions; universal nodes are conjunctions), prunes decided
+//! CNF matrices, and returns `Unknown` when its node budget is exhausted. The
+//! tests use it as an independent reference for the abstraction engine.
 //!
 //! The QCDCL implementation in the sibling modules includes watched literals,
 //! universal reduction, clause/cube learning, and VSIDS-like activity, but is
@@ -66,6 +72,8 @@ use crate::formula::QbfFormula;
 use ay_sat::{Literal, SolverContext, Variable};
 use std::collections::HashSet;
 
+mod abstraction;
+mod cdcl;
 mod core;
 mod database;
 mod propagate;

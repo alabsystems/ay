@@ -24,6 +24,19 @@ use crate::pdr::frame::Lemma;
 use crate::{ChcExpr, ChcOp, ChcVar, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// Clause-derived propagation indexes. They read only the clause set and the
+/// canonical variables, neither of which changes during a solve, so they are
+/// built once per solver ([`PdrSolver::propagation_indexes`]) rather than on
+/// every propagation call (one per admitted lemma during startup).
+pub(in crate::pdr::solver) struct PropagationIndexes {
+    /// Source predicate -> propagation candidates (#2429).
+    candidates: FxHashMap<PredicateId, Vec<PropagationCandidate>>,
+    /// Source predicate -> predicates related to it by a reversible
+    /// variable permutation.
+    shared_patterns: FxHashMap<PredicateId, Vec<PredicateId>>,
+}
 
 impl PdrSolver {
     /// Propagate frame[1] discovered invariants to dependent predicates until fixpoint.
@@ -104,7 +117,8 @@ impl PdrSolver {
         const PRIORITY: u16 = 180;
         const MAX_HINTS_PER_TARGET: usize = 12;
 
-        let candidate_index = self.build_propagation_candidate_index();
+        let indexes = self.propagation_indexes();
+        let candidate_index = &indexes.candidates;
         let mut hints = Vec::new();
         let mut per_target: FxHashMap<PredicateId, usize> = FxHashMap::default();
 
@@ -422,11 +436,11 @@ impl PdrSolver {
     ) -> usize {
         let mut total_added = 0;
 
-        // #2429: Precompute the propagation candidate index once. The clauses are
-        // immutable during propagation, so scanning all clauses per worklist item
-        // is redundant. Build a source_pred -> candidates map upfront.
-        let candidate_index = self.build_propagation_candidate_index();
-        let shared_pattern_index = self.build_shared_variable_pattern_index(&candidate_index);
+        // #2429: the clauses are immutable during a solve, so both indexes are
+        // built once per solver and shared by every propagation call.
+        let indexes = self.propagation_indexes();
+        let candidate_index = &indexes.candidates;
+        let shared_pattern_index = &indexes.shared_patterns;
 
         // #2192: Bound iterations to avoid performance regression.
         // The worklist propagation is O(lemmas * clauses * SMT_checks) per iteration.
@@ -650,6 +664,18 @@ impl PdrSolver {
         }
 
         total_added
+    }
+
+    /// The solver's propagation indexes, built on first use.
+    pub(in crate::pdr::solver) fn propagation_indexes(&self) -> Arc<PropagationIndexes> {
+        Arc::clone(self.propagation_indexes.get_or_init(|| {
+            let candidates = self.build_propagation_candidate_index();
+            let shared_patterns = self.build_shared_variable_pattern_index(&candidates);
+            Arc::new(PropagationIndexes {
+                candidates,
+                shared_patterns,
+            })
+        }))
     }
 
     /// Precompute propagation candidates indexed by source predicate (#2429).

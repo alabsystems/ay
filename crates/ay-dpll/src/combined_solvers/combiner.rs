@@ -125,8 +125,34 @@ impl CrossTheoryEqualityReplay {
 /// QF_ALIA AllInterval-011 (814 top-of-stack samples, 2026-11-18
 /// profile). Groups stay sorted by `(term, value)` so both insert
 /// and lookup binary-search; slots inside a group keep append order.
-pub(super) type CrossReplayEndpointIndex =
-    ay_core::kani_compat::DetHashMap<TermId, Vec<(TheoryLit, Vec<usize>)>>;
+#[derive(Default)]
+pub(super) struct CrossReplayEndpointIndex {
+    groups: ay_core::kani_compat::DetHashMap<TermId, Vec<(TheoryLit, Vec<usize>)>>,
+    /// Ordered `(lhs, rhs)` pairs pushed since the last clear
+    /// (#allinterval-replay-pair-set). The insert paths' tombstone
+    /// scan only acts on same-pair edges, so when a candidate's pair
+    /// is absent here the scan is a guaranteed no-op and is skipped
+    /// (measured on AllInterval-011: 676M scanned slots, zero
+    /// same-pair hits, in 20s). Monotone between clears: a pair
+    /// whose edges were all tombstoned stays present, which only
+    /// loses the skip, never a tombstone.
+    pairs: DetHashSet<(TermId, TermId)>,
+}
+
+impl CrossReplayEndpointIndex {
+    fn clear(&mut self) {
+        self.groups.clear();
+        self.pairs.clear();
+    }
+
+    fn endpoint_groups(&self, endpoint: TermId) -> Option<&Vec<(TheoryLit, Vec<usize>)>> {
+        self.groups.get(&endpoint)
+    }
+
+    fn has_pair(&self, lhs: TermId, rhs: TermId) -> bool {
+        self.pairs.contains(&(lhs, rhs))
+    }
+}
 
 /// Group key for empty-reason replays. Empty reasons are a subset of
 /// every candidate reason, so the covered-by DFS always scans this
@@ -155,8 +181,11 @@ fn cross_replay_index_push(
     replay: &CrossTheoryEqualityReplay,
     idx: usize,
 ) {
+    if endpoint == replay.lhs {
+        index.pairs.insert((replay.lhs, replay.rhs));
+    }
     let head = cross_replay_reason_head(replay);
-    let groups = index.entry(endpoint).or_default();
+    let groups = index.groups.entry(endpoint).or_default();
     let pos = groups.partition_point(|(h, _)| (h.term.0, h.value) < (head.term.0, head.value));
     if pos < groups.len() && groups[pos].0 == head {
         groups[pos].1.push(idx);
@@ -171,7 +200,7 @@ fn cross_replay_index_group<'a>(
     endpoint: TermId,
     head: TheoryLit,
 ) -> Option<&'a [usize]> {
-    let groups = index.get(&endpoint)?;
+    let groups = index.groups.get(&endpoint)?;
     let pos = groups.partition_point(|(h, _)| (h.term.0, h.value) < (head.term.0, head.value));
     groups
         .get(pos)
@@ -712,7 +741,7 @@ impl<'a> TheoryCombiner<'a> {
             array_replay_pending_set: DetHashSet::default(),
             imported_array_equality_replays: Vec::new(),
             cross_theory_equality_replays: Vec::new(),
-            cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap::default(),
+            cross_replay_endpoint_index: CrossReplayEndpointIndex::default(),
             cross_replay_index_valid: false,
             cross_replay_cover_scratch: CrossReplayCoverScratch::default(),
             cross_theory_replay_processed: DetHashSet::default(),
@@ -786,7 +815,7 @@ impl<'a> TheoryCombiner<'a> {
             array_replay_pending_set: DetHashSet::default(),
             imported_array_equality_replays: Vec::new(),
             cross_theory_equality_replays: Vec::new(),
-            cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap::default(),
+            cross_replay_endpoint_index: CrossReplayEndpointIndex::default(),
             cross_replay_index_valid: false,
             cross_replay_cover_scratch: CrossReplayCoverScratch::default(),
             cross_theory_replay_processed: DetHashSet::default(),
@@ -853,7 +882,7 @@ impl<'a> TheoryCombiner<'a> {
             array_replay_pending_set: DetHashSet::default(),
             imported_array_equality_replays: Vec::new(),
             cross_theory_equality_replays: Vec::new(),
-            cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap::default(),
+            cross_replay_endpoint_index: CrossReplayEndpointIndex::default(),
             cross_replay_index_valid: false,
             cross_replay_cover_scratch: CrossReplayCoverScratch::default(),
             cross_theory_replay_processed: DetHashSet::default(),
@@ -923,7 +952,7 @@ impl<'a> TheoryCombiner<'a> {
             array_replay_pending_set: DetHashSet::default(),
             imported_array_equality_replays: Vec::new(),
             cross_theory_equality_replays: Vec::new(),
-            cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap::default(),
+            cross_replay_endpoint_index: CrossReplayEndpointIndex::default(),
             cross_replay_index_valid: false,
             cross_replay_cover_scratch: CrossReplayCoverScratch::default(),
             cross_theory_replay_processed: DetHashSet::default(),
@@ -993,7 +1022,7 @@ impl<'a> TheoryCombiner<'a> {
             array_replay_pending_set: DetHashSet::default(),
             imported_array_equality_replays: Vec::new(),
             cross_theory_equality_replays: Vec::new(),
-            cross_replay_endpoint_index: ay_core::kani_compat::DetHashMap::default(),
+            cross_replay_endpoint_index: CrossReplayEndpointIndex::default(),
             cross_replay_index_valid: false,
             cross_replay_cover_scratch: CrossReplayCoverScratch::default(),
             cross_theory_replay_processed: DetHashSet::default(),
@@ -1539,7 +1568,9 @@ impl TheoryCombiner<'_> {
         // (a dominated edge's head need not occur in the candidate reason,
         // so every group at the endpoint is scanned; marking is
         // order-independent).
-        if let Some(groups) = by_endpoint.get(&candidate.lhs) {
+        if !by_endpoint.has_pair(candidate.lhs, candidate.rhs) {
+            super::theory_stats::inc_replay_tombstone_scans_skipped();
+        } else if let Some(groups) = by_endpoint.endpoint_groups(candidate.lhs) {
             for (_, indices) in groups {
                 for &idx in indices {
                     if removed[idx] {
@@ -2186,7 +2217,14 @@ impl TheoryCombiner<'_> {
                 // the candidate's (the candidate strictly dominates them).
                 // Every head group at `replay.lhs` is scanned: a dominated
                 // edge's head need not occur in the candidate reason.
-                if let Some(groups) = self.cross_replay_endpoint_index.get(&replay.lhs) {
+                if !self
+                    .cross_replay_endpoint_index
+                    .has_pair(replay.lhs, replay.rhs)
+                {
+                    super::theory_stats::inc_replay_tombstone_scans_skipped();
+                } else if let Some(groups) =
+                    self.cross_replay_endpoint_index.endpoint_groups(replay.lhs)
+                {
                     for (_, indices) in groups {
                         for &idx in indices {
                             if removed[idx] {
@@ -2323,10 +2361,10 @@ impl TheoryCombiner<'_> {
             // a head outside the candidate reason and fail the subset
             // test, so skipping them changes no answer (the debug
             // reference oracle above cross-checks exactly this).
-            let mut scan_group = |indices: &[usize],
-                                  eligible_epoch: &mut Vec<u32>,
-                                  eligible_value: &mut Vec<bool>,
-                                  stack: &mut Vec<TermId>| {
+            let scan_group = |indices: &[usize],
+                              eligible_epoch: &mut Vec<u32>,
+                              eligible_value: &mut Vec<bool>,
+                              stack: &mut Vec<TermId>| {
                 for &idx in indices {
                     if removed[idx] {
                         continue;
@@ -3718,5 +3756,90 @@ mod cover_scratch_tests {
         assert!(covered(4, 6, &[], &mut scratch));
         assert!(!covered(1, 6, &[], &mut scratch));
         assert!(covered(1, 6, &[999], &mut scratch));
+    }
+
+    /// Pair-gated tombstone scan (#allinterval-replay-pair-set): the
+    /// insert path scans every head group at the candidate's lhs to
+    /// tombstone dominated same-pair edges — measured 676M slot
+    /// visits for zero same-pair hits on AllInterval-011. The scan
+    /// may run only when the ordered pair was inserted before; the
+    /// gate must not change which edges are tombstoned.
+    #[test]
+    fn pair_set_gates_the_tombstone_scan_without_changing_it() {
+        let _ = super::super::theory_stats::drain_stats();
+        let lit = |t: u32| TheoryLit::new(TermId(t), true);
+        let replay = |a: u32, b: u32, r: &[u32]| {
+            CrossTheoryEqualityReplay::new(
+                TermId(a),
+                TermId(b),
+                r.iter().map(|&t| lit(t)).collect(),
+            )
+        };
+        let mut replays: Vec<CrossTheoryEqualityReplay> = Vec::new();
+        let mut by_endpoint: CrossReplayEndpointIndex = Default::default();
+        let mut removed: Vec<bool> = Vec::new();
+        let mut scratch = CrossReplayCoverScratch::default();
+
+        // Broad edge 1~2, unrelated edge 1~3: neither pair seen before.
+        assert!(
+            TheoryCombiner::insert_cross_theory_equality_replay_minimal_indexed(
+                &mut replays,
+                &mut by_endpoint,
+                &mut removed,
+                &mut scratch,
+                replay(1, 2, &[900, 901]),
+            )
+        );
+        assert!(
+            TheoryCombiner::insert_cross_theory_equality_replay_minimal_indexed(
+                &mut replays,
+                &mut by_endpoint,
+                &mut removed,
+                &mut scratch,
+                replay(1, 3, &[902]),
+            )
+        );
+        assert_eq!(
+            super::super::theory_stats::drain_stats().replay_tombstone_scans_skipped,
+            2,
+            "both first-of-pair inserts skip the scan"
+        );
+
+        // Dominating same-pair candidate: the scan must run and
+        // tombstone the broad edge, exactly as ungated.
+        assert!(
+            TheoryCombiner::insert_cross_theory_equality_replay_minimal_indexed(
+                &mut replays,
+                &mut by_endpoint,
+                &mut removed,
+                &mut scratch,
+                replay(1, 2, &[900]),
+            )
+        );
+        assert!(removed[0], "dominated same-pair edge tombstoned");
+        assert!(!removed[1], "unrelated edge kept");
+        assert_eq!(
+            super::super::theory_stats::drain_stats().replay_tombstone_scans_skipped,
+            0,
+            "a seen pair still scans"
+        );
+
+        // A fresh pair at the same busy endpoint skips again.
+        assert!(
+            TheoryCombiner::insert_cross_theory_equality_replay_minimal_indexed(
+                &mut replays,
+                &mut by_endpoint,
+                &mut removed,
+                &mut scratch,
+                replay(1, 4, &[903]),
+            )
+        );
+        assert_eq!(
+            super::super::theory_stats::drain_stats().replay_tombstone_scans_skipped,
+            1,
+            "fresh pair at a busy endpoint skips the scan"
+        );
+        assert_eq!(replays.len(), 4);
+        assert!(!removed[3]);
     }
 }

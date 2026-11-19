@@ -263,7 +263,8 @@ fn probe_clock() -> Duration {
 /// (the reference is now CPU, not wall, so a cold page-faulting single-row
 /// pass no longer buys the arm a longer slice), dcmulti 8.1 ms vs 8.1 ms with
 /// the same pre-existing bimodal 32 ms overrun in both, p0201/gen unchanged
-/// at the structural decline; zero `attempt=` retries on the corpus.
+/// at the structural decline; zero retries (`attempt=2` or later) on the
+/// corpus.
 ///
 /// BOUNDS. Each attempt is clamped to the outer trial deadline as before, and
 /// `MAX_ATTEMPTS` bounds the total wall at a small multiple of the slice. The
@@ -290,7 +291,7 @@ fn probe_arm<T>(
         let cpu_used = probe_clock().saturating_sub(cpu_started);
         let wall_used = started.elapsed();
         let robbed = Instant::now() >= deadline && cpu_used < slice / 2;
-        if structure_trace_enabled() && (robbed || attempt > 1) {
+        if structure_trace_enabled() {
             eprintln!(
                 "--trace infeasibility-probe {name} attempt={attempt} slice={:.6}s \
                  wall={:.6}s cpu={:.6}s robbed={robbed}",

@@ -79,8 +79,11 @@ impl From<DimacsCoreError> for QdimacsError {
 /// Parse a QDIMACS string into a QBF formula
 pub fn parse_qdimacs(input: &str) -> Result<QbfFormula, QdimacsError> {
     let (header, records) = dimacs_core::parse_dimacs_records_str(input)?;
-    // Declared count: used only for the quantifier-prefix validity check below,
-    // never to size an allocation.
+    // Declared count: every prefix variable (checked below) and every clause
+    // variable (checked by `dimacs_core`, `VariableOutOfRange`) lies within
+    // it, so the dense state, sized by the largest variable actually named,
+    // is bounded by the header as well as by `MAX_QBF_VARS`. It never sizes
+    // an allocation itself.
     let num_vars = header.num_vars;
 
     let mut prefix = Vec::new();

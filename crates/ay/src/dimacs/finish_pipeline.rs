@@ -245,6 +245,21 @@ fn finish_dimacs_solve_with_source(
     separator_cover: Option<&SeparatorCoverSidecarRunStats>,
     proof_writer_telemetry_override: Option<DimacsProofWriterTelemetry>,
 ) {
+    // The sequential member of the parallel race (run_dimacs_parallel.rs)
+    // finishes here like any sequential solve, with two differences. A
+    // decisive answer first claims the race, before anything is written, so
+    // the two members never both report. A solve that ends without an answer
+    // (and that the finalize rescue cannot retry) says nothing: the portfolio
+    // is still searching, and the race's unanswered exits belong to it.
+    let racing = crate::verdict_race_active();
+    if racing {
+        if matches!(result, SatResult::Sat(_) | SatResult::Unsat(_)) {
+            crate::claim_verdict_race_or_yield();
+            safe_eprintln!("c parallel: answer from the sequential-route member");
+        } else if !finalize_rescue_applicable(solver, &result, proof_config) {
+            return;
+        }
+    }
     let request = DimacsFinishRequest {
         solver,
         result,
@@ -256,6 +271,13 @@ fn finish_dimacs_solve_with_source(
         proof_writer_telemetry: proof_writer_telemetry_override,
     };
     let mut state = DimacsFinishState::prepare(request);
+    if racing {
+        // Only a finalize rescue changes the result inside `prepare`.
+        if !matches!(state.result, SatResult::Sat(_) | SatResult::Unsat(_)) {
+            return;
+        }
+        crate::claim_verdict_race_or_yield();
+    }
     state.emit_statistics();
     state.publish_verdict();
 }

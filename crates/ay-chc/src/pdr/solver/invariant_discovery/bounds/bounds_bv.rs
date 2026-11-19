@@ -73,11 +73,14 @@ impl PdrSolver {
         // routinely needs 10-20ms, and 82+ candidates need testing. Increased to
         // 2s to allow the joint fixpoint to complete at least one round while
         // leaving time for blocking phase.
+        // The budget is per solve: the startup fixpoint calls this pass once
+        // per iteration, and a deadline re-armed on each call bounded only
+        // one iteration (3 s each, up to one iteration per predicate).
         let bv_discovery_deadline = if budgeted {
-            Some(
+            Some(*self.bv_range_discovery_deadline.get_or_insert_with(|| {
                 ay_core::time::Instant::now()
-                    + std::time::Duration::from_secs(BV_DISCOVERY_BUDGET_SECS),
-            )
+                    + std::time::Duration::from_secs(BV_DISCOVERY_BUDGET_SECS)
+            }))
         } else {
             None
         };
