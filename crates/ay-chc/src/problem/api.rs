@@ -882,11 +882,13 @@ impl ChcProblem {
     /// caller uses this detector as a conservative safety guard, so a bounded
     /// classification failure must retain datatype handling/downgrades rather
     /// than silently classify the problem as scalar.
+    ///
+    /// The budget is charged only for the array nodes that must be descended.
+    /// A scalar root is decided without a walk, so it costs nothing: charging
+    /// it made every problem with more than 32,768 scalar predicate arguments
+    /// report datatype sorts it does not have (20 of the 96 CHC-COMP 2026 BV
+    /// tasks), which bypassed the Spacer lane and the scalar engines on them.
     fn sort_contains_datatype_bounded(root: &ChcSort, sort_nodes: &mut usize) -> bool {
-        *sort_nodes = match sort_nodes.checked_add(1) {
-            Some(count) if count <= MAX_DATATYPE_FEATURE_SORT_NODES => count,
-            _ => return true,
-        };
         let mut stack = vec![root];
         while let Some(sort) = stack.pop() {
             match sort {

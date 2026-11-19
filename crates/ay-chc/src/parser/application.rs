@@ -499,7 +499,36 @@ impl ChcParser {
                 Ok(result)
             }
             // Bitvector unary operations
-            "bvnot" | "bvneg" | "bv2nat" | "bv2int" => {
+            // `sbv_to_int` (SMT-LIB 2.7) is the signed reading:
+            // `ite(msb(x) = 1, -(ubv_to_int(bvneg x)), ubv_to_int(x))`. On the
+            // minimum value `bvneg x = x`, whose unsigned value 2^(n-1) negates
+            // to -2^(n-1), so no 2^n constant is needed at any width.
+            "sbv_to_int" => {
+                if args.len() != 1 {
+                    return Err(ChcError::Parse(
+                        "'sbv_to_int' requires exactly 1 argument".to_string(),
+                    ));
+                }
+                let ChcSort::BitVec(width) = args[0].sort() else {
+                    return Err(ChcError::Parse(
+                        "'sbv_to_int' requires a bitvector argument".to_string(),
+                    ));
+                };
+                let x = Arc::new(args.into_iter().next().expect("one argument checked"));
+                let msb = ChcExpr::Op(ChcOp::BvExtract(width - 1, width - 1), vec![x.clone()]);
+                let negative = ChcExpr::eq(msb, ChcExpr::BitVec(1, 1));
+                let magnitude = ChcExpr::Op(
+                    ChcOp::Bv2Nat,
+                    vec![Arc::new(ChcExpr::Op(ChcOp::BvNeg, vec![x.clone()]))],
+                );
+                Ok(ChcExpr::ite(
+                    negative,
+                    ChcExpr::neg(magnitude),
+                    ChcExpr::Op(ChcOp::Bv2Nat, vec![x]),
+                ))
+            }
+            // `ubv_to_int` is the SMT-LIB 2.7 name of `bv2nat`.
+            "bvnot" | "bvneg" | "bv2nat" | "bv2int" | "ubv_to_int" => {
                 if args.len() != 1 {
                     return Err(ChcError::Parse(format!(
                         "'{func}' requires exactly 1 argument"
@@ -508,7 +537,7 @@ impl ChcParser {
                 let op = match func {
                     "bvnot" => ChcOp::BvNot,
                     "bvneg" => ChcOp::BvNeg,
-                    "bv2nat" | "bv2int" => ChcOp::Bv2Nat,
+                    "bv2nat" | "bv2int" | "ubv_to_int" => ChcOp::Bv2Nat,
                     _ => {
                         return Err(ChcError::Parse(format!(
                             "Unexpected unary BV operator: {func}"

@@ -59,6 +59,52 @@ pub(super) const MAX_EXECUTOR_UF_ALIAS_EMITTED_BYTES: usize = MAX_DT_DECLARATION
 /// separate cap from the original expression-DAG admission.
 pub(super) const MAX_EXECUTOR_UF_ALIAS_EMIT_WORK: usize = MAX_DT_EXPR_NODES;
 
+/// Limits of one admission walk.
+///
+/// An executor query is admitted against [`EXECUTOR_QUERY_LIMITS`]: those caps
+/// bound what one executor script may carry. A whole-problem scan
+/// ([`collect_uninterpreted_function_declarations_for_problem`], behind
+/// `ChcProblem::validate`, PDR initialisation and the BMC executor sessions)
+/// serializes nothing. It walks a problem the parser already holds in memory,
+/// linearly, so its caps only bound work proportional to that input and are
+/// [`PROBLEM_SCAN_LIMITS`]. Charging a whole problem against one query's caps
+/// refused every CHC-COMP 2026 BV `ssh-simplified` task (147 k to 497 k
+/// argument roots plus constraint nodes against 131,072), so `validate` failed
+/// and PDR, the Spacer lane and the BMC executor lanes never ran on them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WalkLimits {
+    /// Expression roots, and expression nodes charged per walk.
+    pub(super) expr_nodes: usize,
+    /// Name bytes hashed or compared (variable, sort, constructor, selector).
+    pub(super) name_bytes: usize,
+    /// Sort nodes visited; each distinct variable name pays at least one.
+    pub(super) sort_nodes: usize,
+    /// Repeated-variable sort comparisons.
+    pub(super) compare_work: usize,
+}
+
+pub(super) const EXECUTOR_QUERY_LIMITS: WalkLimits = WalkLimits {
+    expr_nodes: MAX_DT_EXPR_NODES,
+    name_bytes: MAX_DT_NAME_BYTES,
+    sort_nodes: MAX_DT_SORT_NODES,
+    compare_work: MAX_DT_DEFINITION_COMPARE_WORK,
+};
+
+/// How much larger a whole-problem scan may be than one executor query: the
+/// executor's tree-node ceiling, the largest expression it admits at all,
+/// over one query's distinct-node cap (32).
+const PROBLEM_SCAN_SCALE: usize = MAX_EXECUTOR_TREE_NODES / MAX_DT_EXPR_NODES;
+
+/// Every per-walk cap of [`EXECUTOR_QUERY_LIMITS`], scaled by
+/// [`PROBLEM_SCAN_SCALE`]. The definition-comparison and datatype-count caps
+/// stay per query: they grow with datatype definitions, not problem size.
+pub(super) const PROBLEM_SCAN_LIMITS: WalkLimits = WalkLimits {
+    expr_nodes: MAX_DT_EXPR_NODES * PROBLEM_SCAN_SCALE,
+    name_bytes: MAX_DT_NAME_BYTES * PROBLEM_SCAN_SCALE,
+    sort_nodes: MAX_DT_SORT_NODES * PROBLEM_SCAN_SCALE,
+    compare_work: MAX_DT_DEFINITION_COMPARE_WORK * PROBLEM_SCAN_SCALE,
+};
+
 /// A fail-closed reason for declining executor-bound datatype declarations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatatypeDeclarationError {
@@ -226,13 +272,20 @@ pub(super) fn expr_children(expr: &ChcExpr) -> ExprChildren<'_> {
 pub(crate) fn collect_dt_declarations_for_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a ChcExpr>,
 ) -> Result<Vec<(&'a str, &'a [ChcDtConstructor])>, DatatypeDeclarationError> {
-    let mut collector = DatatypeDeclarationCollector::default();
+    collect_dt_declarations_for_exprs_within(exprs, EXECUTOR_QUERY_LIMITS)
+}
+
+fn collect_dt_declarations_for_exprs_within<'a>(
+    exprs: impl IntoIterator<Item = &'a ChcExpr>,
+    limits: WalkLimits,
+) -> Result<Vec<(&'a str, &'a [ChcDtConstructor])>, DatatypeDeclarationError> {
+    let mut collector = DatatypeDeclarationCollector::new(limits);
     let mut root_count = 0usize;
     for expr in exprs {
         root_count = bounded_add(
             root_count,
             1,
-            MAX_EXECUTOR_EXPR_ROOTS,
+            limits.expr_nodes,
             "executor expression roots",
         )?;
         collector.visit_expr(expr)?;
@@ -240,14 +293,14 @@ pub(crate) fn collect_dt_declarations_for_exprs<'a>(
     Ok(collector.finish())
 }
 
-#[derive(Default)]
 struct DatatypeDeclarationCollector<'a> {
+    limits: WalkLimits,
     definitions: FxHashMap<&'a str, &'a [ChcDtConstructor]>,
     checked_variable_sorts: FxHashMap<&'a str, &'a ChcSort>,
     checked_definition_pairs: FxHashSet<(&'a str, usize, usize, usize, usize)>,
     expanded_definition_instances: FxHashSet<(usize, usize)>,
     sort_nodes: usize,
-    /// Distinct expression nodes visited (capped by `MAX_DT_EXPR_NODES`).
+    /// Distinct expression nodes visited (capped by `limits.expr_nodes`).
     expr_nodes: usize,
     /// Tree expansion of every visited root (saturating just above
     /// `MAX_EXECUTOR_TREE_NODES`; enforced by the single-query admission).
@@ -263,12 +316,39 @@ struct DatatypeDeclarationCollector<'a> {
     variable_sort_compare_work: usize,
 }
 
+impl Default for DatatypeDeclarationCollector<'_> {
+    fn default() -> Self {
+        Self::new(EXECUTOR_QUERY_LIMITS)
+    }
+}
+
 impl<'a> DatatypeDeclarationCollector<'a> {
+    fn new(limits: WalkLimits) -> Self {
+        Self {
+            limits,
+            definitions: FxHashMap::default(),
+            checked_variable_sorts: FxHashMap::default(),
+            checked_definition_pairs: FxHashSet::default(),
+            expanded_definition_instances: FxHashSet::default(),
+            sort_nodes: 0,
+            expr_nodes: 0,
+            tree_nodes: 0,
+            expr_memo: FxHashMap::default(),
+            constructors: 0,
+            selectors: 0,
+            expanded_constructors: 0,
+            expanded_selectors: 0,
+            name_bytes: 0,
+            definition_compare_work: 0,
+            variable_sort_compare_work: 0,
+        }
+    }
+
     fn charge_name_bytes(&mut self, bytes: usize) -> Result<(), DatatypeDeclarationError> {
         self.name_bytes = bounded_add(
             self.name_bytes,
             bytes,
-            MAX_DT_NAME_BYTES,
+            self.limits.name_bytes,
             "executor surface name bytes",
         )?;
         Ok(())
@@ -286,6 +366,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                 &variable.sort,
                 &mut self.variable_sort_compare_work,
                 &mut self.name_bytes,
+                self.limits,
             )? {
                 return Ok(());
             }
@@ -328,7 +409,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
         // This memo records ONLY a completed emitted-signature comparison.
         // visit_sort still expands every distinct metadata allocation below.
         // Borrowed input remains live throughout this collector's lifetime.
-        if self.checked_definition_pairs.len() >= MAX_DT_SORT_NODES {
+        if self.checked_definition_pairs.len() >= self.limits.sort_nodes {
             return Err(DatatypeDeclarationError::ResourceLimit(
                 "datatype comparison memo entries",
             ));
@@ -345,15 +426,19 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                     "datatype sort nesting depth",
                 ));
             }
-            self.sort_nodes =
-                bounded_add(self.sort_nodes, 1, MAX_DT_SORT_NODES, "datatype sort nodes")?;
+            self.sort_nodes = bounded_add(
+                self.sort_nodes,
+                1,
+                self.limits.sort_nodes,
+                "datatype sort nodes",
+            )?;
 
             match sort {
                 ChcSort::Datatype { name, constructors } => {
                     self.name_bytes = bounded_add(
                         self.name_bytes,
                         name.len(),
-                        MAX_DT_NAME_BYTES,
+                        self.limits.name_bytes,
                         "datatype name bytes",
                     )?;
                     if let Some(previous) = self.definitions.get(name.as_str()).copied() {
@@ -428,14 +513,14 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                         self.name_bytes = bounded_add(
                             self.name_bytes,
                             constructor.name.len(),
-                            MAX_DT_NAME_BYTES,
+                            self.limits.name_bytes,
                             "datatype name bytes",
                         )?;
                         for selector in &constructor.selectors {
                             self.name_bytes = bounded_add(
                                 self.name_bytes,
                                 selector.name.len(),
-                                MAX_DT_NAME_BYTES,
+                                self.limits.name_bytes,
                                 "datatype name bytes",
                             )?;
                         }
@@ -459,7 +544,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
                     self.name_bytes = bounded_add(
                         self.name_bytes,
                         name.len(),
-                        MAX_DT_NAME_BYTES,
+                        self.limits.name_bytes,
                         "datatype name bytes",
                     )?;
                 }
@@ -470,7 +555,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
 
     /// Admit one root. Pointer-memoised (bridge item D-1; WP-F's DAG-linear
     /// admission): each distinct node is visited and charged once against
-    /// `MAX_DT_EXPR_NODES`; the nesting depth stays exact (a shared node met
+    /// `limits.expr_nodes`; the nesting depth stays exact (a shared node met
     /// again is charged at its deeper occurrence through its memoised
     /// height); the root's tree expansion is accumulated (saturating) for the
     /// single-query executor admission's `MAX_EXECUTOR_TREE_NODES` check.
@@ -550,7 +635,7 @@ impl<'a> DatatypeDeclarationCollector<'a> {
         self.expr_nodes = bounded_add(
             self.expr_nodes,
             1,
-            MAX_DT_EXPR_NODES,
+            self.limits.expr_nodes,
             "datatype expression nodes",
         )?;
         match expr {
@@ -961,7 +1046,7 @@ pub(crate) fn collect_uninterpreted_function_applications(
 pub(crate) fn collect_uninterpreted_function_applications_for_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a ChcExpr>,
 ) -> ChcResult<Vec<ChcExpr>> {
-    Ok(collect_uninterpreted_function_surface(exprs)?.applications)
+    Ok(collect_uninterpreted_function_surface(exprs, EXECUTOR_QUERY_LIMITS)?.applications)
 }
 
 struct UninterpretedFunctionSurface {
@@ -977,10 +1062,11 @@ fn executor_resource_limit(resource: &str) -> ChcError {
 
 fn bounded_executor_expr_roots<'a>(
     exprs: impl IntoIterator<Item = &'a ChcExpr>,
+    max_roots: usize,
 ) -> ChcResult<Vec<&'a ChcExpr>> {
     let mut roots = Vec::new();
     for expr in exprs {
-        if roots.len() >= MAX_EXECUTOR_EXPR_ROOTS {
+        if roots.len() >= max_roots {
             return Err(executor_resource_limit("expression roots"));
         }
         roots.push(expr);
@@ -991,8 +1077,9 @@ fn bounded_executor_expr_roots<'a>(
 fn push_bounded_executor_expr_root<'a>(
     roots: &mut Vec<&'a ChcExpr>,
     expr: &'a ChcExpr,
+    max_roots: usize,
 ) -> ChcResult<()> {
-    if roots.len() >= MAX_EXECUTOR_EXPR_ROOTS {
+    if roots.len() >= max_roots {
         return Err(executor_resource_limit("expression roots"));
     }
     roots.push(expr);
@@ -1001,14 +1088,17 @@ fn push_bounded_executor_expr_root<'a>(
 
 fn collect_uninterpreted_function_surface<'a>(
     exprs: impl IntoIterator<Item = &'a ChcExpr>,
+    limits: WalkLimits,
 ) -> ChcResult<UninterpretedFunctionSurface> {
-    let exprs = bounded_executor_expr_roots(exprs)?;
+    let max_nodes = limits.expr_nodes;
+    let exprs = bounded_executor_expr_roots(exprs, max_nodes)?;
 
     // One collector owns the caps for the complete expression set.  Calling a
     // fresh collector per root would let a large CHC problem multiply every
     // node/name/datatype limit by its clause count.
-    let datatype_declarations = collect_dt_declarations_for_exprs(exprs.iter().copied())
-        .map_err(|error| ChcError::Internal(error.to_string()))?;
+    let datatype_declarations =
+        collect_dt_declarations_for_exprs_within(exprs.iter().copied(), limits)
+            .map_err(|error| ChcError::Internal(error.to_string()))?;
     let mut datatype_constructors: FxHashSet<&str> = FxHashSet::default();
     let mut datatype_selectors: FxHashSet<&str> = FxHashSet::default();
     for (_, constructors) in datatype_declarations {
@@ -1048,7 +1138,7 @@ fn collect_uninterpreted_function_surface<'a>(
         }
         expr_nodes = expr_nodes
             .checked_add(1)
-            .filter(|nodes| *nodes <= MAX_DT_EXPR_NODES)
+            .filter(|nodes| *nodes <= max_nodes)
             .ok_or_else(|| executor_resource_limit("expression nodes"))?;
         match current {
             ChcExpr::FuncApp(name, return_sort, args) => {
@@ -1058,7 +1148,7 @@ fn collect_uninterpreted_function_surface<'a>(
                     .ok_or_else(|| executor_resource_limit("pending expression nodes"))?;
                 if expr_nodes
                     .checked_add(pending)
-                    .is_none_or(|nodes| nodes > MAX_DT_EXPR_NODES)
+                    .is_none_or(|nodes| nodes > max_nodes)
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
@@ -1113,7 +1203,7 @@ fn collect_uninterpreted_function_surface<'a>(
                     .ok_or_else(|| executor_resource_limit("pending expression nodes"))?;
                 if expr_nodes
                     .checked_add(pending)
-                    .is_none_or(|nodes| nodes > MAX_DT_EXPR_NODES)
+                    .is_none_or(|nodes| nodes > max_nodes)
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
@@ -1123,7 +1213,7 @@ fn collect_uninterpreted_function_surface<'a>(
                 if expr_nodes
                     .checked_add(stack.len())
                     .and_then(|nodes| nodes.checked_add(1))
-                    .is_none_or(|nodes| nodes > MAX_DT_EXPR_NODES)
+                    .is_none_or(|nodes| nodes > max_nodes)
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
@@ -1137,7 +1227,7 @@ fn collect_uninterpreted_function_surface<'a>(
                     .ok_or_else(|| executor_resource_limit("pending expression nodes"))?;
                 if expr_nodes
                     .checked_add(pending)
-                    .is_none_or(|nodes| nodes > MAX_DT_EXPR_NODES)
+                    .is_none_or(|nodes| nodes > max_nodes)
                 {
                     return Err(executor_resource_limit("expression nodes"));
                 }
@@ -1182,7 +1272,24 @@ fn collect_uninterpreted_function_surface<'a>(
 pub(crate) fn collect_uninterpreted_function_declarations_for_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a ChcExpr>,
 ) -> ChcResult<Vec<UninterpretedFunctionDeclaration>> {
-    Ok(collect_uninterpreted_function_surface(exprs)?.declarations)
+    Ok(collect_uninterpreted_function_surface(exprs, EXECUTOR_QUERY_LIMITS)?.declarations)
+}
+
+/// Whether a predicate argument can contribute to the UF or datatype surface.
+/// A literal, or a variable of a scalar sort (Bool, Int, Real, BitVec), has
+/// no function application, no datatype and no sort to declare, so the
+/// whole-problem scan skips it rather than charging it as a root. The test
+/// reads only the root sort: every other sort is scanned, and charged, by the
+/// collector, which owns the caps on walking sort metadata.
+fn predicate_argument_has_surface(argument: &ChcExpr) -> bool {
+    match argument {
+        ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => false,
+        ChcExpr::Var(var) => !matches!(
+            var.sort,
+            ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_)
+        ),
+        _ => true,
+    }
 }
 
 /// Collect ordinary UFs from every expression owned by a CHC problem.
@@ -1194,26 +1301,28 @@ pub(crate) fn collect_uninterpreted_function_declarations_for_exprs<'a>(
 pub(crate) fn collect_uninterpreted_function_declarations_for_problem(
     problem: &ChcProblem,
 ) -> ChcResult<Vec<UninterpretedFunctionDeclaration>> {
+    let max_roots = PROBLEM_SCAN_LIMITS.expr_nodes;
     let mut exprs = Vec::new();
     for clause in problem.source_clauses() {
         if let Some(constraint) = &clause.body.constraint {
-            push_bounded_executor_expr_root(&mut exprs, constraint)?;
+            push_bounded_executor_expr_root(&mut exprs, constraint, max_roots)?;
         }
+        let head_arguments = match &clause.head {
+            ClauseHead::Predicate(_, args) => args.as_slice(),
+            ClauseHead::False => &[],
+        };
         for argument in clause
             .body
             .predicates
             .iter()
             .flat_map(|(_, args)| args.iter())
+            .chain(head_arguments)
+            .filter(|argument| predicate_argument_has_surface(argument))
         {
-            push_bounded_executor_expr_root(&mut exprs, argument)?;
-        }
-        if let ClauseHead::Predicate(_, args) = &clause.head {
-            for argument in args {
-                push_bounded_executor_expr_root(&mut exprs, argument)?;
-            }
+            push_bounded_executor_expr_root(&mut exprs, argument, max_roots)?;
         }
     }
-    collect_uninterpreted_function_declarations_for_exprs(exprs)
+    Ok(collect_uninterpreted_function_surface(exprs, PROBLEM_SCAN_LIMITS)?.declarations)
 }
 
 /// Emit one ordinary UF declaration for an executor-generated SMT-LIB script.

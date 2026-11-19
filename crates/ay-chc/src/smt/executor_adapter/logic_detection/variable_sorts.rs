@@ -9,16 +9,14 @@
 //! are insufficient: a structurally different definition must reach the
 //! collector even when its emitted outer signature looks identical.
 
-use super::{
-    bounded_add, ChcSort, DatatypeDeclarationError, MAX_DT_DEFINITION_COMPARE_WORK,
-    MAX_DT_NAME_BYTES, MAX_DT_NESTING_DEPTH,
-};
+use super::{bounded_add, ChcSort, DatatypeDeclarationError, WalkLimits, MAX_DT_NESTING_DEPTH};
 
 pub(super) fn same_metadata_shape(
     left: &ChcSort,
     right: &ChcSort,
     work: &mut usize,
     name_bytes: &mut usize,
+    limits: WalkLimits,
 ) -> Result<bool, DatatypeDeclarationError> {
     let mut stack = vec![(left, right, 0usize)];
     while let Some((left, right, depth)) = stack.pop() {
@@ -27,7 +25,7 @@ pub(super) fn same_metadata_shape(
                 "variable sort comparison depth",
             ));
         }
-        charge(work, 1)?;
+        charge(work, 1, limits)?;
         if std::ptr::eq(left, right) {
             continue;
         }
@@ -53,13 +51,13 @@ pub(super) fn same_metadata_shape(
                 if !crate::ChcDtConstructors::ptr_eq(left_metadata, right_metadata) {
                     return Ok(false);
                 }
-                charge_names(name_bytes, left_name.len().max(right_name.len()))?;
+                charge_names(name_bytes, left_name.len().max(right_name.len()), limits)?;
                 if left_name != right_name {
                     return Ok(false);
                 }
             }
             (ChcSort::Uninterpreted(left), ChcSort::Uninterpreted(right)) => {
-                charge_names(name_bytes, left.len().max(right.len()))?;
+                charge_names(name_bytes, left.len().max(right.len()), limits)?;
                 if left != right {
                     return Ok(false);
                 }
@@ -70,19 +68,27 @@ pub(super) fn same_metadata_shape(
     Ok(true)
 }
 
-fn charge(work: &mut usize, amount: usize) -> Result<(), DatatypeDeclarationError> {
+fn charge(
+    work: &mut usize,
+    amount: usize,
+    limits: WalkLimits,
+) -> Result<(), DatatypeDeclarationError> {
     *work = bounded_add(
         *work,
         amount,
-        MAX_DT_DEFINITION_COMPARE_WORK,
+        limits.compare_work,
         "variable sort comparison",
     )?;
     Ok(())
 }
 
-fn charge_names(bytes: &mut usize, amount: usize) -> Result<(), DatatypeDeclarationError> {
+fn charge_names(
+    bytes: &mut usize,
+    amount: usize,
+    limits: WalkLimits,
+) -> Result<(), DatatypeDeclarationError> {
     // Preserve the existing shared name-byte envelope on cache hits. Long
     // datatype names must not newly consume the smaller node-work allowance.
-    *bytes = bounded_add(*bytes, amount, MAX_DT_NAME_BYTES, "datatype name bytes")?;
+    *bytes = bounded_add(*bytes, amount, limits.name_bytes, "datatype name bytes")?;
     Ok(())
 }

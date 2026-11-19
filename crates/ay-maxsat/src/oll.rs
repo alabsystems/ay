@@ -52,6 +52,10 @@ use crate::solver::MaxSatStats;
 /// OnceLock pattern as the other engine knobs below — the previous literal
 /// env::var_os read of the flag name was dead (nothing sets an env var
 /// named "--maxsat-debug").
+/// #first-model-seed: the first-model SAT call may use at most
+/// 1/`FIRST_MODEL_SEED_SHARE` of the remaining budget.
+const FIRST_MODEL_SEED_SHARE: u32 = 8;
+
 fn debug_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| ay_core::misc_cli_flags().maxsat_debug)
@@ -4804,6 +4808,7 @@ impl OllEngine {
         started: Instant,
         exhaust_spent: &mut Duration,
         should_stop: &dyn Fn() -> bool,
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
     ) -> bool {
         if self.pending_relax.is_empty() {
             return true;
@@ -4855,7 +4860,7 @@ impl OllEngine {
             }
             if exhaust_spent.as_secs_f64() < EXHAUST_TIME_SHARE * started.elapsed().as_secs_f64() {
                 let t0 = Instant::now();
-                let ok = self.exhaust_sum(sel, suspended, should_stop);
+                let ok = self.exhaust_sum(sel, suspended, should_stop, on_upper_bound);
                 *exhaust_spent += t0.elapsed();
                 if !ok {
                     return false;
@@ -5311,6 +5316,7 @@ impl OllEngine {
         mut sel: Literal,
         suspended: &mut HashSet<Literal>,
         should_stop: &dyn Fn() -> bool,
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
     ) -> bool {
         loop {
             if should_stop() || !self.active.contains_key(&sel) {
@@ -5340,11 +5346,14 @@ impl OllEngine {
                 }
                 AssumeResult::Sat(model) => {
                     // Free feasible model: keep it if it improves the
-                    // incumbent, then stop exhausting.
+                    // incumbent, then stop exhausting. Announce it like every
+                    // other incumbent, so a caller answering from its last
+                    // callback (the CLI's stop watchdog) holds this model.
                     let cost = self.model_cost(&model);
                     if cost < self.ub {
                         self.ub = cost;
                         self.ub_last_improved = Instant::now();
+                        on_upper_bound(cost, &model);
                         self.best_model = Some(model);
                     }
                     return true;
@@ -6571,7 +6580,7 @@ impl OllEngine {
         &mut self,
         deadline: Instant,
         should_stop: &dyn Fn() -> bool,
-        on_upper_bound: &mut dyn FnMut(Weight),
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
     ) -> Option<OllOutcome> {
         self.pause_core_drought();
         let outcome = self.descend_slice(deadline, should_stop, on_upper_bound);
@@ -6588,7 +6597,7 @@ impl OllEngine {
         &mut self,
         deadline: Instant,
         should_stop: &dyn Fn() -> bool,
-        on_upper_bound: &mut dyn FnMut(Weight),
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
     ) -> Option<OllOutcome> {
         let guard = self.descent_guard;
         loop {
@@ -6635,8 +6644,8 @@ impl OllEngine {
                     if cost < self.ub {
                         self.ub = cost;
                         self.ub_last_improved = Instant::now();
+                        on_upper_bound(cost, &model);
                         self.best_model = Some(model.clone());
-                        on_upper_bound(cost);
                         self.harden();
                     }
                     if self.effective_lb() >= self.ub {
@@ -6854,7 +6863,8 @@ impl OllEngine {
     /// Run OLL to optimality or interruption.
     ///
     /// `should_stop` is polled inside SAT calls and between iterations.
-    /// `on_upper_bound` is invoked whenever the incumbent improves.
+    /// `on_upper_bound` is invoked whenever the incumbent improves, with its
+    /// cost and its model (indexed by variable id, the layout of `best()`).
     /// Supply the whole-solve deadline (see `MaxSatSolver::set_deadline`).
     pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
@@ -6872,10 +6882,84 @@ impl OllEngine {
             .map(|d| d.saturating_duration_since(Instant::now()))
     }
 
+    /// #first-model-seed (AY-SAT-6): one bounded SAT call with no
+    /// assumptions — the hard clauses, every soft relaxable — before the core
+    /// phase, so a budgeted run holds an incumbent from the start.
+    ///
+    /// Core-guided search produces its first model only when an assumption
+    /// solve over the active selectors comes back SAT; on uniform-weight
+    /// instances that is a single stratum holding every soft, which on large
+    /// instances is not reached within an anytime budget (178 of 772 anytime
+    /// jobs of official-20261114 ended with no model at all). The selectors'
+    /// phases already prefer "soft satisfied" (`install`), so this call is a
+    /// greedy model of the hard clauses, typically far from optimal but
+    /// creditable, and its upper bound starts hardening at once.
+    ///
+    /// Measured (60 s budget): a model in 0.2 to 0.9 s on uniform-weight
+    /// generalized-hypertree-width, ramsey, optimizing-bdds and decision-trees
+    /// instances that had none in 58 s. On weighted job-shop, routing and
+    /// robot-navigation instances neither this call nor a second one with the
+    /// selectors phased "relaxed" found a model in 7 s each, so the share is
+    /// kept small and there is no second call.
+    ///
+    /// Runs only when the caller set a deadline (budget-blind callers keep the
+    /// previous schedule exactly) and gives the call at most
+    /// 1/[`FIRST_MODEL_SEED_SHARE`] of the remaining budget. The model is an
+    /// ordinary incumbent (same cost accounting and `on_upper_bound` path as
+    /// every other SAT model). An UNSAT or interrupted call changes nothing:
+    /// the core phase decides as before.
+    fn seed_first_model(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
+    ) -> Option<OllOutcome> {
+        if self.best_model.is_some() || should_stop() {
+            return None;
+        }
+        let limit = self.budget_remaining()? / FIRST_MODEL_SEED_SHARE;
+        if limit.is_zero() {
+            return None;
+        }
+        let t0 = Instant::now();
+        let stop_at = t0 + limit;
+        let stop = || should_stop() || Instant::now() >= stop_at;
+        self.stats.sat_calls = self.stats.sat_calls.saturating_add(1);
+        let result = self
+            .sat
+            .solve_with_assumptions_interruptible(&[], &stop)
+            .into_inner();
+        let found = match result {
+            AssumeResult::Sat(model) => {
+                self.stats.seed_models = self.stats.seed_models.saturating_add(1);
+                let cost = self.model_cost(&model);
+                if cost < self.ub {
+                    self.ub = cost;
+                    self.ub_last_improved = Instant::now();
+                    on_upper_bound(cost, &model);
+                    self.best_model = Some(model);
+                    self.harden();
+                }
+                Some(cost)
+            }
+            _ => None,
+        };
+        if debug_trace() {
+            eprintln!(
+                "c first-model seed: cost={found:?} in {} ms (limit {} ms)",
+                t0.elapsed().as_millis(),
+                limit.as_millis()
+            );
+        }
+        if self.best_model.is_some() && self.effective_lb() >= self.ub {
+            return Some(self.optimal());
+        }
+        None
+    }
+
     pub(crate) fn solve(
         &mut self,
         should_stop: &dyn Fn() -> bool,
-        on_upper_bound: &mut dyn FnMut(Weight),
+        on_upper_bound: &mut dyn FnMut(Weight, &[bool]),
     ) -> OllOutcome {
         let started = Instant::now();
         let mut exhaust_spent = Duration::ZERO;
@@ -6890,6 +6974,11 @@ impl OllEngine {
         self.activate_stratum(self.level);
 
         self.pay_mined_cores();
+
+        // #first-model-seed (AY-SAT-6): an incumbent before the core phase.
+        if let Some(outcome) = self.seed_first_model(should_stop, on_upper_bound) {
+            return outcome;
+        }
 
         // Sum selectors created since the last SAT answer. They are not
         // assumed yet ("totalizer delay"): the solver keeps discovering
@@ -6926,7 +7015,7 @@ impl OllEngine {
         if let Some(sel) = band_set {
             if self.active.contains_key(&sel) {
                 let t0 = Instant::now();
-                if !self.exhaust_sum(sel, &mut suspended, should_stop) {
+                if !self.exhaust_sum(sel, &mut suspended, should_stop, on_upper_bound) {
                     return match self.best_model {
                         Some(_) => self.optimal(),
                         None => OllOutcome::Unsatisfiable,
@@ -7001,7 +7090,7 @@ impl OllEngine {
                         if should_stop() {
                             break;
                         }
-                        if !self.exhaust_sum(sel, &mut suspended, should_stop) {
+                        if !self.exhaust_sum(sel, &mut suspended, should_stop, on_upper_bound) {
                             return match self.best_model {
                                 Some(_) => self.optimal(),
                                 None => OllOutcome::Unsatisfiable,
@@ -7030,6 +7119,7 @@ impl OllEngine {
                     started,
                     &mut exhaust_spent,
                     should_stop,
+                    on_upper_bound,
                 ) {
                     return match self.best_model {
                         Some(_) => self.optimal(),
@@ -7197,6 +7287,7 @@ impl OllEngine {
                     started,
                     &mut exhaust_spent,
                     should_stop,
+                    on_upper_bound,
                 ) {
                     return match self.best_model {
                         Some(_) => self.optimal(),
@@ -7354,6 +7445,7 @@ impl OllEngine {
                     started,
                     &mut exhaust_spent,
                     should_stop,
+                    on_upper_bound,
                 ) {
                     return match self.best_model {
                         Some(_) => self.optimal(),
@@ -7495,8 +7587,8 @@ impl OllEngine {
                     if cost < self.ub {
                         self.ub = cost;
                         self.ub_last_improved = Instant::now();
+                        on_upper_bound(cost, &model);
                         self.best_model = Some(model);
-                        on_upper_bound(cost);
                         self.harden();
                     }
                     // Residual-mass hardening: sound exactly here, where the
@@ -7522,6 +7614,7 @@ impl OllEngine {
                         started,
                         &mut exhaust_spent,
                         should_stop,
+                        on_upper_bound,
                     ) {
                         return match self.best_model {
                             Some(_) => self.optimal(),
@@ -7634,6 +7727,7 @@ impl OllEngine {
                             started,
                             &mut exhaust_spent,
                             should_stop,
+                            on_upper_bound,
                         )
                     {
                         return match self.best_model {
@@ -7660,7 +7754,12 @@ impl OllEngine {
                                 < EXHAUST_TIME_SHARE * started.elapsed().as_secs_f64()
                             {
                                 let t0 = Instant::now();
-                                let ok = self.exhaust_sum(sel, &mut suspended, should_stop);
+                                let ok = self.exhaust_sum(
+                                    sel,
+                                    &mut suspended,
+                                    should_stop,
+                                    on_upper_bound,
+                                );
                                 exhaust_spent += t0.elapsed();
                                 if !ok {
                                     return match self.best_model {
@@ -7894,7 +7993,7 @@ mod lsu_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             lsu_exercised += engine.stats().lsu_steps;
             // #lp-boost unweighted identity gate: uniform (unit) weights
             // must keep the lane fully inert even under aggressive tuning.
@@ -8009,7 +8108,7 @@ mod lsu_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             lsu_exercised += engine.stats().lsu_steps;
             match (outcome, expected) {
                 (OllOutcome::Optimal { cost, .. }, Some(exp)) => {
@@ -8134,7 +8233,7 @@ mod lsu_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             // Not every seed reaches the watchdog: the count totalizer claims
             // any instance whose LIVE residual has become uniform-weight
             // (hardening can produce that from a mixed fixture), and an
@@ -8343,7 +8442,7 @@ mod lsu_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             if matches!(engine.descent, Some(DescentEnc::ClusterTot { .. }))
                 || matches!(engine.descent, Some(DescentEnc::Adder { .. }))
             {
@@ -8451,7 +8550,7 @@ mod lsu_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             lsu_exercised += engine.stats().lsu_steps;
             match (outcome, expected) {
                 (OllOutcome::Optimal { cost, .. }, Some(exp)) => {
@@ -8510,7 +8609,7 @@ mod lsu_tests {
             tot_eqs: Some(true),
             core_clause: Some(true),
         });
-        match engine.solve(&|| false, &mut |_| {}) {
+        match engine.solve(&|| false, &mut |_, _| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 11),
             other => panic!("expected optimal, got {other:?}"),
         }
@@ -8689,7 +8788,7 @@ mod level_tests {
             let mut engine = OllEngine::new(num_vars + 1, hard_store, soft_store, weights.clone());
             engine.set_tuning(pure_oll_tuning());
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             if engine.stats().strat_levels > 1 {
                 multi_level += 1;
             }
@@ -8736,7 +8835,7 @@ mod level_tests {
         let weights = vec![7u64; n as usize];
         let mut engine = OllEngine::new(n as u32 + 1, hard_store, soft_store, weights);
         engine.set_tuning(pure_oll_tuning());
-        match engine.solve(&|| false, &mut |_| {}) {
+        match engine.solve(&|| false, &mut |_, _| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 21),
             other => panic!("expected optimal, got {other:?}"),
         }
@@ -8769,7 +8868,7 @@ mod level_tests {
         let weights = vec![1000u64, 1000, 1000, 1, 2, 3];
         let mut engine = OllEngine::new(7, hard_store, soft_store, weights);
         engine.set_tuning(pure_oll_tuning());
-        match engine.solve(&|| false, &mut |_| {}) {
+        match engine.solve(&|| false, &mut |_, _| {}) {
             // Two heavy violations (2000) + the cheapest dust violation (1).
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 2001),
             other => panic!("expected optimal, got {other:?}"),
@@ -8896,7 +8995,7 @@ mod wce_tests {
             let mut engine = OllEngine::new(num_vars + 1, hard_store, soft_store, weights.clone());
             engine.set_tuning(wce_tuning());
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             flushes += engine.stats().wce_flushes;
             relaxed += engine.stats().wce_relaxed_cores;
             if engine.stats().wce_max_flush_batch >= 2 {
@@ -9136,7 +9235,7 @@ mod minimize_tests {
             let (hard_store, soft_store) = stores(&hard, &soft);
             let mut engine = OllEngine::new(num_vars + 1, hard_store, soft_store, weights.clone());
             engine.set_tuning(minimize_tuning());
-            match engine.solve(&|| false, &mut |_| {}) {
+            match engine.solve(&|| false, &mut |_, _| {}) {
                 OllOutcome::Optimal { cost, .. } => {
                     assert_eq!(
                         cost, w_hi,
@@ -9264,7 +9363,7 @@ mod lp_boost_tests {
                 core_clause: Some(true),
             });
 
-            let outcome = engine.solve(&|| false, &mut |_| {});
+            let outcome = engine.solve(&|| false, &mut |_, _| {});
             boost_ran += engine.stats().lp_boost_runs;
             match (outcome, expected) {
                 (OllOutcome::Optimal { cost, .. }, Some(exp)) => {
@@ -9321,7 +9420,7 @@ mod lp_boost_tests {
             tot_eqs: Some(true),
             core_clause: Some(true),
         });
-        match engine.solve(&|| false, &mut |_| {}) {
+        match engine.solve(&|| false, &mut |_, _| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 21),
             other => panic!("expected optimal, got {other:?}"),
         }
@@ -10012,7 +10111,7 @@ mod abstraction_tests {
                 tot_eqs,
                 core_clause: Some(false),
             });
-            let cost = match engine.solve(&|| false, &mut |_| {}) {
+            let cost = match engine.solve(&|| false, &mut |_, _| {}) {
                 OllOutcome::Optimal { cost, .. } => cost,
                 other => panic!("expected optimal, got {other:?}"),
             };
@@ -10096,7 +10195,7 @@ mod abstraction_tests {
         // so mining is currently the only lane exploiting this shape.
         engine.mined_cores.clear();
 
-        match engine.solve(&|| false, &mut |_| {}) {
+        match engine.solve(&|| false, &mut |_, _| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 6),
             other => panic!("expected optimal, got {other:?}"),
         }
@@ -10192,7 +10291,7 @@ mod am1_probe_tests {
         }
         let mut engine = OllEngine::new(num_vars + 1, hard_store, soft_store, weights);
         engine.set_tuning(am1_probe_tuning());
-        let outcome = engine.solve(&|| false, &mut |_| {});
+        let outcome = engine.solve(&|| false, &mut |_, _| {});
         (outcome, engine.stats().clone())
     }
 
@@ -10442,5 +10541,118 @@ mod am1_probe_tests {
             "the probe pass must harden the failed selector (failed={})",
             stats.am1_probe_failed,
         );
+    }
+}
+
+#[cfg(test)]
+mod first_model_seed_tests {
+    use super::*;
+
+    fn engine(num_vars: u32, hard: &[Vec<i32>], soft: &[Vec<i32>], weights: &[u64]) -> OllEngine {
+        let mut hard_store = ClauseStore::new();
+        for c in hard {
+            hard_store.push_from_iter(c.iter().map(|&l| Literal::from(l)));
+        }
+        let mut soft_store = ClauseStore::new();
+        for c in soft {
+            soft_store.push_from_iter(c.iter().map(|&l| Literal::from(l)));
+        }
+        OllEngine::new(num_vars + 1, hard_store, soft_store, weights.to_vec())
+    }
+
+    fn sat(c: &[i32], m: &[bool]) -> bool {
+        c.iter()
+            .any(|&l| m.get(l.unsigned_abs() as usize).copied().unwrap_or(false) == (l > 0))
+    }
+
+    /// Every soft wants its variable true; the hards forbid pairs, so the
+    /// optimum is far from trivial but any independent set is a model.
+    fn chain(n: i32) -> (Vec<Vec<i32>>, Vec<Vec<i32>>, Vec<u64>) {
+        let hard: Vec<Vec<i32>> = (1..n).map(|v| vec![-v, -(v + 1)]).collect();
+        let soft: Vec<Vec<i32>> = (1..=n).map(|v| vec![v]).collect();
+        let weights = (1..=n as u64).map(|w| 1 + w % 7).collect();
+        (hard, soft, weights)
+    }
+
+    #[test]
+    fn budgeted_seed_yields_a_feasible_incumbent_before_the_core_phase() {
+        let (hard, soft, weights) = chain(60);
+        let mut e = engine(60, &hard, &soft, &weights);
+        e.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        let mut seen: Vec<(u64, Vec<bool>)> = Vec::new();
+        let outcome = e.seed_first_model(&|| false, &mut |c, m| seen.push((c, m.to_vec())));
+        assert!(
+            outcome.is_none(),
+            "a chain instance is not closed by one model"
+        );
+        assert_eq!(seen.len(), 1, "one o line for the seed");
+        let (cost, model) = &seen[0];
+        assert!(hard.iter().all(|c| sat(c, model)), "seed model is feasible");
+        let actual: u64 = soft
+            .iter()
+            .zip(&weights)
+            .filter(|(c, _)| !sat(c, model))
+            .map(|(_, w)| *w)
+            .sum();
+        assert_eq!(*cost, actual, "seed cost is the model's cost");
+        let (best_cost, best_model) = e.best().expect("the seed is the incumbent");
+        assert_eq!((best_cost, &best_model), (*cost, model));
+    }
+
+    #[test]
+    fn budget_blind_runs_keep_the_old_schedule() {
+        let (hard, soft, weights) = chain(10);
+        let mut e = engine(10, &hard, &soft, &weights);
+        let mut calls = 0;
+        assert!(e
+            .seed_first_model(&|| false, &mut |_, _| calls += 1)
+            .is_none());
+        assert_eq!(calls, 0);
+        assert!(e.best().is_none());
+    }
+
+    #[test]
+    fn unsat_hards_leave_the_verdict_to_the_core_phase() {
+        let mut e = engine(1, &[vec![1], vec![-1]], &[vec![1]], &[1]);
+        e.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        let mut calls = 0;
+        assert!(e
+            .seed_first_model(&|| false, &mut |_, _| calls += 1)
+            .is_none());
+        assert_eq!(calls, 0);
+        assert!(e.best().is_none());
+        assert!(matches!(
+            e.solve(&|| false, &mut |_, _| {}),
+            OllOutcome::Unsatisfiable
+        ));
+    }
+
+    /// The seeded solve still reaches the brute-force optimum.
+    #[test]
+    fn seeded_solves_stay_exact() {
+        for n in [5i32, 8, 12] {
+            let (hard, soft, weights) = chain(n);
+            let mut best = u64::MAX;
+            for bits in 0u64..(1 << n) {
+                let m: Vec<bool> = std::iter::once(false)
+                    .chain((0..n).map(|i| bits >> i & 1 == 1))
+                    .collect();
+                if hard.iter().all(|c| sat(c, &m)) {
+                    let c: u64 = soft
+                        .iter()
+                        .zip(&weights)
+                        .filter(|(c, _)| !sat(c, &m))
+                        .map(|(_, w)| *w)
+                        .sum();
+                    best = best.min(c);
+                }
+            }
+            let mut e = engine(n as u32, &hard, &soft, &weights);
+            e.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+            match e.solve(&|| false, &mut |_, _| {}) {
+                OllOutcome::Optimal { cost, .. } => assert_eq!(cost, best, "n={n}"),
+                other => panic!("n={n}: expected optimal, got {other:?}"),
+            }
+        }
     }
 }

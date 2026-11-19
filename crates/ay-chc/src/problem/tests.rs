@@ -74,6 +74,99 @@ fn datatype_feature_detection_includes_typed_local_without_registry() {
     assert!(problem.uses_datatype_features());
 }
 
+/// The sort-node budget bounds the descent into array sorts only. Before
+/// 2026-11-18 every scalar argument was charged a node, so a predicate with
+/// more than 32,768 scalar arguments (CHC-COMP 2026 BV `ssh-simplified`
+/// `s3_srvr_1_BUG` has 47,490 over 342 predicates) was classified as having
+/// datatype sorts and bypassed the Spacer lane as `dt`.
+#[test]
+fn datatype_sort_detection_does_not_charge_scalar_arguments() {
+    let mut problem = ChcProblem::new();
+    problem.declare_predicate("wide_int", vec![ChcSort::Int; 40_000]);
+    problem.declare_predicate("wide_bv", vec![ChcSort::BitVec(32); 40_000]);
+
+    assert!(
+        !problem.has_datatype_sorts(),
+        "80,000 scalar predicate arguments contain no datatype"
+    );
+}
+
+/// The clause-term walk visits the sort of every variable occurrence and
+/// shares the same sort-node budget, so before the fix any problem with more
+/// than 32,768 scalar variable occurrences reported datatype features.
+#[test]
+fn datatype_feature_detection_does_not_charge_scalar_variable_occurrences() {
+    let conjuncts = (0..20_000).map(|index| {
+        ChcExpr::eq(
+            ChcExpr::var(ChcVar::new(format!("x{index}"), ChcSort::Int)),
+            ChcExpr::var(ChcVar::new(format!("y{index}"), ChcSort::Int)),
+        )
+    });
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::and_all(
+        conjuncts,
+    ))));
+    let stored = problem.clauses()[0]
+        .body
+        .constraint
+        .as_ref()
+        .expect("the conjunction survives clause simplification");
+    assert!(
+        stored.vars().len() > 32_768,
+        "the walk must see more variable occurrences than the old budget"
+    );
+
+    assert!(
+        !problem.uses_datatype_features(),
+        "40,000 integer variable occurrences use no datatype feature"
+    );
+}
+
+#[test]
+fn datatype_sort_detection_finds_datatype_inside_array() {
+    let constructors = crate::ChcDtConstructors::new(vec![crate::ChcDtConstructor {
+        name: "cell".to_string(),
+        selectors: vec![crate::ChcDtSelector {
+            name: "cell-value".to_string(),
+            sort: ChcSort::Int,
+        }],
+    }]);
+    let cell = ChcSort::Datatype {
+        name: "Cell".to_string(),
+        constructors,
+    };
+    let mut problem = ChcProblem::new();
+    problem.declare_predicate(
+        "heap",
+        vec![
+            ChcSort::Int,
+            ChcSort::Array(Box::new(ChcSort::Int), Box::new(cell)),
+        ],
+    );
+
+    assert!(problem.has_datatype_sorts());
+}
+
+#[test]
+fn datatype_sort_detection_fails_closed_when_array_budget_is_exhausted() {
+    let array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    // Each array node charges two and its scalar root nothing, so 16,384
+    // arrays fit the 32,768 budget exactly and 16,385 exceed it.
+    let mut within = ChcProblem::new();
+    within.declare_predicate("many_arrays", vec![array.clone(); 16_384]);
+    assert!(
+        !within.has_datatype_sorts(),
+        "16,384 integer arrays are within the budget and hold no datatype"
+    );
+
+    let mut problem = ChcProblem::new();
+    problem.declare_predicate("many_arrays", vec![array; 16_385]);
+    assert!(
+        problem.has_datatype_sorts(),
+        "an exhausted budget must keep the conservative datatype answer"
+    );
+}
+
 #[test]
 fn query_obligations_unfold_markers_and_prune_unrelated_properties() {
     let mut problem = ChcProblem::new();
@@ -1391,4 +1484,74 @@ mod dead_end_cone_tests {
         assert!(problem.query_cone_of_influence().is_none());
         assert!(!problem.strip_dead_end_cycle_predicates());
     }
+}
+
+/// `validate` scans every clause for UF and datatype declarations. That scan
+/// used to be charged against one executor query's caps (131,072 roots and
+/// nodes), so a problem with many scalar predicate arguments failed `validate`
+/// and PDR, the Spacer lane and the BMC executor lanes never ran on it (all
+/// 20 CHC-COMP 2026 BV `ssh-simplified`/`LU` tasks with 147 k-497 k).
+#[test]
+fn validate_admits_wide_scalar_problem_beyond_one_query_cap() {
+    const ARITY: usize = 1_000;
+    const RULES: usize = 80;
+    let mut problem = ChcProblem::new();
+    let state = problem.declare_predicate("state", vec![ChcSort::Int; ARITY]);
+    let current: Vec<ChcVar> = (0..ARITY)
+        .map(|index| ChcVar::new(format!("x{index}"), ChcSort::Int))
+        .collect();
+    let next: Vec<ChcVar> = (0..ARITY)
+        .map(|index| ChcVar::new(format!("y{index}"), ChcSort::Int))
+        .collect();
+    let args = |vars: &[ChcVar]| vars.iter().cloned().map(ChcExpr::var).collect::<Vec<_>>();
+    problem.add_clause(HornClause::fact(
+        ChcExpr::Bool(true),
+        state,
+        vec![ChcExpr::int(0); ARITY],
+    ));
+    for _ in 0..RULES {
+        let step = ChcExpr::and_all(current.iter().zip(&next).map(|(x, y)| {
+            ChcExpr::eq(
+                ChcExpr::var(y.clone()),
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+            )
+        }));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(state, args(&current))], Some(step)),
+            ClauseHead::Predicate(state, args(&next)),
+        ));
+    }
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(state, args(&current))],
+        Some(ChcExpr::lt(
+            ChcExpr::var(current[0].clone()),
+            ChcExpr::int(0),
+        )),
+    )));
+
+    // 161,000 scalar argument occurrences and 400,000 constraint nodes.
+    problem
+        .validate()
+        .expect("a wide scalar problem is valid; the scan is not one executor query");
+}
+
+/// Each distinct variable name pays a sort node in the whole-problem scan, so
+/// a scan charged against one query's 32,768 sort nodes refused problems
+/// whose front end names variables per clause.
+#[test]
+fn validate_admits_more_distinct_variable_names_than_one_query_cap() {
+    let conjuncts = (0..20_000).map(|index| {
+        ChcExpr::eq(
+            ChcExpr::var(ChcVar::new(format!("x{index}"), ChcSort::Int)),
+            ChcExpr::var(ChcVar::new(format!("y{index}"), ChcSort::Int)),
+        )
+    });
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::and_all(
+        conjuncts,
+    ))));
+
+    problem
+        .validate()
+        .expect("40,000 distinct scalar variable names are a valid problem");
 }

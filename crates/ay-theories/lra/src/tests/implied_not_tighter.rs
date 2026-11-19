@@ -252,3 +252,73 @@ fn weaker_direct_bound_does_not_stamp_var_for_rederivation() {
         Rational::from(0)
     );
 }
+
+/// Same-round best suppression (#allinterval-round-best): three rows
+/// `b = x`, `a = x`, `c = x` with `b >= 0`, `a >= 5`, `c >= 5` derive
+/// lower bounds 0, 5, 5 for `x` in one cascade round. The first is
+/// admitted, the tighter second replaces it as the round best, and
+/// the equal third is suppressed before its explanation is built —
+/// the apply loop would drop it anyway (not tighter than the bound
+/// the second stores). The surviving explanation must still be the
+/// second row's, byte-identical to the unsuppressed run.
+#[test]
+fn same_round_looser_and_equal_derivations_are_suppressed_before_explanation() {
+    let terms = TermStore::new();
+    let mut solver = LraSolver::new(&terms);
+    let bound = |value: i64| {
+        Bound::new(
+            BigRational::from(BigInt::from(value)).into(),
+            vec![TermId::new(900)],
+            vec![true],
+            vec![Rational::one()],
+            false,
+        )
+    };
+    let var = |lower: Option<i64>, status: VarStatus| VarInfo {
+        value: InfRational::from_rational(BigRational::zero()),
+        lower: lower.map(|v| bound(v)),
+        upper: None,
+        status: Some(status),
+    };
+    // x = 0 (nonbasic); b = 1 basic in row 0; a = 2 basic in row 1;
+    // c = 3 basic in row 2. Every row is `basic = x`.
+    solver.vars = vec![
+        var(None, VarStatus::NonBasic),
+        var(Some(0), VarStatus::Basic(0)),
+        var(Some(5), VarStatus::Basic(1)),
+        var(Some(5), VarStatus::Basic(2)),
+    ];
+    solver.rows = (1..=3u32)
+        .map(|basic| {
+            TableauRow::new(
+                basic,
+                vec![(0, BigRational::from(BigInt::from(1)))],
+                BigRational::zero(),
+            )
+        })
+        .collect();
+    solver.col_index = vec![Vec::new(); 4];
+    for row in 0..3usize {
+        solver.col_index[0].push(ColEntry::new(row, 0));
+        solver.basic_var_to_row.insert(row as u32 + 1, row);
+        solver.touched_rows.insert(row);
+    }
+
+    solver.compute_implied_bounds();
+
+    assert_eq!(
+        solver.stats.implied_round_best_suppressed, 1,
+        "exactly the equal third derivation is suppressed in round one"
+    );
+    let x_lower = solver.implied_bounds[0].0.clone().expect("x >= 5 derived");
+    assert_eq!(x_lower.value, Rational::from(5));
+    assert!(!x_lower.strict);
+    let expl = x_lower
+        .explanation
+        .expect("the winning derivation keeps its explanation");
+    assert_eq!(expl.contributing_vars.len(), 1);
+    assert_eq!(
+        expl.contributing_vars[0].var, 2,
+        "explanation is the tighter second row's, as without suppression"
+    );
+}

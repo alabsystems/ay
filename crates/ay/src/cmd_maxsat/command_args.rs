@@ -108,7 +108,8 @@ pub(crate) struct MaxSatSolveArgs {
     /// WCNF/MaxSAT input file.
     pub file: PathBuf,
     /// Wall-clock timeout in seconds (0 = none). On timeout, prints the best
-    /// bound found and `s UNKNOWN`.
+    /// model found under `s SATISFIABLE` once it has been re-checked against
+    /// the instance, or `s UNKNOWN` when there is none.
     #[arg(long, default_value_t = 0.0)]
     pub timeout: f64,
     /// EXPERIMENTAL: solve via the native ay-milp 0/1-ILP encoding instead of

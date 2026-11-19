@@ -644,13 +644,18 @@ mod unproductive_round_limits_tests {
     /// The two measured refutations: string_search.ads_35_14 (7,618 atoms with
     /// the enumerative lane on) needs a 357-round consecutive run and 592
     /// unproductive rounds in total; R509-011 why_fb578d (6,130 atoms) needs a
-    /// 211-round run and 1,017 in total. Both bounds clear both with margin,
-    /// and a bound never goes below its constant.
+    /// 211-round run and 1,017 in total. The corpus guard's current fixture,
+    /// N624-020 perm.adb_31_51 (5,489 atoms with the lane on, measured
+    /// 2026-11-18), needs a 235-round run and 510 in total. The bounds clear
+    /// all three with margin, and a bound never goes below its constant.
     #[test]
     fn large_vocabularies_scale_linearly_and_clear_the_measured_refutations() {
         let (consecutive, total) = unproductive_round_limits(7_618);
         assert_eq!((consecutive, total), (952, 7_618));
         assert!(consecutive > 357 && total > 592);
+        let (consecutive, total) = unproductive_round_limits(5_489);
+        assert_eq!((consecutive, total), (686, 5_489));
+        assert!(consecutive > 235 && total > 510);
         let (consecutive, total) = unproductive_round_limits(6_130);
         assert_eq!((consecutive, total), (766, 6_130));
         assert!(consecutive > 211 && total > 1_017);

@@ -1087,6 +1087,13 @@ pub struct LraSolver {
     ib_updates_scratch: Vec<(usize, Option<ImpliedBound>, Option<ImpliedBound>)>,
     ib_row_indices_scratch: Vec<usize>,
     ib_round_newly_bounded_scratch: Vec<u32>,
+    /// #allinterval-round-best: per-variable tightest bound proposed so
+    /// far in the current cascade round, `(lower, upper)` as
+    /// `(value, strict)`, plus the touched-variable list used to reset
+    /// it in O(touched) at each round top. Same mem::take/restore
+    /// scratch discipline as the buffers above.
+    ib_round_best_scratch: Vec<(Option<(Rational, bool)>, Option<(Rational, bool)>)>,
+    ib_round_best_touched_scratch: Vec<u32>,
     ib_cross_neg_updates_scratch: Vec<(usize, Option<ImpliedBound>, Option<ImpliedBound>)>,
     ib_cascade_rows_scratch: Vec<usize>,
     ib_fixed_vars_scratch: Vec<u32>,

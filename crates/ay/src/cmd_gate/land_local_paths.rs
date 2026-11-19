@@ -135,7 +135,7 @@ impl<'a> Graph<'a> {
     /// Unlike `consumers`, traverse through workspace importers as well.
     /// Only metadata resolving the actual CLI features may exclude a build;
     /// unavailable, ambiguous or incomplete graph input stays conservative.
-    pub fn cli_depends_on(&self, id: &str) -> bool {
+    pub(super) fn cli_depends_on(&self, id: &str) -> bool {
         let mut candidates = self.metadata.packages.iter().filter(|package| {
             package.name == "ay" && self.metadata.workspace_members.contains(&package.id)
         });

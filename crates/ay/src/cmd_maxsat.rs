@@ -1181,6 +1181,8 @@ enum MaxSatUnreapedChildState {
 
 #[cfg(target_os = "macos")]
 mod darwin_child;
+
+mod anytime;
 #[cfg(target_os = "macos")]
 use darwin_child::{observe_maxsat_child_unreaped, wait_for_maxsat_guard_stop};
 
@@ -2030,6 +2032,23 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
         .then(|| checked_timeout_deadline(Instant::now(), timeout))
         .transpose()?;
 
+    // AY-N1: a stop request (SIGTERM/SIGINT) and an overrun of the deadline
+    // both end with the model of the last `o` line (or `s UNKNOWN`), one `s`
+    // line and status 0 — see `anytime`. Armed before the instance is read,
+    // so a run stopped while still parsing answers too.
+    let stop_requested = anytime::install_stop_request()?;
+    let reporter = Arc::new(anytime::Reporter::new());
+    anytime::spawn_watchdog(
+        Arc::clone(&reporter),
+        Arc::clone(&stop_requested),
+        deadline,
+        args.file.clone(),
+    )?;
+    let stop_now = {
+        let stop = Arc::clone(&stop_requested);
+        move || stop.load(Ordering::Acquire) || deadline.is_some_and(|d| Instant::now() >= d)
+    };
+
     // MILP-race clause capture: collect while all size gates hold; on the
     // first violation drop the buffers and stop collecting (the OLL engine
     // is unaffected).
@@ -2041,7 +2060,15 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     let mut race_ok = race_wanted;
 
     let mut solver = MaxSatSolver::new();
-    let summary = stream_wcnf_file(&args.file, &mut |weight, lits| {
+    let parse_started = Instant::now();
+    let mut clauses_read: u64 = 0;
+    let mut stopped_while_reading = false;
+    let parsed = stream_wcnf_file(&args.file, &mut |weight, lits| {
+        clauses_read += 1;
+        if clauses_read % 4096 == 0 && stop_now() {
+            stopped_while_reading = true;
+            bail!("stopped while reading the instance");
+        }
         match weight {
             None => {
                 if race_ok {
@@ -2086,9 +2113,21 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
             }
         }
         Ok(())
-    })
-    .with_context(|| format!("failed to parse '{}'", args.file.display()))?;
+    });
+    if stopped_while_reading {
+        // The budget ended (or a stop was requested) before the instance was
+        // read: no model exists, so the answer is `s UNKNOWN`.
+        let Some(_) = reporter.claim() else {
+            anytime::wait_for_the_answer();
+        };
+        eprintln!("c anytime: stopped after {clauses_read} clauses, before the instance was read");
+        anytime::write_unproven_answer(&mut std::io::stdout().lock(), 0, None, None)?;
+        return Ok(0);
+    }
+    let summary = parsed.with_context(|| format!("failed to parse '{}'", args.file.display()))?;
+    let parse_elapsed = parse_started.elapsed();
     let num_vars = summary.num_vars;
+    reporter.set_instance(num_vars, anytime::audit_budget(parse_elapsed));
     // #milp-race-tall: eligible if EITHER the original column-and-row gate
     // passes, OR the model is tall-thin (few columns, many rows) — see
     // MILP_RACE_TALL_MAX_VARS.
@@ -2135,17 +2174,12 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     }
 
     let milp_won_stop = milp_won.clone();
-    let should_stop = move || {
-        milp_won_stop.load(Ordering::Acquire) || deadline.is_some_and(|d| Instant::now() >= d)
-    };
-    let mut last_printed: Option<u64> = None;
+    let should_stop = move || milp_won_stop.load(Ordering::Acquire) || stop_now();
     let shared_ub_cb = shared_ub.clone();
-    let mut on_upper_bound = |cost: u64| {
+    let reporter_cb = Arc::clone(&reporter);
+    let mut on_upper_bound = |cost: u64, model: &[bool]| {
         shared_ub_cb.fetch_min(cost, Ordering::Relaxed);
-        if last_printed != Some(cost) {
-            last_printed = Some(cost);
-            println!("o {cost}");
-        }
+        reporter_cb.improved(&mut std::io::stdout(), cost, model);
     };
 
     // Hand the engine its budget, not just a stop bit. Without this every
@@ -2153,7 +2187,14 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     // a fixed constant that suits exactly one timeout — the measured cause of
     // AY's flat 60s→3600s curve.
     solver.set_deadline(deadline);
-    match solver.solve_interruptible(&should_stop, &mut on_upper_bound) {
+    let result = solver.solve_interruptible_with_models(&should_stop, &mut on_upper_bound);
+    // Only the side that claims the answer prints an `s` line; when the
+    // watchdog already has, it ends the process.
+    let Some(claim) = reporter.claim() else {
+        anytime::wait_for_the_answer();
+    };
+    let last_printed = claim.last_printed;
+    match result {
         MaxSatResult::Optimal { model, cost } => {
             // #answer-audit: never claim an optimum without re-checking the
             // model against the instance. A wrong answer is disqualifying, so a
@@ -2269,29 +2310,48 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
                 None => {}
             }
             if let Some((cost, model)) = solver.best_solution() {
+                // A model without an optimality proof: MSE credits it only
+                // under `s SATISFIABLE`, and grades that claim, so it is
+                // audited against the instance first, within a bounded time,
+                // and withheld (`s UNKNOWN`) unless the audit is clean.
+                let audit = anytime::audit_incumbent(
+                    &args.file,
+                    model,
+                    cost,
+                    Some(Instant::now() + anytime::audit_budget(parse_elapsed)),
+                );
+                anytime::write_unproven_answer(
+                    &mut std::io::stdout().lock(),
+                    num_vars,
+                    Some((cost, model, &audit)),
+                    last_printed,
+                )?;
                 // The anytime certificate. This is the case `--proof` exists
                 // for: AY holds a model it cannot prove optimal, and the
                 // emitted `lo <= obj <= cost` interval says exactly that —
                 // the incumbent is checked in full, and the interval does not
                 // claim optimality unless the mined-core floor happens to meet
                 // it, in which case the checker has proven it independently.
-                if last_printed != Some(cost) {
-                    println!("o {cost}");
-                }
-                println!("s UNKNOWN");
-                print_assignment(num_vars, model);
                 // Answer first, certificate second — see the OPTIMUM site
                 // above. This path matters most: it is the one a bench sweep
-                // hits hundreds of times, always within the kill grace.
-                emit_proof_if_requested(
-                    args,
-                    model,
-                    cost,
-                    solver.paid_mined_cores(),
-                    solver.paid_sat_cores(),
-                );
+                // hits hundreds of times, always within the kill grace. A
+                // withheld model gets no certificate.
+                if audit == anytime::IncumbentAudit::Clean {
+                    emit_proof_if_requested(
+                        args,
+                        model,
+                        cost,
+                        solver.paid_mined_cores(),
+                        solver.paid_sat_cores(),
+                    );
+                }
             } else {
-                println!("s UNKNOWN");
+                anytime::write_unproven_answer(
+                    &mut std::io::stdout().lock(),
+                    num_vars,
+                    None,
+                    None,
+                )?;
             }
             Ok(0)
         }
@@ -2300,17 +2360,7 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
 
 fn print_assignment(num_vars: usize, model: &[bool]) {
     // MSE 2022+ format: `v` followed by one 0/1 per variable, one token.
-    let mut line = String::with_capacity(num_vars + 2);
-    line.push('v');
-    line.push(' ');
-    for var in 1..=num_vars {
-        line.push(if model.get(var).copied().unwrap_or(false) {
-            '1'
-        } else {
-            '0'
-        });
-    }
-    println!("{line}");
+    println!("{}", anytime::assignment_line(num_vars, model));
 }
 
 /// EXPERIMENTAL native-MILP MaxSAT solver (validation lane for LP-structured

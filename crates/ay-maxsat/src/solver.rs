@@ -101,6 +101,9 @@ pub struct MaxSatStats {
     /// fail-safe (sibling of `core_mine_abandoned`) that turns a would-be wrong
     /// answer into a slower, exact-encoding descent.
     pub descent_residual_abandoned: u64,
+    /// First-model seed calls (#first-model-seed) that returned a model of
+    /// the hard clauses
+    pub seed_models: u64,
 }
 
 /// MAX-SAT Solver
@@ -240,6 +243,22 @@ impl MaxSatSolver {
         &mut self,
         should_stop: &dyn Fn() -> bool,
         on_upper_bound: &mut dyn FnMut(u64),
+    ) -> MaxSatResult {
+        self.solve_interruptible_with_models(should_stop, &mut |cost, _| on_upper_bound(cost))
+    }
+
+    /// [`Self::solve_interruptible`], with each improving model handed to
+    /// `on_upper_bound` together with its cost.
+    ///
+    /// The model has the layout of [`Self::best_solution`] (indexed by
+    /// variable id, index 0 unused) and is the incumbent from that moment on,
+    /// so a caller that must answer without waiting for the solve to return
+    /// (a stop signal, an engine that overruns its deadline) can keep the
+    /// model of its last `o` line.
+    pub fn solve_interruptible_with_models(
+        &mut self,
+        should_stop: &dyn Fn() -> bool,
+        on_upper_bound: &mut dyn FnMut(u64, &[bool]),
     ) -> MaxSatResult {
         // Handle empty instance
         if self.hard_clauses.is_empty() && self.soft_clauses.is_empty() {

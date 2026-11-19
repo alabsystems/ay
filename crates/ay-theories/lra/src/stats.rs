@@ -178,6 +178,11 @@ pub(crate) struct LraStats {
     /// the derived bound is not tighter than the variable's current implied
     /// bound (the deferred-update apply loop would discard it).
     pub(crate) implied_not_tighter_skips: u64,
+    /// Derivations dropped before explanation construction because an
+    /// earlier derivation in the same cascade round already proposed a
+    /// bound at least as tight for the same variable side
+    /// (#allinterval-round-best); the apply loop would discard them.
+    pub(crate) implied_round_best_suppressed: u64,
 
     // ----- Snapshot telemetry (#8255) -----
     /// Number of `save_feasible_snapshot` calls skipped because simplex did

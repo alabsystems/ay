@@ -554,11 +554,24 @@ fn identity_comparison_and_failed_first_admission_are_bounded() {
     let right = left.clone();
     let mut exact = MAX_DT_DEFINITION_COMPARE_WORK - 3;
     let mut names = 0;
-    assert!(variable_sorts::same_metadata_shape(&left, &right, &mut exact, &mut names).unwrap());
+    assert!(variable_sorts::same_metadata_shape(
+        &left,
+        &right,
+        &mut exact,
+        &mut names,
+        EXECUTOR_QUERY_LIMITS
+    )
+    .unwrap());
     assert_eq!(exact, MAX_DT_DEFINITION_COMPARE_WORK);
     let mut short = MAX_DT_DEFINITION_COMPARE_WORK - 2;
     assert!(matches!(
-        variable_sorts::same_metadata_shape(&left, &right, &mut short, &mut names),
+        variable_sorts::same_metadata_shape(
+            &left,
+            &right,
+            &mut short,
+            &mut names,
+            EXECUTOR_QUERY_LIMITS
+        ),
         Err(DatatypeDeclarationError::ResourceLimit(
             "variable sort comparison"
         ))

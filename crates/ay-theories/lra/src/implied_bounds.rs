@@ -22,6 +22,80 @@ pub(crate) struct ImpliedBoundsResult {
     pub deep_cascade_productive: bool,
 }
 
+/// Strict-aware "not tighter" order: exactly the negation of the
+/// deferred-update apply loop's `tighter` comparison for a candidate
+/// `(value, strict)` against an incumbent `(cur_value, cur_strict)`
+/// on the `is_upper` side. Shared by the slot pre-filter
+/// (`derived_bound_not_tighter`) and the same-round best test so the
+/// two can never disagree about the order.
+#[inline]
+fn bound_not_tighter_than(
+    is_upper: bool,
+    value: &Rational,
+    strict: bool,
+    cur_value: &Rational,
+    cur_strict: bool,
+) -> bool {
+    let tighter = match value.cmp(cur_value) {
+        std::cmp::Ordering::Less => is_upper,
+        std::cmp::Ordering::Greater => !is_upper,
+        std::cmp::Ordering::Equal => strict && !cur_strict,
+    };
+    !tighter
+}
+
+/// Per-variable tightest proposals of one cascade round:
+/// `(lower, upper)`, each `(value, strict)`.
+type RoundBest = (Option<(Rational, bool)>, Option<(Rational, bool)>);
+
+/// Same-round best test (#allinterval-round-best): admit a candidate
+/// only when it is tighter than every bound already proposed for the
+/// same variable side in this cascade round, recording it as the new
+/// round best. A suppressed candidate could never be stored by the
+/// apply loop: proposals apply in push order and slots only tighten,
+/// so if the round best stores, the candidate is not tighter than
+/// the slot; if the round best is instead rejected (the interest
+/// gate or the Zeno accept test — both tightness-monotone in the
+/// candidate value over a frozen asserted set, and the accept test
+/// mutates its streak only on the store path), the looser candidate
+/// is rejected for the same reason with no side effect. Suppressing
+/// it before its explanation is built therefore changes nothing but
+/// the work done, exactly like the slot pre-filter. Measured on
+/// AllInterval-011: 7.65M of 23.87M proposals in 20s died at apply
+/// as not-tighter after their explanations were already built.
+#[inline]
+fn round_best_admit(
+    best: &mut [RoundBest],
+    touched: &mut Vec<u32>,
+    vi: usize,
+    is_upper: bool,
+    value: &Rational,
+    strict: bool,
+) -> bool {
+    let first_touch = best[vi].0.is_none() && best[vi].1.is_none();
+    let slot = if is_upper {
+        &mut best[vi].1
+    } else {
+        &mut best[vi].0
+    };
+    match slot {
+        Some((cur_value, cur_strict)) => {
+            if bound_not_tighter_than(is_upper, value, strict, cur_value, *cur_strict) {
+                return false;
+            }
+            *slot = Some((value.clone(), strict));
+            true
+        }
+        None => {
+            if first_touch {
+                touched.push(vi as u32);
+            }
+            *slot = Some((value.clone(), strict));
+            true
+        }
+    }
+}
+
 impl LraSolver {
     /// #inc-ib-gate (Rank 2, Yices2 propagator1.h:252-261 clean-room): a
     /// derived bound is worth STORING only if it could decide a pending atom
@@ -71,12 +145,7 @@ impl LraSolver {
         let Some(cur) = cur else {
             return false;
         };
-        let tighter = match value.cmp(&cur.value) {
-            std::cmp::Ordering::Less => is_upper,
-            std::cmp::Ordering::Greater => !is_upper,
-            std::cmp::Ordering::Equal => strict && !cur.strict,
-        };
-        !tighter
+        bound_not_tighter_than(is_upper, value, strict, &cur.value, cur.strict)
     }
 
     /// Compute implied bounds for all variables from tableau rows.
@@ -390,7 +459,18 @@ impl LraSolver {
         let mut round_newly_bounded = std::mem::take(&mut self.ib_round_newly_bounded_scratch);
         let mut cross_neg_updates = std::mem::take(&mut self.ib_cross_neg_updates_scratch);
         let mut cascade_rows = std::mem::take(&mut self.ib_cascade_rows_scratch);
+        let mut round_best = std::mem::take(&mut self.ib_round_best_scratch);
+        let mut round_best_touched = std::mem::take(&mut self.ib_round_best_touched_scratch);
+        round_best.resize(num_vars, (None, None));
         loop {
+            // #allinterval-round-best: the round best is per cascade
+            // round; reset in O(touched) via the touched list.
+            for &v in &round_best_touched {
+                if let Some(slot) = round_best.get_mut(v as usize) {
+                    *slot = (None, None);
+                }
+            }
+            round_best_touched.clear();
             updates.clear();
             // #8008: Removed coefficient budget (#8257). Z3's
             // bound_analyzer_on_row has no coefficient budget. The budget was
@@ -820,6 +900,20 @@ impl LraSolver {
                                 self.stats.implied_not_tighter_skips += 1;
                                 continue;
                             }
+                            // #allinterval-round-best: beaten by an
+                            // earlier proposal this round; apply would
+                            // drop it (see round_best_admit).
+                            if !round_best_admit(
+                                &mut round_best,
+                                &mut round_best_touched,
+                                vi,
+                                is_upper,
+                                &bound_val,
+                                derived_strict,
+                            ) {
+                                self.stats.implied_round_best_suppressed += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // Z3's bound_analyzer_on_row stores ALL derived bounds and
                             // only checks interest at the propagation level (arith_solver.cpp:363).
@@ -881,6 +975,16 @@ impl LraSolver {
                             ) {
                                 // Not tighter than the slot: the apply loop would drop it.
                                 self.stats.implied_not_tighter_skips += 1;
+                            } else if !round_best_admit(
+                                &mut round_best,
+                                &mut round_best_touched,
+                                target_vi,
+                                is_upper,
+                                &bound_val,
+                                lb_any_strict,
+                            ) {
+                                // #allinterval-round-best (see site above).
+                                self.stats.implied_round_best_suppressed += 1;
                             } else {
                                 let derived_strict = lb_any_strict;
                                 // #6617: Build eager explanation -- all other variables.
@@ -1206,6 +1310,18 @@ impl LraSolver {
                                 self.stats.implied_not_tighter_skips += 1;
                                 continue;
                             }
+                            // #allinterval-round-best (see LB site).
+                            if !round_best_admit(
+                                &mut round_best,
+                                &mut round_best_touched,
+                                vi,
+                                is_upper,
+                                &bound_val,
+                                derived_strict,
+                            ) {
+                                self.stats.implied_round_best_suppressed += 1;
+                                continue;
+                            }
                             // #8422: Do NOT filter bounds at the LP derivation level.
                             // (See LB direction comment above for full rationale.)
                             let interesting =
@@ -1248,6 +1364,16 @@ impl LraSolver {
                             ) {
                                 // Not tighter than the slot: the apply loop would drop it.
                                 self.stats.implied_not_tighter_skips += 1;
+                            } else if !round_best_admit(
+                                &mut round_best,
+                                &mut round_best_touched,
+                                target_vi,
+                                !eq_c.is_positive(),
+                                &bound_val,
+                                ub_any_strict,
+                            ) {
+                                // #allinterval-round-best (see LB site).
+                                self.stats.implied_round_best_suppressed += 1;
                             } else {
                                 let derived_strict = ub_any_strict;
                                 // #6617: Build eager explanation for UB single-unbounded.
@@ -1540,6 +1666,8 @@ impl LraSolver {
         self.ib_round_newly_bounded_scratch = round_newly_bounded;
         self.ib_cross_neg_updates_scratch = cross_neg_updates;
         self.ib_cascade_rows_scratch = cascade_rows;
+        self.ib_round_best_scratch = round_best;
+        self.ib_round_best_touched_scratch = round_best_touched;
 
         // #inc-cib-nodelta: this call swept every row, so the persistent
         // overlay is now complete for the current row set — repeat calls with

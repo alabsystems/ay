@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use std::time::Duration;
 
 #[test]
 fn test_simple_unweighted() {
@@ -442,6 +443,29 @@ fn brute_force_optimum(num_vars: u32, hard: &[Vec<i32>], soft: &[(u64, Vec<i32>)
 /// splitting, totalizer bounds, stratification, and hardening.
 #[test]
 fn test_random_cross_check_brute_force() {
+    let seeded = random_cross_check_brute_force(None);
+    // Budget-blind solves never run the first-model seed.
+    assert_eq!(seeded, 0, "the seed ran without a deadline");
+}
+
+/// The same cross-check with a whole-solve deadline set, the way the CLI
+/// runs under `--timeout`: the first-model seed (#first-model-seed) then
+/// runs before the core phase, and its model, its upper bound and the
+/// hardening it triggers must still lead to the brute-force optimum.
+#[test]
+fn test_random_cross_check_brute_force_with_deadline() {
+    let seeded = random_cross_check_brute_force(Some(Duration::from_secs(600)));
+    assert!(
+        seeded > 400,
+        "the seed found a model on only {seeded} instances"
+    );
+}
+
+/// Runs the brute-force cross-check, with a deadline `budget` from each
+/// solve's start when given, and returns how many solves the first-model
+/// seed gave a model.
+fn random_cross_check_brute_force(budget: Option<Duration>) -> u64 {
+    let mut seeded = 0u64;
     for seed in 0..500u64 {
         let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
         let num_vars = 3 + rng.below(6) as u32; // 3..8
@@ -476,8 +500,11 @@ fn test_random_cross_check_brute_force() {
         for (w, c) in &soft {
             solver.add_soft_clause(c.clone(), *w);
         }
+        solver.set_deadline(budget.map(|b| Instant::now() + b));
 
-        match (solver.solve(), expected) {
+        let result = solver.solve();
+        seeded += solver.stats().seed_models;
+        match (result, expected) {
             (MaxSatResult::Optimal { cost, model }, Some(exp)) => {
                 assert_eq!(
                     cost, exp,
@@ -515,6 +542,7 @@ fn test_random_cross_check_brute_force() {
             ),
         }
     }
+    seeded
 }
 
 /// Large-optimum unit-weight instance: exercises the LSU descent (OLL alone
@@ -570,4 +598,138 @@ fn residual_units_refuses_a_bound_it_cannot_represent() {
     // Weight 1, budget just past the selector count.
     assert_eq!(OllEngine::residual_units_for_test(9, 1, 8), None);
     assert_eq!(OllEngine::residual_units_for_test(8, 1, 8), Some(8));
+}
+
+/// `solve_interruptible_with_models` hands out, with every cost, a model that
+/// satisfies every hard clause and costs exactly that much, and costs fall
+/// strictly. A caller that answers from the last callback (on a stop signal,
+/// before the solve returns) therefore reports a feasible model whose cost is
+/// its last `o` line.
+#[test]
+fn test_upper_bound_models_are_feasible_and_cost_what_they_claim() {
+    let mut callbacks = 0usize;
+    for seed in 0..300u64 {
+        let mut rng = Lcg(seed.wrapping_mul(0x2545F4914F6CDD1D).wrapping_add(7));
+        let num_vars = 4 + rng.below(9) as u32; // 4..12
+        let gen_clause = |rng: &mut Lcg| -> Vec<i32> {
+            let len = 1 + rng.below(3) as usize;
+            (0..len)
+                .map(|_| {
+                    let v = 1 + rng.below(num_vars as u64) as i32;
+                    if rng.below(2) == 0 {
+                        v
+                    } else {
+                        -v
+                    }
+                })
+                .collect()
+        };
+        let hard: Vec<Vec<i32>> = (0..rng.below(8)).map(|_| gen_clause(&mut rng)).collect();
+        let soft: Vec<(u64, Vec<i32>)> = (0..=rng.below(20))
+            .map(|_| (1 + rng.below(30), gen_clause(&mut rng)))
+            .collect();
+        let mut solver = MaxSatSolver::new();
+        for c in &hard {
+            solver.add_hard_clause(c.clone());
+        }
+        for (w, c) in &soft {
+            solver.add_soft_clause(c.clone(), *w);
+        }
+        let sat = |c: &[i32], m: &[bool]| {
+            c.iter()
+                .any(|&l| m.get(l.unsigned_abs() as usize).copied().unwrap_or(false) == (l > 0))
+        };
+        let mut last: Option<u64> = None;
+        let result = solver.solve_interruptible_with_models(&|| false, &mut |cost, model| {
+            callbacks += 1;
+            assert!(
+                hard.iter().all(|c| sat(c, model)),
+                "seed {seed}: callback model falsifies a hard clause"
+            );
+            let actual: u64 = soft
+                .iter()
+                .filter(|(_, c)| !sat(c, model))
+                .map(|(w, _)| *w)
+                .sum();
+            assert_eq!(
+                actual, cost,
+                "seed {seed}: callback cost differs from its model"
+            );
+            assert!(
+                last.is_none_or(|l| cost < l),
+                "seed {seed}: cost did not fall"
+            );
+            last = Some(cost);
+        });
+        if let MaxSatResult::Optimal { cost, .. } = result {
+            assert!(
+                last.is_none_or(|l| cost <= l),
+                "seed {seed}: optimum above an o line"
+            );
+        }
+    }
+    assert!(callbacks > 0, "no instance reported an upper bound");
+}
+
+/// The last `on_upper_bound` callback of a solve that ends optimal carries
+/// the optimum's cost and model. The CLI's stop watchdog answers from the
+/// last callback, so an incumbent the engine adopted without a callback
+/// (the exhaust probe's free model did) would leave it holding an older,
+/// worse model than the engine's.
+#[test]
+fn test_last_upper_bound_callback_is_the_returned_optimum() {
+    let mut checked = 0usize;
+    for seed in 0..500u64 {
+        let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
+        let num_vars = 3 + rng.below(6) as u32; // 3..8
+        let num_hard = rng.below(6) as usize;
+        let num_soft = 1 + rng.below(12) as usize;
+        let gen_clause = |rng: &mut Lcg| -> Vec<i32> {
+            let len = 1 + rng.below(3) as usize;
+            (0..len)
+                .map(|_| {
+                    let v = 1 + rng.below(num_vars as u64) as i32;
+                    if rng.below(2) == 0 {
+                        v
+                    } else {
+                        -v
+                    }
+                })
+                .collect()
+        };
+        let hard: Vec<Vec<i32>> = (0..num_hard).map(|_| gen_clause(&mut rng)).collect();
+        let soft: Vec<(u64, Vec<i32>)> = (0..num_soft)
+            .map(|_| (1 + rng.below(20), gen_clause(&mut rng)))
+            .collect();
+        let mut solver = MaxSatSolver::new();
+        for c in &hard {
+            solver.add_hard_clause(c.clone());
+        }
+        for (w, c) in &soft {
+            solver.add_soft_clause(c.clone(), *w);
+        }
+        let mut last: Option<(u64, Vec<bool>)> = None;
+        let result = solver.solve_interruptible_with_models(&|| false, &mut |cost, model| {
+            last = Some((cost, model.to_vec()));
+        });
+        if let MaxSatResult::Optimal { cost, model } = result {
+            // Every soft-bearing instance goes through the engine, and every
+            // incumbent the engine adopts must have been announced.
+            let (last_cost, last_model) = last.unwrap_or_else(|| {
+                panic!(
+                    "seed {seed}: optimum {cost} with no callback\nhard: {hard:?}\nsoft: {soft:?}"
+                )
+            });
+            assert_eq!(
+                last_cost, cost,
+                "seed {seed}: last callback cost {last_cost} != optimum {cost}\nhard: {hard:?}\nsoft: {soft:?}",
+            );
+            assert_eq!(
+                last_model, model,
+                "seed {seed}: last callback model is not the returned model"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "only {checked} engine optima were checked");
 }

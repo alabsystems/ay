@@ -75,8 +75,10 @@ impl ChcParser {
                 }
             }
             "extract" => Self::parse_extract_indices(&idx_args),
+            // `int_to_bv` is the SMT-LIB 2.7 name of `int2bv` (CHC-COMP 2026
+            // ADT-LIA-Arrays Solidity inputs use it).
             "zero_extend" | "sign_extend" | "rotate_left" | "rotate_right" | "repeat"
-            | "int2bv" => {
+            | "int2bv" | "int_to_bv" => {
                 if idx_args.len() != 1 {
                     return Err(ChcError::Parse(format!(
                         "(_ {name} n) requires exactly 1 index argument"
@@ -87,14 +89,14 @@ impl ChcParser {
                 })?;
                 let width_sized_index = matches!(
                     name.as_str(),
-                    "zero_extend" | "sign_extend" | "repeat" | "int2bv"
+                    "zero_extend" | "sign_extend" | "repeat" | "int2bv" | "int_to_bv"
                 );
                 if width_sized_index && n > MAX_BITVECTOR_WIDTH {
                     return Err(ChcError::Parse(format!(
                         "{name} index {n} exceeds the supported bitvector width {MAX_BITVECTOR_WIDTH}"
                     )));
                 }
-                if matches!(name.as_str(), "repeat" | "int2bv") && n == 0 {
+                if matches!(name.as_str(), "repeat" | "int2bv" | "int_to_bv") && n == 0 {
                     return Err(ChcError::Parse(format!(
                         "{name} requires a positive bitvector width/count"
                     )));
@@ -105,7 +107,7 @@ impl ChcParser {
                     "rotate_left" => ChcOp::BvRotateLeft(n),
                     "rotate_right" => ChcOp::BvRotateRight(n),
                     "repeat" => ChcOp::BvRepeat(n),
-                    "int2bv" => ChcOp::Int2Bv(n),
+                    "int2bv" | "int_to_bv" => ChcOp::Int2Bv(n),
                     _ => {
                         return Err(ChcError::Parse(format!(
                             "Unexpected indexed operator: {name}"

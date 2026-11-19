@@ -716,3 +716,70 @@ fn raw_bv_literals_and_indexed_results_obey_the_shared_width_cap() {
                 && matches!(args[0].as_ref(), ChcExpr::Op(ChcOp::BvConcat, inner) if inner.len() == 2)
     ));
 }
+
+/// SMT-LIB 2.7 names of the integer/bit-vector conversions. 389 CHC-COMP 2026
+/// ADT-LIA-Arrays (Solidity) inputs use `int_to_bv` and `ubv_to_int`; before
+/// 2026-11-18 AY stopped at "Unknown indexed identifier: int_to_bv".
+#[test]
+fn test_parse_smtlib27_int_to_bv_and_ubv_to_int() {
+    let mut parser = ChcParser::new();
+    parser.variables.insert("n".to_string(), ChcSort::Int);
+    parser.input = "((_ int_to_bv 16) n)".to_string();
+    parser.pos = 0;
+    let expr = parser.parse_expr().expect("int_to_bv should parse");
+    assert!(
+        matches!(&expr, ChcExpr::Op(ChcOp::Int2Bv(16), args) if args.len() == 1),
+        "expected Int2Bv(16), got {expr:?}"
+    );
+    assert_eq!(expr.sort(), ChcSort::BitVec(16));
+
+    let mut parser = ChcParser::new();
+    parser.input = "(ubv_to_int #xff)".to_string();
+    parser.pos = 0;
+    let expr = parser.parse_expr().expect("ubv_to_int should parse");
+    assert!(
+        matches!(&expr, ChcExpr::Op(ChcOp::Bv2Nat, args) if *args[0] == ChcExpr::BitVec(255, 8)),
+        "expected Bv2Nat, got {expr:?}"
+    );
+}
+
+#[test]
+fn test_parse_smtlib27_int_to_bv_rejects_zero_width() {
+    let mut parser = ChcParser::new();
+    parser.variables.insert("n".to_string(), ChcSort::Int);
+    parser.input = "((_ int_to_bv 0) n)".to_string();
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+}
+
+/// `sbv_to_int` reads the argument as two's complement, including the
+/// minimum value, at a width beyond 128 bits as well.
+#[test]
+fn test_parse_smtlib27_sbv_to_int_is_signed() {
+    let mut parser = ChcParser::new();
+    parser.variables.insert("x".to_string(), ChcSort::BitVec(8));
+    parser.input = "(sbv_to_int x)".to_string();
+    parser.pos = 0;
+    let expr = parser.parse_expr().expect("sbv_to_int should parse");
+    assert_eq!(expr.sort(), ChcSort::Int);
+    for (bits, expected) in [(0x00, 0), (0x01, 1), (0x7f, 127), (0x80, -128), (0xff, -1)] {
+        let mut model = ay_core::kani_compat::DetHashMap::default();
+        model.insert("x".to_string(), crate::smt::SmtValue::BitVec(bits, 8));
+        assert_eq!(
+            crate::expr::evaluate_expr(&expr, &model),
+            Some(crate::smt::SmtValue::Int(expected)),
+            "sbv_to_int(#x{bits:02x})"
+        );
+    }
+
+    let mut parser = ChcParser::new();
+    parser
+        .variables
+        .insert("w".to_string(), ChcSort::BitVec(256));
+    parser.input = "(sbv_to_int w)".to_string();
+    parser.pos = 0;
+    let wide = parser
+        .parse_expr()
+        .expect("256-bit sbv_to_int should parse");
+    assert_eq!(wide.sort(), ChcSort::Int);
+}

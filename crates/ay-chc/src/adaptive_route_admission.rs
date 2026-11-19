@@ -900,6 +900,20 @@ impl SortSurface<'_> {
         stats: &mut RouteSurfaceStats,
         label: &str,
     ) -> Result<(), RouteAdmissionFailure> {
+        // A scalar sort at the root owns nothing on the heap: cloning the
+        // problem copies it inline with its variable or signature, which the
+        // expression and name-byte caps already charge. Charging it here made
+        // a problem with many scalar predicate arguments exceed the sort-node
+        // cap with no array or datatype in it (CHC-COMP 2026 BV `s3_srvr_6`,
+        // `s3_srvr_6_BUG` and `s3_srvr_14_BUG`: 204 k-210 k sort nodes, all
+        // scalar). Inside an array or datatype every node, scalar leaves
+        // included, is its own allocation and stays charged.
+        if matches!(
+            sort,
+            ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_)
+        ) {
+            return Ok(());
+        }
         let mut stack = vec![(sort, 1usize)];
         while let Some((current, depth)) = stack.pop() {
             if stats.total_sort_nodes & 0xff == 0 {
@@ -2517,6 +2531,37 @@ mod tests {
             sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(sort));
         }
         sort
+    }
+
+    #[test]
+    fn scalar_root_sorts_are_not_charged_but_array_nodes_are() {
+        let mut sort_caps = caps();
+        sort_caps.max_predicate_arity = 256;
+        sort_caps.max_total_sort_nodes = 4;
+        let mut scalars = ChcProblem::new();
+        scalars.declare_predicate("P", vec![ChcSort::Int; 100]);
+        scalars.declare_predicate("Q", vec![ChcSort::BitVec(32); 100]);
+        scan_predicate_surface(
+            &scalars,
+            sort_caps,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("200 scalar arguments own no sort node to clone");
+
+        let array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+        let mut arrays = ChcProblem::new();
+        arrays.declare_predicate("A", vec![array.clone(), array]);
+        let failure = scan_predicate_surface(
+            &arrays,
+            sort_caps,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("two arrays are six owned sort nodes, past the cap of four");
+        assert!(
+            matches!(failure, RouteAdmissionFailure::Cap(reason) if reason.contains("total sort nodes 5 > cap 4"))
+        );
     }
 
     #[test]

@@ -962,7 +962,11 @@ impl ChcFeatureExtractor {
             sorted.dedup();
             sorted.len()
         };
-        let l1_norm: u128 = constants.iter().sum();
+        // Saturating: release builds check overflow, and a large input's
+        // coefficients can sum past u128 (design W0.7).
+        let l1_norm: u128 = constants
+            .iter()
+            .fold(0u128, |total, constant| total.saturating_add(*constant));
         let mean = l1_norm as f64 / constants.len() as f64;
         let min_abs = constants.iter().copied().min().unwrap_or(0);
         let max_abs = constants.iter().copied().max().unwrap_or(0);
