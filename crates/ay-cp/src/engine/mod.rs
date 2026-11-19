@@ -446,4 +446,8 @@ impl Default for CpSatEngine {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_brute_force;
+#[cfg(test)]
+mod tests_disjunctive;
+#[cfg(test)]
 mod tests_incremental;

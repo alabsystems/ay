@@ -413,3 +413,62 @@ fn test_jobshop_minimize_improves_dispatch_incumbent_by_machine_swaps() {
         "first solution should improve over the dispatch-only makespan 21: {output}"
     );
 }
+
+/// rect-euler/3venn (MiniZinc Challenge 2026) regression, in small: the
+/// detected machine's edge-finding explained `s_i >= ect(Theta)` by lower
+/// bounds alone, omitting the Theta tasks' upper bounds (and mirrored for
+/// upper bounds). The optimisation loop keeps those clauses learned, so it
+/// proved a wrong optimum here (12 for the engine-level copy of this model,
+/// seed 15 of `test_random_disjunctive_optimum_matches_brute_force`); brute
+/// force gives 23. On 3venn it answered UNSAT under `objective <= 821`
+/// although or-tools, huub and picatsat prove 821 optimal.
+#[test]
+fn test_detected_machine_maximize_reaches_true_optimum() {
+    let fzn = "\
+        var 1..9: s0;\n\
+        var 1..11: s1;\n\
+        var 3..11: s2;\n\
+        var 0..10: s3;\n\
+        var -40..40: obj :: output_var;\n\
+        array [1..4] of var int: starts :: output_array([1..4]) = [s0, s1, s2, s3];\n\
+        var bool: b01; var bool: b10;\n\
+        var bool: b02; var bool: b20;\n\
+        var bool: b03; var bool: b30;\n\
+        var bool: b12; var bool: b21;\n\
+        var bool: b13; var bool: b31;\n\
+        var bool: b23; var bool: b32;\n\
+        constraint int_lin_le_reif([1, -1], [s0, s1], -5, b01);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s0], -2, b10);\n\
+        constraint bool_clause([b01, b10], []);\n\
+        constraint int_lin_le_reif([1, -1], [s0, s2], -5, b02);\n\
+        constraint int_lin_le_reif([1, -1], [s2, s0], -3, b20);\n\
+        constraint bool_clause([b02, b20], []);\n\
+        constraint int_lin_le_reif([1, -1], [s0, s3], -5, b03);\n\
+        constraint int_lin_le_reif([1, -1], [s3, s0], -4, b30);\n\
+        constraint bool_clause([b03, b30], []);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s2], -2, b12);\n\
+        constraint int_lin_le_reif([1, -1], [s2, s1], -3, b21);\n\
+        constraint bool_clause([b12, b21], []);\n\
+        constraint int_lin_le_reif([1, -1], [s1, s3], -2, b13);\n\
+        constraint int_lin_le_reif([1, -1], [s3, s1], -4, b31);\n\
+        constraint bool_clause([b13, b31], []);\n\
+        constraint int_lin_le_reif([1, -1], [s2, s3], -3, b23);\n\
+        constraint int_lin_le_reif([1, -1], [s3, s2], -4, b32);\n\
+        constraint bool_clause([b23, b32], []);\n\
+        constraint int_lin_eq([-1, 3, 1, -1], [s0, s1, s3, obj], 0);\n\
+        solve maximize obj;\n";
+
+    let (_, skipped) = detect_and_count_skipped(fzn);
+    assert_eq!(skipped, 18, "the six pairs should become one machine");
+
+    let output = solve_cp_output(fzn, false);
+    assert!(
+        output.trim_end().ends_with("=========="),
+        "optimum should be proved: {output}"
+    );
+    let last = output
+        .rsplit("----------")
+        .nth(1)
+        .expect("at least one solution");
+    assert!(last.contains("obj = 23;"), "true optimum is 23: {output}");
+}

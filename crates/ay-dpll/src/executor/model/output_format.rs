@@ -1270,6 +1270,17 @@ impl Executor {
             return None;
         }
         let bare = crate::executor_format::canonical_internal_atom(raw);
+        // The QF_AX witness passes (cross-base chain completion, nested and
+        // guard witnesses) mint `@ay!wit!<kind>!<n>` elements of the index and
+        // element sorts. They are first-class model values exactly like
+        // `@Sort!n`: the scalar printer already ascribes them (`(as
+        // @ay!wit!xidx!1 I)`). Refusing them here dropped every such cell from
+        // the printed array, and replaced a witness default by `@Sort!0`, so
+        // the printed model was not the validated one (AY-N9: Dolmen
+        // `bad-model` on a QF_AX swap instance).
+        if crate::executor_format::is_internal_witness_atom(&bare) {
+            return Some(format_model_atom_surface(&self.ctx, sort, &bare));
+        }
         let index = bare.strip_prefix('@')?.strip_prefix(sort_name.as_str())?;
         let digits = index.strip_prefix('!')?;
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -1552,8 +1563,27 @@ impl Executor {
                     )
                 }
                 TermData::Var(_, _) => {
+                    // Reached again through its own definition (`(= a (store a
+                    // i v))`): the inner occurrence denotes the array's own
+                    // value, which is its model interpretation. Refusing here
+                    // left a self-referential array without a printable value
+                    // on a validated `sat` (`(error "model value for array a0
+                    // is not available")`). The expansion is checked against
+                    // the validated value by the printed-array-witness gate.
+                    // Completion keeps refusing: it must not build a candidate
+                    // from the interpretation it is about to replace.
                     if def_visited.contains(&array_term) {
-                        return None;
+                        if mode.completes_missing_default() {
+                            return None;
+                        }
+                        return self.array_witness_base_interp(
+                            model,
+                            array_term,
+                            elem_sort,
+                            def_visited,
+                            mode,
+                            authenticated_dt_cells,
+                        );
                     }
                     // A store/const definitional equality `(= a <store-chain>)` is
                     // authoritative and store-axiom-correct, so resolve it first
@@ -2468,8 +2498,15 @@ impl Executor {
                 // it cannot round-trip: fail closed rather than leak a skolem
                 // (mirrors the printer's existing `@`-skolem avoidance,
                 // #model-witness-no-skolem).
+                //
+                // Except an abstract element of an UNINTERPRETED sort
+                // (`@Sort!n`, `@ay!wit!<kind>!<n>`): that is a model value,
+                // printed sort-ascribed exactly as the scalar printer prints
+                // it. Refusing it sent every QF_AX array to the separate
+                // witness builder instead of printing the value this gate
+                // validated (AY-N9).
                 if tok.starts_with('@') || tok.contains('!') {
-                    return None;
+                    return self.printable_uninterpreted_atom(tok, sort);
                 }
                 Some(format_model_atom_surface(&self.ctx, sort, tok))
             }

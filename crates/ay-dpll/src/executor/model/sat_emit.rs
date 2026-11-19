@@ -992,6 +992,11 @@ impl Executor {
             let gated = self.apply_independent_model_gate(gated);
             self.record_gate_span_ms("phase.sat_gate.independent.ms", span);
             self.trace_unknown_funnel("sat-independent-return", None, Some(&gated), false);
+            // (3b) PRINTED-WITNESS fidelity: the arrays `(get-model)` prints
+            // through the witness builder must denote the validated values.
+            let span = Instant::now();
+            let gated = self.apply_printed_array_witness_gate(gated);
+            self.record_gate_span_ms("phase.sat_gate.printed_array.ms", span);
             // (4) AUTHORITATIVE-FAILCLOSED defense in depth. The universal gate
             // above already rejects CannotConfirm; this preserves the narrower
             // ground-theory classifier and its regression diagnostics.

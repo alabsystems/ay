@@ -168,7 +168,12 @@ impl Cumulative {
                 }
             }
 
-            // Backward propagation: find latest feasible start time
+            // Backward propagation: find latest feasible start time. Every
+            // start in `[new_lst + 1, lst_j]` runs into an overload point
+            // `t` with `start <= t <= start + dur_j - 1`, so the points the
+            // inference used lie in `[new_lst + 1, lst_j + dur_j - 1]` (the
+            // forward pass, by contrast, only uses points below `new_est`).
+            let backward_last_point = lst_j_wide + i128::from(dur_j) - 1;
             let new_lst = Self::find_latest_start(
                 profile,
                 est_j_wide,
@@ -185,7 +190,7 @@ impl Cumulative {
                         encoder,
                         j,
                         new_lst + 1,
-                        lst_j_wide,
+                        backward_last_point,
                         false,
                     ) {
                         return PropagationResult::Conflict(conflict);
@@ -199,7 +204,7 @@ impl Cumulative {
                         encoder,
                         j,
                         i128::from(new_lst) + 1,
-                        lst_j_wide,
+                        backward_last_point,
                         false,
                     ) {
                         let explanation = Explanation::new(reasons);

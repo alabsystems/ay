@@ -541,3 +541,62 @@ fn a_face_proposal_cannot_hide_a_separation_on_two_remaining_coordinates() {
         assert!(arms.iter().all(|a| upper >= exact(a.offset, a.terms, &x)));
     }
 }
+
+#[test]
+fn corner_facets_separate_additive_four_arm_interiors() {
+    fn check<const N: usize>(
+        offsets: [f64; 4],
+        coeffs: [[f64; N]; 4],
+        point: [f64; N],
+        optimum: f64,
+        probe: f64,
+    ) {
+        let rows = coeffs.map(|r| r.into_iter().enumerate().collect::<Vec<_>>());
+        let arms = std::array::from_fn(|i| AffineArm {
+            offset: offsets[i],
+            terms: &rows[i],
+        });
+        assert!(separate_four_arm_unit_box_hull(arms, &point, optimum).is_none());
+        let cut = separate_four_arm_unit_box_hull(arms, &point, probe).unwrap();
+        let at_point = exact(cut.offset, &cut.terms, &point);
+        assert!(at_point >= q(optimum) && at_point < q(probe));
+        for mask in 0..1_usize << N {
+            let x: [f64; N] =
+                std::array::from_fn(|j| if mask & (1 << j) == 0 { -1.0 } else { 1.0 });
+            let upper = exact(cut.offset, &cut.terms, &x);
+            assert!(arms.iter().all(|a| upper >= exact(a.offset, a.terms, &x)));
+        }
+    }
+    // At (-1/4,-1/2) the corner mixture (3/8,1/4,3/8) attains 17/8.
+    // Plane 2-3x/2+y/2 matches it. The preceding heuristic gave 5/2.
+    check(
+        [0., 0., -1., -1.],
+        [[0., 0.], [-2., 2.], [-2., -2.], [-4., 0.]],
+        [-0.25, -0.5],
+        17. / 8.,
+        9. / 4.,
+    );
+    // The four tight corners (-,+,-), (+,-,+), (+,+,-), (+,+,+)
+    // with weights (1/4,1/2,1/8,1/8) attain 23/4. The heuristic gave 6.
+    check(
+        [0., 2., 2., 4.],
+        [[0., 0., 0.], [2., -1., 2.], [-2., -1., 1.], [0., -2., 3.]],
+        [0.5, 0., 0.25],
+        23. / 4.,
+        47. / 8.,
+    );
+    // Embed the same problem in a boundary face. The upper plane must
+    // also cover all four original arms on the opposite face.
+    check(
+        [0., 0., 3., 3.],
+        [
+            [0., 0., 0., 0.],
+            [2., -1., 2., 2.],
+            [-2., -1., 1., -1.],
+            [0., -2., 3., 1.],
+        ],
+        [0.5, 0., 0.25, 1.],
+        23. / 4.,
+        47. / 8.,
+    );
+}

@@ -180,7 +180,7 @@ fn sort_children(sort: &Sort) -> Vec<Sort> {
 fn sort_shell_digest(sort: &Sort, child: impl Fn(&Sort) -> Option<[u8; 32]>) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(SORT_DOMAIN);
-    let mut child_digest = |sort: &Sort| hasher_input(child(sort));
+    let child_digest = |sort: &Sort| hasher_input(child(sort));
     let mut fields: Vec<Vec<u8>> = Vec::new();
     let tag: &str = match sort.inner() {
         SortInner::Bool => "Bool",

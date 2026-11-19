@@ -63,6 +63,7 @@ mod native_map_gate;
 mod nested_record_array_witness;
 mod no_fabricated_output;
 mod nonnullary_constructor_eval;
+mod printed_array_witness_gate;
 mod projection_uf;
 mod published_model_agreement;
 mod select_asserted_equality_anchors;

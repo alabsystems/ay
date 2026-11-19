@@ -182,6 +182,23 @@ pub(crate) fn strip_abstract_atom_ascription(s: &str) -> Option<&str> {
     Some(token)
 }
 
+/// Whether `token` (bare internal dialect) is an element minted by one of the
+/// model-witness passes: `@ay!wit!<kind>!<n>` or `@ay!wit!<kind>!default`,
+/// with `<kind>` lowercase ASCII letters. These are abstract elements of an
+/// uninterpreted sort, printed sort-ascribed like `@Sort!n`.
+pub(crate) fn is_internal_witness_atom(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix("@ay!wit!") else {
+        return false;
+    };
+    let Some((kind, suffix)) = rest.split_once('!') else {
+        return false;
+    };
+    !kind.is_empty()
+        && kind.bytes().all(|b| b.is_ascii_lowercase())
+        && (suffix == "default"
+            || (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())))
+}
+
 /// Canonicalize a model-atom string to the INTERNAL bare dialect: ascribed
 /// abstract atoms lose their `(as .. ..)` wrapper, everything else is
 /// returned unchanged. See [`strip_abstract_atom_ascription`].

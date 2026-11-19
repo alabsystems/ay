@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+mod corners;
+
 use super::{
     add_up, gradual_underflow, separate_unit_box_hull, support_term, valid_arm, AffineArm,
     BoxHullCut,
@@ -229,9 +231,15 @@ pub fn separate_four_arm_unit_box_hull(
         |slopes| certified_cut(arms.map(|arm| arm.offset), &columns, slopes, point, value);
     // Changing the search space changes the heuristic on its remaining
     // coordinates. A failed face proposal must not hide a previous separation.
-    face_slopes(arms, &columns, point)
+    let previous = face_slopes(arms, &columns, point)
         .and_then(&certify)
-        .or_else(|| search_slopes(arms, &columns, point).and_then(certify))
+        .or_else(|| search_slopes(arms, &columns, point).and_then(&certify));
+    let small = corners::slopes(arms.map(|a| a.offset), &columns, point).and_then(certify);
+    match (previous, small) {
+        (Some((old, _)), Some((new, cut))) if new < old => Some(cut),
+        (Some((_, cut)), _) | (None, Some((_, cut))) => Some(cut),
+        (None, None) => None,
+    }
 }
 
 fn certified_cut(
@@ -240,7 +248,7 @@ fn certified_cut(
     slopes: Vec<f64>,
     point: &[f64],
     value: f64,
-) -> Option<BoxHullCut> {
+) -> Option<(f64, BoxHullCut)> {
     // Discard every search intercept. Each source arm is enclosed for the
     // exact binary64 coefficients that will be returned to the LP solver.
     let mut upper = offsets;
@@ -264,5 +272,5 @@ fn certified_cut(
     let offset = maximum(upper);
     let limit = add_up(offset, at_point);
     (offset.is_finite() && limit.is_finite() && value > limit)
-        .then_some(BoxHullCut { offset, terms })
+        .then_some((limit, BoxHullCut { offset, terms }))
 }

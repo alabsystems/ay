@@ -53,6 +53,8 @@ mod folded_bool_array_read_certification;
 mod qf_aufnia_nested_array_row_wrong_sat;
 #[path = "group_arrays/qf_ax_benchmark_suite.rs"]
 mod qf_ax_benchmark_suite;
+#[path = "group_arrays/qf_ax_printed_model_check.rs"]
+mod qf_ax_printed_model_check;
 #[path = "group_arrays/row_chain_double_negated_conclusion.rs"]
 mod row_chain_double_negated_conclusion;
 #[path = "group_arrays/small_index_abv_row_certification.rs"]

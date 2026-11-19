@@ -12,6 +12,9 @@
 
 pub(crate) mod theta_lambda_tree;
 
+#[cfg(test)]
+mod tests;
+
 use crate::encoder::IntegerEncoder;
 use crate::propagator::{PropagationResult, Propagator, PropagatorPriority};
 use crate::trail::IntegerTrail;
@@ -52,13 +55,17 @@ impl Disjunctive {
         }
     }
 
-    /// Edge-finding for lower bounds.
+    /// Edge-finding for lower bounds (Vilím 2008, Algorithm 3).
     ///
     /// For each task j (by decreasing LCT):
-    /// 1. If ect(Theta) > lct(j) → conflict
+    /// 1. If ect(Theta) > lct(j) = lct(Theta) → conflict
     /// 2. Move j from Theta to Lambda
-    /// 3. While ect_bar > lct(j): the responsible Lambda task i
-    ///    must start after all Theta tasks → lb(i) >= ect(Theta)
+    /// 3. While ect_bar(Theta, Lambda) > lct(Theta): the responsible Lambda
+    ///    task i must end after all Theta tasks → lb(i) >= ect(Theta)
+    ///
+    /// Throughout, Theta is exactly `ws_by_lct[idx + 1..]` once j =
+    /// `ws_by_lct[idx]` has moved to Lambda (and `ws_by_lct[idx..]` before),
+    /// which is what the explanations below name.
     fn edge_finding_lower(
         &mut self,
         trail: &IntegerTrail,
@@ -98,10 +105,17 @@ impl Disjunctive {
         for idx in 0..n {
             let (j, lct_j) = self.ws_by_lct[idx];
 
-            // Check for overload: ect(Theta) > lct(j)
-            if self.tree.ect() > lct_j {
-                // Conflict: tasks in Theta cannot fit before lct(j)
-                return self.build_overload_conflict(trail, encoder);
+            // Check for overload: ect(Theta) > lct(Theta) = lct(j)
+            let ect_theta = self.tree.ect();
+            if ect_theta > lct_j {
+                // Conflict: the Theta tasks cannot all end by ect(Theta) - 1.
+                return self.overload_conflict(
+                    trail,
+                    encoder,
+                    idx,
+                    ect_theta - 1,
+                    Direction::Lower,
+                );
             }
 
             // Move j from Theta to Lambda
@@ -111,27 +125,37 @@ impl Disjunctive {
             self.tree.remove_from_theta(j);
             self.tree.add_to_lambda(j, ect_j, duration_j);
 
+            // lct(Theta) is the largest LCT still in Theta; with Theta empty
+            // there is nothing for a Lambda task to come after.
+            let Some(&(_, lct_theta)) = self.ws_by_lct.get(idx + 1) else {
+                break;
+            };
+
             // Edge-finding: while some Lambda task must come after all Theta tasks
-            while self.tree.ect_bar() > lct_j {
-                if let Some(i) = self.tree.responsible_ect_bar() {
-                    let new_lb = self.tree.ect();
-                    let current_lb = i128::from(trail.lb(self.starts[i]));
-
-                    if new_lb > current_lb {
-                        // Propagate: lb(s_i) >= ect(Theta)
-                        let Ok(new_lb) = i64::try_from(new_lb) else {
-                            return self.build_overload_conflict(trail, encoder);
-                        };
-                        if let Some(clause) = self.build_lb_clause(trail, encoder, i, new_lb) {
-                            clauses.push(clause);
-                        }
-                    }
-
-                    // Remove i from Lambda to continue
-                    self.tree.remove_from_lambda(i);
-                } else {
+            while self.tree.ect_bar() > lct_theta {
+                let ect_bar = self.tree.ect_bar();
+                let Some(i) = self.tree.responsible_ect_bar() else {
                     break;
+                };
+                let new_lb = self.tree.ect();
+                let current_lb = i128::from(trail.lb(self.starts[i]));
+
+                if new_lb > current_lb {
+                    // Propagate: lb(s_i) >= ect(Theta). The detection holds for
+                    // any common completion bound of Theta below ect_bar.
+                    let edge = Edge {
+                        theta_from: idx + 1,
+                        completion: ect_bar - 1,
+                        target: i,
+                        direction: Direction::Lower,
+                    };
+                    if let Some(clause) = self.edge_finding_clause(trail, encoder, edge, new_lb) {
+                        clauses.push(clause);
+                    }
                 }
+
+                // Remove i from Lambda to continue
+                self.tree.remove_from_lambda(i);
             }
         }
 
@@ -146,6 +170,8 @@ impl Disjunctive {
     ///
     /// Negate times: est' = -lct, lct' = -est, ect' = -lst.
     /// Run the same algorithm, convert back: new_ub = -(new_lb') - duration.
+    /// Mirrored, a task's est' comes from its upper bound and its lct' from
+    /// its lower bound, so the explanations swap the two.
     fn edge_finding_upper(
         &mut self,
         trail: &IntegerTrail,
@@ -188,8 +214,15 @@ impl Disjunctive {
         for idx in 0..n {
             let (j, lct_j_mirror) = self.ws_by_lct[idx];
 
-            if self.tree.ect() > lct_j_mirror {
-                return self.build_overload_conflict_upper(trail, encoder);
+            let ect_theta_mirror = self.tree.ect();
+            if ect_theta_mirror > lct_j_mirror {
+                return self.overload_conflict(
+                    trail,
+                    encoder,
+                    idx,
+                    ect_theta_mirror - 1,
+                    Direction::Upper,
+                );
             }
 
             let ub_j = i128::from(trail.ub(self.starts[j]));
@@ -198,27 +231,34 @@ impl Disjunctive {
             self.tree.remove_from_theta(j);
             self.tree.add_to_lambda(j, ect_j_mirror, duration_j);
 
-            while self.tree.ect_bar() > lct_j_mirror {
-                if let Some(i) = self.tree.responsible_ect_bar() {
-                    // In mirrored coords: new_lb_mirror = ect(Theta)
-                    // Convert back: new_ub_original = -(new_lb_mirror) - duration_i
-                    let new_lb_mirror = self.tree.ect();
-                    let new_ub = -new_lb_mirror - i128::from(self.durations[i]);
-                    let current_ub = i128::from(trail.ub(self.starts[i]));
+            let Some(&(_, lct_theta_mirror)) = self.ws_by_lct.get(idx + 1) else {
+                break;
+            };
 
-                    if new_ub < current_ub {
-                        let Ok(new_ub) = i64::try_from(new_ub) else {
-                            return self.build_overload_conflict_upper(trail, encoder);
-                        };
-                        if let Some(clause) = self.build_ub_clause(trail, encoder, i, new_ub) {
-                            clauses.push(clause);
-                        }
-                    }
-
-                    self.tree.remove_from_lambda(i);
-                } else {
+            while self.tree.ect_bar() > lct_theta_mirror {
+                let ect_bar_mirror = self.tree.ect_bar();
+                let Some(i) = self.tree.responsible_ect_bar() else {
                     break;
+                };
+                // In mirrored coords: new_lb_mirror = ect(Theta)
+                // Convert back: new_ub_original = -(new_lb_mirror) - duration_i
+                let new_lb_mirror = self.tree.ect();
+                let new_ub = -new_lb_mirror - i128::from(self.durations[i]);
+                let current_ub = i128::from(trail.ub(self.starts[i]));
+
+                if new_ub < current_ub {
+                    let edge = Edge {
+                        theta_from: idx + 1,
+                        completion: ect_bar_mirror - 1,
+                        target: i,
+                        direction: Direction::Upper,
+                    };
+                    if let Some(clause) = self.edge_finding_clause(trail, encoder, edge, new_ub) {
+                        clauses.push(clause);
+                    }
                 }
+
+                self.tree.remove_from_lambda(i);
             }
         }
 
@@ -229,122 +269,181 @@ impl Disjunctive {
         }
     }
 
-    /// Build conflict clause for overload detection (lower-bound direction).
-    /// All tasks' lower bounds contribute to the conflict.
-    fn build_overload_conflict(
-        &self,
-        trail: &IntegerTrail,
-        encoder: &IntegerEncoder,
-    ) -> PropagationResult {
-        let mut clause = Vec::new();
-
-        // Every task's current bounds contribute to the overload.
-        // Conflict: conjunction of all bounds is contradictory.
-        // Clause: ¬reason1 ∨ ¬reason2 ∨ ...
-        for i in 0..self.starts.len() {
-            let lb = trail.lb(self.starts[i]);
-            let ub = trail.ub(self.starts[i]);
-
-            if let Some(ge_lit) = encoder.lookup_ge(self.starts[i], lb) {
-                clause.push(ge_lit.negated());
-            }
-            if let Some(le_lit) = encoder.lookup_le(self.starts[i], ub) {
-                clause.push(le_lit.negated());
-            }
-        }
-
-        PropagationResult::Conflict(clause)
-    }
-
-    /// Build conflict clause for upper-bound overload.
-    fn build_overload_conflict_upper(
-        &self,
-        trail: &IntegerTrail,
-        encoder: &IntegerEncoder,
-    ) -> PropagationResult {
-        // Same structure: all bounds contribute.
-        self.build_overload_conflict(trail, encoder)
-    }
-
-    /// Build propagation clause for lower-bound inference.
+    /// Push the reason for "every task `k` of Theta (`ws_by_lct[theta_from..]`)
+    /// starts no earlier than its current earliest start and completes by
+    /// `completion`", in the pass's own coordinates.
     ///
-    /// Clause: conclusion ∨ ¬reason1 ∨ ¬reason2 ∨ ...
-    /// where conclusion = [s_target >= new_lb]
-    /// and reasons = lower bounds of all other tasks + target's upper bound.
-    fn build_lb_clause(
-        &self,
-        trail: &IntegerTrail,
-        encoder: &IntegerEncoder,
-        target_task: usize,
-        new_lb: i64,
-    ) -> Option<Vec<Literal>> {
-        // Propagated literal: [s_target >= new_lb]
-        let conclusion = encoder.lookup_ge(self.starts[target_task], new_lb)?;
-
-        let mut clause = Vec::with_capacity(self.starts.len() + 1);
-        clause.push(conclusion);
-
-        // Reason: all other tasks' lower bounds force target to start later
-        for i in 0..self.starts.len() {
-            if i == target_task {
-                continue;
-            }
-            let lb = trail.lb(self.starts[i]);
-            {
-                let ge_lit = encoder.lookup_ge(self.starts[i], lb)?;
-                clause.push(ge_lit.negated());
-            }
-        }
-
-        // Target upper bound also contributes
-        let target_ub = trail.ub(self.starts[target_task]);
-        {
-            let le_lit = encoder.lookup_le(self.starts[target_task], target_ub)?;
-            clause.push(le_lit.negated());
-        }
-
-        Some(clause)
-    }
-
-    /// Build propagation clause for upper-bound inference.
+    /// The detection rules (overload `ect(Θ) > lct(Θ)`, edge-finding
+    /// `ect(Θ ∪ {i}) > lct(Θ)`) read both the earliest start and the latest
+    /// completion of every Theta task, so a reason must bound both. A reason
+    /// that names only the earliest starts (as the propagator did before
+    /// 2026-11-18) is a clause the SAT core learns permanently although
+    /// solutions of the constraint falsify it (AY-N8).
     ///
-    /// Clause: conclusion ∨ ¬reason1 ∨ ¬reason2 ∨ ...
-    /// where conclusion = [s_target <= new_ub] = ¬[s_target >= new_ub + 1]
-    /// and reasons = upper bounds of all other tasks + target's lower bound.
-    fn build_ub_clause(
+    /// The completion side is lifted: any common completion bound below the
+    /// detection's ect still detects, so the literal names that bound, not
+    /// each task's current latest start, and is left out where the root
+    /// domain implies it. In the lower pass, the earliest start is the lower
+    /// bound and "completes by c" is `s_k <= c - d_k`; mirrored (upper pass,
+    /// `t' = -t - d`), the earliest start is the upper bound and "completes
+    /// by c" is `s_k >= -c`.
+    ///
+    /// Returns `None` when a literal is missing; the caller then drops the
+    /// inference rather than weaken its reason.
+    fn push_theta_reason(
         &self,
         trail: &IntegerTrail,
         encoder: &IntegerEncoder,
-        target_task: usize,
-        new_ub: i64,
-    ) -> Option<Vec<Literal>> {
-        // Propagated literal: [s_target <= new_ub] = ¬[s_target >= new_ub + 1]
-        let conclusion = encoder.lookup_le(self.starts[target_task], new_ub)?;
-
-        let mut clause = Vec::with_capacity(self.starts.len() + 1);
-        clause.push(conclusion);
-
-        // Reason: all other tasks' upper bounds
-        for i in 0..self.starts.len() {
-            if i == target_task {
-                continue;
-            }
-            let ub = trail.ub(self.starts[i]);
-            {
-                let le_lit = encoder.lookup_le(self.starts[i], ub)?;
-                clause.push(le_lit.negated());
+        theta_from: usize,
+        completion: i128,
+        direction: Direction,
+        clause: &mut Vec<Literal>,
+    ) -> Option<()> {
+        for &(k, _) in &self.ws_by_lct[theta_from..] {
+            let var = self.starts[k];
+            let (root_lb, root_ub) = encoder.var_bounds(var);
+            match direction {
+                Direction::Lower => {
+                    push_lb_reason(trail, encoder, var, clause)?;
+                    let latest_start = completion - i128::from(self.durations[k]);
+                    if latest_start < i128::from(root_ub) {
+                        let latest_start = i64::try_from(latest_start).ok()?;
+                        clause.push(encoder.lookup_le(var, latest_start)?.negated());
+                    }
+                }
+                Direction::Upper => {
+                    push_ub_reason(trail, encoder, var, clause)?;
+                    let earliest_start = -completion;
+                    if earliest_start > i128::from(root_lb) {
+                        let earliest_start = i64::try_from(earliest_start).ok()?;
+                        clause.push(encoder.lookup_ge(var, earliest_start)?.negated());
+                    }
+                }
             }
         }
-
-        // Target lower bound also contributes
-        let target_lb = trail.lb(self.starts[target_task]);
-        {
-            let ge_lit = encoder.lookup_ge(self.starts[target_task], target_lb)?;
-            clause.push(ge_lit.negated());
-        }
-
-        Some(clause)
+        Some(())
     }
+
+    /// Conflict for overload detection: the tasks `ws_by_lct[theta_from..]`
+    /// (every task whose lct is at most the current lct(j)) cannot all
+    /// complete by `completion` = ect(Theta) - 1. Only their bounds are the
+    /// reason.
+    fn overload_conflict(
+        &self,
+        trail: &IntegerTrail,
+        encoder: &IntegerEncoder,
+        theta_from: usize,
+        completion: i128,
+        direction: Direction,
+    ) -> PropagationResult {
+        let mut clause = Vec::with_capacity(2 * (self.starts.len() - theta_from));
+        match self.push_theta_reason(
+            trail,
+            encoder,
+            theta_from,
+            completion,
+            direction,
+            &mut clause,
+        ) {
+            Some(()) => PropagationResult::Conflict(clause),
+            None => PropagationResult::NoChange,
+        }
+    }
+
+    /// Explain an edge-finding inference `s_target >= bound` (lower pass) or
+    /// `s_target <= bound` (upper pass): `conclusion ∨ ¬(Theta reason) ∨
+    /// ¬(target's earliest start)`, where the target's earliest start is its
+    /// lower bound in the lower pass and, mirrored, its upper bound in the
+    /// upper pass.
+    ///
+    /// A bound outside the target's root domain makes the conclusion
+    /// literal false at the root, so the clause acts as a conflict. Returns
+    /// `None` when a literal is missing (the inference is dropped).
+    fn edge_finding_clause(
+        &self,
+        trail: &IntegerTrail,
+        encoder: &IntegerEncoder,
+        edge: Edge,
+        bound: i128,
+    ) -> Option<Vec<Literal>> {
+        let var = self.starts[edge.target];
+        let (root_lb, root_ub) = encoder.var_bounds(var);
+        let conclusion = match edge.direction {
+            // [s >= bound] with bound clamped to root_ub + 1 (root-false
+            // literal) is implied by s >= bound, so the clause stays valid.
+            Direction::Lower => {
+                let clamped = bound.min(i128::from(root_ub) + 1);
+                i64::try_from(clamped)
+                    .ok()
+                    .and_then(|v| encoder.lookup_ge(var, v))
+            }
+            Direction::Upper => {
+                let clamped = bound.max(i128::from(root_lb) - 1);
+                i64::try_from(clamped)
+                    .ok()
+                    .and_then(|v| encoder.lookup_le(var, v))
+            }
+        };
+        let conclusion = conclusion?;
+        let mut clause = Vec::with_capacity(2 * (self.starts.len() - edge.theta_from) + 2);
+        clause.push(conclusion);
+        let explained = self
+            .push_theta_reason(
+                trail,
+                encoder,
+                edge.theta_from,
+                edge.completion,
+                edge.direction,
+                &mut clause,
+            )
+            .and_then(|()| match edge.direction {
+                Direction::Lower => push_lb_reason(trail, encoder, var, &mut clause),
+                Direction::Upper => push_ub_reason(trail, encoder, var, &mut clause),
+            });
+        explained.map(|()| clause)
+    }
+}
+
+/// One edge-finding inference: the Theta set `ws_by_lct[theta_from..]`, a
+/// completion bound every Theta task must meet for the detection to fire
+/// (pass coordinates), and the Lambda task it moves.
+#[derive(Debug, Clone, Copy)]
+struct Edge {
+    theta_from: usize,
+    completion: i128,
+    target: usize,
+    direction: Direction,
+}
+
+/// Which bound an edge-finding pass tightens.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    /// Earliest starts (lower bounds) move up.
+    Lower,
+    /// Latest starts (upper bounds) move down; the pass runs mirrored.
+    Upper,
+}
+
+/// Push `¬[s >= lb]` for the current lower bound of `var`.
+fn push_lb_reason(
+    trail: &IntegerTrail,
+    encoder: &IntegerEncoder,
+    var: IntVarId,
+    clause: &mut Vec<Literal>,
+) -> Option<()> {
+    clause.push(encoder.lookup_ge(var, trail.lb(var))?.negated());
+    Some(())
+}
+
+/// Push `¬[s <= ub]` for the current upper bound of `var`.
+fn push_ub_reason(
+    trail: &IntegerTrail,
+    encoder: &IntegerEncoder,
+    var: IntVarId,
+    clause: &mut Vec<Literal>,
+) -> Option<()> {
+    clause.push(encoder.lookup_le(var, trail.ub(var))?.negated());
+    Some(())
 }
 
 impl Propagator for Disjunctive {

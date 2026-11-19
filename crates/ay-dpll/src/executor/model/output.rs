@@ -86,6 +86,58 @@ impl ModelResponse {
 }
 
 impl Executor {
+    /// The array constants `(get-model)` would print through the witness
+    /// builder ([`Self::format_array_witness_value`]) rather than through the
+    /// independent gate's own value, with the text it would print.
+    ///
+    /// Constants the printer takes from the gate (`completed_model_value`, the
+    /// aggregate reconstruction) are left out: their text is the gate's value
+    /// by construction. The witness builder assembles its text from direct
+    /// reads and the array interpretation and can leave out what it cannot
+    /// spell, so its text is the one that has to be checked against the
+    /// validated model (AY-N9). A symbol the builder cannot render is left
+    /// out too: `(get-model)` refuses it on its own.
+    pub(in crate::executor) fn printed_array_witness_texts(
+        &self,
+        model: &Model,
+    ) -> Result<Vec<(TermId, String)>, String> {
+        let has_array_constant = self.ctx.symbol_iter().any(|(_, info)| {
+            info.arg_sorts.is_empty() && info.term.is_some() && matches!(info.sort, Sort::Array(_))
+        });
+        if !has_array_constant || model.has_residual_arrays() {
+            return Ok(Vec::new());
+        }
+        let aggregate_values = AggregateConstantValues::collect(self, model)?;
+        let mut printed = Vec::new();
+        for (name, info) in self.ctx.symbol_iter() {
+            if !info.arg_sorts.is_empty() || !matches!(info.sort, Sort::Array(_)) {
+                continue;
+            }
+            let Some(term_id) = info.term else {
+                continue;
+            };
+            if self.is_exact_dt_internal_symbol(self.ctx.symbol_identity_name(name, info))
+                || self.ctx.is_internal_symbol(name)
+                || self.ctx.is_defined_fun(name)
+                || self.ctx.adopted_macro_interp(name).is_some()
+            {
+                continue;
+            }
+            match self.completed_model_value(model, term_id) {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(()) => continue,
+            }
+            match aggregate_values.resolve(self, model, term_id)? {
+                AggregateConstantValue::Absent => {}
+                AggregateConstantValue::Value(_) | AggregateConstantValue::Poisoned => continue,
+            }
+            if let Some(text) = self.format_array_witness_value(model, term_id, &info.sort) {
+                printed.push((term_id, text));
+            }
+        }
+        Ok(printed)
+    }
+
     /// Generate model output for get-model command.
     pub(crate) fn model(&self) -> String {
         self.checked_evaluation_output(|| {

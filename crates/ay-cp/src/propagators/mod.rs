@@ -47,6 +47,9 @@ pub mod linear_ne;
 pub mod shifted_alldifferent;
 pub mod table;
 
+#[cfg(test)]
+pub(crate) mod soundness_tests;
+
 // Future propagators (stubs):
 // pub mod circuit;
 // pub mod inverse;

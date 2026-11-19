@@ -4200,6 +4200,80 @@ impl Executor {
         }
     }
 
+    /// The first array constant whose printed witness `printed` (from
+    /// [`Self::printed_array_witness_texts`]) does not denote the value the
+    /// independent gate validated, or `None`.
+    ///
+    /// Compared by denotation ([`values_equal`]: agreement at every explicit
+    /// index of either side and on the default). A constant the gate cannot
+    /// evaluate, or whose printed text it cannot read back, is not compared;
+    /// the gate verdict already covers what it can evaluate.
+    pub(in crate::executor) fn printed_array_witness_divergence(
+        &self,
+        model: &Model,
+        printed: &[(TermId, String)],
+    ) -> Option<TermId> {
+        if printed.is_empty() {
+            return None;
+        }
+        let view = IndependentModelView::new(self, model);
+        view.ensure_def_index().ok()?;
+        for (term, text) in printed {
+            let sort = self.ctx.terms.sort(*term).clone();
+            let EvalOutcome::Value(validated @ ModelValue::Array(_)) =
+                ay_model_check::evaluate_term(&self.ctx.terms, &view, *term)
+            else {
+                continue;
+            };
+            let Some(printed_value @ ModelValue::Array(_)) = view.parse_leaf(text, &sort) else {
+                continue;
+            };
+            if !values_equal(&validated, &printed_value) {
+                return Some(*term);
+            }
+        }
+        None
+    }
+
+    /// Printed-witness fidelity gate (AY-N9). Every other gate checks the
+    /// INTERNAL model; `(get-model)` prints arrays through a separate witness
+    /// builder. When that builder's text denotes another array than the one
+    /// validated, the printed model is unchecked, so `sat` is withdrawn.
+    /// Runs only when models are produced: without them nothing is printed.
+    pub(in crate::executor) fn apply_printed_array_witness_gate(
+        &mut self,
+        result: SolveResult,
+    ) -> SolveResult {
+        if result != SolveResult::Sat || !self.produce_models_enabled() {
+            return result;
+        }
+        let Some(model) = self.last_model.as_ref() else {
+            return result;
+        };
+        // A printer refusal is reported by `(get-model)` itself.
+        let Ok(printed) = self.printed_array_witness_texts(model) else {
+            return result;
+        };
+        let Some(term) = self.printed_array_witness_divergence(model, &printed) else {
+            return result;
+        };
+        let name = self.format_term(term);
+        tracing::warn!(
+            array = %name,
+            "printed-array-witness gate: the printed array differs from the validated model; \
+             downgrading SAT to Unknown"
+        );
+        self.last_statistics.model_validation_failures += 1;
+        self.last_statistics.set_string(
+            "model_check_gate.printed_array_witness_diverges",
+            name.clone(),
+        );
+        self.downgrade_sat_after_gate(&format!(
+            "the printed witness of array {name} differs from the validated model"
+        ));
+        SolveResult::Unknown
+    }
+
     /// Common bookkeeping for downgrading a gate-rejected `Sat` to `Unknown`.
     pub(in crate::executor) fn downgrade_sat_after_gate(&mut self, detail: &str) {
         if self.publish_evaluation_stop() {
