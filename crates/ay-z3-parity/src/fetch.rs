@@ -39,14 +39,13 @@
 //! failure, or empty division skips ONLY that division with a warning — the run
 //! continues and exits non-zero after attempting the remaining divisions.
 //! Destination replacement is staged, collision-checked, and stale-file-free.
-//! Network and extraction are done by shelling out to `curl`, `md5`/`md5sum`,
-//! and `tar --use-compress-program=unzstd` (no new dependencies); the API JSON
-//! is parsed with the crate's existing `serde_json`.
+//! Downloads use `curl`, and the existing checksum tools verify MD5.
+//! Bounded tar/zstd extraction and API JSON parsing run in Rust.
 
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RECORD: &str = "11061097";
@@ -566,8 +565,8 @@ fn official_workspace(destination: &Path) -> Result<tempfile::TempDir, String> {
         .map_err(|error| format!("create official corpus workspace: {error}"))
 }
 
-/// Native decompression shared by official archive materialization and the
-/// independent archive-to-manifest replay. The existing corpus expansion
+/// Native decompression shared by archive materialization and the independent
+/// official archive-to-manifest replay. The existing corpus expansion
 /// budget bounds all uncompressed bytes, including padding and ignored files.
 pub(crate) struct OfficialArchiveReader {
     decoder: zstd::stream::read::Decoder<'static, std::io::BufReader<std::fs::File>>,
@@ -603,7 +602,7 @@ impl Read for OfficialArchiveReader {
 pub(crate) fn open_official_archive(path: &Path) -> Result<OfficialArchiveReader, String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.file_type().is_file() {
-        return Err("official archive must be a regular, non-symlink file".to_string());
+        return Err("archive must be a regular, non-symlink file".to_string());
     }
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let decoder = zstd::stream::read::Decoder::new(file)
@@ -624,7 +623,55 @@ pub(crate) fn finish_official_archive(reader: &mut OfficialArchiveReader) -> Res
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CorpusArchive {
+    Official,
+    Interactive,
+}
+
 fn extract_official_native(archive: &Path, destination: &Path) -> Result<(), String> {
+    extract_native_archive(archive, destination, CorpusArchive::Official)
+}
+
+fn extract_native_archive(
+    archive: &Path,
+    destination: &Path,
+    source: CorpusArchive,
+) -> Result<(), String> {
+    visit_native_archive(archive, source, |path, kind, size, input| {
+        let target = destination.join(path);
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true);
+            match source {
+                CorpusArchive::Official => options.create_new(true),
+                // The interactive destination is a new private tree. Repeated
+                // regular members keep the last data, as in tar extraction.
+                CorpusArchive::Interactive => options.create(true).truncate(true),
+            };
+            let mut output = options
+                .open(&target)
+                .map_err(|error| format!("create {}: {error}", target.display()))?;
+            let copied = std::io::copy(input, &mut output).map_err(|error| error.to_string())?;
+            if copied != size {
+                return Err("truncated tar entry".to_string());
+            }
+        }
+        Ok(())
+    })?;
+    validate_extracted_tree(destination)
+}
+
+fn visit_native_archive(
+    archive: &Path,
+    source: CorpusArchive,
+    mut visit: impl FnMut(&Path, tar::EntryType, u64, &mut dyn Read) -> Result<(), String>,
+) -> Result<(), String> {
     const MAX_ENTRIES: usize = 1_000_000;
     let mut reader = open_official_archive(archive)?;
     let payload_budget = reader.byte_limit();
@@ -638,53 +685,42 @@ fn extract_official_native(archive: &Path, destination: &Path) -> Result<(), Str
         for entry in entries {
             let mut entry = entry.map_err(|error| format!("read tar entry: {error}"))?;
             let kind = entry.header().entry_type();
-            if !kind.is_file() && !kind.is_dir() {
-                return Err("official archive contains a link or special entry".to_string());
+            let regular =
+                kind.is_file() || (source == CorpusArchive::Interactive && kind.is_gnu_sparse());
+            if !regular && !kind.is_dir() {
+                return Err("archive contains a link or special entry".to_string());
             }
-            let path = entry
-                .path()
-                .map_err(|error| error.to_string())?
-                .into_owned();
-            let path = normalized_official_member(&path)?;
-            if !seen.insert(path.clone()) {
-                return Err(format!(
-                    "duplicate normalized archive path: {}",
-                    path.display()
-                ));
-            }
-            if seen.len() > MAX_ENTRIES {
-                return Err("official archive exceeds its member count bound".to_string());
+            let path = entry.path().map_err(|error| error.to_string())?;
+            let path = normalized_archive_member(&path)?;
+            match source {
+                CorpusArchive::Official => {
+                    if !seen.insert(path.clone()) {
+                        return Err(format!(
+                            "duplicate normalized archive path: {}",
+                            path.display()
+                        ));
+                    }
+                    if seen.len() > MAX_ENTRIES {
+                        return Err("official archive exceeds its member count bound".to_string());
+                    }
+                }
+                CorpusArchive::Interactive if path.to_str().is_none() => {
+                    return Err("archive contains a non-UTF-8 member name".to_string());
+                }
+                CorpusArchive::Interactive => {}
             }
             let size = entry.size();
-            account_official_payload(&mut declared_payload, size, payload_budget, &path)?;
-            let target = destination.join(path);
-            if kind.is_dir() {
-                if size != 0 {
-                    return Err("directory tar entry has nonzero payload".to_string());
-                }
-                std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
-            } else {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                let mut output = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .map_err(|error| format!("create {}: {error}", target.display()))?;
-                let copied =
-                    std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
-                if copied != size {
-                    return Err("truncated tar entry".to_string());
-                }
+            account_archive_payload(&mut declared_payload, size, payload_budget, &path)?;
+            if kind.is_dir() && size != 0 {
+                return Err("directory tar entry has nonzero payload".to_string());
             }
+            visit(&path, kind, size, &mut entry)?;
         }
     }
-    finish_official_archive(&mut reader)?;
-    validate_extracted_tree(destination)
+    finish_official_archive(&mut reader)
 }
 
-fn account_official_payload(
+fn account_archive_payload(
     total: &mut u64,
     bytes: u64,
     budget: u64,
@@ -692,10 +728,10 @@ fn account_official_payload(
 ) -> Result<(), String> {
     let next = total
         .checked_add(bytes)
-        .ok_or("official archive declared payload overflows u64")?;
+        .ok_or("archive declared payload overflows u64")?;
     if next > budget {
         return Err(format!(
-            "official archive declared payload exceeds its {budget}-byte expansion budget at {}",
+            "archive declared payload exceeds its {budget}-byte expansion budget at {}",
             path.display()
         ));
     }
@@ -703,7 +739,7 @@ fn account_official_payload(
     Ok(())
 }
 
-fn normalized_official_member(path: &Path) -> Result<PathBuf, String> {
+fn normalized_archive_member(path: &Path) -> Result<PathBuf, String> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -983,7 +1019,7 @@ fn fetch_one_inner(
 
     let xd = tmp.join("x");
     std::fs::create_dir_all(&xd).map_err(|_| "extract failed".to_string())?;
-    extract(&archive, &xd, expansion_budget(e.size))?;
+    extract_interactive_native(&archive, &xd)?;
 
     let mut keys = collect_smt2(&xd).map_err(|_| "extract failed".to_string())?;
     sort_keys(&mut keys);
@@ -1332,249 +1368,12 @@ fn md5_of(path: &Path) -> Result<String, String> {
     }
 }
 
-/// A `tar` run whose zstd decompressor we own, rather than letting `tar` fork it.
-struct TarRun {
-    stdout: Vec<u8>,
-    status: std::process::ExitStatus,
-}
-
-/// Run `tar` over a `.tar.zst` archive with the decompressor as a pipeline this
-/// process owns.
-///
-/// `tar --use-compress-program=unzstd` makes `tar` the PARENT of the
-/// decompressor, and bsdtar stops reading once it has seen the end-of-archive
-/// marker while the decompressor is still writing the trailing padding. The
-/// decompressor then dies of `EPIPE` and bsdtar reports its child's failure as
-/// its own: exit 1 with `zstd: /*stdout*\: Broken pipe` and
-/// `tar: Error exit delayed from previous errors.` Measured 2026-09-06 on the
-/// 689 MB `QF_LIA.tar.zst` of Zenodo record 11061097: one failure in ten for
-/// `-tf` and four in five for `-tvf`. `extract` lists twice, streams the whole
-/// expansion, then extracts, so on a large archive the odds of losing that race
-/// at least once are high — which is why `QF_LIA` could never be fetched.
-///
-/// Owning the pipeline makes `tar`'s own status authoritative. Integrity is not
-/// weakened: the caller verifies the archive's published md5 before extracting,
-/// a truncated or corrupt stream still makes `tar` fail on a short archive, and
-/// a decompressor failure that is NOT a broken pipe is still reported even when
-/// `tar` is happy ([`decompressor_lost_its_reader`]).
-fn tar_over_zstd(
-    archive: &Path,
-    tar_args: &[&str],
-    capture_stdout: bool,
-) -> Result<TarRun, String> {
-    let mut decompressor = Command::new("zstd")
-        .args(["-d", "-c"])
-        .arg(archive)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run zstd decompressor: {err}"))?;
-    let decompressed = decompressor
-        .stdout
-        .take()
-        .ok_or_else(|| "decompressor has no stdout".to_string())?;
-    let tar = Command::new("tar")
-        .args(tar_args)
-        .stdin(Stdio::from(decompressed))
-        .stdout(if capture_stdout {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stderr(Stdio::piped())
-        .spawn();
-    let tar = match tar {
-        Ok(tar) => tar,
-        Err(err) => {
-            let _ = decompressor.kill();
-            let _ = decompressor.wait();
-            return Err(format!("failed to run tar: {err}"));
-        }
-    };
-    // Wait on `tar` first: it is the process whose verdict matters, and draining
-    // its stdout here is what keeps a large listing from deadlocking on a full
-    // pipe.
-    let tar = tar
-        .wait_with_output()
-        .map_err(|err| format!("failed to wait for tar: {err}"))?;
-    let decompressor = decompressor
-        .wait_with_output()
-        .map_err(|err| format!("failed to wait for zstd decompressor: {err}"))?;
-    if !decompressor.status.success() {
-        let stderr = String::from_utf8_lossy(&decompressor.stderr)
-            .trim()
-            .to_string();
-        if !decompressor_lost_its_reader(decompressor.status, &stderr) {
-            return Err(format!(
-                "decompressor failed ({}): {stderr}",
-                decompressor.status
-            ));
-        }
-    }
-    Ok(TarRun {
-        stdout: tar.stdout,
-        status: tar.status,
-    })
-}
-
-/// Whether the decompressor stopped only because `tar` closed the pipe after
-/// the end-of-archive marker, which `tar`'s own status already judges.
-///
-/// A decompressor that ignores SIGPIPE reports that as an `EPIPE` error
-/// ("Broken pipe"); one with SIGPIPE at its default action dies of the signal
-/// with nothing on stderr. Every decompressor this process spawns is the second
-/// kind: std gives the children it spawns SIGPIPE's default action, and under
-/// `unix_hardened` (`-Zon-broken-pipe=kill`) they inherit it from AY itself.
-/// Measured 2026-10-08 on macOS under load: 6 of 25 runs of this crate's tests
-/// lost `listing_a_valid_archive_is_not_defeated_by_a_decompressor_broken_pipe`
-/// as "decompressor failed (signal: 13 (SIGPIPE))".
-fn decompressor_lost_its_reader(status: std::process::ExitStatus, stderr: &str) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt as _;
-        if status.signal() == Some(libc::SIGPIPE) {
-            return true;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = status;
-    stderr.to_ascii_lowercase().contains("broken pipe")
-}
-
-/// Validate member paths, extract, then reject links and special files.
-///
-/// The record id is caller-selected, so a record is not implicitly trusted to
-/// contain the official corpus. Both the pre-extraction path check and the
-/// post-extraction file-type walk are required: the former blocks `..`/absolute
-/// writes, while the latter prevents a sampled path from traversing a link.
-fn extract(archive: &Path, into: &Path, max_expanded_bytes: u64) -> Result<(), String> {
-    validate_archive_members(archive)?;
-    validate_expanded_size(archive, max_expanded_bytes)?;
-    let into_arg = into
-        .to_str()
-        .ok_or_else(|| format!("destination path is not UTF-8: {}", into.display()))?;
-    let run = tar_over_zstd(archive, &["-xf", "-", "-C", into_arg], false)?;
-    if !run.status.success() {
-        return Err(format!("extract failed ({})", run.status));
-    }
-    validate_extracted_tree(into)?;
-    Ok(())
-}
-
-/// Stream every regular member to stdout without writing it, bounding the
-/// total expanded payload before the real extraction mutates disk.
-fn validate_expanded_size(archive: &Path, max_expanded_bytes: u64) -> Result<(), String> {
-    let mut decompressor = Command::new("zstd")
-        .args(["-d", "-c"])
-        .arg(archive)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| format!("failed to run zstd decompressor: {err}"))?;
-    let decompressed = decompressor
-        .stdout
-        .take()
-        .ok_or_else(|| "decompressor has no stdout".to_string())?;
-    let mut child = match Command::new("tar")
-        .arg("-xOf")
-        .arg("-")
-        .stdin(Stdio::from(decompressed))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            let _ = decompressor.kill();
-            let _ = decompressor.wait();
-            return Err(format!("failed to preflight archive expansion: {err}"));
-        }
-    };
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "archive expansion preflight has no stdout".to_string())?;
-    let mut total = 0u64;
-    let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = match stdout.read(&mut buffer) {
-            Ok(read) => read,
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = decompressor.kill();
-                let _ = decompressor.wait();
-                return Err(format!("archive expansion preflight read failed: {err}"));
-            }
-        };
-        if read == 0 {
-            break;
-        }
-        total = total.saturating_add(read as u64);
-        if total > max_expanded_bytes {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = decompressor.kill();
-            let _ = decompressor.wait();
-            return Err(format!(
-                "archive expands past safety bound ({total} > {max_expanded_bytes} bytes)"
-            ));
-        }
-    }
-    let status = child
-        .wait()
-        .map_err(|err| format!("archive expansion preflight wait failed: {err}"))?;
-    // The decompressor is expected to die of `EPIPE` here: `tar -xOf` stops at
-    // the end-of-archive marker with padding still unread. Reap it either way.
-    let _ = decompressor.kill();
-    let _ = decompressor.wait();
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("archive expansion preflight failed ({status})"))
-    }
-}
-
-fn validate_archive_members(archive: &Path) -> Result<(), String> {
-    let names = tar_over_zstd(archive, &["-tf", "-"], true)?;
-    if !names.status.success() {
-        return Err(format!("archive listing failed ({})", names.status));
-    }
-    let listing = String::from_utf8(names.stdout)
-        .map_err(|_| "archive contains a non-UTF-8 member name".to_string())?;
-    for member in listing.lines() {
-        if !archive_member_is_safe(member) {
-            return Err(format!("unsafe archive member path `{member}`"));
-        }
-    }
-
-    // A safe member pathname is insufficient when an earlier symlink/hardlink
-    // can redirect a later extraction. Reject every archive object except a
-    // regular file or directory before extracting anything. Both bsdtar and
-    // GNU tar begin a verbose-list row with the Unix type/mode character.
-    let verbose = tar_over_zstd(archive, &["-tvf", "-"], true)?;
-    if !verbose.status.success() {
-        return Err(format!("archive type listing failed ({})", verbose.status));
-    }
-    let type_listing = String::from_utf8(verbose.stdout)
-        .map_err(|_| "archive type listing is not UTF-8".to_string())?;
-    for row in type_listing.lines() {
-        if !archive_listing_type_is_safe(row) {
-            return Err(format!("archive contains a link or special entry: `{row}`"));
-        }
-    }
-    Ok(())
-}
-
-fn archive_member_is_safe(member: &str) -> bool {
-    !member.is_empty()
-        && Path::new(member)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-}
-
-fn archive_listing_type_is_safe(row: &str) -> bool {
-    matches!(row.trim_start().as_bytes().first(), Some(b'-' | b'd'))
+/// A caller-selected archive must pass the complete path, type and expansion
+/// preflight before we write its private staging tree. The native reader also
+/// validates compression after tar's end marker.
+fn extract_interactive_native(archive: &Path, into: &Path) -> Result<(), String> {
+    visit_native_archive(archive, CorpusArchive::Interactive, |_, _, _, _| Ok(()))?;
+    extract_native_archive(archive, into, CorpusArchive::Interactive)
 }
 
 fn validate_extracted_tree(root: &Path) -> Result<(), String> {
@@ -1770,8 +1569,8 @@ mod tests {
             .unwrap_err()
             .contains("link"));
         assert!(!destination.join("link").exists());
-        assert!(normalized_official_member(Path::new("a/../../escape")).is_err());
-        assert!(normalized_official_member(Path::new("/absolute")).is_err());
+        assert!(normalized_archive_member(Path::new("a/../../escape")).is_err());
+        assert!(normalized_archive_member(Path::new("/absolute")).is_err());
     }
 
     #[test]
@@ -1828,7 +1627,7 @@ mod tests {
     fn official_declared_payload_cannot_exceed_the_existing_total_budget() {
         let budget = official_archive_expansion_budget(1);
         let mut total = 0;
-        account_official_payload(
+        account_archive_payload(
             &mut total,
             1024 * 1024 * 1024 + 1,
             budget,
@@ -1836,20 +1635,17 @@ mod tests {
         )
         .unwrap();
         let remaining = budget - total;
-        account_official_payload(&mut total, remaining, budget, Path::new("rest.smt2")).unwrap();
+        account_archive_payload(&mut total, remaining, budget, Path::new("rest.smt2")).unwrap();
         assert_eq!(total, budget);
         assert!(
-            account_official_payload(&mut total, 1, budget, Path::new("overflow.smt2")).is_err()
+            account_archive_payload(&mut total, 1, budget, Path::new("overflow.smt2")).is_err()
         );
         assert_eq!(total, budget);
         let mut overflowing = u64::MAX;
-        assert!(account_official_payload(
-            &mut overflowing,
-            1,
-            u64::MAX,
-            Path::new("overflow.smt2")
-        )
-        .is_err());
+        assert!(
+            account_archive_payload(&mut overflowing, 1, u64::MAX, Path::new("overflow.smt2"))
+                .is_err()
+        );
         let directory = tempfile::tempdir().unwrap();
         let archive = declared_member_archive(directory.path(), budget + 1);
         let destination = directory.path().join("out");
@@ -1999,139 +1795,75 @@ mod tests {
 
     use super::*;
     use std::fs;
+    use std::process::Stdio;
 
     /// Build a `.tar.zst` whose payload is large enough that the decompressor
     /// still has output buffered when `tar` stops at the end-of-archive marker.
-    fn write_test_archive(dir: &Path, members: &[(&str, usize)]) -> PathBuf {
-        let stage = dir.join("stage");
-        fs::create_dir_all(&stage).expect("stage dir");
-        for (name, size) in members {
-            fs::write(stage.join(name), vec![b'x'; *size]).expect("member");
+    fn padded_interactive_archive(directory: &Path) -> PathBuf {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut root = tar::Header::new_gnu();
+        root.set_entry_type(tar::EntryType::Directory);
+        root.set_size(0);
+        root.set_mode(0o755);
+        builder.append_data(&mut root, ".", &[][..]).unwrap();
+        for (path, contents) in [
+            ("./nested/a.smt2", b"replaced file contents".as_slice()),
+            ("nested/a.smt2", b"(check-sat)\n".as_slice()),
+        ] {
+            let mut file = tar::Header::new_gnu();
+            file.set_size(contents.len() as u64);
+            file.set_mode(0o644);
+            builder.append_data(&mut file, path, contents).unwrap();
         }
-        let archive = dir.join("t.tar.zst");
-        let names: Vec<&str> = members.iter().map(|(n, _)| *n).collect();
-        let mut tar = Command::new("tar")
-            .arg("-cf")
-            .arg("-")
-            .arg("-C")
-            .arg(&stage)
-            .args(&names)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("tar -cf");
-        let tar_stdout = tar.stdout.take().expect("tar stdout");
-        let compressed = Command::new("zstd")
-            .arg("-q")
-            .arg("-o")
-            .arg(&archive)
-            .stdin(Stdio::from(tar_stdout))
-            .status();
-        let archived = tar.wait();
-        let compressed = compressed.expect("zstd");
-        let archived = archived.expect("tar -cf");
-        assert!(archived.success(), "archiving the fixture failed");
-        assert!(compressed.success(), "compressing the fixture failed");
-        archive
+        let tar = builder.into_inner().unwrap();
+        let mut archive = zstd::stream::encode_all(tar.as_slice(), 1).unwrap();
+        // The native reader must drain a second compressed frame containing
+        // padding after tar's end marker.
+        let padding = vec![0; 8 << 20];
+        archive.extend(zstd::stream::encode_all(padding.as_slice(), 1).unwrap());
+        let path = directory.join("padded.tar.zst");
+        fs::write(&path, archive).unwrap();
+        path
     }
 
-    /// `tar --use-compress-program=unzstd` reports its decompressor's `EPIPE` as
-    /// its own failure once `tar` stops at the end-of-archive marker; measured on
-    /// the 689 MB `QF_LIA` archive at 1 listing in 10 (`-tf`) and 4 in 5
-    /// (`-tvf`), which made that division unfetchable. Owning the pipeline makes
-    /// `tar`'s status authoritative, so a valid archive lists every time.
     #[test]
-    fn listing_a_valid_archive_is_not_defeated_by_a_decompressor_broken_pipe() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let archive = write_test_archive(
-            dir.path(),
-            &[
-                ("a.smt2", 4 << 20),
-                ("b.smt2", 4 << 20),
-                ("c.smt2", 4 << 20),
-            ],
+    fn interactive_archive_accepts_root_entries_repeated_files_and_trailing_padding() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = padded_interactive_archive(directory.path());
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        extract_interactive_native(&archive, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("nested/a.smt2")).unwrap(),
+            b"(check-sat)\n"
         );
-        for attempt in 0..12 {
-            let run = tar_over_zstd(&archive, &["-tf", "-"], true)
-                .unwrap_or_else(|err| panic!("attempt {attempt}: {err}"));
-            assert!(run.status.success(), "attempt {attempt}: {:?}", run.status);
-            let listing = String::from_utf8(run.stdout).expect("utf-8 listing");
-            let mut names: Vec<&str> = listing.lines().collect();
-            names.sort_unstable();
-            assert_eq!(
-                names,
-                vec!["a.smt2", "b.smt2", "c.smt2"],
-                "attempt {attempt}"
-            );
-        }
-        // The whole member-validation pass must be equally stable.
-        for attempt in 0..4 {
-            validate_archive_members(&archive)
-                .unwrap_or_else(|err| panic!("validation attempt {attempt}: {err}"));
-        }
     }
 
-    /// The race above, made certain: 8 MiB of zero padding after the
-    /// end-of-archive marker keeps the decompressor writing into a full pipe
-    /// after `tar` has listed everything and exited, so it dies of SIGPIPE
-    /// (the default action every child of this process has) every time. That
-    /// is `tar` closing its input, not a decompressor failure.
-    #[cfg(unix)]
     #[test]
-    fn a_decompressor_killed_by_sigpipe_after_the_end_marker_is_not_a_failure() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let stage = dir.path().join("stage");
-        fs::create_dir_all(&stage).expect("stage dir");
-        fs::write(stage.join("a.smt2"), b"(check-sat)\n").expect("member");
-        let tar = Command::new("tar")
-            .args(["-cf", "-", "-C"])
-            .arg(&stage)
-            .arg("a.smt2")
-            .output()
-            .expect("tar -cf");
-        assert!(tar.status.success(), "creating the fixture tar failed");
-        let mut padded = tar.stdout;
-        padded.extend(std::iter::repeat_n(0u8, 8 << 20));
-        let padded_tar = dir.path().join("padded.tar");
-        fs::write(&padded_tar, &padded).expect("write padded tar");
-        let archive = dir.path().join("padded.tar.zst");
-        let compressed = Command::new("zstd")
-            .arg("-q")
-            .arg("-o")
-            .arg(&archive)
-            .arg(&padded_tar)
-            .status()
-            .expect("zstd");
-        assert!(compressed.success(), "compressing the fixture failed");
-        for attempt in 0..3 {
-            let run = tar_over_zstd(&archive, &["-tf", "-"], true)
-                .unwrap_or_else(|err| panic!("attempt {attempt}: {err}"));
-            assert!(run.status.success(), "attempt {attempt}: {:?}", run.status);
-            assert_eq!(
-                String::from_utf8(run.stdout).expect("utf-8 listing").trim(),
-                "a.smt2",
-                "attempt {attempt}"
-            );
-        }
+    fn interactive_archive_rejects_truncated_trailing_frame_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = padded_interactive_archive(directory.path());
+        let contents = fs::read(&archive).unwrap();
+        fs::write(&archive, &contents[..contents.len() - 1]).unwrap();
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        assert!(extract_interactive_native(&archive, &destination).is_err());
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
     }
 
-    /// Owning the pipeline must not weaken integrity checking: a truncated
-    /// stream still fails, it is not silently accepted as an empty archive.
     #[test]
-    fn a_truncated_archive_still_fails_the_listing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let archive = write_test_archive(dir.path(), &[("a.smt2", 1 << 20)]);
-        let bytes = fs::read(&archive).expect("read archive");
-        let truncated = dir.path().join("truncated.tar.zst");
-        fs::write(&truncated, &bytes[..bytes.len() / 2]).expect("write truncated");
-        let listed_cleanly = match tar_over_zstd(&truncated, &["-tf", "-"], true) {
-            Err(_) => false,
-            Ok(run) => run.status.success(),
-        };
-        assert!(
-            !listed_cleanly,
-            "a truncated archive must not list successfully"
-        );
-        assert!(validate_archive_members(&truncated).is_err());
+    fn interactive_archive_rejects_missing_or_oversized_payload_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        let archive = declared_member_archive(directory.path(), 4096);
+        assert!(extract_interactive_native(&archive, &destination).is_err());
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+
+        let archive = declared_member_archive(directory.path(), MAX_ARCHIVE_EXPANSION_BYTES + 1);
+        let error = extract_interactive_native(&archive, &destination).unwrap_err();
+        assert!(error.contains("expansion budget"), "{error}");
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
     }
 
     #[test]
@@ -2320,31 +2052,50 @@ mod tests {
     }
 
     #[test]
-    fn archive_members_fail_closed_on_paths_links_and_special_files() {
-        for safe in ["QF_AX/a.smt2", "./QF_AX/a.smt2", "one"] {
-            assert!(archive_member_is_safe(safe), "{safe}");
-        }
-        for unsafe_path in [
-            "",
-            "/absolute.smt2",
-            "../escape.smt2",
-            "QF_AX/../../escape.smt2",
+    fn interactive_archive_rejects_unsafe_entries_before_any_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        for (name, kind, error_fragment) in [
+            (
+                "../outside.smt2",
+                tar::EntryType::Regular,
+                "unsafe archive path",
+            ),
+            (
+                "/absolute.smt2",
+                tar::EntryType::Regular,
+                "unsafe archive path",
+            ),
+            ("link", tar::EntryType::Link, "link or special entry"),
+            ("symlink", tar::EntryType::Symlink, "link or special entry"),
+            ("fifo", tar::EntryType::Fifo, "link or special entry"),
         ] {
-            assert!(!archive_member_is_safe(unsafe_path), "{unsafe_path}");
-        }
-        for safe_row in [
-            "-rw-r--r-- user/group 10 Jan 1 00:00 QF_AX/a.smt2",
-            "drwxr-xr-x user/group 0 Jan 1 00:00 QF_AX/",
-        ] {
-            assert!(archive_listing_type_is_safe(safe_row), "{safe_row}");
-        }
-        for unsafe_row in [
-            "lrwxr-xr-x user/group 0 Jan 1 00:00 link -> /tmp",
-            "hrw-r--r-- user/group 0 Jan 1 00:00 hard link to target",
-            "prw-r--r-- user/group 0 Jan 1 00:00 fifo",
-            "",
-        ] {
-            assert!(!archive_listing_type_is_safe(unsafe_row), "{unsafe_row}");
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut regular = tar::Header::new_gnu();
+            regular.set_size(0);
+            regular.set_mode(0o644);
+            builder
+                .append_data(&mut regular, "plain.smt2", &[][..])
+                .unwrap();
+            let mut refused = tar::Header::new_gnu();
+            refused.set_entry_type(kind);
+            refused.set_size(0);
+            refused.set_mode(0o644);
+            // Write the raw name because Builder::append_data refuses traversal.
+            refused.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+            refused.set_cksum();
+            builder.append(&refused, &[][..]).unwrap();
+            let tar = builder.into_inner().unwrap();
+            let archive = directory.path().join("refused.tar.zst");
+            fs::write(
+                &archive,
+                zstd::stream::encode_all(tar.as_slice(), 1).unwrap(),
+            )
+            .unwrap();
+            let error = extract_interactive_native(&archive, &destination).unwrap_err();
+            assert!(error.contains(error_fragment), "{name}: {error}");
+            assert!(fs::read_dir(&destination).unwrap().next().is_none());
         }
     }
 

@@ -46,8 +46,6 @@ impl LraSolver {
         self.ite_link_terms_seen.clear();
         self.not_inner_cache.clear();
         self.const_bool_cache.clear();
-        self.refinement_eligible_cache.clear();
-        self.is_integer_sort_cache.clear();
         self.bound_atoms.clear();
         self.atom_slack.clear();
         self.expr_to_slack.clear();
@@ -118,7 +116,6 @@ impl LraSolver {
         self.atom_index.clear();
         self.compound_use_index.clear();
         self.pending_propagations.clear();
-        self.pending_bound_refinements.clear();
         self.last_compound_propagations_queued = 0;
         self.last_compound_wake_dirty_hits = 0;
         self.last_compound_wake_candidates = 0;
@@ -186,7 +183,6 @@ impl LraSolver {
         self.pending_fixed_term_equalities.clear();
         self.pending_offset_equalities.clear();
         self.pending_propagations.clear();
-        self.pending_bound_refinements.clear();
         self.propagated_atoms.clear();
         // #inc-prop-trail: set nuked wholesale — drop the undo trail with it.
         self.propagated_trail.clear();
@@ -319,8 +315,6 @@ impl LraSolver {
             unassigned_atom_count: self.unassigned_atom_count.clone(),
             not_inner_cache: self.not_inner_cache.clone(),
             const_bool_cache: self.const_bool_cache.clone(),
-            refinement_eligible_cache: self.refinement_eligible_cache.clone(),
-            is_integer_sort_cache: self.is_integer_sort_cache.clone(),
             bcp_implied_dry_streak: 0,
             bcp_cascade_dry_streak: 0,
             max_row_width: self.max_row_width,
@@ -374,8 +368,6 @@ impl LraSolver {
         self.unassigned_atom_count = snap.unassigned_atom_count;
         self.not_inner_cache = snap.not_inner_cache;
         self.const_bool_cache = snap.const_bool_cache;
-        self.refinement_eligible_cache = snap.refinement_eligible_cache;
-        self.is_integer_sort_cache = snap.is_integer_sort_cache;
         self.persistent_unsupported_atoms.clear();
         self.persistent_unsupported_trail.clear();
         self.persistent_unsupported_scope_marks.clear();

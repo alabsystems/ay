@@ -283,6 +283,17 @@ impl TermStore {
         if lhs == rhs {
             return self.true_term();
         }
+        // Ordinary array equality can decide these exact lambda forms, including
+        // under negation. Keep the original binder in all other contexts.
+        let (lhs, rhs) = if self.sort(lhs).is_array() {
+            self.array_lambda_equality_values(lhs, rhs)
+                .unwrap_or((lhs, rhs))
+        } else {
+            (lhs, rhs)
+        };
+        if lhs == rhs {
+            return self.true_term();
+        }
 
         if let Some(result) = self.fold_complex_equality(lhs, rhs) {
             return result;

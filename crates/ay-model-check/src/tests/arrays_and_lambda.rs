@@ -403,3 +403,31 @@ fn sat_seq_prefix_and_len() {
     );
     assert_confirmed(&verdict(&ts, &m, &[pre, eqlen]));
 }
+
+#[test]
+fn model_assigned_lambda_indices_cannot_establish_whole_function_congruence() {
+    let mut ts = TermStore::new();
+    let x = ts.mk_var("x", Sort::Int);
+    let y = ts.mk_var("y", Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let two = ts.mk_int(int(2));
+    let three = ts.mk_int(int(3));
+    let x_at_one = ts.mk_eq(x, one);
+    let x_at_two = ts.mk_eq(x, two);
+    let left_key = ts.mk_or(vec![x_at_one, x_at_two]);
+    let right_key = ts.mk_eq(y, three);
+    let left_body = ts.mk_ite(left_key, one, zero);
+    let right_body = ts.mk_ite(right_key, one, zero);
+    let left = ts.mk_lambda_array(x, left_body);
+    let right = ts.mk_lambda_array(y, right_body);
+    let eq = app(&mut ts, "=", &[left, right], Sort::Bool);
+    let model = StubModel::new()
+        .with(x, ModelValue::Int(int(0)))
+        .with(y, ModelValue::Int(int(0)));
+    assert_cannot(&verdict(&ts, &model, &[eq]));
+    let l = app(&mut ts, "select", &[left, one], Sort::Int);
+    let r = app(&mut ts, "select", &[right, one], Sort::Int);
+    let at_one = app(&mut ts, "=", &[l, r], Sort::Bool);
+    assert_violates(&verdict(&ts, &model, &[at_one]));
+}

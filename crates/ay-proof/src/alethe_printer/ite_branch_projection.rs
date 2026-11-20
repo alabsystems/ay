@@ -184,8 +184,11 @@ pub fn checked_ite_branch_projection_lowering_supported(
     if *remaining_work == 0 {
         return false;
     }
+    // The whole remaining allowance: exhaustion zeroes it in every
+    // assembly mode, so nothing assembled past it is read.
     let printer =
-        AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(*remaining_work));
+        AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(*remaining_work))
+            .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     let supported = printer
         .format_ite_branch_projection(ProofId(0), clause)
         .is_some();

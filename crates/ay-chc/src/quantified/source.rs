@@ -198,7 +198,12 @@ pub(super) fn theory_symbol(name: &str) -> bool {
         "rotate_right",
         "repeat",
         "bv2nat",
+        "bv2int",
         "int2bv",
+        // SMT-LIB 2.7 names of the same conversions (AY-SMT-10).
+        "ubv_to_int",
+        "sbv_to_int",
+        "int_to_bv",
     ];
     SYMBOLS.contains(&name)
 }

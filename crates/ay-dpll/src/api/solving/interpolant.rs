@@ -337,7 +337,7 @@ impl Solver {
     /// yields no root reports [`InterpolantFailure::MissingPremise`] at the
     /// root step.
     ///
-    /// Workstream D, Rung 1 (`DESIGN_lra_interp_tpa.md` §4.1). Owner: WP-D1-P.
+    /// Workstream D, Rung 1 (the development design notes at `9598c4206`, §4.1). Owner: WP-D1-P.
     pub fn get_interpolants_for_masks(
         &mut self,
         groups: &[&[Term]],

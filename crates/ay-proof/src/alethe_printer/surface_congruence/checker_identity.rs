@@ -96,7 +96,7 @@ impl AlethePrinter<'_> {
         if let Some(arguments) = split_application(printed, operator) {
             return Some((arguments, None));
         }
-        let canonical = crate::render_term_canonical(self.terms, term);
+        let canonical = self.render_canonical(term);
         let arguments = split_application(&canonical, operator)?;
         (printed_poly_simp_holds(printed, &canonical) == Some(true))
             .then_some((arguments, Some(canonical)))
@@ -219,7 +219,7 @@ impl AlethePrinter<'_> {
         right: &str,
         canonical_term: TermId,
     ) -> Option<Vec<String>> {
-        let canonical = crate::render_term_canonical(self.terms, canonical_term);
+        let canonical = self.render_canonical(canonical_term);
         let left_respelled = surface_literal::canonical_literal_respelling(left);
         let right_respelled = surface_literal::canonical_literal_respelling(right);
         if left_respelled.is_none() && right_respelled.is_none() {

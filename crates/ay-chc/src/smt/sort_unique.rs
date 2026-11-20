@@ -4,7 +4,7 @@
 
 //! Sort-unique variable naming for the text-driven ay-dpll executor lanes
 //! (Rung 0 of the CHC-COMP 2026 bridge-hygiene work,
-//! the development design notes).
+//! the development design notes at `9598c4206`).
 //!
 //! A [`ChcVar`] is identified by `(name, sort)`. CHC clauses independently
 //! scope their `forall` variables and reuse short names (`A`, `B`, ..., `J`)
@@ -16,7 +16,7 @@
 //! rejected the whole script (`unsupported: ambiguous nullary symbol 'J'`) ->
 //! Unknown. Measured on DRAGON_10_000 (kind2): 78–89 % of the executor
 //! Unknowns were this rejection, all decided in ~25 ms once disambiguated
-//! (`MICROBENCH_QUERY_REPLAY_2026-09-18.md` §4 item ii).
+//! (the development design notes at `9598c4206`, §4 item ii).
 //!
 //! Fix at the name->sort mapping: within one script every name carries ONE
 //! sort. Among the variables sharing a name, the one with the smallest sort

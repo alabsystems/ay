@@ -383,7 +383,14 @@ impl SatProofManager<'_> {
         // exhausted, so the trace's level-0 LRAT unit chains are incomplete
         // by construction. Fail closed immediately instead of grinding
         // through a reconstruction that can only end in trust holes. Only
-        // ever set on budgeted (synthesized-default) runs.
+        // ever set on budgeted (synthesized-default) runs. A literals-only
+        // exhausted trace is still refused HERE, by measurement
+        // (DR-AY-SAT-CRUISE-GIANT-TRACE-CENSUS-20261119 addendum): with no
+        // recorded hints every derived row falls to capped generic
+        // re-derivation, which on cruise-control emitted 317k partial
+        // steps and still fell short, tripling mint time before the same
+        // corroboration fallback. The native trace-conversion repair
+        // lanes remain the admitted consumer of literals-only traces.
         if trace.proof_work_exhausted() {
             tracing::warn!(
                 "clause trace marked proof-work-exhausted (#A2b); \

@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! `LitCube` — a cube over one predicate's canonical variables as a literal
-//! vector plus its cached conjunction (`DESIGN_spacer_pob_lemma_pipeline.md`
+//! vector plus its cached conjunction (the development design notes at `9598c4206`
 //! §3.1, contract C1).
 //!
 //! Owner: **WP-B1-L** (lemma core). Declared in the skeleton commit with the

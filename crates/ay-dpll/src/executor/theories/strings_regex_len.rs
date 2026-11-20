@@ -58,6 +58,39 @@ const MAX_REGEX_ALPHABET: usize = 16;
 /// candidate costs one bounded assumption re-solve, so the count is kept small.
 const W1B_MAX_CANDIDATES: usize = 4;
 
+/// Intersect the length windows of every pair of terms with equal lengths,
+/// to a fixpoint (#regex-len-equal-lengths). A term with no window is
+/// `[0, usize::MAX]`; a pair where neither side has a window adds nothing.
+fn propagate_equal_length_windows(
+    bounds: &mut ay_core::kani_compat::DetHashMap<TermId, (usize, usize)>,
+    pairs: &[(TermId, TermId)],
+) {
+    // Each productive round narrows some window, and there are at most
+    // `pairs.len() + 1` rounds before nothing changes along a chain.
+    for _ in 0..=pairs.len() {
+        let mut changed = false;
+        for &(a, b) in pairs {
+            let wa = bounds.get(&a).copied();
+            let wb = bounds.get(&b).copied();
+            if wa.is_none() && wb.is_none() {
+                continue;
+            }
+            let (alo, ahi) = wa.unwrap_or((0, usize::MAX));
+            let (blo, bhi) = wb.unwrap_or((0, usize::MAX));
+            let window = (alo.max(blo), ahi.min(bhi));
+            for t in [a, b] {
+                if bounds.get(&t) != Some(&window) {
+                    bounds.insert(t, window);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// A positive/negative regex membership constraint on a single variable.
 struct Membership {
     /// The regex term `R`.
@@ -550,8 +583,40 @@ impl Executor {
     /// Length window `[lo, hi]` (inclusive) per string variable, with `hi =
     /// usize::MAX` meaning "no upper bound". Mirrors the bound extraction used by
     /// the pivot machinery but without the `MAX_PIVOT_BOUND` filter.
-    fn regex_var_length_bounds(&self) -> ay_core::kani_compat::DetHashMap<TermId, (usize, usize)> {
-        self.detect_all_string_length_bounds_pub(&self.ctx.assertions)
+    pub(super) fn regex_var_length_bounds(
+        &self,
+    ) -> ay_core::kani_compat::DetHashMap<TermId, (usize, usize)> {
+        let mut bounds = self.detect_all_string_length_bounds_pub(&self.ctx.assertions);
+        // #regex-len-equal-lengths (AY-SMT-6): a top-level `(= (str.len a)
+        // (str.len b))` gives `a` and `b` the same window. Without it `x1` in
+        // `len x2 = 14 ∧ len x1 = len x2` had no window, and its candidates
+        // ("", "baa", ...) ignored the asserted length. Intersecting windows
+        // of equal-length terms only narrows them to lengths every model
+        // has, so the enumeration's UNSAT conclusion stays sound.
+        let pairs: Vec<(TermId, TermId)> = self
+            .ctx
+            .assertions
+            .iter()
+            .filter_map(|&assertion| {
+                let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(assertion) else {
+                    return None;
+                };
+                if name != "=" || args.len() != 2 {
+                    return None;
+                }
+                let strlen_arg = |t: TermId| match self.ctx.terms.get(t) {
+                    TermData::App(Symbol::Named(op), inner)
+                        if op == "str.len" && inner.len() == 1 =>
+                    {
+                        Some(inner[0])
+                    }
+                    _ => None,
+                };
+                Some((strlen_arg(args[0])?, strlen_arg(args[1])?))
+            })
+            .collect();
+        propagate_equal_length_windows(&mut bounds, &pairs);
+        bounds
     }
 
     /// Compute a sound, finite superset of every character that any string in the

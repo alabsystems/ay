@@ -87,7 +87,10 @@ fn atom_of(terms: &ay_core::TermStore, literal: TermId) -> TermId {
     atom
 }
 
-pub(super) fn complement_of(terms: &mut ay_core::TermStore, literal: TermId) -> TermId {
+pub(in crate::executor) fn complement_of(
+    terms: &mut ay_core::TermStore,
+    literal: TermId,
+) -> TermId {
     match terms.get(literal) {
         TermData::Not(inner) => *inner,
         _ => terms.mk_not_raw(literal),

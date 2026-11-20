@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Workstream D, WP-D1-E (DESIGN_lra_interp_tpa.md §4.1): IMC's budget-shaped
+//! Workstream D, WP-D1-E (the development design notes at 9598c4206, §4.1): IMC's budget-shaped
 //! base-check retry and its k→1 witness step.
 
 use super::*;

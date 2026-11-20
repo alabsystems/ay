@@ -10,6 +10,13 @@
 
 use super::*;
 
+#[path = "qualify_status.rs"]
+mod status;
+
+pub(super) fn status_command(args: &[String]) -> Result<i32, String> {
+    status::run(args)
+}
+
 const SUMMARY_SCHEMA: &str = "ay-z3-qualification-run/v2";
 const STOCK_SUITE_TIMEOUT_SECONDS: u64 = 120;
 

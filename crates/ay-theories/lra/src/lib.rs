@@ -44,9 +44,9 @@ use crate::rational::Rational;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol, TermData, TermId, TermStore};
 use ay_core::{
-    BoundRefinementRequest, DiscoveredDisequality, DiscoveredEquality, DisequalitySplitRequest,
-    EqualityPropagationResult, ExpressionSplitRequest, ModelEqualityRequest, Sort, TheoryLit,
-    TheoryPropagation, TheoryResult, TheorySolver,
+    DiscoveredDisequality, DiscoveredEquality, DisequalitySplitRequest, EqualityPropagationResult,
+    ExpressionSplitRequest, ModelEqualityRequest, Sort, TheoryLit, TheoryPropagation, TheoryResult,
+    TheorySolver,
 };
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -190,7 +190,6 @@ mod gomory;
 mod implied_bounds;
 mod implied_interval;
 mod implied_maintenance;
-mod implied_refinement;
 mod implied_row_reasons;
 mod implied_row_recursive;
 mod infrational;
@@ -504,8 +503,6 @@ struct LraStructuralSnapshot {
     // Warm-path caches (#6590 Packet 1)
     not_inner_cache: HashMap<TermId, (TermId, bool)>,
     const_bool_cache: HashMap<TermId, Option<bool>>,
-    refinement_eligible_cache: HashMap<TermId, bool>,
-    is_integer_sort_cache: HashMap<TermId, bool>,
     /// BCP implied-bounds dry streak counter (#8200).
     #[allow(dead_code)]
     bcp_implied_dry_streak: u32,
@@ -693,8 +690,6 @@ pub struct LraSolver {
     /// computing `collect_row_reasons_dedup()`. Reasons are materialized only when
     /// drained by `propagate()`.
     pending_propagations: Vec<PendingPropagation>,
-    /// Buffered requests to create tighter bound atoms from implied bounds (#4919).
-    pending_bound_refinements: Vec<BoundRefinementRequest>,
     /// Atoms already propagated in the current scope. Prevents duplicate
     /// propagations. Cleared on pop() alongside bound restoration.
     propagated_atoms: HashSet<(TermId, bool)>,
@@ -1025,17 +1020,21 @@ pub struct LraSolver {
     direct_bounds_changed_vars: Vec<u32>,
     /// Monotonic generation counter, incremented each time any variable's
     /// implied bound is tightened in `compute_implied_bounds()`. Used with
-    /// `var_bound_gen` and `row_computed_gen` to skip rows whose input
-    /// bounds have not changed since last computation (#8003).
+    /// `var_bound_gen` and `row_computed_gen` to skip row directions whose
+    /// input bounds have not changed since last computation (#8003).
     bound_generation: u64,
-    /// Per-variable generation: set to `bound_generation` when the variable's
-    /// implied bound is tightened. Indexed by variable id.
-    var_bound_gen: Vec<u64>,
-    /// Per-row generation: set to `bound_generation` after the row is fully
-    /// processed in `compute_implied_bounds()`. If all variables in the row
-    /// have `var_bound_gen <= row_computed_gen[row_idx]`, the row can be
-    /// skipped because no input bound has changed since it was last analyzed.
-    row_computed_gen: Vec<u64>,
+    /// Per-variable `(lower, upper)` bound generations: a side is set to
+    /// `bound_generation` when that side's implied-bound slot changes.
+    /// Stamp sites that cannot name the side they changed (pop rewinds,
+    /// widenings) stamp both. Indexed by variable id.
+    var_bound_gen: Vec<(u64, u64)>,
+    /// Per-row `(LB, UB)` direction generations: a direction is set to
+    /// `bound_generation` after that direction of the row is processed in
+    /// `compute_implied_bounds()`. A direction can be skipped when every
+    /// bound side its accumulation reads is no newer than its stamp; the
+    /// basic variable stamps both directions (each direction's derivation
+    /// block also reads its opposite side).
+    row_computed_gen: Vec<(u64, u64)>,
     /// Per-variable count of implied-bound tightenings that REPLACED an
     /// existing bound since the variable's direct bound last changed (#8857).
     ///
@@ -1252,13 +1251,6 @@ pub struct LraSolver {
     /// Avoids the O(trail) scan on every check() call by recording disequalities
     /// when they are first asserted. Managed via push/pop for backtracking (#4919).
     disequality_trail: Vec<(TermId, LinearExpr, bool)>,
-    /// A5 core (demand-driven equality rows; B35: the env opt-in is retired,
-    /// the field stays test-settable): equality atoms
-    /// asserted during BCP-time checks are DEFERRED (no tableau bounds);
-    /// after each full-check simplex-Sat, violated deferrals MATERIALIZE and
-    /// the solve iterates. (term, expr, value) in assertion order.
-    pub(crate) deferred_eq_atoms: Vec<(TermId, LinearExpr, bool)>,
-    pub(crate) a5_core: bool,
     /// Position in `disequality_trail` at each push scope, for backtracking.
     disequality_trail_scopes: Vec<usize>,
     /// Count of in-place value flips in `asserted` (an atom re-asserted
@@ -1315,7 +1307,7 @@ pub struct LraSolver {
     #[allow(dead_code)]
     float_simplex: simplex::float_simplex::FloatSimplex,
     /// Reusable buffer for `collect_row_reasons_recursive` seen set (#6364).
-    /// Avoids allocating a fresh HashSet on every `queue_bound_refinement_request` call.
+    /// Avoids allocating a fresh HashSet on every call.
     /// Cleared before each use, but capacity is preserved across calls.
     reason_seen_buf: HashSet<(TermId, bool)>,
     /// NOT-unwrap cache (#6590 Packet 1): maps literal TermId to (inner_term, negated).
@@ -1326,14 +1318,6 @@ pub struct LraSolver {
     /// if the term is a constant Bool, None otherwise. Eliminates `self.terms().get()`
     /// in `check()`'s per-atom constant-Bool detection.
     const_bool_cache: HashMap<TermId, Option<bool>>,
-    /// Per-term refinement eligibility cache (#6590 Packet 1): maps TermId to whether
-    /// `term_supports_bound_refinement` returns true. Eliminates `self.terms().get()`
-    /// in the bound refinement warm path.
-    refinement_eligible_cache: HashMap<TermId, bool>,
-    /// Per-term integer-sort cache (#6590 Packet 1): maps TermId to whether
-    /// `self.terms().sort(term) == Sort::Int`. Eliminates `self.terms().sort()` in
-    /// the bound refinement warm path.
-    is_integer_sort_cache: HashMap<TermId, bool>,
     /// BCP implied-bounds dry streak counter (#8200).
     bcp_implied_dry_streak: u32,
     /// BCP cascade dry streak counter (#8255). Tracks consecutive BCP checks

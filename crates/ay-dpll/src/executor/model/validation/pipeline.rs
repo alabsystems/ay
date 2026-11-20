@@ -3349,17 +3349,6 @@ impl Executor {
         let _assertions_frozen = crate::executor::model::AssertionsFrozen::new();
         self.repair_cross_base_chain_equalities();
         self.repair_negated_same_base_chain();
-        // #uflia-witness-complete (1a-ii): asserted range/disequality index for
-        // the range-aware shift below. Built LAZILY — only when a collision is
-        // actually found — because this primitive runs on every gate pass of
-        // every problem and both scans are O(assertion window).
-        let mut bound_index: Option<(
-            ay_core::kani_compat::DetHashMap<
-                TermId,
-                crate::executor::model::uflia_witness::AssertedRange,
-            >,
-            ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>>,
-        )> = None;
         let wdefs = self.build_array_defs();
         let mut total_applied = 0usize;
         let mut total_shifted = 0usize;
@@ -3500,45 +3489,8 @@ impl Executor {
                                 .collect::<String>()
                         );
                     }
-                    // #uflia-witness-complete (1a-ii): the "shifting one side
-                    // to a fresh integer can only help" justification above is
-                    // FALSE whenever the variable carries ASSERTED BOUNDS —
-                    // the sentinel falsifies the very `(< target N)` the same
-                    // formula asserts, and the strict arithmetic oracle then
-                    // definitively refutes the repaired model. When bounds
-                    // exist the shift is REFUSED (or, under
-                    // `AY_UFLIA_WITNESS_SHIFT=inrange`, confined to the
-                    // interval) and the model is left exactly as the gates
-                    // would otherwise have seen it — the collision still
-                    // falsifies the asserted disequality, so the candidate is
-                    // rejected as before, just not via a fabricated
-                    // out-of-bounds value. Env-gated: with the gate off this
-                    // returns `Some(next_fresh)` and behaviour is
-                    // byte-identical.
-                    if bound_index.is_none() {
-                        bound_index = Some(
-                            if crate::executor::model::uflia_witness::uflia_witness_complete_enabled(
-                            ) {
-                                (self.asserted_int_ranges(), self.asserted_int_diseq_peers())
-                            } else {
-                                Default::default()
-                            },
-                        );
-                    }
-                    let (bound_ranges, diseq_peers) =
-                        bound_index.as_ref().expect("initialized just above");
-                    let Some(shift_to) = self.uflia_bounded_diseq_shift_value(
-                        self.last_model.as_ref().expect("checked above"),
-                        bound_ranges,
-                        diseq_peers,
-                        target,
-                        next_fresh,
-                    ) else {
-                        shifted_vars.insert(target);
-                        continue;
-                    };
-                    diseq_shifts.push((target, shift_to));
-                    pending_shifts.insert(target, num_bigint::BigInt::from(shift_to));
+                    diseq_shifts.push((target, next_fresh));
+                    pending_shifts.insert(target, num_bigint::BigInt::from(next_fresh));
                     next_fresh += 1;
                     shifted_vars.insert(target);
                 }
@@ -4778,25 +4730,10 @@ impl Executor {
         if self.publish_evaluation_stop() {
             return SolveResult::Unknown;
         }
-        // #uflia-witness-complete (1a-i): fill absent / out-of-range
-        // asserted-bound Int leaves BEFORE the read-pin repair measures any
-        // collision, so the range-blind diseq shift is never even reached for
-        // them. Env-gated; default off is a no-op returning 0.
-        self.uflia_fill_bounded_int_leaves();
         // #repair-fallback-unrepaired: open the stash window (see
         // `strict_verdict_after_unrepaired_fallback`).
         self.unrepaired_model_candidate = None;
         self.repair_asserted_array_read_pins_with_datatype_completion();
-        // #uflia-witness-complete (1b), mirroring the finalize site: an
-        // IN-LOOP-validated model reaches the funnel through THIS entry, so
-        // the free-UF-point completion must run here too or the class is never
-        // seen (measured: the whole mathsat Hash 1b sub-class arrives with
-        // `last_model_validated == true`). The completion clears that evidence
-        // itself, so `emit_sat_verdict` re-runs the FULL unchanged validation
-        // pipeline over the completed witness — no gate is bypassed and no
-        // certificate can be minted from stale evidence. Env-gated; default
-        // off is a no-op.
-        self.uflia_complete_free_uf_chain_witness();
         if self.publish_evaluation_stop() {
             return SolveResult::Unknown;
         }
@@ -5584,23 +5521,10 @@ impl Executor {
         // evaluator returns Bool(false) with polarity accounted for), the
         // model is unsound and we MUST degrade SAT to Unknown regardless of
         // downstream fallbacks.
-        // #uflia-witness-complete (1a-i): see `apply_strict_model_gate`.
-        self.uflia_fill_bounded_int_leaves();
         // #repair-fallback-unrepaired: open the stash window (see
         // `strict_verdict_after_unrepaired_fallback`).
         self.unrepaired_model_candidate = None;
         self.repair_asserted_array_read_pins_with_datatype_completion();
-        // #uflia-witness-complete (1b): UNDER-COMPLETED UF TABLE. A falsified
-        // UF-chain equality whose chain argument lands on a function point the
-        // formula constrains NOWHERE ELSE is a model-EXTRACTION gap, not a bad
-        // search point — the table simply did not pick the colliding value.
-        // Complete it here, as a model-completion step, so the strict oracle
-        // below and every downstream gate (independent, authoritative,
-        // postcondition) re-check the COMPLETED witness with NO gate weakened.
-        // Env-gated (`--uflia-witness-complete=1`); default off is a no-op.
-        // A completion the gates refute degrades to `unknown` exactly as the
-        // uncompleted model does today — never a wrong `sat`.
-        self.uflia_complete_free_uf_chain_witness();
         // Central strict-coverage policy: both the existing `datatype-field`
         // array gap and the total-construction `datatype` gap are handled by
         // the same scoped helper as the other SAT funnels. All non-confirming
@@ -5811,23 +5735,6 @@ impl Executor {
             // plus the independent/authoritative funnel — recover-only.
             if self.uflia_congruence_lane {
                 self.uflia_congruence_gate_rejected = true;
-                // #uflia-model-repair EVIDENCE CAPTURE (env-gated): this
-                // strict rejection also fires IN-ATTEMPT (in-loop validation
-                // inside the split-loop arms), where the outer pre-emission
-                // snapshot in `check_sat_guarded` never sees the candidate —
-                // the `last_model = None` below erases it. Preserve the
-                // refuted candidate (latest rejection wins) so the §3.2
-                // targeted repair re-solve can name the colliding value
-                // assignment. Verdict flow is byte-identical: pure clone
-                // before the existing erase.
-                if crate::executor::uflia_model_repair::uflia_model_repair_enabled() {
-                    if let Some(model) = self.last_model.clone() {
-                        crate::executor::uflia_model_repair::push_repair_candidate(
-                            &mut self.uflia_repair_candidates,
-                            model,
-                        );
-                    }
-                }
             }
             // Only a rejected completed seed may spend recovery resources.
             // Valid ordinary models never enter the optional candidate search.

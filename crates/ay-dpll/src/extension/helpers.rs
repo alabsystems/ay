@@ -18,80 +18,12 @@ use super::{BoundRefinementHandoff, TheoryExtension};
 impl<T: TheorySolver> TheoryExtension<'_, T> {
     /// Get the SAT variable for a term ID, if it exists
     pub(super) fn var_for_term(&self, term: TermId) -> Option<Variable> {
-        self.term_to_var
-            .get(&term)
-            .or_else(|| self.minted_term_to_var.get(&term))
-            .map(|&v| Variable::new(v))
-    }
-
-    /// Mint a fresh SAT variable to name `term` mid-search (#6846).
-    ///
-    /// Returns `None` when minting is not safe or not enabled, in which case the
-    /// caller must keep its previous fail-closed behaviour.
-    ///
-    /// Safety of the id choice: the new id starts at the solver's current
-    /// `num_vars()` and advances by one per mint, so it can never alias an
-    /// existing variable. `SolverContext::num_vars` defaults to 0 for contexts
-    /// that do not track it (the test doubles), and 0 is treated as "unknown" —
-    /// refusing rather than guessing, because guessing would alias a fresh term
-    /// onto a live variable and silently corrupt the assignment.
-    ///
-    /// The mapping is recorded permanently for this solve: a term must map to
-    /// exactly one variable for the whole search, or two clauses could name the
-    /// same atom differently.
-    pub(super) fn mint_var_for_term(
-        &mut self,
-        term: TermId,
-        ctx: &dyn ay_sat::SolverContext,
-    ) -> Option<Variable> {
-        if let Some(existing) = self.var_for_term(term) {
-            return Some(existing);
-        }
-        let base = ctx.num_vars();
-        if base == 0 {
-            return None;
-        }
-        let id = u32::try_from(base + self.minted_term_to_var.len()).ok()?;
-        self.minted_term_to_var.insert(term, id);
-        self.minted_var_to_term.insert(id, term);
-        self.minted_var_count += 1;
-        Some(Variable::new(id))
+        self.term_to_var.get(&term).map(|&v| Variable::new(v))
     }
 
     /// Convert a theory literal to a SAT literal.
     pub(super) fn term_to_literal(&self, term: TermId, value: bool) -> Option<Literal> {
         self.var_for_term(term).map(|var| {
-            if value {
-                Literal::positive(var)
-            } else {
-                Literal::negative(var)
-            }
-        })
-    }
-
-    /// `term_to_literal` with optional mid-search minting (#6846 BCP
-    /// parity): when `mint_enabled` and the term has no variable yet,
-    /// mint one via `mint_var_for_term` instead of returning `None`.
-    /// Callers that build clauses from the result must treat a clause
-    /// completed this way as a lemma, not a falsified conflict — the
-    /// minted variable is unassigned. The explicit `mint_enabled`
-    /// parameter (production callers pass
-    /// `check::mint_theory_vars_enabled()`) keeps the behavior
-    /// unit-testable without the global flag.
-    pub(super) fn term_to_literal_minting(
-        &mut self,
-        term: TermId,
-        value: bool,
-        ctx: &dyn ay_sat::SolverContext,
-        mint_enabled: bool,
-    ) -> Option<Literal> {
-        if let Some(literal) = self.term_to_literal(term, value) {
-            return Some(literal);
-        }
-        if !mint_enabled {
-            return None;
-        }
-        self.mint_var_for_term(term, ctx).map(|var| {
             if value {
                 Literal::positive(var)
             } else {

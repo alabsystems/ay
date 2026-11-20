@@ -973,7 +973,7 @@ impl SmtContext {
                         // SAT from the fresh solver, the recovery installed that solver,
                         // and the loop re-derived the same lemmas from the same models
                         // forever (2026-09-23, 3 h 40 min observed on a 12-atom ground
-                        // LIA query; LIA_finite_domain_deadline_2026-09-23.md). The
+                        // LIA query; the development design notes at 9598c4206). The
                         // recovery is also capped at `MAX_UNSAT_RECOVERIES` per query.
                         //
                         // The model-based `violated_constraint` blocks are in the

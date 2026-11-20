@@ -64,7 +64,8 @@ impl PortfolioSolver {
     /// 2. BMC witness-less multi-predicate rejection (#6800)
     /// 3. Skeleton Unsafe rejection (no witness, empty assignments)
     /// 4. Always-on Unsafe validation (#8585, was opt-in via config.validate)
-    /// 5. Mandatory Safe full validation (#6787, #6824)
+    /// 5. Mandatory Safe full validation (#6787, #6824); single-predicate
+    ///    systems try the monolithic clause obligations first (Step 4.4)
     pub(crate) fn accept_or_reject(
         &self,
         result: PortfolioResult,
@@ -328,23 +329,13 @@ impl PortfolioSolver {
             return AcceptDecision::Reject;
         }
 
-        // Step 4.5 (#6787): Fast query-only pre-check for Safe results.
-        // Catches tautological false-Safe where the invariant is literally the
-        // negated query (#6789). This is a syntactic check that avoids the
-        // expensive full validation when the model is obviously wrong.
-        //
-        // EXCEPTION (#1306): An invariant that equals exact `not(query)` is
-        // ambiguous — it might be a genuine inductive invariant that happens
-        // to match the negation of the query constraint. Query-only validation
-        // cannot distinguish this case. Instead of hard-rejecting, defer to
-        // Step 5 (full per-rule validation) which can check inductiveness.
-        // Shared back-translation for Steps 4.5 and 5: the synthesized
+        // Shared back-translation for Steps 4.4, 4.5 and 5: the synthesized
         // interpretations for eliminated predicates are built ONCE and the
-        // same translated model feeds both the query-only pre-check and
-        // mandatory full validation. On graph-collapse stacks
-        // (16-eliminated-predicate HOLA shapes) each translation costs the
-        // full QE/synthesis pipeline, and translating twice doubled the
-        // acceptance latency. Translation failure fails closed (Reject).
+        // same translated model feeds every Safe check below. On
+        // graph-collapse stacks (16-eliminated-predicate HOLA shapes) each
+        // translation costs the full QE/synthesis pipeline, and translating
+        // twice doubled the acceptance latency. Translation failure fails
+        // closed (Reject).
         let translated_for_validation = if let PortfolioResult::Safe(ref model) = result {
             match self.back_translate_safe_model(model) {
                 Ok(translated) => Some(translated),
@@ -362,7 +353,66 @@ impl PortfolioSolver {
             None
         };
 
-        if let Some(ref translated) = translated_for_validation {
+        // Step 4.4: monolithic validation of single-predicate systems
+        // (`validation/monolithic.rs`). When every original clause is a fact,
+        // linear transition or query over one predicate, the three clause
+        // obligations are checked whole, on the original clauses: all UNSAT
+        // is a proof that the model is inductive and safe (accept), a
+        // confirmed SAT model refutes it (reject). Only an undecided
+        // obligation falls through to Step 5's per-rule validator — and then
+        // Step 4.5 is skipped: Step 5 checks every query clause itself, and
+        // the monolithic pass has just tried this shape's query whole.
+        let monolithic = translated_for_validation
+            .as_ref()
+            .and_then(|translated| self.validate_safe_monolithic(translated));
+        match &monolithic {
+            Some(MonolithicVerdict::Valid) => {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Portfolio: Engine {} ({}) Safe result passed monolithic validation",
+                        engine_idx,
+                        engine_name
+                    );
+                }
+                if let Some(translated) = translated_for_validation {
+                    return AcceptDecision::Accept(PortfolioResult::Safe(translated));
+                }
+            }
+            Some(MonolithicVerdict::Invalid(reason)) => {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Portfolio: Engine {} ({}) Safe result failed monolithic validation: {}, rejecting",
+                        engine_idx,
+                        engine_name,
+                        reason
+                    );
+                }
+                return AcceptDecision::Reject;
+            }
+            Some(MonolithicVerdict::Unknown(reason)) => {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "Portfolio: Engine {} ({}) Safe result undecided by monolithic validation ({}); per-rule validation",
+                        engine_idx,
+                        engine_name,
+                        reason
+                    );
+                }
+            }
+            None => {}
+        }
+
+        // Step 4.5 (#6787): Fast query-only pre-check for Safe results.
+        // Catches tautological false-Safe where the invariant is literally the
+        // negated query (#6789). This is a syntactic check that avoids the
+        // expensive full validation when the model is obviously wrong.
+        //
+        // EXCEPTION (#1306): An invariant that equals exact `not(query)` is
+        // ambiguous — it might be a genuine inductive invariant that happens
+        // to match the negation of the query constraint. Query-only validation
+        // cannot distinguish this case. Instead of hard-rejecting, defer to
+        // Step 5 (full per-rule validation) which can check inductiveness.
+        if let (Some(translated), None) = (&translated_for_validation, &monolithic) {
             match self.validate_safe_query_only_pre_translated(translated) {
                 SafePrecheckResult::Valid => {}
                 SafePrecheckResult::ExactNegatedQuery(reason) => {

@@ -56,7 +56,9 @@ pub(super) fn query(
         let value = copy(printer.terms, &mut terms, term, &mut memo, &mut nodes, 0)?;
         // The independent scalar lemma must retain the source printer's exact
         // effective spelling, including any caller-provided overrides.
-        if AlethePrinter::new(&terms).format_term(value) != printer.format_term(term) {
+        if printer.structural_render(&terms, |copy| copy.format_term(value))
+            != printer.format_term(term)
+        {
             return None;
         }
         copied.push(value);

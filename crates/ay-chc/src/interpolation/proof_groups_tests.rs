@@ -4,7 +4,7 @@
 
 //! Unit tests for the multi-group proof substrate (C-P1) and its script /
 //! conversion helpers. Owner: WP-D1-P (Workstream D Rung 1,
-//! `DESIGN_lra_interp_tpa.md` §9): masks and recipes under every validation
+//! the development design notes at `9598c4206`, §9): masks and recipes under every validation
 //! policy, path interpolants on a 3-step chain with the sequence property,
 //! the fail-closed paths (locality against the caller's set, invalid masks,
 //! fragment gate, SAT pairs, budget), the pinned Real constant forms, the

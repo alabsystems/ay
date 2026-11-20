@@ -1,0 +1,6 @@
+(set-logic QF_UFBVLIA)
+(declare-fun __trust_u__3 () Bool)
+(declare-fun |__trust_u__4.1#s1_0| () Bool)
+(declare-fun __trust_u_n () Int)
+(assert (and (<= 0 __trust_u_n) (<= __trust_u_n 255) (<= 0 15) (<= 15 255) (= __trust_u_n (bv2nat (bvand ((_ int2bv 8) 15) ((_ int2bv 8) 15)))) (= __trust_u__3 (> __trust_u_n 9)) (> __trust_u_n 9) (>= 15 0) (<= 15 255) (<= __trust_u_n 15) (= __trust_u_n (bv2nat (bvand ((_ int2bv 8) 15) ((_ int2bv 8) 15)))) (= __trust_u__3 (> __trust_u_n 9)) (= |__trust_u__4.1#s1_0| (or (< (+ __trust_u_n 87) 0) (> (+ __trust_u_n 87) 255))) (<= 0 __trust_u_n) (<= __trust_u_n 255) (<= 0 87) (<= 87 255) (or (< (+ __trust_u_n 87) 0) (> (+ __trust_u_n 87) 255)) (<= 0 __trust_u_n) (<= __trust_u_n 255) (<= 0 87) (<= 87 255)))
+(check-sat)

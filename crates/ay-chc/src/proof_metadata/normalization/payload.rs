@@ -140,7 +140,7 @@ pub(super) fn expression<P: Progress>(
             }
             progress.poll()?;
             if is_commutative_op(*op) {
-                children.sort();
+                progress.sort(&mut children, |s| Key::text(s))?;
             }
             progress.poll()?;
             format!("op:{op:?}({})", children.join(","))

@@ -58,3 +58,4 @@ pub use model::{
 };
 pub use solver::PdrSolver;
 pub use verification::CexVerificationResult;
+pub(crate) use verification::{ConcreteAnswer, ConcreteBudget, ConcreteStop};

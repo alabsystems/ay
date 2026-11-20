@@ -799,7 +799,7 @@ impl LraSolver {
     /// side then rejected), while the `sat` it bought on the attack corpus
     /// (gen2/h1346, h0139) is bought as well by the NIA's verified-point
     /// `Sat` criterion. It is not done here; see
-    /// `2026-09-21-nia-sign-cut-soundness.md` in the campaign ledger.
+    /// the development design notes at `9598c4206` in the campaign ledger.
     fn retract_unjustified_bound_slot(&mut self, var: u32, side: BoundType) {
         let vi = var as usize;
         let old_bound = match side {

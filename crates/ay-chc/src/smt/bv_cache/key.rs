@@ -104,8 +104,8 @@ impl BvCacheKeys {
 fn decoded_operator_arity_ok(symbol: &Symbol, arity: usize) -> Option<bool> {
     let ok = match symbol.name() {
         "and" | "or" | "+" | "-" => arity >= 1,
-        "neg" | "bvnot" | "bvneg" | "bv2nat" | "bv2int" => arity == 1,
-        "int2bv" => {
+        "neg" | "bvnot" | "bvneg" | "bv2nat" | "bv2int" | "ubv_to_int" => arity == 1,
+        "int2bv" | "int_to_bv" => {
             arity == 1 && matches!(symbol, Symbol::Indexed(_, indices) if !indices.is_empty())
         }
         "store" => arity == 3,

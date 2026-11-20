@@ -4702,6 +4702,9 @@ mod submit_tests;
 #[cfg(test)]
 mod sat_memory_pin_tests;
 
+#[cfg(test)]
+mod chc_run_solver_tests;
+
 fn chc_verify_file(
     checks: &mut Vec<serde_json::Value>,
     name: &'static str,
@@ -5576,8 +5579,9 @@ fn create_chc_late_entry_stub_package(package_parent: &Path) -> Result<()> {
     )
 }
 
-// The embedded bash script's `${1:-}`/`${2:-}` parameter expansions are not
-// Rust formatting arguments.
+// The embedded bash script's `${1:-}` and `${@: -1}` (the benchmark is the
+// last argument, after `--chc --no-proof --timeout N`) parameter expansions
+// are not Rust formatting arguments.
 #[allow(clippy::literal_string_with_formatting_args)]
 fn chc_late_entry_fake_ay_text() -> &'static str {
     r#"#!/usr/bin/env bash
@@ -5593,7 +5597,7 @@ if [ "${1:-}" != "--chc" ]; then
   exit 2
 fi
 
-benchmark="${2:-}"
+benchmark="${@: -1}"
 case "$(basename -- "$benchmark")" in
   sat-extra.smt2)
     printf '%s\n' "solver banner" "sat" "(model after status)"
@@ -6996,7 +7000,11 @@ if [ -z "$TIMEOUT_MS" ]; then
   fi
 fi
 
-SOLVER_ARGS=(--chc)
+# --no-proof sheds the proof cycle of the CHC engines' internal SMT queries
+# (no proof recording, certificate mint or Alethe sidecar for them); the CHC
+# validation battery on the final verdict still runs (the development design notes,
+# 2026-11-18, AY-SMT-9).
+SOLVER_ARGS=(--chc --no-proof)
 if is_uint "${TIMEOUT_MS:-}" && [ "$TIMEOUT_MS" -gt 0 ]; then
   SOLVER_ARGS+=(--timeout "$TIMEOUT_MS")
 fi

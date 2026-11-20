@@ -47,6 +47,7 @@ mod carried_sorts;
 mod const_interp_seed;
 mod finite_domain_uf;
 mod instantiation_switch;
+mod theory_interp;
 
 /// Maximum MBQI refinement rounds before giving up.
 const MAX_MBQI_ROUNDS: usize = 5;
@@ -11590,6 +11591,15 @@ impl Executor {
                     ConstInterpCandidateSource::WithAllParameterLambdas,
                     &mut discharged,
                 )
+            })
+            .or_else(|| {
+                self.theory_program_interp_certificate(
+                    snapshot,
+                    fallback_category,
+                    mode,
+                    slice,
+                    &mut discharged,
+                )
             });
         self.set_search_deadline(saved_deadline);
         outcome
@@ -12262,6 +12272,11 @@ impl Executor {
                                 ConstInterpCandidate::LinearInt(body) => {
                                     CertifiedConstInterpWitness::LinearInt(body.clone())
                                 }
+                                ConstInterpCandidate::Expression(body) => {
+                                    CertifiedConstInterpWitness::Expression(std::sync::Arc::clone(
+                                        body,
+                                    ))
+                                }
                             };
                             Some((head.binding, value))
                         })
@@ -12382,6 +12397,7 @@ impl Executor {
                         let shape = match value {
                             CertifiedConstInterpWitness::Constant(_) => "const",
                             CertifiedConstInterpWitness::LinearInt(_) => "linear",
+                            CertifiedConstInterpWitness::Expression(_) => "expression",
                         };
                         Some(format!(
                             "{}/{} ({shape})",
@@ -13001,11 +13017,17 @@ impl Executor {
                         // interpret one; a symbolic body over zero parameters
                         // is not minted, and accepting one here would publish
                         // an interpretation the model layer refuses.
-                        let ConstInterpCandidate::Constant(value) = candidate else {
-                            return None;
+                        let value = match candidate {
+                            ConstInterpCandidate::Constant(value) => *value,
+                            ConstInterpCandidate::Expression(body)
+                                if body.parameters().is_empty() =>
+                            {
+                                body.root()
+                            }
+                            _ => return None,
                         };
                         from.push(t);
-                        to.push(*value);
+                        to.push(value);
                     }
                 }
                 TermData::App(Symbol::Named(name), args) => {
@@ -13032,6 +13054,22 @@ impl Executor {
                             let offset = self.ctx.terms.mk_int(linear.constant().clone());
                             summands.push(offset);
                             let value = self.ctx.terms.mk_add(summands);
+                            from.push(t);
+                            to.push(value);
+                        }
+                        ConstInterpCandidate::Expression(body) => {
+                            if body.parameters().len() != args.len() {
+                                return None;
+                            }
+                            let arguments: Vec<_> = args
+                                .iter()
+                                .map(|&argument| self.ctx.terms.substitute(argument, &from, &to))
+                                .collect();
+                            let value = self.ctx.terms.substitute(
+                                body.root(),
+                                body.parameters(),
+                                &arguments,
+                            );
                             from.push(t);
                             to.push(value);
                         }
@@ -13077,6 +13115,8 @@ enum ConstInterpCandidate {
     Constant(TermId),
     /// `λ ȳ. k + Σ cᵢ·yᵢ` over `Int` parameters with an `Int` result.
     LinearInt(LinearIntBody),
+    /// Acyclic typed native operations, closed over exact formal term slots.
+    Expression(std::sync::Arc<super::model::CertifiedExpressionBody>),
 }
 
 /// One G-route (ground-reduction) forall: `forall var_names. t = ctor(vars) =>

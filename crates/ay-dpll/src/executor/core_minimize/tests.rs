@@ -335,3 +335,81 @@ fn core_subset_nomination_scope_restores_after_unwind() {
     assert!(!executor.core_subset_nomination);
     assert!(!executor.certification_resolve);
 }
+
+/// SMT-COMP 2026 uc-qf-linearintarith, QF_LIA/d2c76902 (scrambled): 39 named
+/// assertions, of which the redirect harvests 19. opensmt publishes 9.
+const QF_LIA_UC_D2C76902: &str =
+    include_str!("../../../tests/fixtures/smtcomp2026_uc_qf_lia_d2c76902.smt2");
+
+/// The named assertions of `script` whose labels are in `labels`, as a fresh
+/// script: the reduced benchmark SMT-COMP's validators re-solve.
+fn reduced_script(script: &str, labels: &[String]) -> String {
+    script
+        .lines()
+        .filter(|line| {
+            if !line.starts_with("(assert") {
+                return !line.starts_with("(get-unsat-core") && !line.starts_with("(exit");
+            }
+            labels
+                .iter()
+                .any(|label| line.ends_with(&format!(":named {label}))")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// AY-SMT-4: the general minimizer's cap bounds the deletion scan, so it is
+/// measured on the scan's start set (the certified harvest), not on the named
+/// count. With the cap on the named count this 39-named instance declined at
+/// the gate and kept its 19-member harvest. The reduced core must be a real
+/// core: a fresh executor re-solves exactly its members and answers unsat.
+#[test]
+fn harvest_below_the_cap_is_minimized_when_the_named_set_is_above_it() {
+    let script = QF_LIA_UC_D2C76902
+        .replace("(check-sat)", "")
+        .replace("(get-unsat-core)", "")
+        .replace("(exit)", "");
+    let (mut executor, named) = named_core_redirect_setup(&script);
+    assert_eq!(named.len(), 39);
+    let entry = redirect_entry(&mut executor, &named);
+    assert!(entry.is_unsat());
+    let harvest = executor
+        .last_assumption_core
+        .clone()
+        .expect("the redirect certifies its harvest");
+    assert!(harvest.len() <= GENERAL_MINIMIZE_CAP && harvest.len() < named.len());
+    let result = executor
+        .minimize_assumption_core(&named, Ok(entry), None, Duration::ZERO)
+        .expect("minimizer never alters the verdict");
+    assert!(result.is_unsat());
+    let (start, final_len, _) = uc_minimize_stat(&executor).expect("the pass ran");
+    assert_eq!(start, harvest.len());
+    assert!(
+        final_len < start,
+        "the scan shrinks the harvest: {start} -> {final_len}"
+    );
+    let core = executor
+        .last_assumption_core
+        .clone()
+        .expect("an adopted core is pinned");
+    assert_eq!(core.len(), final_len);
+    let labels: Vec<String> = executor
+        .ctx
+        .named_terms_iter()
+        .filter(|(_, term)| core.contains(term))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    assert_eq!(labels.len(), core.len());
+
+    let reduced = reduced_script(QF_LIA_UC_D2C76902, &labels);
+    let commands = ay_frontend::parse(&reduced).expect("the reduced benchmark parses");
+    let mut fresh = Executor::new();
+    let outputs = fresh
+        .execute_all(&commands)
+        .expect("the reduced benchmark runs");
+    assert_eq!(
+        outputs.first().map(String::as_str),
+        Some("unsat"),
+        "the reduced core must be unsatisfiable on its own"
+    );
+}

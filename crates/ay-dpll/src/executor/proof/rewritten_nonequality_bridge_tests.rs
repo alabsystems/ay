@@ -107,7 +107,7 @@ pub(super) fn leaf_proof(
     premises: Vec<ProofId>,
     args: Vec<TermId>,
 ) -> ay_core::Proof {
-    let negated = exec.ctx.terms.mk_not(atom);
+    let negated = super::complement_of(&mut exec.ctx.terms, atom);
     let mut proof = ay_core::Proof::new();
     proof.steps.push(ProofStep::Step {
         rule: AletheRule::Trust,
@@ -279,7 +279,7 @@ fn the_lane_assumes_only_authored_roots() {
     let mut exec = solve(STORE_CHAIN);
     let atom = rewritten_negation(&mut exec);
     let mut proof = leaf_proof(&mut exec, atom, Vec::new(), Vec::new());
-    let negated = exec.ctx.terms.mk_not(atom);
+    let negated = super::complement_of(&mut exec.ctx.terms, atom);
     assert_eq!(rerun(&mut exec, &mut proof), 1);
     let scope: Vec<TermId> = exec.complete_problem_assertions_for_strict_proof();
     for step in &proof.steps {
@@ -317,7 +317,7 @@ fn a_trust_step_with_premises_is_left_alone() {
     // A `trust` step WITH premises is a FAILED DERIVATION, not a leaf:
     // relabelling it would drop the premises its consumer references. The
     // fixture is a complete refutation whose only `trust` step has one.
-    let negated = exec.ctx.terms.mk_not(atom);
+    let negated = super::complement_of(&mut exec.ctx.terms, atom);
     let mut proof = ay_core::Proof::new();
     proof.steps.push(ProofStep::Assume(negated));
     proof.steps.push(ProofStep::Step {
@@ -435,4 +435,57 @@ fn a_fired_stop_plans_nothing_and_leaves_the_leaf() {
     // declined it.
     exec.set_solve_controls(Some(Arc::new(AtomicBool::new(false))), None);
     assert_eq!(rerun(&mut exec, &mut proof), 1);
+}
+
+/// Congruence transports the authored disjunction exactly. Widening the
+/// comparison from 5 to 6 is a valid arithmetic implication, but it is
+/// not an equality-substitution explanation for this lane.
+#[test]
+fn authored_equality_transports_only_the_matching_disjunction() {
+    for (has_equality, threshold, expected) in
+        [(true, 5, 1), (false, 5, 0), (true, 6, 0), (true, 4, 0)]
+    {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let x = terms.mk_var("subroot_x", Sort::Int);
+        let y = terms.mk_var("subroot_y", Sort::Int);
+        let z = terms.mk_var("subroot_z", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let five = terms.mk_int(5.into());
+        let bound = terms.mk_int(threshold.into());
+        let x_is_zero = terms.mk_app(Symbol::named("="), [x, zero], Sort::Bool);
+        let z_is_zero = terms.mk_app(Symbol::named("="), [z, zero], Sort::Bool);
+        let y_lt_five = terms.mk_app(Symbol::named("<"), [y, five], Sort::Bool);
+        let y_lt_bound = terms.mk_app(Symbol::named("<"), [y, bound], Sort::Bool);
+        let root = terms.mk_app(Symbol::named("or"), [x_is_zero, y_lt_five], Sort::Bool);
+        let leaf = terms.mk_app(Symbol::named("or"), [z_is_zero, y_lt_bound], Sort::Bool);
+        let equality = terms.mk_app(Symbol::named("="), [x, z], Sort::Bool);
+        // Resolution requires the explicit negation of this exact disjunction.
+        let complement = terms.mk_not_raw(leaf);
+        exec.ctx.assertions = vec![root, complement];
+        if has_equality {
+            exec.ctx.assertions.push(equality);
+        }
+        let mut proof = leaf_proof(&mut exec, leaf, Vec::new(), Vec::new());
+        let before = shape(&proof);
+        assert_eq!(
+            rerun(&mut exec, &mut proof),
+            expected,
+            "equality={has_equality}, bound={threshold}"
+        );
+        if expected == 1 {
+            assert_eq!(premiseless_unit_trust_leaves(&proof), 0);
+            exec.check_proof_strict_with_datatypes(&proof)
+                .expect("authored refutation");
+            for required in [root, equality] {
+                assert!(proof
+                    .steps
+                    .iter()
+                    .any(|step| matches!(step, ProofStep::Assume(t) if *t == required)));
+            }
+        } else {
+            assert_eq!(shape(&proof), before);
+            assert!(exec.check_proof_strict_with_datatypes(&proof).is_err());
+        }
+    }
 }

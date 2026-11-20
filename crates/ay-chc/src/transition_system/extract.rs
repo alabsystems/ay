@@ -470,106 +470,80 @@ impl TransitionSystem {
         Ok((pred_id, vars, parts))
     }
 
-    /// Substitute clause arguments to canonical variables in a constraint.
+    /// Canonicalize one clause constraint onto predicate argument positions.
     ///
-    /// For each argument in `args`:
-    /// - If it's a variable, substitute it in `constraint` with the canonical var.
-    /// - If it's an expression, add an equality: `canonical_var = substituted_expr`.
+    /// `current` pairs the arguments of the predicate application read at
+    /// the current state (a body atom, or a fact's head) with the canonical
+    /// variables `v{i}`; `next`, for a transition clause, pairs the head
+    /// arguments with `v{i}_next`. The result is the constraint conjoined
+    /// with one equality per argument position the substitution cannot
+    /// express:
+    /// - a variable argument's first occurrence is renamed to its position's
+    ///   canonical variable;
+    /// - a repeated variable argument (`P(x, x)`, or a body variable that is
+    ///   also a head argument) yields `canonical_i = canonical_j` of its first
+    ///   occurrence;
+    /// - an expression argument yields `canonical_i = arg`.
     ///
-    /// Returns the modified constraint, extra equalities, and the substitution map
-    /// (needed by callers that do a second pass, e.g., transition head args).
+    /// Every other clause variable is a clause-local existential, renamed to
+    /// `{local_prefix}{name}` (#6789: different clauses reuse local names).
     ///
-    /// Uses the #2508 flatten pattern to avoid deep right-skewed binary And trees.
-    pub(super) fn substitute_args_to_canonical_vars(
-        constraint: ChcExpr,
-        args: &[ChcExpr],
-        canonical_vars: &[ChcVar],
-    ) -> (ChcExpr, Vec<ChcExpr>, Vec<(ChcVar, ChcExpr)>) {
-        let subst_map: Vec<(ChcVar, ChcExpr)> = args
-            .iter()
-            .enumerate()
-            .filter_map(|(i, arg)| {
-                if let ChcExpr::Var(v) = arg {
-                    Some((v.clone(), ChcExpr::var(canonical_vars[i].clone())))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let mut result = constraint;
-        let mut extra_eqs = Vec::new();
-        for (i, arg) in args.iter().enumerate() {
-            if let ChcExpr::Var(v) = arg {
-                result = result.substitute(&[(v.clone(), ChcExpr::var(canonical_vars[i].clone()))]);
-            } else {
-                let substituted_arg = arg.substitute(&subst_map);
-                extra_eqs.push(ChcExpr::eq(
-                    ChcExpr::var(canonical_vars[i].clone()),
-                    substituted_arg,
-                ));
-            }
-        }
-
-        (result, extra_eqs, subst_map)
-    }
-
-    /// Combine a constraint with extra equalities using and_all (#2508 flatten pattern).
-    pub(super) fn finalize_constraint(constraint: ChcExpr, extra_eqs: Vec<ChcExpr>) -> ChcExpr {
-        if extra_eqs.is_empty() {
-            constraint
-        } else {
-            let mut all = extra_eqs;
-            all.insert(0, constraint);
-            ChcExpr::and_all(all)
-        }
-    }
-
-    /// Rename local (non-canonical) variables in a constraint to avoid collisions.
-    ///
-    /// After substituting predicate arguments to canonical variables (v0..vN,
-    /// v0_next..vN_next), any remaining free variables are clause-local
-    /// existentials. Different clauses may reuse the same variable names for
-    /// their locals. When init, transition, and query constraints are conjoined
-    /// (e.g., `init ∧ Tr ∧ query`), these same-named locals accidentally merge,
-    /// adding spurious constraints that make satisfiable formulas appear UNSAT.
-    ///
-    /// This function renames all non-canonical variables by prefixing them with
-    /// a unique clause tag (e.g., `__init0_`, `__tr0_`, `__qry0_`).
-    ///
-    /// Fixes #6789: Kind engine false-Safe caused by local variable collision.
-    pub(super) fn rename_local_vars(
-        constraint: ChcExpr,
-        canonical_vars: &[ChcVar],
-        next_vars: Option<&[ChcVar]>,
-        prefix: &str,
+    /// The renaming is ONE simultaneous substitution decided on the clause's
+    /// own variables, so a clause variable whose name is a canonical name
+    /// (`v1`, `v0_next`) is neither captured by a later argument's renaming
+    /// nor mistaken for a state variable.
+    pub(crate) fn canonicalize_clause_constraint(
+        constraint: &ChcExpr,
+        current: (&[ChcExpr], &[ChcVar]),
+        next: Option<(&[ChcExpr], &[ChcVar])>,
+        local_prefix: &str,
     ) -> ChcExpr {
-        // Collect all variables in the constraint
-        let all_vars = constraint.vars();
+        let positions: Vec<(&ChcExpr, &ChcVar)> = {
+            let (args, vars) = current;
+            let mut positions: Vec<_> = args.iter().zip(vars).collect();
+            if let Some((args, vars)) = next {
+                positions.extend(args.iter().zip(vars));
+            }
+            positions
+        };
 
-        // Build set of canonical var names to exclude from renaming
-        let mut canonical_names: FxHashSet<String> =
-            canonical_vars.iter().map(|v| v.name.clone()).collect();
-        if let Some(nvars) = next_vars {
-            for v in nvars {
-                canonical_names.insert(v.name.clone());
+        // Argument variables, first occurrence wins.
+        let mut renaming: FxHashMap<ChcVar, ChcExpr> = FxHashMap::default();
+        for (arg, canonical) in &positions {
+            if let ChcExpr::Var(v) = arg {
+                renaming
+                    .entry(v.clone())
+                    .or_insert_with(|| ChcExpr::var((*canonical).clone()));
             }
         }
+        // Clause locals: every other variable of the constraint or of an
+        // expression argument.
+        let mut clause_vars = constraint.vars();
+        for (arg, _) in &positions {
+            clause_vars.extend(arg.vars());
+        }
+        for v in clause_vars {
+            if !renaming.contains_key(&v) {
+                let local = ChcVar::new(format!("{local_prefix}{}", v.name), v.sort.clone());
+                renaming.insert(v, ChcExpr::var(local));
+            }
+        }
+        let rename =
+            |expr: &ChcExpr| expr.substitute_with_lookup(&|v: &ChcVar| renaming.get(v).cloned());
 
-        // Build substitution for local vars only
-        let substitutions: Vec<(ChcVar, ChcExpr)> = all_vars
-            .into_iter()
-            .filter(|v| !canonical_names.contains(&v.name))
-            .map(|v| {
-                let renamed = ChcVar::new(format!("{}{}", prefix, v.name), v.sort.clone());
-                (v, ChcExpr::var(renamed))
-            })
-            .collect();
-
-        if substitutions.is_empty() {
-            constraint
+        let mut conjuncts = vec![rename(constraint)];
+        for (arg, canonical) in positions {
+            let canonical_expr = ChcExpr::var(canonical.clone());
+            let value = rename(arg);
+            if value != canonical_expr {
+                conjuncts.push(ChcExpr::eq(canonical_expr, value));
+            }
+        }
+        if conjuncts.len() == 1 {
+            conjuncts.pop().expect("one conjunct")
         } else {
-            constraint.substitute(&substitutions)
+            // #2508: one flat conjunction, not a right-skewed binary And tree.
+            ChcExpr::and_all(conjuncts)
         }
     }
 
@@ -601,14 +575,16 @@ impl TransitionSystem {
             };
 
             let constraint = fact.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
-            let (constraint, extra_eqs, _) =
-                Self::substitute_args_to_canonical_vars(constraint, head_args, vars);
-            let combined = Self::finalize_constraint(constraint, extra_eqs);
-            // Rename local variables to avoid collisions with transition/query locals (#6789)
+            // Locals get a per-clause prefix (#6789).
             let prefix = format!("__init{idx}_");
             init_disjuncts.push(TsClauseDisjunct {
                 clause_idx,
-                constraint: Self::rename_local_vars(combined, vars, None, &prefix),
+                constraint: Self::canonicalize_clause_constraint(
+                    &constraint,
+                    (head_args, vars),
+                    None,
+                    &prefix,
+                ),
                 local_prefix: prefix,
             });
         }
@@ -670,41 +646,12 @@ impl TransitionSystem {
             _ => return None,
         };
 
-        // Substitute body args with current canonical vars.
         let constraint = trans.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
-        let (mut constraint, mut extra_eqs, body_subst) =
-            Self::substitute_args_to_canonical_vars(constraint, body_args, vars);
-
-        // Substitute head args with next vars.
-        for (i, head_arg) in head_args.iter().enumerate() {
-            if let ChcExpr::Var(v) = head_arg {
-                // When the same variable appears as a body and head arg, the body
-                // substitution consumes it first; preserve the next-state equality.
-                if let Some((_, canonical_expr)) = body_subst.iter().find(|(bv, _)| bv == v) {
-                    extra_eqs.push(ChcExpr::eq(
-                        ChcExpr::var(next_vars[i].clone()),
-                        canonical_expr.clone(),
-                    ));
-                } else {
-                    constraint =
-                        constraint.substitute(&[(v.clone(), ChcExpr::var(next_vars[i].clone()))]);
-                }
-            } else {
-                // Apply body substitution to head_arg before adding equality.
-                let substituted_head_arg = head_arg.substitute(&body_subst);
-                extra_eqs.push(ChcExpr::eq(
-                    ChcExpr::var(next_vars[i].clone()),
-                    substituted_head_arg,
-                ));
-            }
-        }
-        let combined = Self::finalize_constraint(constraint, extra_eqs);
-        let prefix = format!("__tr{transition_ordinal}_");
-        Some(Self::rename_local_vars(
-            combined,
-            vars,
-            Some(&next_vars),
-            &prefix,
+        Some(Self::canonicalize_clause_constraint(
+            &constraint,
+            (body_args, vars),
+            Some((head_args, &next_vars)),
+            &format!("__tr{transition_ordinal}_"),
         ))
     }
 
@@ -733,14 +680,16 @@ impl TransitionSystem {
             }
 
             let constraint = query.body.constraint.clone().unwrap_or(ChcExpr::Bool(true));
-            let (constraint, extra_eqs, _) =
-                Self::substitute_args_to_canonical_vars(constraint, body_args, vars);
-            let combined = Self::finalize_constraint(constraint, extra_eqs);
-            // Rename local variables to avoid collisions with init/transition locals (#6789)
+            // Locals get a per-clause prefix (#6789).
             let prefix = format!("__qry{idx}_");
             query_disjuncts.push(TsClauseDisjunct {
                 clause_idx,
-                constraint: Self::rename_local_vars(combined, vars, None, &prefix),
+                constraint: Self::canonicalize_clause_constraint(
+                    &constraint,
+                    (body_args, vars),
+                    None,
+                    &prefix,
+                ),
                 local_prefix: prefix,
             });
         }
@@ -756,7 +705,8 @@ impl TransitionSystem {
 pub(crate) struct TsClauseDisjunct {
     pub(crate) clause_idx: usize,
     pub(crate) constraint: ChcExpr,
-    /// Prefix `rename_local_vars` put on this clause's local variables.
+    /// Prefix `canonicalize_clause_constraint` put on this clause's local
+    /// variables.
     pub(crate) local_prefix: String,
 }
 

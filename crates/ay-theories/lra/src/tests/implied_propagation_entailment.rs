@@ -5,7 +5,7 @@
 //! Delivered implied-bound propagations must carry exact explanations.
 //!
 //! These mirror the five synthetic probes (tA..tE) of the QF_LRA-simplex
-//! diagnosis (the development design notes,
+//! diagnosis (the development design notes at `9598c4206`,
 //! section 3.2): the freshness gate used to re-derive compound-atom
 //! entailment from DIRECT bounds of the atom's original variables, so any
 //! propagation whose entailment rests on an implied bound (tD's chain, tE's

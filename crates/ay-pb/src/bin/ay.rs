@@ -1203,7 +1203,7 @@ fn solve_opb<W: Write>(
             );
         }
         return solve_decision_with_proof(
-            instance,
+            instance_arc,
             proof_path,
             timeout_dur,
             start,
@@ -2171,13 +2171,14 @@ fn commit_decision_sat_solution_proof(
 /// UNSAT routes to the native tail (the only compliant refutation source).
 /// Every decline keeps the fail-closed UNKNOWN exit.
 fn solve_decision_with_proof(
-    instance: &PbInstance,
+    instance_arc: &Arc<PbInstance>,
     proof_path: &Path,
     timeout_dur: Option<Duration>,
     start: Instant,
     term_flag: &AtomicBool,
     collect_native_helper_applications: bool,
 ) -> Result<PbSolveOutcome, String> {
+    let instance: &PbInstance = instance_arc;
     let temp_proof_path = prepare_proof_temp(proof_path)?;
     let split_enabled = dec_cert_portfolio_enabled() && timeout_dur.is_some();
     // The slice AND where its length came from, recorded together: the
@@ -2332,8 +2333,8 @@ fn solve_decision_with_proof(
             }
 
             // PHASE P: plain-speed decision solve with the remaining budget.
-            let plain = solve_decision_native(
-                instance,
+            let plain = solve_decision_search_routes(
+                instance_arc,
                 timeout_dur,
                 start,
                 term_flag,
@@ -2456,6 +2457,161 @@ fn solve_decision_with_proof(
     result
 }
 
+/// The search routes of the uncertified decision path, for the phase of a
+/// certified decision solve that follows the proof-logged slice: the clique
+/// witness arm (shape-gated), the symmetry arm, then the decision portfolio
+/// (parallel when `should_parallelize_decision` allows it).
+///
+/// AY-SAT-7: this phase used to run the native CDCL alone, so `--proof`
+/// missed SAT answers that these routes find in seconds (army10.14ls: the
+/// clique arm, 2.5 s; t3002.11tsp11: the portfolio, 4.2 s). Nothing is
+/// certified here: the caller accepts a SAT assignment only after
+/// `verify_all_constraints` and commits it as a solution proof the checker
+/// re-validates, and an UNSAT is accepted only from the proof-logged native
+/// tail it then runs.
+///
+/// These routes poll only the wall deadline and `term_flag`; the native CDCL
+/// they replaced also stopped on `AY_PB_CPU_BUDGET_MS` (PB-COMP limits CPU
+/// time across threads, and the clique arm and the parallel portfolio use
+/// several). They therefore run under [`stop_on_cpu_budget`], whose flag
+/// also rises when the CPU budget is spent. `--cert-debug` names the route
+/// that answered.
+fn solve_decision_search_routes(
+    instance_arc: &Arc<PbInstance>,
+    timeout_dur: Option<Duration>,
+    start: Instant,
+    term_flag: &AtomicBool,
+    collect_native_helper_applications: bool,
+) -> PbSolveOutcome {
+    let budget_spent = cpu_budget().map(|_| cpu_budget_spent as fn() -> bool);
+    let (route, outcome) = stop_on_cpu_budget(term_flag, budget_spent, |stop| {
+        decision_search_routes(
+            instance_arc,
+            timeout_dur,
+            start,
+            stop,
+            collect_native_helper_applications,
+        )
+    });
+    if ay_core::misc_cli_flags().cert_debug {
+        eprintln!(
+            "c dec-cert search route: {route} -> {:?}",
+            outcome.solution.status
+        );
+    }
+    outcome
+}
+
+/// The body of [`solve_decision_search_routes`]; returns the route that
+/// gave the outcome.
+fn decision_search_routes(
+    instance_arc: &Arc<PbInstance>,
+    timeout_dur: Option<Duration>,
+    start: Instant,
+    term_flag: &AtomicBool,
+    collect_native_helper_applications: bool,
+) -> (&'static str, PbSolveOutcome) {
+    let instance: &PbInstance = instance_arc;
+    if !is_linear(instance) {
+        return (
+            "native",
+            solve_decision_native(
+                instance,
+                timeout_dur,
+                start,
+                term_flag,
+                collect_native_helper_applications,
+            ),
+        );
+    }
+    let without_helpers = |solution: PbSolution| PbSolveOutcome {
+        solution,
+        pb_native_code_helper_applications: 0,
+        portfolio_timings: None,
+    };
+    if instance.constraints.len() <= STRUCTURAL_PRECHECK_MAX_ROWS
+        && clique_arm_enabled()
+        && clique_arm_matches(instance)
+    {
+        let clique_deadline = timeout_dur.map(|d| start + d);
+        if let Some(assignment) =
+            try_clique_witness(instance, clique_deadline, term_flag, 0x00C1_19E5)
+        {
+            return (
+                "clique",
+                without_helpers(PbSolution {
+                    status: PbStatus::Satisfiable,
+                    assignment,
+                    objective: None,
+                }),
+            );
+        }
+    }
+    if portfolio::should_parallelize_decision(instance) {
+        return (
+            "portfolio-parallel",
+            without_helpers(portfolio::solve_decision_portfolio_parallel(
+                instance_arc,
+                timeout_dur,
+                start,
+                term_flag,
+            )),
+        );
+    }
+    if symmetry_arm_enabled() {
+        if let Some(solution) = try_symmetry_decision(instance, timeout_dur, start, term_flag) {
+            return ("symmetry", without_helpers(solution));
+        }
+    }
+    let result =
+        portfolio::solve_decision_portfolio_with_timings(instance, timeout_dur, start, term_flag);
+    (
+        "portfolio",
+        PbSolveOutcome {
+            solution: result.solution,
+            pb_native_code_helper_applications: 0,
+            portfolio_timings: Some(result.timings),
+        },
+    )
+}
+
+/// Runs `body` with a stop flag that rises with `term_flag` or once
+/// `budget_spent()` says the CPU budget is spent, for routes that poll only
+/// a flag and the wall clock. A watcher thread polls every 20 ms while
+/// `body` runs; without a budget (`None`) `body` gets `term_flag` itself.
+/// `term_flag` is never set by the watcher.
+fn stop_on_cpu_budget<R>(
+    term_flag: &AtomicBool,
+    budget_spent: Option<fn() -> bool>,
+    body: impl FnOnce(&AtomicBool) -> R,
+) -> R {
+    let Some(budget_spent) = budget_spent else {
+        return body(term_flag);
+    };
+    let stop = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if term_flag.load(Ordering::SeqCst) || budget_spent() {
+                    stop.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let result = body(&stop);
+        done.store(true, Ordering::SeqCst);
+        result
+    })
+}
+
+/// Whether the process has used its `AY_PB_CPU_BUDGET_MS` (unsampled, for
+/// the watcher of [`stop_on_cpu_budget`]).
+fn cpu_budget_spent() -> bool {
+    cpu_budget().is_some_and(|budget| process_cpu_time().is_some_and(|cpu| cpu >= budget))
+}
+
 /// Streams a verified strictly-improving incumbent (o line + cache) exactly
 /// like the plain optimization path; shared by every phase of the certified
 /// pipeline so the improvement bar is monotone across phase handoffs. Returns
@@ -2551,6 +2707,23 @@ fn try_opt_lin_cert_fallback(
     let (pbp, route, solution, timings) = match outcome {
         ay_pb::opt_fallback::OptLinCertFallback::Declined { timings } => {
             return Ok(OptCertFallbackOutcome::Declined(timings));
+        }
+        ay_pb::opt_fallback::OptLinCertFallback::CertifiedInfeasible { pbp, timings } => {
+            fs::write(temp_proof_path, pbp.as_bytes()).map_err(|e| {
+                format!("failed to write proof '{}': {e}", temp_proof_path.display())
+            })?;
+            commit_or_remove_proof(proof_path, temp_proof_path, true)?;
+            return Ok(OptCertFallbackOutcome::Certified(Box::new(
+                PbSolveOutcome {
+                    solution: PbSolution {
+                        status: PbStatus::Unsatisfiable,
+                        assignment: Vec::new(),
+                        objective: None,
+                    },
+                    pb_native_code_helper_applications: 0,
+                    portfolio_timings: timings,
+                },
+            )));
         }
         ay_pb::opt_fallback::OptLinCertFallback::Certified {
             pbp,
@@ -5803,6 +5976,38 @@ mod tests {
         );
         assert_eq!(solution.status, PbStatus::OptimumFound);
         assert_eq!(solution.objective, Some(2));
+    }
+
+    /// Review finding (ce368aefb): the search routes after the proof slice
+    /// poll only the wall clock and `term_flag`, so a run with a spent
+    /// `AY_PB_CPU_BUDGET_MS` went on to its wall deadline. Under
+    /// `stop_on_cpu_budget` the route's flag rises once the budget is spent,
+    /// and the caller's `term_flag` stays down.
+    #[test]
+    fn test_stop_on_cpu_budget_stops_a_flag_polling_route() {
+        static POLLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn spent_after_three_polls() -> bool {
+            POLLS.fetch_add(1, Ordering::SeqCst) >= 3
+        }
+        let term_flag = AtomicBool::new(false);
+        let started = Instant::now();
+        let stopped = stop_on_cpu_budget(&term_flag, Some(spent_after_three_polls), |stop| {
+            // A route that would run for 60 s unless stopped.
+            while !stop.load(Ordering::SeqCst) {
+                if started.elapsed() > Duration::from_secs(60) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            true
+        });
+        assert!(stopped);
+        assert!(!term_flag.load(Ordering::SeqCst));
+        // Without a budget the route polls `term_flag` itself.
+        let same = stop_on_cpu_budget(&term_flag, None, |stop| {
+            std::ptr::eq(stop, &raw const term_flag)
+        });
+        assert!(same);
     }
 
     /// Pins the portfolio ON (the shipped default)

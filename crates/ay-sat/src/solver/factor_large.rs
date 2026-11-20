@@ -4,8 +4,8 @@
 
 //! `--sat-factor-large`, ON by default since 2026-09-18 (`false` opts out):
 //! lets the clause-factoring pass run on formulas the expensive-pass size gate
-//! refuses. Lever 3 of competition/proof-posture-parity/PLAN-next-sat-levers.md
-//! (2026-09-14). Adopted on the A/B of competition/proof-posture-parity: it solved
+//! refuses. Lever 3 of competition/proof-posture-parity/PLAN-next-sat-levers.md at 9598c4206
+//! (2026-09-14). Adopted on the A/B of competition/proof-posture-parity at 9598c4206: it solved
 //! cabp-M k39 (UNSAT, 3 of 3 and at 1500 s) and lost nothing at 1500 s.
 //!
 //! On a formula above `PREPROCESS_EXPENSIVE_MAX_VARS` (200K) or

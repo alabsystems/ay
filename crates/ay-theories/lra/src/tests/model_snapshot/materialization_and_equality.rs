@@ -62,6 +62,91 @@ fn test_materialization_delta_positive_epsilon_upper_bound() {
     );
 }
 
+/// The δ envelope is the exact minimum over every ε-carrying variable's
+/// slack/|ε| candidate, halved — including candidates whose ε magnitude
+/// is not 1 and candidates at big-rational scales. Pins the exact value
+/// so the scan's min-tracking arithmetic cannot drift.
+#[test]
+fn test_materialization_delta_exact_minimum_over_candidates() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_rational(BigRational::zero());
+    let third = terms.mk_rational(BigRational::new(BigInt::from(1), BigInt::from(3)));
+    let half = terms.mk_rational(BigRational::new(BigInt::from(1), BigInt::from(2)));
+    let one = terms.mk_rational(BigRational::one());
+    let a = terms.mk_var("a", Sort::Real);
+    let b = terms.mk_var("b", Sort::Real);
+    let c = terms.mk_var("c", Sort::Real);
+    let a_gt = terms.mk_gt(a, zero);
+    let a_le = terms.mk_le(a, third);
+    let b_gt = terms.mk_gt(b, zero);
+    let b_le = terms.mk_le(b, half);
+    let c_ge = terms.mk_ge(c, zero);
+    let c_lt = terms.mk_lt(c, one);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [a_gt, a_le, b_gt, b_le, c_ge, c_lt] {
+        solver.register_atom(atom);
+        solver.assert_literal(atom, true);
+    }
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+
+    // a = 0 + ε (candidate (1/3)/1), b = 0 + 2ε (candidate (1/2)/2 = 1/4,
+    // the minimum), c = 1 − ε (candidate (1−0)/1, above the cap).
+    let set_value = |solver: &mut LraSolver, var: TermId, x: BigRational, y: BigRational| {
+        let idx = *solver.term_to_var.get(&var).expect("var registered");
+        solver.vars[idx as usize].value = InfRational::new(x, y);
+    };
+    set_value(&mut solver, a, BigRational::zero(), BigRational::one());
+    set_value(
+        &mut solver,
+        b,
+        BigRational::zero(),
+        BigRational::from(BigInt::from(2)),
+    );
+    set_value(&mut solver, c, BigRational::one(), -BigRational::one());
+
+    let delta = solver.compute_materialization_delta();
+    assert_eq!(
+        delta,
+        BigRational::new(BigInt::from(1), BigInt::from(8)),
+        "delta must be min(1, 1/3, 1/4, 1) halved = 1/8"
+    );
+}
+
+/// Same exact-minimum contract at a scale past the i64 fast path:
+/// a bound at 1/10^25 must yield δ = 1/(2·10^25) exactly.
+#[test]
+fn test_materialization_delta_exact_at_big_scale() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_rational(BigRational::zero());
+    let tiny = terms.mk_rational(BigRational::new(
+        BigInt::from(1),
+        BigInt::parse_bytes(b"10000000000000000000000000", 10).expect("decimal"),
+    ));
+    let d = terms.mk_var("d", Sort::Real);
+    let d_gt = terms.mk_gt(d, zero);
+    let d_le = terms.mk_le(d, tiny);
+
+    let mut solver = LraSolver::new(&terms);
+    for atom in [d_gt, d_le] {
+        solver.register_atom(atom);
+        solver.assert_literal(atom, true);
+    }
+    assert!(matches!(solver.check(), TheoryResult::Sat));
+    let idx = *solver.term_to_var.get(&d).expect("d registered");
+    solver.vars[idx as usize].value = InfRational::new(BigRational::zero(), BigRational::one());
+
+    let delta = solver.compute_materialization_delta();
+    assert_eq!(
+        delta,
+        BigRational::new(
+            BigInt::from(1),
+            BigInt::parse_bytes(b"20000000000000000000000000", 10).expect("decimal"),
+        ),
+        "delta must be (1/10^25) halved exactly"
+    );
+}
+
 /// #7654: extract_model() must snap asserted single-variable equalities back
 /// to their exact constant instead of returning a delta-shifted value.
 /// An asserted disequality whose simplex value is `x + k·ε` (accepted by the

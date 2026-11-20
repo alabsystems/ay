@@ -5,7 +5,7 @@
 //! DAG-linear counting and SMT-LIB printing of `ChcExpr`.
 //!
 //! Workstream D, Rung 1 (CHC-COMP 2026; the development design notes
-//! DESIGN_lra_interp_tpa.md` §4.1, interface contract **C-P2**).
+//! DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1, interface contract **C-P2**).
 //! **Owner after the day-1 skeleton: WP-D1-P** (proof substrate). The
 //! implementation shipped with the skeleton, written by WP-D1-M, because the
 //! executor adapter's Search-lane scripts (bridge item D-1, WP-D1-M) print

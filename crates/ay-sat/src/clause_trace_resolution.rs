@@ -1013,6 +1013,16 @@ mod tests {
             ClauseTraceResolutionError::ProofWorkExhausted
         );
 
+        // An exhausted trace that kept recording literals-only carries a
+        // complete clause sequence: conversion may proceed and the
+        // independent DAG replay remains the only authority.
+        let mut literals_only = valid_trace();
+        literals_only.mark_proof_work_exhausted();
+        literals_only.strip_hints_for_literals_only_recording();
+        let converted =
+            convert(&literals_only, 1).expect("literals-only exhausted trace remains convertible");
+        assert_eq!(converted.dag().empty_clause_id, 3);
+
         let mut marker_only = ClauseTrace::new();
         marker_only.add_clause(1, vec![pos(0)], true);
         marker_only.mark_empty();

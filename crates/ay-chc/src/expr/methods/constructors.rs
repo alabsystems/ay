@@ -288,6 +288,29 @@ impl ChcExpr {
         Self::Op(ChcOp::Mod, vec![mk_arc(a), mk_arc(b)])
     }
 
+    /// SMT-LIB 2.7 `(sbv_to_int x)` for `x : (_ BitVec w)`, `w >= 1`: the
+    /// signed (two's-complement) integer value of `x`, expressed with the
+    /// unsigned conversion as `ite(x[w-1] = #b1, bv2nat(x) - 2^w, bv2nat(x))`.
+    /// `None` when `x` is not a bitvector of positive width.
+    pub fn sbv_to_int(arg: Self) -> Option<Self> {
+        let ChcSort::BitVec(width) = arg.sort() else {
+            return None;
+        };
+        let sign_bit = width.checked_sub(1)?;
+        let arg = mk_arc(arg);
+        let unsigned = Self::Op(ChcOp::Bv2Nat, vec![std::sync::Arc::clone(&arg)]);
+        let negative = Self::eq(
+            Self::Op(ChcOp::BvExtract(sign_bit, sign_bit), vec![arg]),
+            Self::BitVec(1, 1),
+        );
+        let modulus = Self::from_bigint(num_bigint::BigInt::from(1u8) << width);
+        Some(Self::ite(
+            negative,
+            Self::sub(unsigned.clone(), modulus),
+            unsigned,
+        ))
+    }
+
     pub fn bv_ule(a: Self, b: Self) -> Self {
         Self::Op(ChcOp::BvULe, vec![mk_arc(a), mk_arc(b)])
     }

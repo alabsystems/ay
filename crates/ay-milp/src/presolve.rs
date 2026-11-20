@@ -1498,31 +1498,253 @@ pub(crate) fn implied_box_f64(
         return None;
     }
     let n = model.num_cols();
-    let mut lo = Vec::with_capacity(n);
-    let mut up = Vec::with_capacity(n);
-    for j in 0..n {
-        let (l, u) = model.col_bounds(Col(j as u32));
-        lo.push(exact_small(l));
-        up.push(exact_small(u));
-    }
-    let integral = vec![false; n];
-    if !propagate(model, deadline, None, &integral, &mut lo, &mut up, false) {
-        return None;
-    }
     let mut lower = Vec::with_capacity(n);
     let mut upper = Vec::with_capacity(n);
     for j in 0..n {
         let (l, u) = model.col_bounds(Col(j as u32));
-        let lb = lo[j]
-            .as_ref()
-            .map_or(f64::NEG_INFINITY, |r| round_out(&r.to_big(), true));
-        let ub = up[j]
-            .as_ref()
-            .map_or(f64::INFINITY, |r| round_out(&r.to_big(), false));
-        lower.push(lb.max(l));
-        upper.push(ub.min(u));
+        if l.is_nan() || u.is_nan() {
+            return None;
+        }
+        lower.push(l);
+        upper.push(u);
+    }
+    if !outward::propagate(model, deadline, &mut lower, &mut upper) {
+        return None;
     }
     Some((lower, upper))
+}
+
+/// Row bound propagation in `f64` with every operation rounded OUTWARD.
+///
+/// `implied_box_f64` used to run [`propagate`] in exact rationals. On NY's
+/// dense network relaxations the rationals grow with every derived bound: a
+/// 6,303 x 4,284 CIFAR-100 relaxation with 1.85 M nonzeros spent 55 s in that
+/// one sweep, on the first rigorous query of every session. The NS tier only
+/// needs an ENCLOSURE of the feasible box, which interval arithmetic in
+/// round-to-nearest provides when each operation is rounded in the direction
+/// that weakens the bound it feeds: activity minima down, maxima up, derived
+/// lower bounds down, upper bounds up.
+///
+/// The direction is exact, not a blanket one-ulp widening: each operation's
+/// rounding error is recovered with an error-free transformation (Knuth's
+/// TwoSum for sums, an FMA residual for products and quotients; see Ogita,
+/// Rump and Oishi, "Accurate sum and dot product", SIAM J. Sci. Comput. 2005)
+/// and the result moves one ulp only when that error points the wrong way.
+/// An exactly representable result stays exact, so a dyadic model gets the
+/// same box the exact sweep gives. Overflow saturates on the safe side, as
+/// `round_out` does; a product or quotient in the subnormal range, where the
+/// FMA residual can itself be rounded, is widened unconditionally.
+mod outward {
+    use super::{Model, Row};
+
+    /// Below this magnitude an FMA residual may be rounded; widen blindly.
+    const TINY: f64 = 1.0e-290;
+
+    /// Direction of rounding wanted for one result.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Dir {
+        Down,
+        Up,
+    }
+
+    /// `v` computed in round-to-nearest with the exact error sign `err`
+    /// (`true value = v + err`), moved to lie on the `dir` side of the truth.
+    fn settle(v: f64, err: f64, dir: Dir) -> f64 {
+        match dir {
+            Dir::Down if err < 0.0 => v.next_down(),
+            Dir::Up if err > 0.0 => v.next_up(),
+            _ => v,
+        }
+    }
+
+    /// An overflowed result of finite operands, saturated on the safe side.
+    fn saturate(v: f64, dir: Dir) -> f64 {
+        match (dir, v > 0.0) {
+            (Dir::Down, true) => f64::MAX,
+            (Dir::Up, false) => f64::MIN,
+            _ => v,
+        }
+    }
+
+    pub(super) fn add(a: f64, b: f64, dir: Dir) -> f64 {
+        let s = a + b;
+        if !s.is_finite() {
+            return if a.is_finite() && b.is_finite() {
+                saturate(s, dir)
+            } else {
+                s
+            };
+        }
+        // TwoSum: s + err == a + b exactly (error-free for every finite
+        // input without overflow, subnormals included).
+        let bb = s - a;
+        let err = (a - (s - bb)) + (b - bb);
+        settle(s, err, dir)
+    }
+
+    pub(super) fn mul(a: f64, b: f64, dir: Dir) -> f64 {
+        let p = a * b;
+        if !p.is_finite() {
+            return if a.is_finite() && b.is_finite() {
+                saturate(p, dir)
+            } else {
+                p
+            };
+        }
+        if p != 0.0 && p.abs() < TINY || p == 0.0 && a != 0.0 && b != 0.0 {
+            return match dir {
+                Dir::Down => p.next_down(),
+                Dir::Up => p.next_up(),
+            };
+        }
+        settle(p, a.mul_add(b, -p), dir)
+    }
+
+    pub(super) fn div(a: f64, b: f64, dir: Dir) -> f64 {
+        let q = a / b;
+        if !q.is_finite() {
+            return if a.is_finite() && b.is_finite() && b != 0.0 {
+                saturate(q, dir)
+            } else {
+                q
+            };
+        }
+        // The residual has the scale of the DIVIDEND, not the quotient.
+        // Tiny operands can produce an ordinary-sized quotient while their
+        // nonzero FMA residual rounds to zero (for example 2*minsub/3*minsub).
+        // Do not use that rounded-away sign to claim an exact enclosure.
+        if a != 0.0 && (a.abs() < TINY || q.abs() < TINY) {
+            return match dir {
+                Dir::Down => q.next_down(),
+                Dir::Up => q.next_up(),
+            };
+        }
+        // a - q*b exactly; the true quotient minus q has the sign of r/b.
+        let r = (-q).mul_add(b, a);
+        let err = if b > 0.0 { r } else { -r };
+        settle(q, err, dir)
+    }
+
+    const ROUNDS: usize = 8;
+
+    /// Tighten `lower`/`upper` (the declared box on entry) to bounds every
+    /// feasible point satisfies. `false` when the box is proved empty.
+    pub(super) fn propagate(
+        model: &Model,
+        deadline: Option<std::time::Instant>,
+        lower: &mut [f64],
+        upper: &mut [f64],
+    ) -> bool {
+        use Dir::{Down, Up};
+        let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+        for _ in 0..ROUNDS {
+            let mut changed = false;
+            for r in 0..model.num_rows() {
+                if r % 256 == 0 && expired() {
+                    return true; // everything derived so far is still valid
+                }
+                let (coeffs, rlb, rub) = model.row(Row(r as u32));
+                if rlb.is_nan() || rub.is_nan() || (!rlb.is_finite() && !rub.is_finite()) {
+                    continue;
+                }
+                // Activity range with the count of columns that make it infinite.
+                let (mut min_act, mut max_act) = (0.0_f64, 0.0_f64);
+                let (mut min_inf, mut max_inf) = (0usize, 0usize);
+                for &(c, a) in coeffs {
+                    let j = c as usize;
+                    let (at_min, at_max) = if a > 0.0 {
+                        (lower[j], upper[j])
+                    } else {
+                        (upper[j], lower[j])
+                    };
+                    if at_min.is_finite() {
+                        min_act = add(min_act, mul(a, at_min, Down), Down);
+                    } else {
+                        min_inf += 1;
+                    }
+                    if at_max.is_finite() {
+                        max_act = add(max_act, mul(a, at_max, Up), Up);
+                    } else {
+                        max_inf += 1;
+                    }
+                }
+                // A non-finite accumulated activity says nothing usable.
+                if !min_act.is_finite() {
+                    min_inf = usize::MAX;
+                }
+                if !max_act.is_finite() {
+                    max_inf = usize::MAX;
+                }
+                if min_inf > 1 && max_inf > 1 {
+                    continue;
+                }
+                for &(c, a) in coeffs {
+                    if a == 0.0 || !a.is_finite() {
+                        continue;
+                    }
+                    let j = c as usize;
+                    let (at_min, at_max) = if a > 0.0 {
+                        (lower[j], upper[j])
+                    } else {
+                        (upper[j], lower[j])
+                    };
+                    // The rest of the row without column j: a LOWER bound on
+                    // its least value and an UPPER bound on its greatest.
+                    let rest_min = match (min_inf, at_min.is_finite()) {
+                        (0, true) => Some(add(min_act, -mul(a, at_min, Up), Down)),
+                        (1, false) => Some(min_act),
+                        _ => None,
+                    };
+                    let rest_max = match (max_inf, at_max.is_finite()) {
+                        (0, true) => Some(add(max_act, -mul(a, at_max, Down), Up)),
+                        (1, false) => Some(max_act),
+                        _ => None,
+                    };
+                    // a·x_j <= rub − rest_min
+                    if let (true, Some(rm)) = (rub.is_finite(), rest_min) {
+                        let slack = add(rub, -rm, Up);
+                        if a > 0.0 {
+                            let b = div(slack, a, Up);
+                            if b < upper[j] {
+                                upper[j] = b;
+                                changed = true;
+                            }
+                        } else {
+                            let b = div(slack, a, Down);
+                            if b > lower[j] {
+                                lower[j] = b;
+                                changed = true;
+                            }
+                        }
+                    }
+                    // a·x_j >= rlb − rest_max
+                    if let (true, Some(rm)) = (rlb.is_finite(), rest_max) {
+                        let slack = add(rlb, -rm, Down);
+                        if a > 0.0 {
+                            let b = div(slack, a, Down);
+                            if b > lower[j] {
+                                lower[j] = b;
+                                changed = true;
+                            }
+                        } else {
+                            let b = div(slack, a, Up);
+                            if b < upper[j] {
+                                upper[j] = b;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if lower[j] > upper[j] {
+                        return false;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        true
+    }
 }
 
 /// A rational to an `f64` that is certainly on the outside of it.
@@ -2861,6 +3083,66 @@ mod implied_box_tests {
     use crate::exact::{Budget, ExactLp, LpOptimum};
     use crate::model::{Col, Model};
     use ay_lra::rational::Rational;
+
+    #[test]
+    fn outward_arithmetic_encloses_exact_dyadics_at_extreme_scales() {
+        use super::outward::{add, div, mul, Dir};
+        let magnitudes = [
+            f64::from_bits(1),
+            f64::from_bits(2),
+            f64::from_bits(3),
+            f64::MIN_POSITIVE,
+            1.0e-300,
+            1.0e-290,
+            1.0e-280,
+            1.0e-100,
+            1.0,
+            3.0,
+            1.0e100,
+            f64::MAX,
+        ];
+        let encloses = |lo: f64, hi: f64, exact: BigRational| {
+            assert!(!lo.is_nan() && !hi.is_nan());
+            assert!(
+                lo == f64::NEG_INFINITY || BigRational::from_float(lo).unwrap() <= exact,
+                "lower {lo:?} exceeds {exact}"
+            );
+            assert!(
+                hi == f64::INFINITY || BigRational::from_float(hi).unwrap() >= exact,
+                "upper {hi:?} is below {exact}"
+            );
+        };
+        for a in magnitudes.into_iter().chain([0.0]) {
+            for b in magnitudes {
+                for (a, b) in [(a, b), (-a, b), (a, -b), (-a, -b)] {
+                    let x = BigRational::from_float(a).unwrap();
+                    let y = BigRational::from_float(b).unwrap();
+                    encloses(add(a, b, Dir::Down), add(a, b, Dir::Up), &x + &y);
+                    encloses(mul(a, b, Dir::Down), mul(a, b, Dir::Up), &x * &y);
+                    encloses(div(a, b, Dir::Down), div(a, b, Dir::Up), &x / &y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn implied_box_keeps_the_exact_feasible_point_with_subnormal_coefficients() {
+        let epsilon = f64::from_bits(1);
+        let exact = BigRational::new(2.into(), 3.into());
+        for sign in [1.0, -1.0] {
+            let mut model = Model::new();
+            let x = model.add_col(0.0, 1.0);
+            if sign > 0.0 {
+                model.add_row(f64::NEG_INFINITY, 2.0 * epsilon, &[(x, 3.0 * epsilon)]);
+            } else {
+                model.add_row(-2.0 * epsilon, f64::INFINITY, &[(x, -3.0 * epsilon)]);
+            }
+            model.check_point(&[exact.clone()]).unwrap();
+            let (lower, upper) = implied_box_f64(&model, None).unwrap();
+            assert!(BigRational::from_float(lower[0]).unwrap() <= exact);
+            assert!(BigRational::from_float(upper[0]).unwrap() >= exact);
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

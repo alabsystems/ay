@@ -11,23 +11,16 @@
 //! opaque between polls. No authority or partial artifact is returned on refusal.
 
 use super::*;
-use crate::proof_metadata::{
-    normalized_chc_input_identity_with_progress, ordered_chc_clause_sequence_sha256_with_progress,
-};
-
 /// The source's normalized-input schema and hash, and its clause-sequence hash.
 type SourceHashes = (&'static str, String, String);
 
 fn source_hashes(
     problem: &ChcProblem,
+    mut budget: Option<usize>,
     control: &mut GroundValidationControl<'_>,
 ) -> Result<SourceHashes, ChcGroundDerivationArtifactError> {
-    let (schema, normalized) =
-        normalized_chc_input_identity_with_progress(problem, &mut || control.poll().is_ok())
-            .map_err(|_| interruption_error(GroundValidationInterrupted))?;
-    let ordered =
-        ordered_chc_clause_sequence_sha256_with_progress(problem, &mut || control.poll().is_ok())
-            .map_err(|_| interruption_error(GroundValidationInterrupted))?;
+    let (schema, normalized) = rebuild::normalized_source(problem, &mut budget, control)?;
+    let ordered = rebuild::ordered_source(problem, &mut budget, control)?;
     control.poll().map_err(interruption_error)?;
     Ok((schema, normalized, ordered))
 }
@@ -51,11 +44,11 @@ pub(super) fn encode_v1_with_control(
     control: &mut GroundValidationControl<'_>,
 ) -> Result<ChcProofRunArtifact, ChcGroundDerivationArtifactError> {
     control.poll().map_err(interruption_error)?;
-    validate_problem_bounds_with_control(problem, control)?;
+    let budget = validate_wire_problem(problem, control)?;
     // V1 must classify strict wire errors before native proof errors, just as
     // the legacy exporter did (notably opaque/private/mis-sorted bindings).
     let (steps, counts) = wire_steps_from_derivation_with_control(problem, derivation, control)?;
-    let (schema, normalized, ordered) = source_hashes(problem, control)?;
+    let (schema, normalized, ordered) = source_hashes(problem, budget, control)?;
     let envelope = GroundDerivationEnvelope::from_parts(
         steps,
         counts,
@@ -87,14 +80,14 @@ pub(super) fn encode_v2_with_control(
     control: &mut GroundValidationControl<'_>,
 ) -> Result<ChcProofRunArtifact, ChcGroundDerivationArtifactError> {
     control.poll().map_err(interruption_error)?;
-    validate_problem_bounds_with_control(problem, control)?;
+    let budget = validate_wire_problem(problem, control)?;
     // V2 authenticates native types/resources before wire encoding can
     // evaluate ordinary UF arguments or clone their observed values.
     let checked = validate_ground_derivation_with_control(problem, derivation, control);
     control.poll().map_err(interruption_error)?;
     checked.map_err(map_v2_derivation_error)?;
     let (steps, counts) = wire_steps_v2_from_derivation_with_control(problem, derivation, control)?;
-    let (schema, normalized, ordered) = source_hashes(problem, control)?;
+    let (schema, normalized, ordered) = source_hashes(problem, budget, control)?;
     let envelope = GroundDerivationEnvelopeV2::from_parts(
         steps,
         counts,

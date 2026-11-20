@@ -186,7 +186,6 @@ impl LraSolver {
             return false;
         }
 
-        let saved_pending_bound_refinements = std::mem::take(&mut self.pending_bound_refinements);
         let saved_pending_propagations = std::mem::take(&mut self.pending_propagations);
         let saved_propagated_atoms = std::mem::take(&mut self.propagated_atoms);
         let saved_propagation_dirty_vars = std::mem::take(&mut self.propagation_dirty_vars);
@@ -270,7 +269,6 @@ impl LraSolver {
             }
         }
 
-        self.pending_bound_refinements = saved_pending_bound_refinements;
         self.pending_propagations = saved_pending_propagations;
         self.propagated_atoms = saved_propagated_atoms;
         self.propagation_dirty_vars = saved_propagation_dirty_vars;

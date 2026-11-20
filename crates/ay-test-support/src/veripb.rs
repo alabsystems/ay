@@ -99,7 +99,7 @@ fn stale_pre_pin_build() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// The NEUTRAL default candidate. `publish/DECISIONS.md` (2026-07-18 scrub log)
+/// The NEUTRAL default candidate. The 2026-07-18 scrub (`publish/DECISIONS.md` at `9598c4206`)
 /// kept it deliberately when the maintainer's personal path was dropped: it is
 /// machine-independent, so it can survive into a public snapshot.
 ///
@@ -1805,7 +1805,8 @@ esac
     /// list, and `$PATH` was scanned before that list was consulted at all. So
     /// on a machine carrying both, a checker whose path records no commit and
     /// no patch beat the build this repo's own scripts produce. The neutral
-    /// default is still offered — `publish/DECISIONS.md` keeps it on purpose —
+    /// default is still offered — the 2026-07-18 scrub kept it on purpose
+    /// (`publish/DECISIONS.md` at `9598c4206`) —
     /// but it is offered LAST-but-one, not first.
     #[test]
     fn the_pinned_build_outranks_every_identity_free_candidate() {

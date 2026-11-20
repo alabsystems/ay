@@ -108,10 +108,6 @@ impl TheorySolver for LraSolver {
         self.warm_reuse_hint = reused;
     }
 
-    fn take_bound_refinements(&mut self) -> Vec<BoundRefinementRequest> {
-        std::mem::take(&mut self.pending_bound_refinements)
-    }
-
     fn registered_atom_count(&self) -> usize {
         self.registered_atoms.len()
     }

@@ -344,7 +344,7 @@ impl AlethePrinter<'_> {
     ) -> Option<(usize, String, ConjunctBridge)> {
         /// Operands one projection may try.
         const MAX_PROJECTED_CONJUNCTS: usize = 64;
-        if crate::render_term_canonical(self.terms, term) != folded {
+        if self.render_canonical(term) != folded {
             return None;
         }
         let operands =
@@ -399,7 +399,7 @@ impl AlethePrinter<'_> {
         if nesting.operands.first().map_or(0, Vec::len) < 2 {
             return false;
         }
-        let folded = crate::render_term_canonical(self.terms, term);
+        let folded = self.render_canonical(term);
         self.flat_folded_and_projection("probe", surface, &folded)
             .or_else(|| self.navigate_and_pos_gate("probe", surface, &folded))
             .is_some()

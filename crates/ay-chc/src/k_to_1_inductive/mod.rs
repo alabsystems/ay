@@ -45,7 +45,15 @@ pub(crate) const DEFAULT_CONVERT_TIMEOUT: std::time::Duration = std::time::Durat
 
 /// Convert a k-inductive invariant to a 1-inductive invariant.
 ///
-/// If the invariant is already 1-inductive (k <= 1), returns it unchanged.
+/// `k` is the number of transitions in the induction check the caller
+/// proved: `inv(x0) ∧ ... ∧ inv(x{k-1}) ∧ Tr^k ∧ ¬inv(xk)` is UNSAT. PDKind
+/// (`k = n + 1`, checked over `Tr^k`) passes its `k` as is; Kind's loop
+/// index is one less than its transition count and passes `k + 1`
+/// (DR-CHC-KIND-K-TO-1-DEPTH-20261118). If the invariant is already
+/// 1-inductive (k <= 1), returns it unchanged. IMC does not call this: it
+/// uses [`path::convert_path`], which takes `k` in the same transition-count
+/// convention but returns `None` for `k == 0` and, for `k == 1`, returns the
+/// input only after checking it.
 /// Tries halving first (O(log k) interpolations), then chained single-query
 /// (k interpolations) as fallback.
 /// Returns `None` if all methods fail or the timeout is exceeded.

@@ -5,7 +5,7 @@
 //! Bounded, query-sealed proof path for direct finite-enum pigeonholes.
 
 mod declarations;
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 mod stop_tests;
 
 use ay_core::term::TermEntryStamp;

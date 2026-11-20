@@ -17,6 +17,7 @@ use crate::executor_format::{
 use crate::executor_types::SolveResult;
 
 use super::construction_owner::{ModelConstructionRead, ModelRead};
+use super::independent_gate::{PublishedAnswer, PublishedAnswerSession};
 use super::overloaded_ctor_surface::ValueSpelling;
 use super::Executor;
 use super::{debug_model, CertifiedConstInterpBody, EvalValue, LinearIntBody, Model};
@@ -471,6 +472,9 @@ impl Executor {
                 // guessed definition.
                 let body = match entry.body() {
                     CertifiedConstInterpBody::Constant { value, .. } => self.format_term(*value),
+                    CertifiedConstInterpBody::Expression(body) => {
+                        self.format_model_expression(body)
+                    }
                     CertifiedConstInterpBody::LinearInt(linear) => {
                         match format_linear_int_body(linear) {
                             Some(rendered) => rendered,
@@ -1038,7 +1042,7 @@ impl Executor {
                 // concat), printing an INVALID witness that contradicted the
                 // assertions.
                 if matches!(info.sort, Sort::Seq(..)) {
-                    match self.term_value_string_in_read(read, term_id) {
+                    match self.term_value_string_in_read(read, None, term_id) {
                         Ok(value_str) => {
                             definitions.push(format!(
                                 "  (define-fun {quoted_name} () {sort_str} {value_str})"
@@ -1306,9 +1310,15 @@ impl Executor {
         result
     }
 
+    /// The value text of `term_id` under `read`. An answer read (`(get-value)`,
+    /// `(eval)`) passes its batch's `answers`, and a term that mentions an
+    /// application of an ordinary declared function then takes
+    /// [`Self::published_answer`] (#get-value-published-model); a model
+    /// builder passes `None` and reads the per-term authorities.
     fn term_value_string_in_read(
         &self,
         read: &dyn ModelRead,
+        answers: Option<&PublishedAnswerSession<'_>>,
         term_id: TermId,
     ) -> Result<String, String> {
         let model = read.model();
@@ -1320,7 +1330,13 @@ impl Executor {
         }
         let result = match self.dt_fd_ground_value(model, term_id) {
             Some(value) => Ok(value),
-            None => self.term_value_string_unstopped_in_read(model, term_id, Some(read)),
+            None => match answers.map(|answers| self.published_answer(answers, term_id)) {
+                Some(PublishedAnswer::Value(value)) => Ok(value),
+                Some(PublishedAnswer::Error(error)) => Err(error),
+                Some(PublishedAnswer::NotApplicable) | None => {
+                    self.term_value_string_unstopped_in_read(model, term_id, Some(read))
+                }
+            },
         };
         self.check_evaluation_read()?;
         result
@@ -1468,9 +1484,18 @@ impl Executor {
                     eval_value
                 };
             self.check_evaluation_read()?;
-            // A UF application at an argument point the function table does
-            // not list reads back the printed define-fun's ELSE branch, so
-            // (get-value) never contradicts (get-model).
+            // The last raw table row's value for an application the evaluator
+            // left Unknown. This is NOT the printed body's value at the
+            // application's point: an Unknown argument is read as "unlisted"
+            // and the table is keyed by `sym.name()` over the EUF tables only.
+            // It is therefore not an answer source for a term that mentions an
+            // ordinary declared function's application: `(get-value)`,
+            // `(eval)` and `values()` answer those through
+            // `Self::published_answer` before reaching this chain
+            // (#get-value-published-model). It remains on the builder reads
+            // (`term_value_string`, and `uf_table_candidate_value_in_read`,
+            // which the ground-application table fallback uses) and on answer
+            // reads of terms that mention no such application.
             if matches!(eval_value, EvalValue::Unknown) {
                 if let Some(else_value) = self.uf_unlisted_point_value(model, term_id) {
                     return else_value;
@@ -1480,17 +1505,16 @@ impl Executor {
         }
     }
 
-    /// Model-completion read of a UF application at an argument tuple its
-    /// function table does not list.
+    /// The last resolved row's value of the raw EUF table keyed by the
+    /// application's head name, or the canonical default body for an empty
+    /// table; `None` when the term is not an application with a table, or when
+    /// an argument has no value under the per-term evaluator.
     ///
-    /// The printed `(define-fun f ...)` is TOTAL: its else branch is the last
-    /// resolved table entry (see `format_function_table`), or the canonical
-    /// default body for an empty table. `(get-value ((f <unlisted args>)))`
-    /// must therefore answer exactly that else value — the former sort-default
-    /// fabrication contradicted the printed model
-    /// (#no-fabricated-model-values). `None` when the term is not a UF
-    /// application with a table, or when an argument itself has no model value
-    /// (the read is then genuinely unavailable and the caller errors).
+    /// The last row is the printed body's else branch, but the printed body
+    /// answers it only at a point that no other row's key equals; this read
+    /// does not compare the argument values with the keys
+    /// (#no-fabricated-model-values, #get-value-published-model). Answer reads
+    /// of ordinary declared functions use `Self::published_answer`.
     fn uf_unlisted_point_value(
         &self,
         model: &Model,
@@ -1543,7 +1567,7 @@ impl Executor {
     fn get_value_string(
         &self,
         read: &dyn ModelRead,
-        aggregate_values: &AggregateConstantValues,
+        batch: &ValueBatch<'_>,
         term_id: TermId,
     ) -> Result<String, String> {
         if let Some(value) = read.check_array_functions(term_id)? {
@@ -1554,18 +1578,14 @@ impl Executor {
         if !self.materialized_scalar_functions_current(read.model()) {
             return Err("materialized scalar function model is stale".to_string());
         }
-        let value = self.get_value_core(read, aggregate_values, term_id);
+        let value = self.get_value_core(read, batch, term_id);
         if value.is_err() && matches!(self.ctx.terms.sort(term_id), Sort::Bool) {
             // A Boolean combination whose leaves all have printed values has
             // the value those printed values give it (#get-value-printed-bool).
             let mut memo = DetHashMap::default();
-            if let Some(b) = self.gv_printed_bool(
-                read,
-                aggregate_values,
-                term_id,
-                &mut memo,
-                PRINTED_BOOL_DEPTH,
-            ) {
+            if let Some(b) =
+                self.gv_printed_bool(read, batch, term_id, &mut memo, PRINTED_BOOL_DEPTH)
+            {
                 return Ok(b.to_string());
             }
         }
@@ -1586,7 +1606,7 @@ impl Executor {
     fn gv_printed_bool(
         &self,
         read: &dyn ModelRead,
-        aggregate_values: &AggregateConstantValues,
+        batch: &ValueBatch<'_>,
         term: TermId,
         memo: &mut DetHashMap<TermId, Option<bool>>,
         fuel: u32,
@@ -1594,7 +1614,7 @@ impl Executor {
         if let Some(&known) = memo.get(&term) {
             return known;
         }
-        let value = self.gv_printed_bool_uncached(read, aggregate_values, term, memo, fuel);
+        let value = self.gv_printed_bool_uncached(read, batch, term, memo, fuel);
         memo.insert(term, value);
         value
     }
@@ -1602,7 +1622,7 @@ impl Executor {
     fn gv_printed_bool_uncached(
         &self,
         read: &dyn ModelRead,
-        aggregate_values: &AggregateConstantValues,
+        batch: &ValueBatch<'_>,
         term: TermId,
         memo: &mut DetHashMap<TermId, Option<bool>>,
         fuel: u32,
@@ -1610,7 +1630,7 @@ impl Executor {
         if fuel == 0 {
             return None;
         }
-        if let Ok(value) = self.get_value_core(read, aggregate_values, term) {
+        if let Ok(value) = self.get_value_core(read, batch, term) {
             return match value.as_str() {
                 "true" => Some(true),
                 "false" => Some(false),
@@ -1620,25 +1640,25 @@ impl Executor {
         let fuel = fuel - 1;
         match self.ctx.terms.get(term) {
             TermData::Not(inner) => self
-                .gv_printed_bool(read, aggregate_values, *inner, memo, fuel)
+                .gv_printed_bool(read, batch, *inner, memo, fuel)
                 .map(|b| !b),
             TermData::Ite(c, t, e) => {
-                let branch = if self.gv_printed_bool(read, aggregate_values, *c, memo, fuel)? {
+                let branch = if self.gv_printed_bool(read, batch, *c, memo, fuel)? {
                     *t
                 } else {
                     *e
                 };
-                self.gv_printed_bool(read, aggregate_values, branch, memo, fuel)
+                self.gv_printed_bool(read, batch, branch, memo, fuel)
             }
             TermData::App(sym, args) => match sym.name() {
                 "not" if args.len() == 1 => self
-                    .gv_printed_bool(read, aggregate_values, args[0], memo, fuel)
+                    .gv_printed_bool(read, batch, args[0], memo, fuel)
                     .map(|b| !b),
                 "and" | "or" => {
                     let absorbing = sym.name() == "or";
                     let mut unknown = false;
                     for &a in args {
-                        match self.gv_printed_bool(read, aggregate_values, a, memo, fuel) {
+                        match self.gv_printed_bool(read, batch, a, memo, fuel) {
                             Some(b) if b == absorbing => return Some(absorbing),
                             Some(_) => {}
                             None => unknown = true,
@@ -1649,7 +1669,7 @@ impl Executor {
                 "=>" | "xor" => {
                     let mut values = Vec::with_capacity(args.len());
                     for &a in args {
-                        values.push(self.gv_printed_bool(read, aggregate_values, a, memo, fuel)?);
+                        values.push(self.gv_printed_bool(read, batch, a, memo, fuel)?);
                     }
                     if sym.name() == "xor" {
                         return Some(values.iter().fold(false, |acc, &b| acc ^ b));
@@ -1661,10 +1681,10 @@ impl Executor {
                     let mut values = Vec::with_capacity(args.len());
                     for &a in args {
                         let value = if matches!(self.ctx.terms.sort(a), Sort::Bool) {
-                            self.gv_printed_bool(read, aggregate_values, a, memo, fuel)?
+                            self.gv_printed_bool(read, batch, a, memo, fuel)?
                                 .to_string()
                         } else {
-                            self.get_value_string(read, aggregate_values, a)
+                            self.get_value_string(read, batch, a)
                                 .ok()
                                 .filter(|v| self.canonical_datatype_value(v))?
                         };
@@ -1687,7 +1707,7 @@ impl Executor {
     fn get_value_core(
         &self,
         read: &dyn ModelRead,
-        aggregate_values: &AggregateConstantValues,
+        batch: &ValueBatch<'_>,
         term_id: TermId,
     ) -> Result<String, String> {
         let model = read.model();
@@ -1698,6 +1718,14 @@ impl Executor {
         if let Some(value) = self.dt_fd_ground_value(model, term_id) {
             return Ok(value);
         }
+        // A term that mentions an application of an ordinary declared
+        // function answers from the published model or errors; it never
+        // reaches the per-term readers below (#get-value-published-model).
+        match self.published_answer(&batch.answers, term_id) {
+            PublishedAnswer::Value(value) => return Ok(value),
+            PublishedAnswer::Error(error) => return Err(error),
+            PublishedAnswer::NotApplicable => {}
+        }
         // A wrong-constructor selector application the model never valued
         // reads the printed selector table (#get-value-wrong-ctor), before
         // the aggregate reader: that reader completes a datatype-sorted term
@@ -1707,7 +1735,7 @@ impl Executor {
         if let Some(value) = self.wrong_ctor_selector_table_value(model, term_id)? {
             return Ok(value);
         }
-        match aggregate_values.resolve(self, model, term_id)? {
+        match batch.aggregate_values.resolve(self, model, term_id)? {
             AggregateConstantValue::Value(value) => Ok(value),
             AggregateConstantValue::Absent => {
                 // A non-query selector on its owning constructor projects
@@ -1718,7 +1746,7 @@ impl Executor {
                 // A tester answers for its argument's printed value
                 // (#get-value-tester-coherence).
                 if let Some((arg, tested)) = self.tester_application(term_id) {
-                    if let Ok(value) = self.get_value_string(read, aggregate_values, arg) {
+                    if let Ok(value) = self.get_value_string(read, batch, arg) {
                         if let Some(answer) = self.tester_on_printed_value(arg, tested, &value) {
                             return Ok(answer.to_string());
                         }
@@ -1729,7 +1757,7 @@ impl Executor {
                 if let Some(args) = self.datatype_comparison(term_id) {
                     let mut values = Vec::with_capacity(args.len());
                     for &arg in args {
-                        match self.get_value_string(read, aggregate_values, arg) {
+                        match self.get_value_string(read, batch, arg) {
                             Ok(value) if self.canonical_datatype_value(&value) => {
                                 values.push(value);
                             }
@@ -1744,7 +1772,7 @@ impl Executor {
                         return Ok(if is_eq { equal } else { distinct }.to_string());
                     }
                 }
-                self.term_value_string_in_read(read, term_id)
+                self.term_value_string_in_read(read, Some(&batch.answers), term_id)
             }
             AggregateConstantValue::Poisoned => {
                 Err("datatype model class is incoherent".to_string())
@@ -1805,6 +1833,10 @@ impl Executor {
             Ok(values) => values,
             Err(error) => return format!("(error \"{error}\")"),
         };
+        let batch = ValueBatch {
+            aggregate_values,
+            answers: PublishedAnswerSession::new(model, self.overloaded_ctors_for(spelling)),
+        };
 
         // Echo the term's ORIGINAL SMT-LIB text as the key (per the SMT-LIB
         // spec), not a reconstruction of the elaborated term — a
@@ -1813,7 +1845,7 @@ impl Executor {
         let mut pairs: Vec<String> = Vec::with_capacity(requested.len());
         let overloaded = self.overloaded_ctors_for(spelling);
         for (term_str, term_id) in requested {
-            match self.get_value_string(read, &aggregate_values, *term_id) {
+            match self.get_value_string(read, &batch, *term_id) {
                 Ok(value_str) => {
                     // In `ValueSpelling::Surface` this may ascribe an
                     // overloaded nullary constructor (#overloaded-nil-surface).
@@ -2028,12 +2060,24 @@ impl Executor {
             Err(e) => return e,
         };
         self.with_model_construction_read(model, |read| {
-            match self.term_value_string_in_read(read, term_id) {
+            let answers = PublishedAnswerSession::new(
+                read.model(),
+                self.overloaded_ctors_for(ValueSpelling::Sorted),
+            );
+            match self.term_value_string_in_read(read, Some(&answers), term_id) {
                 Ok(value_str) => value_str,
                 Err(e) => format!("(error \"value is not available: {e}\")"),
             }
         })
     }
+}
+
+/// What one value batch shares across its requested terms.
+struct ValueBatch<'a> {
+    /// The aggregate-constant authority for the batch.
+    aggregate_values: AggregateConstantValues,
+    /// The answer route's session (#get-value-published-model).
+    answers: PublishedAnswerSession<'a>,
 }
 
 /// A `sat` from a lane that Ackermannizes uninterpreted functions (the BV

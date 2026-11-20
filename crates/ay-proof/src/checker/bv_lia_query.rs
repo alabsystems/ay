@@ -22,6 +22,8 @@ use num_traits::{One, ToPrimitive, Zero};
 
 #[path = "bv_lia_query_eval.rs"]
 mod application_evaluation;
+#[path = "bv_lia_query_choices.rs"]
+mod finite_choices;
 #[path = "bv_lia_query_guarded.rs"]
 mod guarded_range;
 #[path = "bv_lia_query_int.rs"]
@@ -685,6 +687,9 @@ impl<'a> QueryChecker<'a> {
         let Some((mut name, args)) = named_app(self.terms, assertion) else {
             return Ok(());
         };
+        if name == "or" {
+            return self.record_int_choice_bound(assertion, classes);
+        }
         let Some((first, second)) = two_args(args) else {
             return Ok(());
         };

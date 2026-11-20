@@ -1155,3 +1155,28 @@ fn test_bv_signed_div_rem_mod_edge_cases() {
     assert_eq!(executor.evaluate_term(&model, bvsrem), bv(0));
     assert_eq!(executor.evaluate_term(&model, bvsmod), bv(0));
 }
+
+#[test]
+fn array_lambda_equality_cannot_use_uninterpreted_function_congruence() {
+    let mut executor = Executor::new();
+    let t = &mut executor.ctx.terms;
+    let x = t.mk_var("x", Sort::Int);
+    let y = t.mk_var("y", Sort::Int);
+    let one = t.mk_int(BigInt::from(1));
+    let two = t.mk_int(BigInt::from(2));
+    let zero = t.mk_int(BigInt::from(0));
+    let left_hit = t.mk_eq(x, one);
+    let right_hit = t.mk_eq(y, two);
+    let left_body = t.mk_ite(left_hit, one, zero);
+    let right_body = t.mk_ite(right_hit, one, zero);
+    let left = t.mk_lambda_array(x, left_body);
+    let right = t.mk_lambda_array(y, right_body);
+    let equality = t.mk_app(Symbol::named("="), [left, right], Sort::Bool);
+    let mut model = empty_model();
+    let mut values = HashMap::default();
+    values.insert(x, BigInt::from(0));
+    values.insert(y, BigInt::from(0));
+    model.lia_model = Some(LiaModel { values });
+    assert_eq!(executor.eq_via_uf_congruence(&model, left, right), None);
+    assert_eq!(executor.evaluate_term(&model, equality), EvalValue::Unknown);
+}

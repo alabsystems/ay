@@ -6,7 +6,7 @@
 //! interpolants (binary masks and path interpolants) from its proof.
 //!
 //! CHC-COMP 2026 Workstream D, Rung 1 (the development design notes
-//! DESIGN_lra_interp_tpa.md` §4.1, interface contract **C-P1**).
+//! DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1, interface contract **C-P1**).
 //! **Owner: WP-D1-P** (proof substrate).
 //!
 //! Soundness covenant (INV-1..INV-6): interpolants are candidates, never

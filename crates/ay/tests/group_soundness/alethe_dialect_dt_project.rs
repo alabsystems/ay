@@ -171,3 +171,45 @@ fn the_in_script_strict_option_agrees_with_the_flag_in_each_dialect() {
         }
     }
 }
+
+/// Moving a bounded word through its own datatype field preserves both the
+/// reachable endpoint and the exclusion of the adjacent value.
+#[test]
+fn checked_projected_word_preserves_both_equality_orientations() {
+    let projected = "(len (box (ite (bvule x #x04) x #x04)))";
+    for (bound, verdict) in [("#x04", "sat"), ("#x05", "unsat")] {
+        for (left, right) in [(projected, bound), (bound, projected)] {
+            let dir = tempfile::tempdir().expect("query directory");
+            let path = dir.path().join("projected.smt2");
+            let query = format!(
+                "(set-logic ALL)\n(declare-const x (_ BitVec 8))\n\
+                 (declare-datatype Vec ((box (len (_ BitVec 8)))))\n\
+                 (assert (= {left} {right}))\n(check-sat)\n"
+            );
+            std::fs::write(&path, &query).expect("write query");
+            let output = Command::new(env!("CARGO_BIN_EXE_ay"))
+                .arg("-smt2")
+                .arg(&path)
+                .args(["--rigor", "strict", "--alethe-dialect", "clean"])
+                .output_timeout(QUERY_TIMEOUT)
+                .expect("AY answers");
+            assert_eq!(
+                verdict_lines(&String::from_utf8_lossy(&output.stdout)),
+                [verdict],
+                "{query}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if verdict == "unsat" {
+                let proof = std::fs::read_to_string(dir.path().join("projected.smt2.alethe"))
+                    .expect("strict projection certificate");
+                let assume = proof
+                    .lines()
+                    .find(|line| line.starts_with("(assume "))
+                    .expect("authored assumption");
+                assert_eq!(assume.matches("(len (box ").count(), 1, "{assume}");
+                assert!(proof.contains(":rule dt_project"));
+                assert!(!proof.contains(":rule hole"));
+            }
+        }
+    }
+}

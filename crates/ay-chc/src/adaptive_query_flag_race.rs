@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Background validation of the query-flag candidate invariant (T1/T9 of
-//! the development design notes).
+//! the development design notes at `9598c4206`).
 //!
 //! 47 % of the safe lustre instances in LIA-Lin are 1-INDUCTIVE: the property
 //! flag the query names is itself the inductive invariant, and the proof is

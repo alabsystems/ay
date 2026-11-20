@@ -683,6 +683,67 @@ pub fn certify_opt_lin_bounds_pb_interruptible(
     String::from_utf8(sink.take()?).ok()
 }
 
+/// VeriPB proof that an OPTIMIZATION instance has no feasible solution:
+/// `conclusion BOUNDS INF INF`, derived by the DECISION proof-tap CDCL on the
+/// instance's constraints (the objective plays no part in infeasibility).
+///
+/// AY-SAT-7: the optimization proof solver logs through the legacy
+/// synchronous writer, whose conflict analysis cannot refute some infeasible
+/// instances the decision proof tap refutes at once
+/// (`factor-size=9-P=379-Q=521`: no refutation in 58 s against 0.3 s). This
+/// route gives such instances the tap's refutation.
+///
+/// Proof layout: `f f_count` (the original rows), the solver's refutation
+/// (every learned row a checked `pol`/`rup` step, ending in a contradiction
+/// row), then `output NONE; conclusion BOUNDS INF INF;` exactly as
+/// [`VeriPbWriter::conclude_opt_infeasible`] writes it.
+///
+/// SOUNDNESS: returns proof text only, for the external checker. `None`
+/// (nothing claimed) when the instance has no objective, the search does not
+/// end UNSAT before `should_stop`, or any proof step fails.
+pub fn certify_opt_infeasible_pb_interruptible(
+    instance: &PbInstance,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<String> {
+    if should_stop() || instance.objective.is_none() {
+        return None;
+    }
+    let mut decision = instance.clone();
+    decision.objective = None;
+    let f_count = veripb_input_constraint_count(instance).ok()?;
+    let sink = SharedProofSink::default();
+    let writer = VeriPbWriter::new(sink.clone(), f_count).ok()?;
+    let route_started = Instant::now();
+    let mut solver = crate::cdcl::PbCdclSolver::with_appended_proof_tap_interruptible(
+        &decision,
+        writer,
+        should_stop,
+    )
+    .ok()?;
+    let result = solver.solve_refutation_only_interruptible(should_stop);
+    if ay_core::misc_cli_flags().cert_debug {
+        eprintln!(
+            "c [cert/opt-infeasible] decision pb-cdcl result = {result:?} ({}ms)",
+            route_started.elapsed().as_millis(),
+        );
+    }
+    if !matches!(result, crate::cdcl::PbCdclResult::Unsatisfiable) {
+        return None;
+    }
+    solver.take_unsat_contradiction_proof_id()?;
+    // Drain the tap serializer and surface any voided step before the
+    // conclusion is appended.
+    solver.conclude_proof().ok()?;
+    drop(solver);
+    {
+        use std::io::Write as _;
+        let mut tail = sink.clone();
+        tail.write_all(b"output NONE;\nconclusion BOUNDS INF INF;\nend pseudo-Boolean proof;\n")
+            .ok()?;
+    }
+    String::from_utf8(sink.take()?).ok()
+}
+
 /// Shared in-memory proof sink: lets [`certify_opt_lin_bounds_pb_interruptible`]
 /// read the proof text back after the `VeriPbWriter` has been moved into — and
 /// dropped by — the proof-tap serializer thread.

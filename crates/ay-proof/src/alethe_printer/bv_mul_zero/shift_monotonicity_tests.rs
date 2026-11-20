@@ -159,7 +159,25 @@ fn shift_shape_declines_connective_operand_and_clause_drift() {
         unreachable!()
     };
     clause.push(extra);
-    assert_honest_hole(&non_unit);
+    // The bounded template still declines a non-unit clause. This one is a
+    // weakening of the valid unit lemma, so the complete-blast clause fallback
+    // refutes the conjunction of its literals' complements
+    // (DR-MIXED-BV-CLAUSE-EXPORT-20261117).
+    assert_checked_broader_lowering(&non_unit);
+
+    // A non-unit clause that is not a theorem keeps the honest hole: with
+    // `x = 1` and `p` false, `(not (bvult 0 x))` and `p` are both false.
+    let mut invalid_non_unit = raw_shift_step(8, 1);
+    let extra = invalid_non_unit.terms.mk_var("p", Sort::Bool);
+    let not_positive = invalid_non_unit.terms.mk_not_raw(invalid_non_unit.positive);
+    invalid_non_unit.step = ProofStep::TheoryLemma {
+        theory: "bv".to_string(),
+        clause: vec![not_positive, extra],
+        farkas: None,
+        kind: TheoryLemmaKind::BvBitBlast,
+        lia: None,
+    };
+    assert_honest_hole(&invalid_non_unit);
 
     let mut reversed_and = raw_shift_step(8, 1);
     let reversed_root = reversed_and.terms.mk_app(

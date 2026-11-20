@@ -313,6 +313,7 @@ impl Executor {
                 | "select"
                 | "store"
                 | "const-array"
+                | "lambda-array"
                 | "str.len"
                 | "str.++"
                 | "str.substr"

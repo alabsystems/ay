@@ -29,7 +29,7 @@ use std::time::Duration;
 /// anchored search under a deadline also keeps to half of what it leaves
 /// ([`ConcreteBudget`]), so it never runs into it.
 #[derive(Clone, Default)]
-pub(in crate::pdr::verification) struct ConcreteStop {
+pub(crate) struct ConcreteStop {
     tokens: Vec<CancellationToken>,
     deadline: Option<Instant>,
     thread: bool,
@@ -52,6 +52,17 @@ impl ConcreteStop {
             tokens,
             deadline,
             thread: false,
+        }
+    }
+
+    /// The stop of a validator outside PDR (the portfolio's monolithic Safe
+    /// validation): `tokens` and `deadline`, and the thread's SMT deadline and
+    /// lane cancellation, as a verifier's stop reads them.
+    pub(crate) fn of_caller(tokens: Vec<CancellationToken>, deadline: Option<Instant>) -> Self {
+        Self {
+            tokens,
+            deadline,
+            thread: true,
         }
     }
 
@@ -125,7 +136,7 @@ impl ResolvedStop {
 
 /// What one concrete check answers.
 #[derive(Debug, PartialEq)]
-pub(in crate::pdr::verification) enum ConcreteAnswer {
+pub(crate) enum ConcreteAnswer {
     /// An assignment that makes the query true: the verifier rejects.
     Witness(FxHashMap<String, SmtValue>),
     /// No witness: none of the assignments searched makes the query true, or
@@ -168,7 +179,7 @@ impl ConcreteAnswer {
 /// ([`Self::take_anchored_spent`]), which moves its own wall-clock budget
 /// forward by it: the work before the anchored window existed keeps the wall
 /// time it had. Every check also stops at the [`ConcreteStop`].
-pub(in crate::pdr::verification) struct ConcreteBudget {
+pub(crate) struct ConcreteBudget {
     limit: Duration,
     elapsed: Duration,
     anchored_elapsed: Duration,
@@ -179,7 +190,7 @@ pub(in crate::pdr::verification) struct ConcreteBudget {
 }
 
 impl ConcreteBudget {
-    pub(in crate::pdr::verification) fn new(limit: Duration, stop: ConcreteStop) -> Self {
+    pub(crate) fn new(limit: Duration, stop: ConcreteStop) -> Self {
         Self {
             limit,
             elapsed: Duration::ZERO,
@@ -193,7 +204,7 @@ impl ConcreteBudget {
 
     /// True while the check's own budget lasts: the verifier may start a
     /// check. Anchored searches never spend it.
-    pub(in crate::pdr::verification) fn has_room(&self) -> bool {
+    pub(crate) fn has_room(&self) -> bool {
         self.elapsed < self.limit
     }
 
@@ -233,11 +244,7 @@ impl ConcreteBudget {
 
     /// `transition_check` on `body` and `query`, charged as the type
     /// describes and stopped by the [`ConcreteStop`].
-    pub(in crate::pdr::verification) fn check(
-        &mut self,
-        body: &ChcExpr,
-        query: &ChcExpr,
-    ) -> ConcreteAnswer {
+    pub(crate) fn check(&mut self, body: &ChcExpr, query: &ChcExpr) -> ConcreteAnswer {
         let stop = self.stop.resolve();
         if stop.fired_now() {
             return ConcreteAnswer::Interrupted;

@@ -568,7 +568,7 @@ impl Executor {
         array: TermId,
         index: TermId,
         def_visited: &mut HashSet<TermId>,
-        certified: &mut Option<CertifiedArrayRead>,
+        certified: &mut Option<CertifiedArrayRead<'_>>,
         depth: usize,
     ) -> EvalValue {
         let index_val = match certified.as_mut() {
@@ -886,7 +886,7 @@ impl Executor {
         outer_arr: TermId,
         outer_idx: TermId,
         def_visited: &mut HashSet<TermId>,
-        certified: &mut Option<CertifiedArrayRead>,
+        certified: &mut Option<CertifiedArrayRead<'_>>,
         depth: usize,
     ) -> Option<TermId> {
         // A binder-dependent nested array denotes a different array per beta
@@ -1944,7 +1944,7 @@ impl Executor {
     /// extensionality violation. Returns `None` when no such witness is found
     /// (the caller must then fail closed to Unknown). Never returns
     /// `Some(true)`: a finite probe cannot prove agreement at all indices.
-    fn function_backed_array_equality(
+    pub(super) fn function_backed_array_equality(
         &self,
         model: &Model,
         lhs: TermId,

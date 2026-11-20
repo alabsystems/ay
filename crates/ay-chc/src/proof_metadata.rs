@@ -142,6 +142,7 @@ pub(crate) use normalization::normalized_chc_input_sha256_with_progress;
 pub use normalization::prepared::{
     prepare_normalized_chc_input_with_work, PreparedNormalizedChcInput,
 };
+pub(crate) use normalization::wire_sort;
 pub(crate) use normalization::{
     normalized_chc_input_identity, normalized_chc_input_identity_with_progress,
     ordered_chc_clause_sequence_sha256_with_progress, IdentityHashInterrupted,

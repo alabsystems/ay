@@ -224,8 +224,11 @@ fn main() -> ExitCode {
     if cmd == "fetch" {
         return ExitCode::from(fetch::run(rest) as u8);
     }
-    if cmd == "qualify" {
-        let mut args = vec!["qualify".to_string()];
+    if matches!(
+        cmd,
+        "qualify" | "qualify-status" | "official-corpus-gaps" | "abi-gaps"
+    ) {
+        let mut args = vec![cmd.to_string()];
         args.extend_from_slice(rest);
         return ExitCode::from(smtlib_conformance::run(&args) as u8);
     }

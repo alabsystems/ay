@@ -2580,40 +2580,11 @@ impl Executor {
                 }
             }
         }
-        // #qf-ax-negated-swap: a top-level NEGATED ARRAY equality (e.g.
-        // `(not (= a1 a2))` in the storeinv `_np_` variants) also supplies the
-        // witness — `add_array_extensionality_axioms` fabricates the
-        // `__ay_ext_diff` select-disequality Skolem for exactly this atom, and
-        // the storeinv refutation then needs the same eager ROW2b/decomposition
-        // unroll as the explicit-witness `_sf_` variants. Without this, the
-        // two-base `_np_` shape (positive store-store equality + negated base
-        // equality) kept a lazy ArraySolver that misses upward select
-        // propagation, certifying a witness-less model: false SAT (4 residual
-        // conflicts in the 2026-07-02 QF_AX sweep after the same-base fix).
-        // OPT-IN research gate (--qfax-neg-eq-witness). Same latent
-        // eager-axiom unsoundness as the negated-chain gate above:
-        // storeinv_invalid_t3_np_nf_ai_00002_001 (`:status sat`) flips to
-        // FALSE UNSAT when this fires. Default OFF until the eager fixpoint
-        // derivation is fixed; the storeinv `_np_` wrong-SAT models this was
-        // added for are instead degraded fail-closed by the unwitnessed
-        // array-disequality guard in model validation.
-        if !ay_core::misc_cli_flags().qfax_neg_eq_witness {
-            return false;
-        }
-        for &assertion in &self.ctx.assertions {
-            let TermData::Not(inner) = self.ctx.terms.get(assertion) else {
-                continue;
-            };
-            let TermData::App(sym, args) = self.ctx.terms.get(*inner) else {
-                continue;
-            };
-            if sym.name() == "="
-                && args.len() == 2
-                && matches!(self.ctx.terms.sort(args[0]), Sort::Array(_))
-            {
-                return true;
-            }
-        }
+        // A top-level NEGATED array equality alone does not count: firing the
+        // eager ROW2b unroll on it flipped `:status sat` storeinv `_np_`
+        // instances to false UNSAT. Their wrong-SAT models are degraded
+        // fail-closed by the unwitnessed array-disequality guard in model
+        // validation instead.
         false
     }
 
@@ -2664,59 +2635,6 @@ impl Executor {
             }
         }
         max_depth
-    }
-
-    /// Detect a top-level NEGATED array equality whose sides are (deep) store
-    /// chains: `(assert (not (= (store (store ...)) (store (store ...)))))`.
-    ///
-    /// This is the SMT-COMP QF_AX swap/storeinv `_np_nf_` shape: the whole
-    /// benchmark is one negated equality between two nested store chains, with
-    /// NO explicit select-disequality witness anywhere — the only witness is
-    /// the `__ay_ext_diff` Skolem fabricated by `add_array_extensionality_axioms`.
-    /// Refuting it requires unrolling `select(chain, __ay_ext_diff)` down BOTH
-    /// chains (ROW2b upward propagation), which the lazy runtime ArraySolver's
-    /// event-driven queues never trigger for unnamed nested stores — leaving a
-    /// model that satisfies ROW1/ROW2 locally but violates extensionality
-    /// globally, i.e. false SAT (the 2026-07-02 QF_AX sweep found 40 of these).
-    /// Firing the same eager-ROW2b rescue as `has_storeinv_extensionality_witness`
-    /// closes the gap; the ROW2b budget bounds the cost. Depth >= 2 on at least
-    /// one side: single stores are handled exactly by the lazy solver.
-    pub(in crate::executor) fn has_negated_deep_store_chain_array_equality(&self) -> bool {
-        // OPT-IN research gate (--qfax-neg-chain-gate). Firing eager
-        // ROW2b on every negated deep-chain equality exposed a LATENT
-        // eager-axiom unsoundness: `:status sat` siblings of the swap `_np_`
-        // family (e.g. swap_invalid_t1_np_sf_ai_00002_008) flip to FALSE
-        // UNSAT, and the family's solve rate collapses (2026-07-02 postfix
-        // sweep: QF_AX 231 -> 95 solved). Until the eager fixpoint derivation
-        // is proven sound on these shapes, the sound default is OFF: wrong
-        // lazy models are caught fail-closed by the strict-gate array oracle
-        // (`store_chain_equality_violated`) and degrade to unknown instead.
-        if !ay_core::misc_cli_flags().qfax_neg_chain_gate {
-            return false;
-        }
-        for &assertion in &self.ctx.assertions {
-            let TermData::Not(inner) = self.ctx.terms.get(assertion) else {
-                continue;
-            };
-            let TermData::App(sym, args) = self.ctx.terms.get(*inner) else {
-                continue;
-            };
-            if sym.name() != "=" || args.len() != 2 {
-                continue;
-            }
-            let (lhs, rhs) = (args[0], args[1]);
-            if !matches!(self.ctx.terms.sort(lhs), Sort::Array(_)) {
-                continue;
-            }
-            if self
-                .store_nesting_depth(lhs)
-                .max(self.store_nesting_depth(rhs))
-                >= 2
-            {
-                return true;
-            }
-        }
-        false
     }
 
     /// Count the `store` nesting depth of a term: the number of chained
@@ -3525,60 +3443,6 @@ impl Executor {
             // datatype sort is unwitnessable on its own — push it into the
             // constructor's fields. No-op for every other element sort.
             self.bridge_datatype_element_extensionality(sel_a, sel_b);
-
-            // #qfax-ext-row-seed: eagerly materialize the ROW unrolling of the
-            // extensionality witness down BOTH store chains. The lazy Row2Down
-            // machinery blocks forever when the inner select(base, diff) term
-            // or the (= diff i) atom does not already exist (axiom_checkers.rs
-            // keeps the pending axiom in `remaining` with 0 array conflicts,
-            // and the wrong model is rejected fail-closed -> unknown on the
-            // whole swap_t/storeinv_t _np_ unsat families). Each level adds
-            // two guarded ROW instances at the witness index — pure array
-            // tautologies, linear in chain depth:
-            //   (= diff i)  ∨ (= (select (store b i v) diff) (select b diff))
-            //   ¬(= diff i) ∨ (= (select (store b i v) diff) v)
-            // Measured: fires (75 levels on swap_t1_np_nf_00007_004) but does
-            // NOT yet convert the family — the QF_AX route's arrays checkers
-            // still degrade via the strict oracle; the transitive select-value
-            // chain the seed creates needs e-graph closure the checker-based
-            // route lacks. Kept OPT-IN for the follow-up interplay work.
-            if ay_core::misc_cli_flags().ext_row_seed {
-                for side in [lhs, rhs] {
-                    let mut t = side;
-                    let mut depth = 0usize;
-                    while depth < 24 {
-                        let TermData::App(sym, args) = self.ctx.terms.get(t) else {
-                            break;
-                        };
-                        if sym.name() != "store" || args.len() != 3 {
-                            break;
-                        }
-                        let (b, i, v) = (args[0], args[1], args[2]);
-                        let sel_outer = self.ctx.terms.mk_select(t, diff_var);
-                        let sel_inner = self.ctx.terms.mk_select(b, diff_var);
-                        let idx_eq = self.ctx.terms.mk_eq(diff_var, i);
-                        let not_idx_eq = self.ctx.terms.mk_not(idx_eq);
-                        let row1 = {
-                            let eq = self.ctx.terms.mk_eq(sel_outer, sel_inner);
-                            self.ctx.terms.mk_or(vec![idx_eq, eq])
-                        };
-                        let row2 = {
-                            let eq = self.ctx.terms.mk_eq(sel_outer, v);
-                            self.ctx.terms.mk_or(vec![not_idx_eq, eq])
-                        };
-                        self.push_array_axiom_assertion_site(row1, "ext_row_seed");
-                        self.push_array_axiom_assertion_site(row2, "ext_row_seed");
-                        if ay_core::misc_cli_flags().debug_row_seed {
-                            eprintln!(
-                                "[row-seed] level depth={depth} side={} store={}",
-                                side.0, t.0
-                            );
-                        }
-                        t = b;
-                        depth += 1;
-                    }
-                }
-            }
         }
     }
 

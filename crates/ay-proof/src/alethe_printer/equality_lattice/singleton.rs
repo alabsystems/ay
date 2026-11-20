@@ -23,7 +23,8 @@ pub(super) fn lowering_supported(
     kind: &ay_core::TheoryLemmaKind,
     overrides: Option<&HashMap<TermId, String>>,
 ) -> bool {
-    let printer = AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(MAX_WORK));
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(MAX_WORK))
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     plan(&printer, clause, kind).is_some() && !printer.work_budget_exhausted()
 }
 

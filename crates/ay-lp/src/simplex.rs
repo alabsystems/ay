@@ -343,48 +343,40 @@ impl StandardForm {
     fn build(problem: &Problem) -> Result<Self, LpError> {
         validate_problem(problem)?;
         let (transforms, upper_bound_rows, n_decision) = build_var_transforms(problem)?;
-        let mut rows: Vec<(Vec<f64>, RowKind, f64)> = Vec::new();
+        // Rows are kept sparse until the tableau is allocated: a dense
+        // `n_decision`-wide copy per row was itself an m x n allocation, and
+        // on a 1.37M-column MIPLIB model it aborted the process before any
+        // size check could run (AY-N6).
+        let mut rows: Vec<(Vec<(usize, f64)>, RowKind, f64)> = Vec::new();
 
         // Convert each original constraint by expanding every source variable
-        // into nonnegative decision columns.
+        // into nonnegative decision columns. Duplicate columns are summed
+        // (with overflow checks) when the dense tableau row is filled.
         for c in &problem.constraints {
-            let mut row = vec![0.0; n_decision];
+            let mut row: Vec<(usize, f64)> = Vec::with_capacity(c.coeffs.len());
             let mut adjusted_rhs = c.rhs;
             for &(idx, coef) in &c.coeffs {
                 let transform = &transforms[idx];
-                let shift = checked_mul(
-                    coef,
-                    transform.constant,
+                let shift = checked_mul(coef, transform.constant, || {
                     format!(
                         "constraint '{}' RHS shift overflows while normalizing variable {}",
                         c.name, idx
-                    ),
-                )?;
-                adjusted_rhs = checked_sub(
-                    adjusted_rhs,
-                    shift,
+                    )
+                })?;
+                adjusted_rhs = checked_sub(adjusted_rhs, shift, || {
                     format!(
                         "constraint '{}' RHS overflows during variable normalization",
                         c.name
-                    ),
-                )?;
+                    )
+                })?;
                 for &(col, term_coef) in &transform.terms {
-                    let term = checked_mul(
-                        coef,
-                        term_coef,
+                    let term = checked_mul(coef, term_coef, || {
                         format!(
                             "constraint '{}' coefficient overflows while expanding variable {}",
                             c.name, idx
-                        ),
-                    )?;
-                    row[col] = checked_add(
-                        row[col],
-                        term,
-                        format!(
-                            "constraint '{}' coefficient overflows after duplicate accumulation",
-                            c.name
-                        ),
-                    )?;
+                        )
+                    })?;
+                    row.push((col, term));
                 }
             }
             rows.push((row, c.kind, adjusted_rhs));
@@ -394,15 +386,15 @@ impl StandardForm {
         // rows. Upper-only variables use `x = upper - y`, so `y >= 0` already
         // captures the bound and no row is needed.
         for (col, ub_shifted) in upper_bound_rows {
-            let mut row = vec![0.0; n_decision];
-            row[col] = 1.0;
-            rows.push((row, RowKind::Le, ub_shifted));
+            rows.push((vec![(col, 1.0)], RowKind::Le, ub_shifted));
         }
 
-        // Ensure all b >= 0 by negating rows if needed.
+        // Ensure all b >= 0 by negating rows if needed. Negation is exact in
+        // IEEE arithmetic, so negating the terms before they are summed gives
+        // the same row as negating the sum.
         for (row, kind, rhs) in &mut rows {
             if *rhs < 0.0 {
-                for a in row.iter_mut() {
+                for (_, a) in row.iter_mut() {
                     *a = -*a;
                 }
                 *rhs = -*rhs;
@@ -433,7 +425,7 @@ impl StandardForm {
         }
 
         let n_total = n_decision + cols_slack.len() + cols_surplus.len() + cols_artif.len();
-        let mut a = vec![vec![0.0; n_total]; m];
+        let mut a = allocate_dense_tableau(m, n_total, DENSE_TABLEAU_MAX_BYTES)?;
         let mut b = vec![0.0; m];
         let mut c = vec![0.0; n_total];
 
@@ -448,35 +440,41 @@ impl StandardForm {
         for (source_var, transform) in problem.variables.iter().zip(transforms.iter()) {
             for &(col, term_coef) in &transform.terms {
                 let term = checked_mul(
-                    checked_mul(
-                        source_var.obj_coeff,
-                        term_coef,
+                    checked_mul(source_var.obj_coeff, term_coef, || {
                         format!(
-                            "objective coefficient for variable '{}' overflows during normalization",
-                            source_var.name
-                        ),
-                    )?,
+                                "objective coefficient for variable '{}' overflows during normalization",
+                                source_var.name
+                            )
+                    })?,
                     sense_sign,
-                    format!(
-                        "objective coefficient for variable '{}' overflows while applying sense",
-                        source_var.name
-                    ),
+                    || {
+                        format!(
+                            "objective coefficient for variable '{}' overflows while applying sense",
+                            source_var.name
+                        )
+                    },
                 )?;
-                c[col] = checked_add(
-                    c[col],
-                    term,
+                c[col] = checked_add(c[col], term, || {
                     format!(
                         "objective coefficient for variable '{}' overflows after accumulation",
                         source_var.name
-                    ),
-                )?;
+                    )
+                })?;
             }
         }
 
-        // Copy original rows.
+        // Copy original rows, summing duplicate columns.
         for (r, (row, _, rhs)) in rows.iter().enumerate() {
-            for (j, val) in row.iter().enumerate() {
-                a[r][j] = *val;
+            for &(j, val) in row {
+                a[r][j] = checked_add(a[r][j], val, || {
+                    let name = problem
+                        .constraints
+                        .get(r)
+                        .map_or("upper-bound row", |c| c.name.as_str());
+                    format!(
+                        "constraint '{name}' coefficient overflows after duplicate accumulation"
+                    )
+                })?;
             }
             b[r] = *rhs;
         }
@@ -612,24 +610,73 @@ fn validate_problem(problem: &Problem) -> Result<(), LpError> {
     Ok(())
 }
 
-fn checked_add(a: f64, b: f64, context: String) -> Result<f64, LpError> {
+// The context closures run only on failure: formatting a message per
+// coefficient up front cost one allocation per matrix entry.
+fn checked_add(a: f64, b: f64, context: impl FnOnce() -> String) -> Result<f64, LpError> {
     finite_standard_value(a + b, context)
 }
 
-fn checked_sub(a: f64, b: f64, context: String) -> Result<f64, LpError> {
+fn checked_sub(a: f64, b: f64, context: impl FnOnce() -> String) -> Result<f64, LpError> {
     finite_standard_value(a - b, context)
 }
 
-fn checked_mul(a: f64, b: f64, context: String) -> Result<f64, LpError> {
+fn checked_mul(a: f64, b: f64, context: impl FnOnce() -> String) -> Result<f64, LpError> {
     finite_standard_value(a * b, context)
 }
 
-fn finite_standard_value(value: f64, context: String) -> Result<f64, LpError> {
+fn finite_standard_value(value: f64, context: impl FnOnce() -> String) -> Result<f64, LpError> {
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(LpError::InvalidInstance(context))
+        Err(LpError::InvalidInstance(context()))
     }
+}
+
+/// Largest dense tableau, in bytes, that [`StandardForm::build`] allocates
+/// (1 GiB, 2^27 entries). The tableau simplex touches every entry on every
+/// pivot, so a larger tableau could not be solved in a competition time limit
+/// even where it fits in memory; a model above the cap is refused with
+/// [`LpError::ResourceLimit`] before anything of its size is allocated. The
+/// MIPcc26 models that aborted (AY-N6) needed 10^11 to 10^12 bytes.
+pub(crate) const DENSE_TABLEAU_MAX_BYTES: usize = 1 << 30;
+
+/// Bytes of an `rows` x `cols` dense `f64` tableau, or `None` on overflow.
+#[must_use]
+pub(crate) fn dense_tableau_bytes(rows: usize, cols: usize) -> Option<usize> {
+    rows.checked_mul(cols)?.checked_mul(size_of::<f64>())
+}
+
+/// Allocates the zeroed `rows` x `cols` tableau, refusing (instead of
+/// aborting the process) when it exceeds `max_bytes` or when the allocator
+/// cannot provide it.
+fn allocate_dense_tableau(
+    rows: usize,
+    cols: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<f64>>, LpError> {
+    let too_large = || {
+        LpError::ResourceLimit(format!(
+            "dense simplex tableau of {rows} x {cols} exceeds the {max_bytes}-byte limit"
+        ))
+    };
+    match dense_tableau_bytes(rows, cols) {
+        Some(bytes) if bytes <= max_bytes => {}
+        _ => return Err(too_large()),
+    }
+    let alloc_failed = || {
+        LpError::ResourceLimit(format!(
+            "allocating the dense simplex tableau of {rows} x {cols} failed"
+        ))
+    };
+    let mut a: Vec<Vec<f64>> = Vec::new();
+    a.try_reserve_exact(rows).map_err(|_| alloc_failed())?;
+    for _ in 0..rows {
+        let mut row: Vec<f64> = Vec::new();
+        row.try_reserve_exact(cols).map_err(|_| alloc_failed())?;
+        row.resize(cols, 0.0);
+        a.push(row);
+    }
+    Ok(a)
 }
 
 fn finite_simplex_value(value: f64, context: String) -> Result<f64, LpError> {
@@ -677,11 +724,9 @@ fn build_var_transforms(
             if upper.is_finite() {
                 upper_bound_rows.push((
                     col,
-                    checked_sub(
-                        upper,
-                        lower,
-                        format!("variable '{}' finite bound width overflows", var.name),
-                    )?,
+                    checked_sub(upper, lower, || {
+                        format!("variable '{}' finite bound width overflows", var.name)
+                    })?,
                 ));
             }
             transforms.push(VarTransform {
@@ -1843,5 +1888,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// AY-N6: a model whose dense tableau would need ~640 GB (2e5 rows by
+    /// 4e5 columns) is refused with `ResourceLimit` before anything of that
+    /// size is allocated. Before the fix the builder allocated one dense row
+    /// per constraint and the process aborted with "memory allocation of N
+    /// bytes failed".
+    #[test]
+    fn test_large_sparse_model_is_refused_without_dense_allocation() {
+        let n = 200_000;
+        let mut p = Problem::new();
+        p.sense = Sense::Min;
+        for i in 0..n {
+            p.variables.push(Variable {
+                name: format!("x{i}"),
+                obj_coeff: 1.0,
+                lower: 0.0,
+                upper: f64::INFINITY,
+                kind: VarKind::Continuous,
+            });
+            p.constraints.push(Constraint {
+                name: format!("c{i}"),
+                kind: RowKind::Ge,
+                coeffs: vec![(i, 1.0)],
+                rhs: 1.0,
+            });
+        }
+        let started = std::time::Instant::now();
+        let err = solve_lp_relaxation(&p).expect_err("must be refused");
+        assert!(
+            matches!(&err, LpError::ResourceLimit(msg) if msg.contains("200000 x 600000")),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let err = solve_lp_relaxation_budgeted(&p, 10, &|| false).expect_err("refused");
+        assert!(matches!(err, LpError::ResourceLimit(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_dense_tableau_size_is_checked() {
+        assert_eq!(dense_tableau_bytes(3, 4), Some(96));
+        assert_eq!(dense_tableau_bytes(usize::MAX, 2), None);
+        assert!(matches!(
+            allocate_dense_tableau(usize::MAX, 2, usize::MAX),
+            Err(LpError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            allocate_dense_tableau(1, 17, 128),
+            Err(LpError::ResourceLimit(_))
+        ));
+        let a = allocate_dense_tableau(2, 16, 256).expect("fits");
+        assert_eq!(a.len(), 2);
+        assert!(a
+            .iter()
+            .all(|row| row.len() == 16 && row.iter().all(|&v| v == 0.0)));
+    }
+
+    /// Sparse row construction keeps the old semantics: duplicate entries of
+    /// one variable in a row are summed, and a row with negative right-hand
+    /// side is negated as a whole.
+    #[test]
+    fn test_duplicate_coefficients_are_summed_in_negated_rows() {
+        // min x s.t. -x - x <= -4 (i.e. 2x >= 4), x >= 0: optimum x = 2.
+        let mut p = Problem::new();
+        p.sense = Sense::Min;
+        p.variables.push(Variable {
+            name: "x".into(),
+            obj_coeff: 1.0,
+            lower: 0.0,
+            upper: f64::INFINITY,
+            kind: VarKind::Continuous,
+        });
+        p.constraints.push(Constraint {
+            name: "dup".into(),
+            kind: RowKind::Le,
+            coeffs: vec![(0, -1.0), (0, -1.0)],
+            rhs: -4.0,
+        });
+        let sol = solve_lp_relaxation(&p).expect("solve");
+        assert!((sol.values[0] - 2.0).abs() < 1e-9, "{sol:?}");
     }
 }

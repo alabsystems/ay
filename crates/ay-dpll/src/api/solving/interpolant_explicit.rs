@@ -6,7 +6,7 @@
 //! interpolation over assertion GROUPS.
 //!
 //! CHC-COMP 2026 Workstream D, Rung 1 (the development design notes
-//! DESIGN_lra_interp_tpa.md` §4.1, §6 INV-4/INV-5). Owner: WP-D1-P.
+//! DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1, §6 INV-4/INV-5). Owner: WP-D1-P.
 //!
 //! One labelled interpolation system (D'Silva et al., VMCAI 2010) per cut,
 //! with ONE literal-label function shared by every rule:

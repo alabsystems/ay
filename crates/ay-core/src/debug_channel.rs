@@ -679,20 +679,6 @@ pub fn theory_disable_flags() -> &'static TheoryDisableFlags {
     GLOBAL_THEORY_DISABLE_FLAGS.get_or_init(TheoryDisableFlags::default)
 }
 
-/// `--uflia-arith-decisions`: forwards the arithmetic
-/// solver's LP-model-guided `suggest_decision_atom` through `LiaSolver` and
-/// `TheoryCombiner` to the SAT extension's theory-suggested-decision rank
-/// (eager-theory-propagation design 2026-07-20 §2 Inc2). Default OFF: LRA has
-/// implemented the suggestion since #8445 but neither adapter ever forwarded
-/// it (git-verified never-wired, not deliberate), so the default preserves the
-/// historical byte-identical trajectory on every lane. Carried by
-/// `--uflia-arith-decisions`; both forwarding sites gate on this one
-/// function.
-#[inline]
-pub fn uflia_arith_decisions_enabled() -> bool {
-    misc_cli_flags().uflia_arith_decisions
-}
-
 // ---------------------------------------------------------------------------
 // Global singleton: SAT debug env flags (#8506)
 // ---------------------------------------------------------------------------
@@ -1204,26 +1190,16 @@ pub struct MiscCliFlags {
     pub spike_dump: bool,
     /// `--spike-verbose` — interpolation-spike verbosity.
     pub spike_verbose: bool,
-    /// `--qfax-combiner-route` — QF_AX combiner route arm.
-    pub qfax_combiner_route: bool,
-    /// `--qfax-cegar` — QF_AX CEGAR arm.
-    pub qfax_cegar: bool,
     /// `--qfax-lanes-debug` — QF_AX lane diagnostics.
     pub qfax_lanes_debug: bool,
     /// `--probe-strict-check` — strict-check progress probe.
     pub probe_strict_check: bool,
     /// `--probe-cert-reject` — certificate-reject probe.
     pub probe_cert_reject: bool,
-    /// `--uflia-witness-debug`.
-    pub uflia_witness_debug: bool,
     /// `--pb-sym-debug` — PB symmetry diagnostics.
     pub pb_sym_debug: bool,
     /// `--pb-farkas-cert` — PB Farkas certificate arm.
     pub pb_farkas_cert: bool,
-    /// `--qfax-neg-eq-witness` — QF_AX negative-equality witness arm.
-    pub qfax_neg_eq_witness: bool,
-    /// `--qfax-neg-chain-gate` — QF_AX negative-chain gate arm.
-    pub qfax_neg_chain_gate: bool,
     /// `--vsids-decay <f>` — VSIDS decay override in (0, 1).
     pub vsids_decay: Option<f64>,
     /// `--inprobe-mult <f>` — inprocessing probe interval multiplier.
@@ -1368,12 +1344,6 @@ pub struct MiscCliFlags {
     pub vacuous_marker_narrow: bool,
     /// `--proj-axiom-budget <n>` — projection axiom cap (default 50000).
     pub proj_axiom_budget: Option<usize>,
-    /// `--uflia-witness-complete`.
-    pub uflia_witness_complete: bool,
-    /// `--uflia-witness-parts fill|chain`.
-    pub uflia_witness_parts: Option<String>,
-    /// `--uflia-fused-detour`.
-    pub uflia_fused_detour: bool,
     /// `--verify-memo`.
     pub verify_memo: bool,
     /// `--pb-eqagg-debug`.
@@ -1471,26 +1441,12 @@ pub struct MiscCliFlags {
     pub chc_dt_recursive_prefix: bool,
     /// `--interface-diet on|shadow` (unset = off).
     pub interface_diet: Option<String>,
-    /// `--bv-preprocess quick|full` (unset = no preprocessing).
-    pub bv_preprocess: Option<String>,
     /// `--fc-cegar-iters <n>` (default 16).
     pub fc_cegar_iters: Option<u32>,
     /// `--int-pigeonhole-enrich-k <n>` (default unbounded).
     pub int_pigeonhole_enrich_k: Option<usize>,
-    /// `--ext-row-seed`.
-    pub ext_row_seed: bool,
-    /// `--debug-row-seed`.
-    pub debug_row_seed: bool,
-    /// `--dpll-mint-theory-vars` (opt-in).
-    pub dpll_mint_theory_vars: bool,
-    /// `--dpll-ite-lift`.
-    pub dpll_ite_lift: bool,
     /// `--euf-bool-arg-repair`.
     pub euf_bool_arg_repair: bool,
-    /// `--lra-warm-theory`.
-    pub lra_warm_theory: bool,
-    /// `--force-array-euf`.
-    pub force_array_euf: bool,
     /// `--ab-maxsat-core-clause` (A/B arm).
     pub ab_maxsat_core_clause: bool,
     /// `--ab-maxsat-descent-organic-slice`.
@@ -1499,9 +1455,6 @@ pub struct MiscCliFlags {
     pub ab_maxsat_kick_gap_abs: bool,
     /// `--ab-maxsat-descent-kick-scale`.
     pub ab_maxsat_descent_kick_scale: bool,
-    /// `--uflia-arith-decisions`: forward UFLIA arith decision hints to
-    /// the arith adapters (default off preserves the historical trajectory).
-    pub uflia_arith_decisions: bool,
     /// `--no-skolem-witness-sat` — kill switch for the skolem-witness SAT
     /// confirmation arm in quantifier restore (#skolem-witness-sat).
     pub no_skolem_witness_sat: bool,
@@ -1519,11 +1472,6 @@ pub struct MiscCliFlags {
     pub euf_cong_undo_debug: bool,
     /// `--euf-diseq-undo-debug`: EUF disequality-undo tracing.
     pub euf_diseq_undo_debug: bool,
-    /// `--probe-prescreen`: arm the LIA probe batch prescreen.
-    pub probe_prescreen: bool,
-    /// `--lia-probe-qx`: probe minimization mode
-    /// (`quickxplain` | `gallop`; default scan).
-    pub lia_probe_qx: Option<String>,
     /// `--probe-stats`: LIA probe statistics to stderr.
     pub probe_stats: bool,
     /// `--debug-fixed-eqs`: LIA fixed-equality tracing.
@@ -1544,16 +1492,6 @@ pub struct MiscCliFlags {
     pub reve_debug: bool,
     /// `--max-propagate-rounds`: extension spin guard override (default 50M).
     pub max_propagate_rounds: Option<u64>,
-    /// `--lra-cond-trail`: experimental LRA conditional bound trail.
-    pub lra_cond_trail: bool,
-    /// `--lra-unit-pivot-pref` (#lra-unit-pivot-pref): experimental simplex
-    /// entering-variable tie-break preferring ±1 coefficients. Changes pivot
-    /// paths (models/certificates), never verdicts; default OFF until a
-    /// corpus diff clears it.
-    pub lra_unit_pivot_pref: bool,
-    /// `--euf-inc-neg-pop`: opt-in; 2026-08-20 A/B was not a win.
-    /// (+2/314 limit-edge runs; median unchanged; see the dated EUF A/B report.)
-    pub euf_inc_neg_pop: bool,
     /// `--nra-diag`: NRA ICP diagnostics.
     pub nra_diag: bool,
     /// `--nra-grid-probe`: NRA ICP grid probe diagnostics.
@@ -1573,7 +1511,8 @@ pub struct MiscCliFlags {
     /// `--quant-relevance-debug`: per-round admission trace.
     pub quant_relevance_debug: bool,
     /// The proof-cycle-shedding posture the CLI's own executor EFFECTIVELY
-    /// runs with (T8, the development design notes): `--competition` /
+    /// runs with (T8, the development design notes
+    /// at `9598c4206`): `--competition` /
     /// `AY_COMPETITION`, `--no-proof` or `--z3-mode` selected shedding AND no
     /// proof or certificate demand is in scope (`--proof`, `--strict-proofs`,
     /// `--self-check`, `--verify-firewall`, `--emit-firewall-lean`,
@@ -1757,17 +1696,12 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         a5_uf_eq_defer: false,
         spike_dump: false,
         spike_verbose: false,
-        qfax_combiner_route: false,
-        qfax_cegar: false,
         qfax_lanes_debug: false,
         // Test runs install --probe-strict-check via `misc_test_override`.
         probe_strict_check: false,
         probe_cert_reject: false,
-        uflia_witness_debug: false,
         pb_sym_debug: false,
         pb_farkas_cert: false,
-        qfax_neg_eq_witness: false,
-        qfax_neg_chain_gate: false,
         vsids_decay: None,
         inprobe_mult: None,
         factor_elim_bound: None,
@@ -1798,9 +1732,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         no_fp_incremental: false,
         vacuous_marker_narrow: false,
         proj_axiom_budget: None,
-        uflia_witness_complete: false,
-        uflia_witness_parts: None,
-        uflia_fused_detour: false,
         verify_memo: false,
         pb_eqagg_debug: false,
         pb_bnb: false,
@@ -1842,21 +1773,13 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         chc_array_inv: false,
         chc_dt_recursive_prefix: false,
         interface_diet: None,
-        bv_preprocess: None,
         fc_cegar_iters: None,
         int_pigeonhole_enrich_k: None,
-        ext_row_seed: false,
-        debug_row_seed: false,
-        dpll_mint_theory_vars: false,
-        dpll_ite_lift: false,
         euf_bool_arg_repair: false,
-        lra_warm_theory: false,
-        force_array_euf: false,
         ab_maxsat_core_clause: false,
         ab_maxsat_descent_organic_slice: false,
         ab_maxsat_kick_gap_abs: false,
         ab_maxsat_descent_kick_scale: false,
-        uflia_arith_decisions: false,
         no_skolem_witness_sat: false,
         no_singleton_carrier_mint: false,
         // The theory-crate diagnostics are CLI-carried; no env fallbacks.
@@ -1865,8 +1788,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         debug_euf_init: false,
         euf_cong_undo_debug: false,
         euf_diseq_undo_debug: false,
-        probe_prescreen: false,
-        lia_probe_qx: None,
         probe_stats: false,
         debug_fixed_eqs: false,
         algebraic_stats: false,
@@ -1878,10 +1799,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         ic3_lane_noslice: false,
         reve_debug: false,
         max_propagate_rounds: None,
-        lra_cond_trail: false,
-        lra_unit_pivot_pref: false,
         // The euf/nra experiment and diagnostic flags.
-        euf_inc_neg_pop: false,
         nra_diag: false,
         nra_grid_probe: false,
         nra_witness: None,

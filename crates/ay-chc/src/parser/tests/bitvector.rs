@@ -717,6 +717,91 @@ fn raw_bv_literals_and_indexed_results_obey_the_shared_width_cap() {
     ));
 }
 
+use crate::SmtValue;
+use ay_core::kani_compat::DetHashMap;
+
+fn parse_bv_expr(source: &str, variables: &[(&str, ChcSort)]) -> ChcResult<ChcExpr> {
+    let mut parser = ChcParser::new();
+    for (name, sort) in variables {
+        parser.variables.insert((*name).to_string(), sort.clone());
+    }
+    parser.input = source.to_string();
+    parser.pos = 0;
+    parser.parse_expr()
+}
+
+/// AY-SMT-10: the SMT-LIB 2.7 names `(_ int_to_bv n)` and `ubv_to_int` denote
+/// exactly `(_ int2bv n)` and `bv2nat`.
+#[test]
+fn smtlib_2_7_int_to_bv_and_ubv_to_int_parse_as_int2bv_and_bv2nat() {
+    let vars = [("i", ChcSort::Int), ("b", ChcSort::BitVec(8))];
+    assert_eq!(
+        parse_bv_expr("((_ int_to_bv 8) i)", &vars).expect("int_to_bv parses"),
+        parse_bv_expr("((_ int2bv 8) i)", &vars).expect("int2bv parses"),
+    );
+    assert_eq!(
+        parse_bv_expr("(ubv_to_int b)", &vars).expect("ubv_to_int parses"),
+        parse_bv_expr("(bv2nat b)", &vars).expect("bv2nat parses"),
+    );
+    // Same index and argument checks as the old spelling.
+    assert!(parse_bv_expr("((_ int_to_bv 0) i)", &vars).is_err());
+    assert!(parse_bv_expr("((_ int_to_bv 8) b)", &vars).is_err());
+}
+
+/// AY-SMT-10: `sbv_to_int` is the signed (two's-complement) value, checked
+/// exhaustively against the definition for every 8-bit value.
+#[test]
+fn smtlib_2_7_sbv_to_int_is_the_twos_complement_value() {
+    let vars = [("b", ChcSort::BitVec(8))];
+    let signed = parse_bv_expr("(sbv_to_int b)", &vars).expect("sbv_to_int parses");
+    assert_eq!(signed.sort(), ChcSort::Int);
+    for value in 0u128..256 {
+        let mut model = DetHashMap::default();
+        model.insert("b".to_string(), SmtValue::BitVec(value, 8));
+        let expected = if value >= 128 {
+            value as i64 - 256
+        } else {
+            value as i64
+        };
+        assert_eq!(
+            crate::expr::evaluate_expr(&signed, &model),
+            Some(SmtValue::Int(expected.into())),
+            "sbv_to_int of {value:#04x}"
+        );
+    }
+    // Width 1: the sign bit is the only bit.
+    for (source, expected) in [("(sbv_to_int #b1)", -1), ("(sbv_to_int #b0)", 0)] {
+        let expr = parse_bv_expr(source, &[]).expect("sbv_to_int parses");
+        assert_eq!(
+            crate::expr::evaluate_expr(&expr, &DetHashMap::default()),
+            Some(SmtValue::Int(expected)),
+            "{source}"
+        );
+    }
+    assert!(parse_bv_expr("(sbv_to_int 3)", &[]).is_err());
+    assert!(parse_bv_expr("(sbv_to_int b b)", &vars).is_err());
+}
+
+/// AY-SMT-10: a whole CHC problem written with the SMT-LIB 2.7 names (the
+/// shape of the Solidity CHC-COMP benchmarks) parses.
+#[test]
+fn chc_problem_with_smtlib_2_7_bv_conversions_parses() {
+    let input = r#"
+        (set-logic HORN)
+        (declare-fun inv (Int) Bool)
+        (assert (forall ((x Int)) (=> (= x 0) (inv x))))
+        (assert (forall ((x Int) (y Int))
+          (=> (and (inv x)
+                   (= y (ubv_to_int (bvor ((_ int_to_bv 8) x) #x01))))
+              (inv y))))
+        (assert (forall ((x Int))
+          (=> (and (inv x) (< (sbv_to_int ((_ int_to_bv 8) x)) (- 128))) false)))
+        (check-sat)
+    "#;
+    let problem = ChcParser::parse(input).expect("SMT-LIB 2.7 conversions parse");
+    assert_eq!(problem.clauses().len(), 3);
+}
+
 /// SMT-LIB 2.7 names of the integer/bit-vector conversions. 389 CHC-COMP 2026
 /// ADT-LIA-Arrays (Solidity) inputs use `int_to_bv` and `ubv_to_int`; before
 /// 2026-11-18 AY stopped at "Unknown indexed identifier: int_to_bv".

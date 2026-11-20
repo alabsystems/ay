@@ -82,6 +82,8 @@ pub(in crate::executor) enum CertifiedConstInterpBody {
     /// — only arbitrary-precision integers. That is why this variant needs no
     /// stamp-currency treatment: there is no arena slot to go stale.
     LinearInt(LinearIntBody),
+    /// A stamped native-theory expression closed over its formal parameters.
+    Expression(Arc<CertifiedExpressionBody>),
 }
 
 /// `k + sum_i c_i * x_i` over the declared `Int` parameters of one head.
@@ -227,6 +229,11 @@ impl CertifiedConstInterpEntry {
                             .iter()
                             .all(|sort| sort == &Sort::Int)
                 }
+                CertifiedConstInterpBody::Expression(body) => body.is_current(
+                    ctx,
+                    self.binding.parameter_sorts(),
+                    self.binding.result_sort(),
+                ),
             }
             && match (
                 self.binding.parameter_sorts().is_empty(),
@@ -273,17 +280,20 @@ impl CertifiedConstInterpEntry {
     pub(in crate::executor) fn constant_value(&self) -> Option<TermId> {
         match &self.body {
             CertifiedConstInterpBody::Constant { value, .. } => Some(*value),
-            CertifiedConstInterpBody::LinearInt(_) => None,
+            CertifiedConstInterpBody::LinearInt(_) | CertifiedConstInterpBody::Expression(_) => {
+                None
+            }
         }
     }
 
-    /// The exact stamped arena slots this entry retains. A symbolic body
-    /// retains none: it carries only integers, so there is nothing for a
-    /// reader's preflight to visit or for a slot reuse to invalidate.
+    /// The exact stamped arena slots this entry retains. Linear bodies contain
+    /// only integers; native expressions retain their complete closed-over-
+    /// parameters graph for source lifetime and reader preflight checks.
     pub(super) fn value_graph_slots(&self) -> &[(TermId, TermEntryStamp)] {
         match &self.body {
             CertifiedConstInterpBody::Constant { value_graph, .. } => &value_graph.slots,
             CertifiedConstInterpBody::LinearInt(_) => &[],
+            CertifiedConstInterpBody::Expression(body) => body.slots(),
         }
     }
 
@@ -387,6 +397,7 @@ pub(in crate::executor) enum FormulaNeutralFunctionDefaultReadError {
 pub(in crate::executor) enum CertifiedConstInterpWitness {
     Constant(TermId),
     LinearInt(LinearIntBody),
+    Expression(Arc<CertifiedExpressionBody>),
 }
 
 /// One read of a model-owned certified interpretation AT an application.
@@ -403,11 +414,17 @@ pub(in crate::executor) enum CertifiedConstInterpRead {
         body: LinearIntBody,
         arguments: Vec<TermId>,
     },
+    Expression {
+        body: Arc<CertifiedExpressionBody>,
+        arguments: Vec<TermId>,
+    },
 }
 
 /// A fail-closed read of a model-owned certified constant interpretation.
 #[derive(Debug, thiserror::Error)]
 pub(in crate::executor) enum CertifiedConstInterpReadError {
+    #[error("certified interpretation read exhausted its evaluation owner")]
+    ResourceRefused,
     #[error("certified constant interpretation has stale source or value identity")]
     StaleIdentity,
     #[error("certified constant interpretation application has a conflicting signature")]

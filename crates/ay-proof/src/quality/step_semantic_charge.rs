@@ -67,6 +67,24 @@ pub(super) fn strict_semantic_charge(
 ) -> Result<(usize, usize), ProofCheckError> {
     if matches!(
         step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::BvLiaTautology,
+            ..
+        }
+    ) {
+        // `prepare_strict_bv_session` prepays every BV/LIA lemma before any
+        // step is validated. Its census reserves the bounded source
+        // interpreter's complete work/byte maxima (or the separately bounded
+        // closed-constant case), including repeated lemmas. The validator
+        // still re-derives UNSAT from the exact recovered source roots.
+        // Authentication and this step's structural charge cover the clause
+        // and explicit-negation wrapper. A General unfolded-payload product
+        // here would reserve a second, unrelated interpreter on top of that
+        // complete reservation: 894M extra work on the 849-root TY query.
+        return Ok((0, 0));
+    }
+    if matches!(
+        step,
         ProofStep::NraSos { .. } | ProofStep::FiniteFieldLinear { .. }
     ) {
         // Native SOS replay debits its actual polynomial and rational work

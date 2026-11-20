@@ -247,6 +247,29 @@ impl Executor {
         &self.last_statistics
     }
 
+    /// How many BV solves on this executor answered `unknown` because a stop
+    /// (the interrupt flag, the solve deadline or the process memory ceiling)
+    /// cut the bit-blast encoding short, before any SAT search began. Monotone
+    /// over the executor's life: a caller reads it before and after a command
+    /// to learn whether THAT command's stop landed during encoding — which
+    /// tells a bounded model checker that a deeper (strictly larger) encoding
+    /// cannot fit the same per-depth deadline either.
+    #[must_use]
+    pub fn bv_encodings_stopped_before_search(&self) -> u64 {
+        self.bv_encodings_stopped_before_search
+    }
+
+    /// How many BV solves on this executor reached a SAT search (the eager
+    /// path after its whole encoding, clause load included, was in the
+    /// solver; the incremental path on entry). Monotone. A command whose
+    /// [`Self::bv_encodings_stopped_before_search`] moved while this did
+    /// NOT spent its whole slice encoding; when both moved (a theory loop
+    /// re-solving), part of the slice went to search.
+    #[must_use]
+    pub fn bv_sat_searches_entered(&self) -> u64 {
+        self.bv_sat_searches_entered
+    }
+
     /// Alias for `statistics()` (backward compat with tests).
     #[must_use]
     pub fn get_statistics(&self) -> &Statistics {

@@ -24,6 +24,28 @@ use crate::logic_detection::{LogicCategory, TheoryKind};
 
 #[path = "check_sat_assuming/publication.rs"]
 mod publication;
+
+/// Floor of the wall budget for re-checking a harvested proper-subset core.
+const HARVEST_RECHECK_FLOOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wall budget for the strict re-check of a harvested core
+/// ([`Executor::certify_assumption_core`]): a third of the time left before
+/// the solve deadline, never less than [`HARVEST_RECHECK_FLOOR`]; the floor
+/// alone without a deadline.
+///
+/// The verdict is already decided when this runs, so the budget only buys
+/// a reduced core, and two thirds of what is left stay for the minimizer and
+/// the output. A fixed 2 s was too little for a proof-carrying re-check over
+/// thousands of assertions: SMT-COMP 2026 uc-qf-linearintarith QF_LIA/bbd20ad3
+/// (2,863 named) harvested a 523-member core whose re-check took 5.4 s on
+/// the loaded host, so the harvest was discarded and the core padded to all
+/// 2,863 assertions (AY-SMT-4). The probe is still bounded by the caller's
+/// deadline, and a re-check that does not finish still pads.
+fn harvest_recheck_budget(remaining: Option<std::time::Duration>) -> std::time::Duration {
+    remaining.map_or(HARVEST_RECHECK_FLOOR, |left| {
+        (left / 3).max(HARVEST_RECHECK_FLOOR)
+    })
+}
 pub(in crate::executor) use publication::AssumptionSatPublication;
 #[path = "check_sat_assuming/fragile_lra_gate.rs"]
 mod fragile_lra_gate;
@@ -429,9 +451,22 @@ impl Executor {
         // re-solve or provenance rerooting is needed.
         let mut obligation = self.ctx.assertions.clone();
         obligation.extend(core.iter().copied());
+        let remaining = self
+            .solve_deadline
+            .get()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let budget_ms =
+            u64::try_from(harvest_recheck_budget(remaining).as_millis()).unwrap_or(u64::MAX);
         let rechecked = self
-            .checked_exact_unsat_solve(obligation.clone(), 2_000)
+            .checked_exact_unsat_solve(obligation.clone(), budget_ms)
             .is_some_and(|checked| checked.consume(self, &obligation));
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!(
+                "c phase-trace uc-certify harvest={} of={} rechecked={rechecked}",
+                core_set.len(),
+                combined_set.len()
+            );
+        }
         if rechecked {
             self.last_assumption_core = Some(core);
             return result;
@@ -2059,3 +2094,26 @@ mod nested_publication_tests;
 #[cfg(test)]
 #[path = "check_sat_assuming/scoped_publication_tests.rs"]
 mod scoped_publication_tests;
+
+#[cfg(test)]
+mod harvest_recheck_budget_tests {
+    use super::{harvest_recheck_budget, HARVEST_RECHECK_FLOOR};
+    use std::time::Duration;
+
+    #[test]
+    fn budget_is_a_third_of_the_remaining_wall_with_a_floor() {
+        assert_eq!(harvest_recheck_budget(None), HARVEST_RECHECK_FLOOR);
+        assert_eq!(
+            harvest_recheck_budget(Some(Duration::from_secs(42))),
+            Duration::from_secs(14)
+        );
+        assert_eq!(
+            harvest_recheck_budget(Some(Duration::from_secs(3))),
+            HARVEST_RECHECK_FLOOR
+        );
+        assert_eq!(
+            harvest_recheck_budget(Some(Duration::ZERO)),
+            HARVEST_RECHECK_FLOOR
+        );
+    }
+}

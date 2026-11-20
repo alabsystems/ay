@@ -52,6 +52,7 @@ pub(super) fn solve(
     let cut_batch = cut_capture.take();
     session.harvested_cuts = cut_batch.cuts;
     session.cut_harvest_summary = cut_batch.summary;
+    session.unsupported_cut_sides = cut_batch.unsupported;
     session.capture_affine_certificate(&raw);
     capture_parity_certificate(session, &raw);
     #[cfg(feature = "smt")]

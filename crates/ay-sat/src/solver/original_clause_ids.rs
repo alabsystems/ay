@@ -68,6 +68,11 @@ impl Solver {
             if let Some(trace) = self.live_clause_trace_mut() {
                 trace.add_clause_with_hint_slices(clause_id, literals, true, &[]);
             }
+        } else if let Some(trace) = self.recording_clause_trace_mut() {
+            // Literals-only recording after #A2b degradation (no charge).
+            if trace.literals_only_recording() {
+                trace.add_clause_with_hint_slices(clause_id, literals, true, &[]);
+            }
         }
         clause_id
     }

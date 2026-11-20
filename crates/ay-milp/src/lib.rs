@@ -198,8 +198,9 @@ pub use hybrid_pb_lp::{
 };
 mod integer_cut;
 mod integer_cut_capture;
+mod integer_cut_split;
 pub use integer_cut::{CertifiedIntegerCut, IntegerCutProof, IntegerCutVerificationError};
-pub use integer_cut_capture::CutHarvestSummary;
+pub use integer_cut_capture::{CutHarvestSummary, SplitCertificationReport};
 mod knobs;
 pub use knobs::{
     env_audit, is_repo_tooling_env, tooling_env_names, Bucket, Deprecation, EnvAudit, Knob, Route,
@@ -309,13 +310,13 @@ pub use cert::{
 };
 pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
-pub use mps::{read_mps, MpsError, MpsProblem};
+pub use mps::{model_from_exact, read_mps, MpsError, MpsProblem, RationalColumn, RationalRow};
 pub use opt_cert::{
-    derive_optimality_tree, derive_optimality_tree_reported, stream_optimality_tree,
-    verify_optimality_tree_block, verify_optimality_tree_bound, MilpOptimalityCertificate,
-    OptTreeBranch, OptTreeDecline, OptTreeNode, OptTreeReport, OptimalityTreeBudget,
-    StreamedOptTree, OPT_TREE_FLOAT_ITERS_PER_UNIT, OPT_TREE_RIM_BUILD_COST,
-    OPT_TREE_RIM_ITER_COST,
+    derive_bound_tree_reported, derive_optimality_tree, derive_optimality_tree_reported,
+    stream_optimality_tree, verify_optimality_tree_block, verify_optimality_tree_bound,
+    MilpBoundCertificate, MilpOptimalityCertificate, OptTreeBranch, OptTreeDecline, OptTreeNode,
+    OptTreeReport, OptimalityTreeBudget, StreamedOptTree, OPT_TREE_FLOAT_ITERS_PER_UNIT,
+    OPT_TREE_RIM_BUILD_COST, OPT_TREE_RIM_ITER_COST,
 };
 pub use opts::{
     EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, FlipSolveMode, SolveOpts,
@@ -342,8 +343,8 @@ pub use session::{
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,
     CertifiedAdaptiveFourLeafComb, CertifiedAdaptiveThreeLeafHarvest,
     CertifiedAdaptiveThreeLeafTree, CertifiedBinaryAssignmentTree, CertifiedBinaryTreeHarvest,
-    CertifiedSplitHarvest, FloatLpAdvice, InfeasibilityEvidenceKind, LpSession, ObbtOpts,
-    ObbtReport, TargetFsbOpts, TargetFsbPrefixOpts, TargetFsbReport,
+    CertifiedSplitHarvest, FloatLpAdvice, InfeasibilityEvidenceKind, LpSession, LpSessionWork,
+    ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbPrefixOpts, TargetFsbReport,
     MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
     MAX_TARGET_FSB_PREFIX_CANDIDATES,
 };

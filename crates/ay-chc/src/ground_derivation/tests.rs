@@ -870,6 +870,64 @@ fn ground_derivation_precharges_aggregate_premise_fanout() {
     );
 }
 
+#[test]
+fn wide_tuple_charges_only_the_position_carrying_the_array() {
+    let width = 256;
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let mut sorts = vec![ChcSort::Int; width];
+    sorts[0] = array_sort.clone();
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("Wide", sorts);
+    let mut produced = vec![ChcExpr::Int(0); width];
+    produced[0] = ChcExpr::var(ChcVar::new("a", array_sort));
+    let mut consumed = vec![ChcExpr::Int(0); width];
+    consumed[0] = ChcExpr::ConstArray(ChcSort::Int, Arc::new(ChcExpr::Int(0)));
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(predicate, produced),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        predicate, consumed,
+    )])));
+    // The full array occurs in one comparison. The remaining scalar
+    // positions are independent, including the final deliberately wrong one.
+    let mut bindings = FxHashMap::default();
+    bindings.insert(
+        "a".to_owned(),
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries: (0..390)
+                .map(|key| (SmtValue::Int(key), SmtValue::Int(0)))
+                .collect(),
+        },
+    );
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: bindings,
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: FxHashMap::default(),
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+    assert_eq!(validate_ground_derivation(&problem, &derivation), Ok(()));
+    problem.clauses_mut()[1].body.predicates[0].1[width - 1] = ChcExpr::Int(1);
+    assert_eq!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::ArgumentMismatch {
+            step: 1,
+            position: 0,
+            argument: width - 1
+        })
+    );
+}
+
 fn many_uf_argument_problem() -> ChcProblem {
     let mut constraint = ChcExpr::Bool(true);
     for index in 0..8 {

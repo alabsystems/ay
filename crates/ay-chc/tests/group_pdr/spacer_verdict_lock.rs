@@ -3,7 +3,7 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
-//! Workstream B lock L-V (`DESIGN_spacer_pob_lemma_pipeline.md` §6 S1/S11):
+//! Workstream B lock L-V (the development design notes at `9598c4206`, §6 S1/S11):
 //! the default config runs the lane (rung 2 since the R3 default flip) and
 //! reaches the same verdict as the legacy pipeline (`SpacerLane::OFF`); a lane
 //! that the problem's sorts bypass (BV, §7.4) is behaviourally identical to

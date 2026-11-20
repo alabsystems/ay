@@ -156,6 +156,8 @@ fn expired_local_wall_allows_a_fresh_depth_without_rearming_the_attempt() {
         solver.execute_controlled_batch(&mut executor, &commands, Some(past), |_, _| panic!(
             "a locally expired batch must not be installed"
         ),),
+        // Expired before the executor ran: the caller's build, not a BV
+        // encoding cut, so the fresh sweep may still continue deeper.
         Err(BatchFailure::LocalDeadline),
     );
     assert_eq!(solver.execution_stop.get(), None);
@@ -359,4 +361,31 @@ fn expired_symbolic_wall_never_becomes_a_fresh_thirty_second_query() {
         solver.check_symbolic_formula(&false_formula, None),
         Some(None)
     );
+}
+
+/// Only a local deadline whose batch cut a BV encoding and searched nothing
+/// is an encoding deadline; a batch that also searched, or cut nothing, keeps
+/// `LocalDeadline`, and every other failure passes through.
+#[test]
+fn only_an_encoding_cut_with_no_search_is_an_encoding_deadline() {
+    use super::classify_local_deadline as classify;
+    assert_eq!(
+        classify(BatchFailure::LocalDeadline, true, false),
+        BatchFailure::EncodingDeadline
+    );
+    assert_eq!(
+        classify(BatchFailure::LocalDeadline, true, true),
+        BatchFailure::LocalDeadline
+    );
+    assert_eq!(
+        classify(BatchFailure::LocalDeadline, false, false),
+        BatchFailure::LocalDeadline
+    );
+    for failure in [
+        BatchFailure::Unavailable,
+        BatchFailure::Stopped(AttemptStop::Deadline),
+        BatchFailure::Stopped(AttemptStop::Memory),
+    ] {
+        assert_eq!(classify(failure, true, false), failure);
+    }
 }

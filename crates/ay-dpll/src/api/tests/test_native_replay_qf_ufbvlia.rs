@@ -4,7 +4,6 @@
 
 //! Native replay coverage for the admitted QF_UFBVLIA scalar subset.
 
-#[cfg(feature = "proof-checker")]
 use std::time::Duration;
 
 use crate::api::{
@@ -114,7 +113,6 @@ fn qf_ufbvlia_native_replay_round_trips_int2bv_bridge_sat() {
     );
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn qf_ufbvlia_native_replay_preserves_strict_unsat_authority() {
     let mut solver = Solver::try_new(Logic::QfUfbvlia).expect("solver");

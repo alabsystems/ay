@@ -194,6 +194,71 @@ fn dag_weight(terms: &ay_core::TermStore, term: TermId, cap: usize) -> usize {
     seen.len()
 }
 
+/// A LOWER bound on the bytes the printer writes for one occurrence of
+/// `term`, saturating just past `cap`; memoized per term in `memo`.
+///
+/// # Why a tree-size precheck (DR-PROOF-RENDER-BUDGET-20261118)
+///
+/// Every fragment prints its ROOT as a literal, and the printer streams every
+/// occurrence of a shared application again: the bytes grow with the root's
+/// TREE size. A `let`-shared CHC transition relation of 1,738 DAG nodes is
+/// 9.7e13 tree nodes. Guard 5 is bounded per check and a root it declined out
+/// of budget is not rendered again for its other leaves, but that first
+/// check still spends the whole per-check budget. This pass costs O(DAG)
+/// once per root instead, and it can only decline what the bounded render
+/// would decline: the fragment's `assume` prints the root in full, the
+/// printer's work counter charges at least every byte it writes (an
+/// assembled `not`/`ite`/`let`/quantifier more, see
+/// `ay_proof::DERIVATION_RENDER_WORK_BUDGET`), and a bound past the budget
+/// therefore cannot render within it. Every node counts its fewest possible bytes, a node with
+/// a surface override counts zero, and a binder (`let`, quantifier) counts one
+/// without descending, so the bound never overstates.
+fn printed_tree_bytes_lower_bound(
+    terms: &ay_core::TermStore,
+    term: TermId,
+    overrides: Option<&DetHashMap<TermId, String>>,
+    cap: u64,
+    memo: &mut DetHashMap<TermId, u64>,
+) -> u64 {
+    let ceiling = cap.saturating_add(1);
+    let mut stack: Vec<(TermId, bool)> = vec![(term, false)];
+    while let Some((node, children_done)) = stack.pop() {
+        if memo.contains_key(&node) {
+            continue;
+        }
+        if overrides.is_some_and(|table| table.contains_key(&node)) {
+            memo.insert(node, 0);
+            continue;
+        }
+        // `(f a b)` is at least `(` + one head byte + one space per argument
+        // + `)`; `(not a)` is 6 bytes around `a`; `(ite c a b)` is 8.
+        let (own, children): (u64, Vec<TermId>) = match terms.get(node) {
+            TermData::App(_, args) if args.is_empty() => (1, Vec::new()),
+            TermData::App(_, args) => ((args.len() as u64).saturating_add(3), args.clone()),
+            TermData::Not(inner) => (6, vec![*inner]),
+            TermData::Ite(c, t, e) => (8, vec![*c, *t, *e]),
+            _ => (1, Vec::new()),
+        };
+        if !children_done {
+            let pending: Vec<TermId> = children
+                .iter()
+                .copied()
+                .filter(|child| !memo.contains_key(child))
+                .collect();
+            if !pending.is_empty() {
+                stack.push((node, true));
+                stack.extend(pending.into_iter().map(|child| (child, false)));
+                continue;
+            }
+        }
+        let total = children.iter().fold(own, |sum, child| {
+            sum.saturating_add(memo.get(child).copied().unwrap_or(0))
+        });
+        memo.insert(node, total.min(ceiling));
+    }
+    memo.get(&term).copied().unwrap_or(0)
+}
+
 /// Whether `step` is a leaf this lane may replace (Guard 2).
 fn is_conjunct_candidate(step: &ProofStep) -> Option<TermId> {
     let ProofStep::Step {
@@ -263,6 +328,10 @@ impl Executor {
         let mut planned = 0usize;
         let mut spent = 0usize;
         let mut root_weights: DetHashMap<TermId, usize> = DetHashMap::default();
+        let mut printed_bytes: DetHashMap<TermId, u64> = DetHashMap::default();
+        // Roots one of whose fragments Guard 5 declined OUT OF BUDGET (or
+        // under the solve's stop). See the decline below.
+        let mut out_of_budget_roots: DetHashSet<TermId> = DetHashSet::default();
         for (step, atom) in leaves {
             // The WORK bound: at most `MAX_CONJUNCT_LEAVES` fragments are
             // built, closed, strict-checked and rendered per call, whatever
@@ -270,13 +339,14 @@ impl Executor {
             if planned >= MAX_CONJUNCT_LEAVES {
                 break;
             }
+            let leaf_root = match index.get(&atom) {
+                Some(HypothesisLeaf::Conjunct { root, .. }) => Some(*root),
+                _ => None,
+            };
             // …and the fragment count alone is not the work: each one carries
             // the whole ROOT as a literal, so the ROOT's DAG size is charged
             // against a second, weighted budget. See `MAX_CONJUNCT_ROOT_WORK`.
-            if let (true, Some(HypothesisLeaf::Conjunct { root, .. })) =
-                (beyond_shipped_population, index.get(&atom))
-            {
-                let root = *root;
+            if let (true, Some(root)) = (beyond_shipped_population, leaf_root) {
                 let weight = match root_weights.get(&root) {
                     Some(&weight) => weight,
                     None => {
@@ -290,6 +360,29 @@ impl Executor {
                     continue;
                 }
                 spent = spent.saturating_add(weight);
+            }
+            // The memo skip and the tree-size precheck come AFTER the
+            // weighted charge, so `spent` advances exactly as on origin/main
+            // (where these leaves were rendered): a decline here never frees
+            // `MAX_CONJUNCT_ROOT_WORK` for later roots.
+            if leaf_root.is_some_and(|root| out_of_budget_roots.contains(&root)) {
+                continue;
+            }
+            // A root whose text cannot fit one renderability check is declined
+            // before anything is built for it: Guard 5 would decline it after
+            // up to a full budget of rendering, once per leaf. See
+            // `printed_tree_bytes_lower_bound`.
+            if let Some(root) = leaf_root {
+                let bytes = printed_tree_bytes_lower_bound(
+                    &self.ctx.terms,
+                    root,
+                    overrides.as_ref(),
+                    ay_proof::DERIVATION_RENDER_WORK_BUDGET,
+                    &mut printed_bytes,
+                );
+                if bytes > ay_proof::DERIVATION_RENDER_WORK_BUDGET {
+                    continue;
+                }
             }
             let Some(leaf) = index.get(&atom) else {
                 continue;
@@ -327,8 +420,26 @@ impl Executor {
             }
             // Guard 5: the PRINTER decides renderability, with the export's own
             // overrides, so producer and exporter cannot drift.
-            if self.bridge_fragment_is_unrenderable(&fragment, atom, overrides.as_ref()) {
-                continue;
+            match self.bridge_fragment_render(&fragment, atom, overrides.as_ref()) {
+                ay_proof::DerivationRender::Renders => {}
+                ay_proof::DerivationRender::Unrenderable => continue,
+                // Every fragment of a root begins `assume ROOT`, then
+                // `and_pos` with `(not ROOT)` in its clause and ROOT as its
+                // argument: three full printings of ROOT, which is what makes a
+                // check run out. A root that exhausted one check (or met the
+                // solve's stop) is not rendered again for its other leaves;
+                // they keep their `trust` leaves. Without this memo each leaf
+                // re-paid up to a full per-check budget, and nothing bounded
+                // the total, because `planned` counts only accepted fragments.
+                // The price: a sibling with a shallower descent could print
+                // fewer bytes and still fit. It keeps its leaf, which is the
+                // sound side (DR-PROOF-RENDER-BUDGET-20261118).
+                ay_proof::DerivationRender::OutOfBudget => {
+                    if let Some(root) = leaf_root {
+                        out_of_budget_roots.insert(root);
+                    }
+                    continue;
+                }
             }
             plans[step] = Some(fragment);
             planned += 1;
@@ -432,3 +543,7 @@ mod negative_tests;
 #[cfg(test)]
 #[path = "authored_conjunct_leaf_sweep_tests.rs"]
 mod sweep_tests;
+
+#[cfg(test)]
+#[path = "authored_conjunct_leaf_render_budget_tests.rs"]
+mod render_budget_tests;

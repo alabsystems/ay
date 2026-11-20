@@ -483,6 +483,10 @@ pub(crate) struct BmcStats {
     pub(crate) exhausted_search: bool,
     /// Whether adaptive stepping was used.
     pub(crate) used_adaptive_stepping: bool,
+    /// The depth whose encoding missed its per-depth slice and so stopped the
+    /// fresh-executor sweep (`BatchFailure::EncodingDeadline`); `None` when
+    /// no sweep stopped that way.
+    pub(crate) encoding_missed_depth: Option<usize>,
     /// Whether the per-depth fresh Executor path produced the final result
     /// (#7982/#7983). Mutually exclusive with `used_legacy_fallback`.
     pub(crate) used_executor_path: bool,
@@ -1576,7 +1580,7 @@ impl BmcSolver {
     /// and confirm a SAT depth from that executor's own model through
     /// `ts_model_unsafe_at_depth` — the same witness construction and the same
     /// original-clause replay gate as the persistent lane
-    /// (`LRA_BMC_unsafe_2026-09-22.md`).
+    /// (the development design notes at `9598c4206`).
     ///
     /// The Real-sorted continuation of the persistent lane's `RetryFresh`
     /// hand-off: (a) the persistent session's later LRA scopes degrade (see
@@ -1656,7 +1660,10 @@ impl BmcSolver {
                         .find(|s| matches!(*s, "sat" | "unsat" | "unknown"))
                         .unwrap_or("unknown")
                         .to_owned(),
-                    Err(execution::BatchFailure::LocalDeadline) => "unknown".to_owned(),
+                    Err(
+                        execution::BatchFailure::LocalDeadline
+                        | execution::BatchFailure::EncodingDeadline,
+                    ) => "unknown".to_owned(),
                     Err(execution::BatchFailure::Stopped(_)) => {
                         return Some(ChcEngineResult::Unknown)
                     }
@@ -1722,10 +1729,10 @@ impl BmcSolver {
     }
 
     /// Per-depth cap of the persistent transition-system lane on Real-sorted
-    /// problems (`LRA_BMC_unsafe_2026-09-22.md`).
+    /// problems (the development design notes at `9598c4206`).
     ///
     /// ay-dpll's incremental push/pop session degrades on later LRA scopes
-    /// ("scope poisoning", `MICROBENCH_QUERY_REPLAY_2026-09-18.md` §5.2): on
+    /// ("scope poisoning", the development design notes at `9598c4206`, §5.2): on
     /// LRA-Lin the lane's SAT-typed counterexample depth took 53 s in-session
     /// for a query a fresh executor decides in 7 s
     /// (`om1_with_relays_agreement_two_faults`, depth 3) and 15.5 s vs 5–9 s
@@ -8049,12 +8056,12 @@ impl BmcSolver {
     /// 15.9 -> 4.5 s; each half alone is mixed. Every other lane keeps the
     /// executor defaults (the #9505 QF_LRA beneficiaries are untouched).
     ///
-    /// Real-sorted scoping (lever L2, DPLL_LRA_perf_2026-09-23.md §2.3-§2.5,
-    /// LRA_L2_bmc_real_lane_2026-09-24.md): T6 was tuned entirely on
+    /// Real-sorted scoping (lever L2, the development design notes at 9598c4206, §2.3-§2.5,
+    /// the development design notes at 9598c4206): T6 was tuned entirely on
     /// Int/Bool transition systems (DRAGON/FIREFLY/MESI/peterson/metros —
     /// all QF_LIA). These same lanes also run on pure-Real (QF_LRA)
-    /// transition systems (`LRA_BMC_unsafe_2026-09-22.md`'s BMC/IMC
-    /// corpus), where the corpus knob A/B found part (2) — leaving the
+    /// transition systems (the BMC/IMC corpus of
+    /// the development design notes at `9598c4206`), where the corpus knob A/B found part (2) — leaving the
     /// #9505 every-decision mode — actively HURTS: it cuts theory
     /// propagations to about a third and turns several LRA-Lin BMC/IMC
     /// queries that solve under the default posture into `unknown`
@@ -9444,6 +9451,29 @@ impl BmcSolver {
                     encountered_unknown = true;
                     consecutive_unsat = 0;
                     continue;
+                }
+                Err(execution::BatchFailure::EncodingDeadline) => {
+                    // The slice ran out while ay-dpll was still bit-blasting
+                    // this depth's BV encoding, before any SAT search. Depth
+                    // k+1 re-encodes the whole prefix 0..k+1, a larger build
+                    // under the same slice: continuing only repeats a bigger
+                    // failed build (measured: a sawtooth of re-blasts, each
+                    // peak higher, until the process memory ceiling —
+                    // DR-CHC-BV-LANE-E-GOVERNED-20261118). Stop with the
+                    // proven prefix (`proven_unsat_prefix`) as frontier. A
+                    // non-BV or pre-executor overrun is `LocalDeadline` above
+                    // and keeps sweeping.
+                    tracing::debug!(
+                        "BMC-exec: depth {} encoding missed its slice; stopping the sweep (frontier {})",
+                        k,
+                        self.proven_unsat_prefix()
+                    );
+                    {
+                        let mut stats = self.stats.borrow_mut();
+                        stats.budget_exhausted = true;
+                        stats.encoding_missed_depth = Some(k);
+                    }
+                    return Some(ChcEngineResult::Unknown);
                 }
                 Err(execution::BatchFailure::Stopped(_)) => return Some(ChcEngineResult::Unknown),
                 Err(execution::BatchFailure::Unavailable) => return None,

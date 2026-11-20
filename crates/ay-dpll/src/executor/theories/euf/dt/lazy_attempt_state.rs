@@ -64,8 +64,6 @@ struct DtLazyAttemptState {
     // persistence and any pre-existing entries; the attempted solve therefore
     // cannot retain speculative TermIds there. This avoids cloning a bounded
     // but potentially large lemma/dedup ledger.
-    uflia_repair_candidates: Vec<crate::executor::model::Model>,
-    uflia_repair_conflict_tables: Vec<String>,
     last_degrade_was_datatype_array: bool,
     nested_array_row_reduction_unsat: bool,
     nested_array_free_justification_unsat: bool,
@@ -73,7 +71,6 @@ struct DtLazyAttemptState {
     uflia_congruence_gate_rejected: bool,
     qfax_retry_done: bool,
     uflia_congruence_retry_done: bool,
-    uflia_model_repair_done: bool,
     sat_validated_by_mod_div_or_branch: bool,
     defer_model_validation: bool,
     skip_model_eval: bool,
@@ -114,8 +111,6 @@ impl DtLazyAttemptState {
             conflict_semantic_verify_memo: executor.conflict_semantic_verify_memo.clone(),
             prop_semantic_verify_memo: executor.prop_semantic_verify_memo.clone(),
             named_assert_rewrites: executor.named_assert_rewrites.clone(),
-            uflia_repair_candidates: executor.uflia_repair_candidates.clone(),
-            uflia_repair_conflict_tables: executor.uflia_repair_conflict_tables.clone(),
             last_degrade_was_datatype_array: executor.last_degrade_was_datatype_array,
             nested_array_row_reduction_unsat: executor.nested_array_row_reduction_unsat,
             nested_array_free_justification_unsat: executor.nested_array_free_justification_unsat,
@@ -123,7 +118,6 @@ impl DtLazyAttemptState {
             uflia_congruence_gate_rejected: executor.uflia_congruence_gate_rejected,
             qfax_retry_done: executor.qfax_retry_done,
             uflia_congruence_retry_done: executor.uflia_congruence_retry_done,
-            uflia_model_repair_done: executor.uflia_model_repair_done,
             sat_validated_by_mod_div_or_branch: executor.sat_validated_by_mod_div_or_branch,
             defer_model_validation: executor.defer_model_validation,
             skip_model_eval: executor.skip_model_eval,
@@ -163,8 +157,6 @@ impl DtLazyAttemptState {
         executor.conflict_semantic_verify_memo = self.conflict_semantic_verify_memo;
         executor.prop_semantic_verify_memo = self.prop_semantic_verify_memo;
         executor.named_assert_rewrites = self.named_assert_rewrites;
-        executor.uflia_repair_candidates = self.uflia_repair_candidates;
-        executor.uflia_repair_conflict_tables = self.uflia_repair_conflict_tables;
         executor.last_degrade_was_datatype_array = self.last_degrade_was_datatype_array;
         executor.nested_array_row_reduction_unsat = self.nested_array_row_reduction_unsat;
         executor.nested_array_free_justification_unsat = self.nested_array_free_justification_unsat;
@@ -172,7 +164,6 @@ impl DtLazyAttemptState {
         executor.uflia_congruence_gate_rejected = self.uflia_congruence_gate_rejected;
         executor.qfax_retry_done = self.qfax_retry_done;
         executor.uflia_congruence_retry_done = self.uflia_congruence_retry_done;
-        executor.uflia_model_repair_done = self.uflia_model_repair_done;
         executor.sat_validated_by_mod_div_or_branch = self.sat_validated_by_mod_div_or_branch;
         executor.defer_model_validation = self.defer_model_validation;
         executor.skip_model_eval = self.skip_model_eval;

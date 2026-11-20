@@ -31,7 +31,7 @@ impl Policy for root::Ordinary {
         Ok(())
     }
     fn add_trace(&self, s: &mut Solver, id: u64, hints: Vec<u64>) -> Result<(), Infallible> {
-        if let Some(trace) = s.live_clause_trace_mut() {
+        if let Some(trace) = s.recording_clause_trace_mut() {
             trace.add_clause_with_hints(id, Vec::new(), false, hints);
         }
         Ok(())

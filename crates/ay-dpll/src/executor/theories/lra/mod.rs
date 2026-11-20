@@ -21,13 +21,6 @@ use super::MAX_SPLITS_LRA;
 #[cfg(test)]
 mod tests;
 
-/// #warm-theory: whether the persistent-theory reuse lane is enabled
-/// (`--lra-warm-theory`). Cached; default OFF (byte-identical default path).
-fn lra_warm_theory_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| ay_core::misc_cli_flags().lra_warm_theory)
-}
-
 /// #lra-inc-engine (S1): whether to log the per-check-sat persistence counters
 /// on the incremental QF_LRA engine lane (`--lra-inc-engine-stats`). Cached;
 /// default OFF.
@@ -64,31 +57,6 @@ fn inc_engine_warm_on() -> bool {
     // re-verify (0-wrong vs z3), with cascade-cap + adaptive-drop-after-SAT
     // neutralizing the alternating-file warm-start regression.
     *V.get_or_init(|| !ay_core::theory_disable_flags().no_lra_inc_warm)
-}
-
-/// #unguarded-tvalid-lemmas (`AY_LRA_INC_UNGUARDED_LEMMAS`): permanently retain
-/// T-valid theory-CONFLICT lemmas on the inc-engine persistent SAT solver
-/// (OpenSMT-style) instead of appending the innermost scope selector that gets
-/// the whole lemma pool (and every CDCL resolvent it poisons) deleted at each
-/// pop(). An LRA Farkas-core conflict lemma is a theory tautology over
-/// term-semantic atoms — valid at every scope forever — and this lane's
-/// atom<->var Tseitin binding (`local_term_to_var`) is session-persistent and
-/// append-only, so retention is sound. Only conflict lemmas are unguarded;
-/// theory PROPAGATION reasons stay scoped in this phase. DEFAULT-ON on this
-/// lane. DEFAULT OFF (opt in with `AY_LRA_INC_UNGUARDED_LEMMAS=1`): measured
-/// 2026-07-24 on fisher_star.ind — neutral @90s (31=31 exact, 2-sample) but
-/// STRONGLY NEGATIVE @1200s (56 vs 82): the retained pool compounds over 100+
-/// cycles into BCP/clause-DB drag without matching replay benefit (resolvents
-/// still inherit selectors through SCOPED propagation reasons, so replay is
-/// blocked while pool cost is paid). Soundness is NOT the issue (adversarially
-/// reviewed SHIP_CANDIDATE; 0 verdict mismatches at both horizons). Retention
-/// needs OpenSMT-style aggressive learnt-DB discipline + unscoped propagation
-/// reasons (phase 2) before it can pay; the flag stays as the experiment gate.
-fn inc_engine_unguarded_lemmas_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        false // B23: never-set opt-in retired.
-    })
 }
 
 /// The standalone QF_LRA lane's preprocessing, on any store: also what the
@@ -347,27 +315,17 @@ impl Executor {
             // paths force the state-preserving incremental reset. CHC/PDR IC3
             // (ic3_mode without this flag) is unaffected.
             sat.set_inc_engine_reset_mode(true);
-            // #unguarded-tvalid-lemmas STAGE 1: retain T-valid theory-CONFLICT
-            // lemmas (Farkas cores + batch bound conflicts) permanently across
-            // pop() on this session-persistent solver. Default-ON, opt out with
-            // AY_LRA_INC_UNGUARDED_LEMMAS=0. Sound on THIS lane because the
-            // atom<->var binding is session-stable (vars never reused across
-            // pop; `local_term_to_var` persists append-only) and every routed
-            // clause is a theory tautology over term-semantic atoms
-            // (map_conflict_lits / TheoryExtension term_to_literal both fail
-            // closed on partial mappings). NOTE: the inc-engine lane
+            // Theory-conflict lemmas stay scope-guarded on this lane (the
+            // solver's default). The inc-engine lane
             // structurally EXCLUDES checked-certificate sessions — solve_lra
             // only routes here under `inc_engine_on &&
-            // !self.checked_certificate_demanded()` — so no DEMANDED proof
-            // stream ever has to justify an unguarded lemma surviving its
-            // birth scope (debug-asserted below). A best-effort tracker may
+            // !self.checked_certificate_demanded()` (debug-asserted below). A best-effort tracker may
             // still be armed here; every routed clause is a theory tautology,
             // so whatever it records is strict-checkable step by step.
             debug_assert!(
                 !self.checked_certificate_demanded(),
                 "#lra-inc-engine lane must exclude checked-certificate sessions (routing guard in solve_lra)"
             );
-            sat.set_unguarded_theory_conflict_lemmas(inc_engine_unguarded_lemmas_on());
             sat.set_random_seed(random_seed);
             // #8093: Z3-style geometric restarts for QF_LRA.
             sat.set_geometric_restarts(100.0, 1.5);
@@ -811,13 +769,11 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
 
-        // #warm-theory: when --lra-warm-theory is set, mark this solve so the
-        // persistent-theory pipeline reuses the LraSolver across check-sats. The
-        // RAII guard restores the previous flag on return (incl. the internal
-        // reverify's standalone call, which runs on a throwaway temp_state and so
-        // stays a fresh, independent oracle). Default (unset) => flag false =>
-        // byte-identical to before.
-        let _warm_guard = crate::warm_theory_flag::WarmTheoryGuard::new(lra_warm_theory_on());
+        // #warm-theory: this lane never reuses a persisted theory solver. The
+        // RAII guard pins the thread-local flag to `false` for this solve, so a
+        // warm flag set by an enclosing inc-engine lane cannot leak into the
+        // persistent-theory pipeline here, and restores it on return.
+        let _warm_guard = crate::warm_theory_flag::WarmTheoryGuard::new(false);
 
         let result = solve_incremental_theory_pipeline!(self,
             tag: "LRA",

@@ -1,0 +1,498 @@
+# AY-21 holdout: real Trust mask-and-shift obligations, split by crate.
+#
+# Source: the exact programs Trust's in-process backend hands AY
+# (`TRUST_AY_SMT_TRACE=1 offline deductive checker check --lib`, ~/trust at the AY-21
+# capture), one standalone crate at a time, deduplicated by SHA-256 of the
+# query text, keeping those whose assertions use bvand/bvor/bvxor/bvshl/
+# bvlshr/bvashr/extract/concat. Crates: Trust's verified crates and
+# bit-manipulation crates from crates.io, as Trust verifies them.
+#
+# Split (fixed before any tuning): a crate is in the holdout when the first
+# 32 bits of SHA-256(crate name) are odd, else in training. Expected
+# verdicts: the ci/z3.pin reference z3, 60 s, reading each query under
+# (set-logic ALL) because under QF_UFBVLIA it rejects int2bv and answers
+# with the assertion dropped; "unknown" when it gave no clean answer.
+#
+# Frozen 2026-11-20. Do not edit, extend or re-label: tune on the training split.
+schema = 1
+deadline_ms = 5000
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/2cea4e00ee813012.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/2e3092fbd5c460d0.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/58782cc6a5093eda.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/67d7351007411494.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/693c1d4dbbb328cd.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/78a904cad9d82b28.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/82f5b1311ddb4382.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/bb4ca633d9fbf3d7.smt2"
+crate = "bit-vec-0.8.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/bd0906670b28751a.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/f5b7d011d8d6a439.smt2"
+crate = "bit-vec-0.8.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/bit-vec-0.8.0/f712edf5a0ebdf31.smt2"
+crate = "bit-vec-0.8.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/0749e4c608601d2d.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/1418944006948f13.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/2d206add287bd8af.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/4b403ea1d55d2f52.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/4ee602b2a0f31163.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/4f0ea75d80195c97.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/5181470bc304d52d.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/57e017140fb61eb4.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/75f34bf9a3d34a52.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/77cd7a90b40e35b5.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/7ed383ac19eb122f.smt2"
+crate = "byteorder-1.5.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/853487def579f578.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/b080eee06853a864.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/b24862f0ccb35261.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/b36e766c4199f714.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/bf38d772e6a93474.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/c5da60ada660c368.smt2"
+crate = "byteorder-1.5.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/ce7c0542eab9ace3.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/ce9a035d4ff3f829.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/d5d53d2cab855096.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/d7147a1e53c17213.smt2"
+crate = "byteorder-1.5.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/df5d8f28c4238c8e.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/e47ddc1acde4877f.smt2"
+crate = "byteorder-1.5.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/e84aa101e4fadac6.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/eb27eba5ff8ae956.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/f4950c265ded05d3.smt2"
+crate = "byteorder-1.5.0"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/byteorder-1.5.0/f5764232a8eb60d6.smt2"
+crate = "byteorder-1.5.0"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/12549ee01cbc56c2.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/19d873e18650a524.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/2cfa282c4b0d6107.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/30346265a9feaaba.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/39784f9b35942f5b.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/5b38a8e721a2df55.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/7521426eaaba2ac9.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/7f5a76be922edd73.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/98821d4bdf4a70c3.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/c7000ba0af9b12fb.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/e86f49cc90806db2.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/fixedbitset-0.5.7/e948e44472f9bad1.smt2"
+crate = "fixedbitset-0.5.7"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/leb128-0.2.5/11228d281e73627e.smt2"
+crate = "leb128-0.2.5"
+expected = "unknown"
+
+[[query]]
+file = "trust-mask-shift/leb128-0.2.5/4c61e93a651f5024.smt2"
+crate = "leb128-0.2.5"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/leb128-0.2.5/5091d1e97b31abf7.smt2"
+crate = "leb128-0.2.5"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/leb128-0.2.5/52b6d206c92902f6.smt2"
+crate = "leb128-0.2.5"
+expected = "sat"
+
+[[query]]
+file = "trust-mask-shift/leb128-0.2.5/dcef891f244c12e9.smt2"
+crate = "leb128-0.2.5"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-bitfield/b816a6ba7de971d1.smt2"
+crate = "trust-bitfield"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-bitfield/dbf30d1b8e7fdbbd.smt2"
+crate = "trust-bitfield"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/133555efdee005ac.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/24ca071ec3297ce7.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/45265f7e1ff91280.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/65fba3b7ea203fd1.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/6e353b0b732ce52a.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/c7391477cbeea464.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/dbaedf6d3af99684.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/f95e561a46afc52b.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-hex/fe706661dbd5d373.smt2"
+crate = "trust-hex"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/05ff1d110b4d2c2a.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/082b40e4d9fb592b.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/17efa17541fdf323.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/1863921289ae3aae.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/1bc352a9d62f99a1.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/2161b30e353559d4.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/2ff5608ae5a4d4b0.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/3a0f90e1c2c936d8.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/50ea49fdc62c663a.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/6521d8abc97e2aa8.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/730e4b7a3c3cb5b7.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/773ea012e094a043.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/79273c35b9a3996f.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/908376a5f17c5b05.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/93a8fa49aa90d864.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/98734b157f292bb2.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/98a4ee3f866ceb16.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/a6ef875e7ee1d923.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/a7000dff5050e7aa.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/aada22a4935f9d85.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/ad247cf0000cf02b.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/afbd50eda00b967a.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/b6e3ac2771e4b789.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/b85d8d743741c451.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/bf2f5c53c2991347.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/bfec248dd3ae0cd0.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/c4ec9b1b233b62d3.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/c720e352bad73721.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/f142888733588f96.smt2"
+crate = "trust-utf"
+expected = "unsat"
+
+[[query]]
+file = "trust-mask-shift/trust-utf/f730d5a2199f77e0.smt2"
+crate = "trust-utf"
+expected = "unsat"

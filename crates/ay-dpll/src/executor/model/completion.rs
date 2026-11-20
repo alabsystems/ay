@@ -4384,22 +4384,6 @@ impl Executor {
             // recover a validated SAT, never mint an unvalidated one.
             if self.uflia_congruence_lane {
                 self.uflia_congruence_gate_rejected = true;
-                // #uflia-model-repair (env-gated): this discard previously
-                // ERASED the evidence a targeted repair needs (relevancy
-                // design §7) — the model is dropped here, before the gate
-                // that would have named a falsified assertion. Preserve the
-                // conflicted table names for the §3.2 repair re-solve (the
-                // candidate model itself was snapshotted in
-                // `check_sat_guarded` before this funnel ran). Verdict flow
-                // is byte-identical: the conflicted model is still discarded,
-                // never shipped.
-                if super::super::uflia_model_repair::uflia_model_repair_enabled() {
-                    if let Some(euf) = model.euf_model.as_ref() {
-                        self.uflia_repair_conflict_tables =
-                            euf.function_table_conflicts.iter().cloned().collect();
-                        self.uflia_repair_conflict_tables.sort_unstable();
-                    }
-                }
             }
             return;
         }

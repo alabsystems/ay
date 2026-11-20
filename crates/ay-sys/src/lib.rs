@@ -61,6 +61,8 @@ pub mod memory_observations;
 pub mod metadata_capture;
 pub mod owned_child;
 #[cfg(unix)]
+pub mod sigterm_defer;
+#[cfg(unix)]
 pub mod supervisor;
 pub mod thread_clock;
 pub mod time;

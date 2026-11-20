@@ -79,7 +79,7 @@ fn stats_expr(expr: &ChcExpr) -> String {
 }
 
 /// A base-check `Unknown` that consumed at least this share of the per-query
-/// cap is budget-shaped (DESIGN_lra_interp_tpa.md §4.1): the query may be
+/// cap is budget-shaped (the development design notes at 9598c4206, §4.1): the query may be
 /// decidable with more time, so it gets exactly one retry.
 const BUDGET_SHAPED_FRACTION: f64 = 0.9;
 

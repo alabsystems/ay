@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Model-based splitting of arithmetic ITE terms (Workstream B R2,
-//! `DESIGN_spacer_pob_lemma_pipeline.md` §4.1.4; Spacer `mbp_arith.cpp`
+//! the development design notes at `9598c4206`, §4.1.4; Spacer `mbp_arith.cpp`
 //! ite handling done syntactically).
 //!
 //! A literal `L[ite(c, a, b)]` whose ITE is arithmetic-sorted and whose guard

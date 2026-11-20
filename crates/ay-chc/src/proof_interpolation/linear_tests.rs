@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Workstream D sort fix (DESIGN_lra_interp_tpa.md §4.1, WP-D1-M).
+//! Workstream D sort fix (the development design notes at 9598c4206, §4.1, WP-D1-M).
 
 use super::*;
 

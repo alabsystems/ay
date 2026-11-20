@@ -18,6 +18,7 @@ fn authenticated_rebuild_keeps_both_legacy_envelopes_exact() {
         &legacy.normalized_input_sha256,
         &legacy.source_clause_sequence_sha256,
         "artifact",
+        None,
         &mut control,
     )
     .unwrap();
@@ -34,6 +35,7 @@ fn authenticated_rebuild_keeps_both_legacy_envelopes_exact() {
         &legacy.normalized_input_sha256,
         &legacy.source_clause_sequence_sha256,
         "v2 artifact",
+        None,
         &mut control,
     )
     .unwrap();
@@ -60,6 +62,7 @@ fn problem_mismatch_does_not_start_positional_hashing() {
             "wrong-normalized-hash",
             "wrong-positional-hash",
             label,
+            None,
             &mut GroundValidationControl::new(&mut || {
                 polls += 1;
                 polls <= normalization_polls
@@ -88,6 +91,7 @@ fn matching_normalized_hash_does_not_authorize_wrong_clause_order() {
         &normalized_chc_input_sha256(&problem),
         "wrong-positional-hash",
         "artifact",
+        None,
         &mut GroundValidationControl::new(&mut || true),
     )
     .err()
@@ -108,6 +112,7 @@ fn authenticated_source_cannot_restart_a_refused_budget_during_rebuild() {
         &envelope.normalized_input_sha256,
         &envelope.source_clause_sequence_sha256,
         "artifact",
+        None,
         &mut GroundValidationControl::new(&mut || true),
     )
     .unwrap();
@@ -148,6 +153,7 @@ fn a_relabelled_normalized_input_schema_does_not_authenticate() {
         &normalized_chc_input_sha256(&problem),
         &crate::proof_metadata::ordered_chc_clause_sequence_sha256(&problem),
         "artifact",
+        None,
         &mut GroundValidationControl::new(&mut || true),
     )
     .err()

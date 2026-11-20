@@ -2771,6 +2771,12 @@ impl<'a> Evaluator<'a> {
         if fl.as_str() == "select" {
             return Ok(false);
         }
+        // The two children of lambda-array are a binder and its scoped body.
+        // Matching their values at model-assigned indices gives one sample,
+        // while equality of the functions requires agreement at every index.
+        if fl.as_str() == "lambda-array" {
+            return Ok(false);
+        }
         for (&x, &y) in al.iter().zip(ar) {
             if self.terms.sort(x) != self.terms.sort(y) {
                 return Ok(false);

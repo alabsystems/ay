@@ -919,7 +919,7 @@ impl SmtContext {
         // goes to the ay-dpll Executor first with the whole per-check budget.
         // Replaying the engines' real query stream showed the executor decides
         // these queries reliably (0 Unknown / 0 disagreements over 2,484
-        // verdicts, MICROBENCH_QUERY_REPLAY_2026-09-18.md) while the
+        // verdicts, the development design notes at 9598c4206) while the
         // internal-first slice + capped fallback produced 28–74 % Unknown.
         // The internal loop stays as the fallback when the executor returns
         // Unknown, so completeness is unchanged; the Verification lane keeps

@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Classify-after-preprocess for collapsible nonlinear problems (CH4/K3 of
-//! the development design notes §3.5).
+//! the development design notes at `9598c4206`, §3.5).
 //!
 //! The kind2 family (823/1287 of LIA-Nonlin) is emitted as a nonlinear
 //! multi-predicate system — `MAIN ← top_step ∧ MAIN`, 10–24 predicates, 12–26

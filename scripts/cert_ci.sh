@@ -57,7 +57,7 @@ done
 # always.
 #
 # ABSENT is not MISMATCHED. The public snapshot ships the pin but not the
-# patch file (a private fork's delta; publish/DECISIONS.md, 2026-09-25). With
+# patch file (a private fork's delta; publish/DECISIONS.md at 9598c4206, 2026-09-25). With
 # no file there is no second identity to disagree with the pin, so the cache
 # probe below still resolves only a build keyed by VERIPB_PATCH_SHA256, and the
 # self-test battery and the soundness fixtures vet whatever is resolved, as they

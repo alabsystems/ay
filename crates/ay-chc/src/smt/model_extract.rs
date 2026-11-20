@@ -285,14 +285,15 @@ impl SmtContext {
                             ChcExpr::Op(ChcOp::BvConcat, vec![Arc::new(a), Arc::new(b)])
                         }
                         // BV/Int conversion (inserted by sort coercion in convert.rs)
-                        "bv2nat" | "bv2int" => {
+                        // `ubv_to_int`/`int_to_bv`: SMT-LIB 2.7 names.
+                        "bv2nat" | "bv2int" | "ubv_to_int" => {
                             if args.len() != 1 {
                                 return None;
                             }
                             let a = go(ctx, args[0], memo)?;
                             ChcExpr::Op(ChcOp::Bv2Nat, vec![Arc::new(a)])
                         }
-                        "int2bv" => {
+                        "int2bv" | "int_to_bv" => {
                             if args.len() != 1 {
                                 return None;
                             }

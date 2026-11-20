@@ -265,8 +265,16 @@ fn dry_run_ref_conflict(receipts: &Path) -> bool {
     let Some(error) = errors.next() else {
         return false;
     };
+    // Native Agh may leave the error's optional repo explicitly null. The
+    // exact request and stdout receipt above already bind this dry run to our
+    // repository. Missing, malformed and foreign error fields still refuse.
+    let repository = match error.get("error").and_then(|error| error.get("repo")) {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(repo)) => repo == REPOSITORY,
+        _ => false,
+    };
     errors.next().is_none()
-        && error["error"]["repo"].as_str() == Some(REPOSITORY)
+        && repository
         && error["error"]["kind"].as_str() == Some("conflict")
         && error["error"]["exit"].as_u64() == Some(9)
         && error["error"]["side_effect"].as_str() == Some("none")

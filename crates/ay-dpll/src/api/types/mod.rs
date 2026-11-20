@@ -8,11 +8,14 @@
 //! The public surface is source-compatible with the former single-file layout.
 
 pub(crate) mod annotated_core;
+mod bool_enumeration;
+pub(crate) use bool_enumeration::EnumerationCommon;
 mod capabilities;
 mod complete_value;
 mod cross_check;
 mod error;
 mod explanation;
+mod finite_enumeration;
 mod handles;
 mod incremental;
 mod interpolant;
@@ -30,7 +33,15 @@ mod scalar_function;
 mod verification;
 
 // Complete-value transport is additive data, not a capability-route change.
+pub use bool_enumeration::{
+    BoolEnumerationOutcome, BoolEnumerationReport, BoolEnumerationRow, BoolEnumerationSearchWork,
+    BoolEnumerationStatistics,
+};
 pub use complete_value::CompleteModelValue;
+pub use finite_enumeration::{
+    FiniteEnumerationOutcome, FiniteEnumerationReport, FiniteEnumerationRow,
+    FiniteEnumerationStatistics, FiniteEnumerationValue,
+};
 
 // Re-export all public types to preserve the existing `types::*` surface.
 pub use annotated_core::{

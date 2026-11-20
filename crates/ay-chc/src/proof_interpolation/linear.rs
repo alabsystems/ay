@@ -113,7 +113,7 @@ pub(crate) fn build_linear_inequality(
 
 /// [`build_linear_inequality`] in the constraint's own arithmetic sort.
 ///
-/// Workstream D (CHC-COMP 2026, `DESIGN_lra_interp_tpa.md` §4.1): a combination
+/// Workstream D (CHC-COMP 2026, the development design notes at `9598c4206`, §4.1): a combination
 /// of `Real` rows must be emitted over `Real` variables with exact rational
 /// coefficients (`farkas::build_linear_inequality_sorted`, no denominator
 /// clearing, no rounding). Emitting it as an `Int` atom mis-types the Craig

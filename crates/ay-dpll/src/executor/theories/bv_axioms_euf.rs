@@ -257,6 +257,12 @@ impl Executor {
         };
         let mut literals_emitted: usize = 0;
         let mut pair_index: u64 = 0;
+        #[cfg(test)]
+        let clause_cap = self
+            .test_euf_bv_congruence_clause_cap
+            .unwrap_or(MAX_EUF_BV_CONGRUENCE_CLAUSES);
+        #[cfg(not(test))]
+        let clause_cap = MAX_EUF_BV_CONGRUENCE_CLAUSES;
 
         // Collect all uninterpreted function applications from assertions AND
         // extra terms (e.g., assumptions). UF applications in assumptions like
@@ -340,7 +346,7 @@ impl Executor {
             for i in 0..applications.len() {
                 for j in (i + 1)..applications.len() {
                     pair_index += 1;
-                    if result.clauses.len() > MAX_EUF_BV_CONGRUENCE_CLAUSES
+                    if result.clauses.len() > clause_cap
                         || literals_emitted > MAX_EUF_BV_CONGRUENCE_LITERALS
                     {
                         result.bail = Some(CongruenceBail::Count);

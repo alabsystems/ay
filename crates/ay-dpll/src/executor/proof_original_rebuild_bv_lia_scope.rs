@@ -216,19 +216,8 @@ impl Executor {
         self.proof_check_result = None;
         self.proof_check_ok = false;
         self.last_proof_quality = None;
-        #[cfg(feature = "proof-checker")]
-        {
-            self.run_internal_proof_check(&candidate);
-            if !self.proof_check_ok {
-                self.proof_check_result = saved_proof_check_result;
-                self.proof_check_ok = saved_proof_check_ok;
-                self.last_proof_quality = saved_proof_quality;
-                self.last_statistics = saved_statistics;
-                return false;
-            }
-        }
-        #[cfg(not(feature = "proof-checker"))]
-        if self.self_check() {
+        self.run_internal_proof_check(&candidate);
+        if !self.proof_check_ok {
             self.proof_check_result = saved_proof_check_result;
             self.proof_check_ok = saved_proof_check_ok;
             self.last_proof_quality = saved_proof_quality;

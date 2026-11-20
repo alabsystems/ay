@@ -20,6 +20,7 @@ pub(in crate::solver) mod root;
 mod rescan_tests;
 
 use super::*;
+use pinned_retry::PinRetryOutcome;
 
 impl Solver {
     /// Compute the LRAT proof chain for literals removed during shrink/minimize.
@@ -280,6 +281,7 @@ impl Solver {
             }};
         }
         let retry_writes_no_proof = self.level0_retry_writes_no_proof();
+        let mut memoized_retries = 0usize;
         for slot in 0..visited_entries {
             let i = if slot < retry_len {
                 pinned[slot]
@@ -287,8 +289,13 @@ impl Solver {
                 start + (slot - retry_len)
             };
             if slot < retry_len && retry_writes_no_proof {
-                if self.retry_pinned_level0_unit_without_proof(i) {
-                    keep_pinned!(i);
+                match self.retry_pinned_level0_unit_without_proof(i) {
+                    PinRetryOutcome::LeavesPinned => {}
+                    PinRetryOutcome::StaysPinned => keep_pinned!(i),
+                    PinRetryOutcome::StaysPinnedMemoized => {
+                        memoized_retries += 1;
+                        keep_pinned!(i);
+                    }
                 }
                 continue;
             }
@@ -388,12 +395,13 @@ impl Solver {
         pinned.truncate(kept);
         self.cold.lrat_level0_unit_materialize_pinned = pinned;
         self.cold.lrat_level0_unit_materialize_cursor = level0_end;
-        // Charge the entries actually visited, not the suffix after the oldest
-        // pin that A5 no longer traverses. This is scan work, not retained
-        // storage: literal/hint copies keep their separate trace-add charges.
-        // Keep the existing post-pass debit and restore scratch before refusal.
-        if visited_entries != 0 {
-            self.charge_proof_bookkeeping(visited_entries as u64);
+        // Charge the entries actually rescanned, not the suffix after the
+        // oldest pin that A5 no longer traverses and not memo-hit retries
+        // (DR-AY-SAT-PIN-MEMO-CHARGE-20261119). This is scan work, not
+        // retained storage: literal/hint copies keep their separate
+        // trace-add charges. Keep the existing post-pass debit.
+        if visited_entries > memoized_retries {
+            self.charge_proof_bookkeeping((visited_entries - memoized_retries) as u64);
         }
     }
 
@@ -510,6 +518,7 @@ impl Solver {
         p.work(pinned.len())?;
         let retry_len = pinned.partition_point(|&p| p < start);
         let mut visited_entries = 0usize;
+        let mut memoized_retries = 0usize;
         // Surviving pins are compacted in place: the write index never
         // overtakes the retry read index, and slots at or past `retry_len`
         // are stale (at or past `start`) and dropped by the final truncate.
@@ -564,8 +573,13 @@ impl Solver {
             }
             visited_entries += 1;
             if from_retry && retry_writes_no_proof {
-                if solver.retry_pinned_level0_unit_without_proof(i) {
-                    keep_pinned!(i);
+                match solver.retry_pinned_level0_unit_without_proof(i) {
+                    PinRetryOutcome::LeavesPinned => {}
+                    PinRetryOutcome::StaysPinned => keep_pinned!(i),
+                    PinRetryOutcome::StaysPinnedMemoized => {
+                        memoized_retries += 1;
+                        keep_pinned!(i);
+                    }
                 }
                 continue;
             }
@@ -735,10 +749,12 @@ impl Solver {
         scratch.cursor = next_cursor;
         solver.stats.lrat_materialize_root_trail_entries += visited_entries as u64;
         // A truncated pass still performed its visited prefix, but neither
-        // cancellation nor an old pin licenses charging an unvisited suffix.
-        // Trace-copy charges and the irreversible exhaustion latch are unchanged.
-        if visited_entries != 0 {
-            solver.charge_proof_bookkeeping(visited_entries as u64);
+        // cancellation nor an old pin licenses charging an unvisited suffix,
+        // and memo-hit retries rescanned nothing
+        // (DR-AY-SAT-PIN-MEMO-CHARGE-20261119). Trace-copy charges and the
+        // irreversible exhaustion latch are unchanged.
+        if visited_entries > memoized_retries {
+            solver.charge_proof_bookkeeping((visited_entries - memoized_retries) as u64);
         }
         p.work(0)?;
         scratch.complete = true;

@@ -507,10 +507,19 @@ fn catalog_identifier(text: &str) -> bool {
 }
 
 fn validate_shape(snapshot: &Snapshot) -> Result<(), String> {
-    let profile = canonical_profile()?;
+    validate_shape_for(snapshot, &canonical_profile()?)
+}
+
+pub(super) fn validate_recorded_source(inventory: &Value, profile: &Profile) -> Result<(), String> {
+    let snapshot = Snapshot::deserialize(inventory)
+        .map_err(|error| format!("invalid recorded reference source inventory: {error}"))?;
+    validate_shape_for(&snapshot, profile)
+}
+
+fn validate_shape_for(snapshot: &Snapshot, profile: &Profile) -> Result<(), String> {
     if snapshot.schema != SCHEMA
         || snapshot.profile_id != profile.id
-        || snapshot.profile_sha256 != canonical_profile_sha256()?
+        || snapshot.profile_sha256 != profile_sha256(profile)?
         || snapshot.source_repository != profile.z3_overlay.source_repository
         || snapshot.source_commit != profile.z3_overlay.source_commit
         || snapshot.source_tree_sha256 != profile.z3_overlay.tracked_source_tree_sha256

@@ -1096,7 +1096,7 @@ fn test_bv_cache_reuse_keeps_circuit_and_subterm_bits() {
 include!("tests_check_sat/pdr_no_progress.rs");
 include!("tests_check_sat/bv_range_facts.rs");
 
-/// Regression (2026-09-23, `LIA_finite_domain_deadline_2026-09-23.md`): a
+/// Regression (2026-09-23, the development design notes at `9598c4206`): a
 /// theory-UNSAT query with Boolean structure livelocked in the DPLL(T) loop.
 /// The #5384 UNSAT replay re-added only the initial CNF, not the Farkas
 /// blocking clauses the loop had learned from LIA, so its fresh solver was

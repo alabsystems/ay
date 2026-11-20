@@ -39,7 +39,12 @@
 //! decided. For a reason of two or more literals every remaining branch keeps
 //! the slot, so the chain walk is never needed. The pinned list, the cursor,
 //! every recorded proof id and the return value are therefore exactly the
-//! full retry's. So is the #A2b waste charge, which reads only the list.
+//! full retry's. The #A2b waste charge originally read only the list;
+//! since DR-AY-SAT-PIN-MEMO-CHARGE-20261119 a memo-hit retry (below)
+//! charges nothing, because it rescans nothing — measured on
+//! cruise-control, ~275 permanent pins retried ~680 times each had
+//! charged ~187k of the 250k budget for skipped work and poisoned the
+//! clause trace before main search.
 //!
 //! The differences are diagnostic only:
 //! * `lrat_materialize[_minimize]_incomplete_chains` and the
@@ -112,6 +117,18 @@ pub(in crate::solver) fn with_full_pinned_retry<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Outcome of one pinned-slot retry in a solver that writes no proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PinRetryOutcome {
+    /// The slot stays pinned after a real rescan of its inputs.
+    StaysPinned,
+    /// The slot stays pinned and no rescan happened: the stay-pinned
+    /// memo fingerprint matched, so the #A2b charge must skip the slot.
+    StaysPinnedMemoized,
+    /// The slot leaves the pinned list.
+    LeavesPinned,
+}
+
 impl Solver {
     /// Whether every proof addition this solver makes returns 0 and reaches
     /// no checker: no proof manager writes it and no forward checker records
@@ -177,8 +194,10 @@ impl Solver {
 
     /// Retry pinned root-trail slot `i` in a solver that writes no proof
     /// ([`Self::level0_retry_writes_no_proof`]), with exactly the effect of
-    /// the full retry. Returns whether the slot stays pinned.
-    pub(super) fn retry_pinned_level0_unit_without_proof(&mut self, i: usize) -> bool {
+    /// the full retry. A `StaysPinnedMemoized` outcome performed no
+    /// rescan: the fingerprint matched, so callers must not debit the
+    /// #A2b bookkeeping budget for the slot.
+    pub(super) fn retry_pinned_level0_unit_without_proof(&mut self, i: usize) -> PinRetryOutcome {
         let fingerprint = self.pin_retry_fingerprint(i);
         let var_idx = self.trail[i].variable().index();
         if fingerprint != 0
@@ -189,7 +208,7 @@ impl Solver {
                 .copied()
                 == Some(fingerprint)
         {
-            return true;
+            return PinRetryOutcome::StaysPinnedMemoized;
         }
         let stays = self.retry_pinned_level0_unit_without_proof_inner(i);
         if fingerprint != 0 {
@@ -197,7 +216,11 @@ impl Solver {
                 *memo = if stays { fingerprint } else { 0 };
             }
         }
-        stays
+        if stays {
+            PinRetryOutcome::StaysPinned
+        } else {
+            PinRetryOutcome::LeavesPinned
+        }
     }
 
     fn retry_pinned_level0_unit_without_proof_inner(&mut self, i: usize) -> bool {

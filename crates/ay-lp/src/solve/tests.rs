@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use crate::model::{Constraint, RowKind, Sense, VarKind, Variable};
+use crate::model::{Constraint, RowKind, Sense, Solution, VarKind, Variable};
 
 #[test]
 fn test_solve_continuous() {
@@ -220,4 +220,117 @@ fn test_pick_fractional_scores_negative_values_symmetrically() {
     assert!((fractional_score(-2.4) - 0.4).abs() < 1e-12);
     assert!((fractional_score(2.4) - 0.4).abs() < 1e-12);
     assert_eq!(pick_fractional(&p, &[-2.4, 3.1]), Some((0, -2.4)));
+}
+
+/// Every improving incumbent reaches the callback as soon as it is found,
+/// each is feasible, and the last one is the proven optimum.
+#[test]
+fn test_incumbents_are_reported_in_improving_order() {
+    // max 3x + 4y s.t. 2x + 3y <= 6, x,y in {0,1,2}, integer: optimum 8 at
+    // (0, 2) (see test_solve_integer_knapsack).
+    let mut p = Problem::new();
+    p.sense = Sense::Max;
+    for (name, obj) in [("x", 3.0), ("y", 4.0)] {
+        p.variables.push(Variable {
+            name: name.into(),
+            obj_coeff: obj,
+            lower: 0.0,
+            upper: 2.0,
+            kind: VarKind::Integer,
+        });
+    }
+    p.constraints.push(Constraint {
+        name: "cap".into(),
+        kind: RowKind::Le,
+        coeffs: vec![(0, 2.0), (1, 3.0)],
+        rhs: 6.0,
+    });
+    let mut seen: Vec<Solution> = Vec::new();
+    let sol = solve_with_incumbents(&p, &mut |s| seen.push(s.clone())).expect("solve");
+    assert!((sol.objective - 8.0).abs() < 1e-6);
+    let last = seen.last().expect("at least one incumbent");
+    assert_eq!(last.values, sol.values);
+    for pair in seen.windows(2) {
+        assert!(pair[1].objective > pair[0].objective);
+    }
+    for s in &seen {
+        assert!(solution_values_feasible(&p, &s.values));
+    }
+}
+
+/// AY-N6: a MIP too large for the dense tableau stops with `ResourceLimit`
+/// (no abort, no incumbent claimed).
+#[test]
+fn test_too_large_mip_stops_with_resource_limit() {
+    let n = 100_000;
+    let mut p = Problem::new();
+    p.sense = Sense::Min;
+    for i in 0..n {
+        p.variables.push(Variable {
+            name: format!("x{i}"),
+            obj_coeff: 1.0,
+            lower: 0.0,
+            upper: 1.0,
+            kind: VarKind::Binary,
+        });
+    }
+    p.constraints.push(Constraint {
+        name: "cover".into(),
+        kind: RowKind::Ge,
+        coeffs: (0..n).map(|i| (i, 1.0)).collect(),
+        rhs: 1.0,
+    });
+    let mut reported = 0usize;
+    let err = solve_with_incumbents(&p, &mut |_| reported += 1).expect_err("refused");
+    assert!(matches!(err, LpError::ResourceLimit(_)), "{err:?}");
+    assert_eq!(reported, 0);
+}
+
+/// `check_point` accepts a feasible point with its objective and names the
+/// first failure otherwise: a fractional integer, a bound, a row.
+#[test]
+fn test_check_point_accepts_feasible_and_rejects_violations() {
+    let mut p = Problem::new();
+    p.sense = Sense::Max;
+    for (name, obj) in [("x", 3.0), ("y", 4.0)] {
+        p.variables.push(Variable {
+            name: name.into(),
+            obj_coeff: obj,
+            lower: 0.0,
+            upper: 2.0,
+            kind: VarKind::Integer,
+        });
+    }
+    p.constraints.push(Constraint {
+        name: "cap".into(),
+        kind: RowKind::Le,
+        coeffs: vec![(0, 2.0), (1, 3.0)],
+        rhs: 6.0,
+    });
+    assert_eq!(check_point(&p, &[0.0, 2.0]), Ok(8.0));
+    assert!(check_point(&p, &[0.5, 1.0])
+        .unwrap_err()
+        .contains("not integral"));
+    assert!(check_point(&p, &[3.0, 0.0])
+        .unwrap_err()
+        .contains("outside"));
+    assert!(check_point(&p, &[2.0, 1.0])
+        .unwrap_err()
+        .contains("row 'cap'"));
+    assert!(check_point(&p, &[2.0]).is_err());
+    assert!(check_point(&p, &[f64::NAN, 0.0]).is_err());
+}
+
+/// Review finding (200554215): a marker integer column with no BOUNDS entry
+/// is in [0, 1] for the MIPLIB checker, and `check_point` accepted `x = 2`
+/// on it. Parsed from MPS, the column now has the checker's bounds and the
+/// point is refused.
+#[test]
+fn test_check_point_refuses_point_outside_checker_default_integer_bounds() {
+    let p = crate::parse_mps(
+        "NAME B\nROWS\n N OBJ\n L C1\nCOLUMNS\n    M 'MARKER' 'INTORG'\n    X OBJ 1 C1 1\n    M 'MARKER' 'INTEND'\nRHS\n    RHS C1 5\nENDATA\n",
+    )
+    .expect("parse");
+    assert_eq!(check_point(&p, &[1.0]), Ok(1.0));
+    assert!(check_point(&p, &[2.0]).unwrap_err().contains("outside"));
 }

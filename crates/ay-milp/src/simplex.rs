@@ -1188,6 +1188,12 @@ pub(crate) struct FloatLp {
     /// there is no seed vertex to protect. That claim was taken on the metro
     /// wcnfs, which are not in this tree; it is not re-derivable here.
     pub(crate) plain_cold: bool,
+    /// A STANDALONE solve: an `LpSession` query, not a branch-and-bound node.
+    /// Such a solve walks thousands of pivots from a cold or distant basis,
+    /// so on a dense factor the refactorization, not the Forrest-Tomlin
+    /// update, is the cost; see `Simplex::refactor_cadence`. The node lanes
+    /// never set it, so their cadence and every tree they search are unchanged.
+    pub(crate) standalone: bool,
     /// PER-INSTANCE eager anti-degeneracy (see `eager_perturb_mode`): perturb the box
     /// before the walk, restore before judging — path-only, never the answer. Set by
     /// callers whose LPs are KNOWN degenerate crawls (the lift-and-project CGLP: measured
@@ -3148,6 +3154,7 @@ impl FloatLp {
             eager_affine_crash: false,
             range_logical_triangular_crash: false,
             plain_cold: false,
+            standalone: false,
             eager_perturb: false,
             cold_stalled: std::cell::Cell::new(false),
             mat_scale,
@@ -3204,6 +3211,7 @@ impl FloatLp {
             return false;
         }
         fresh.plain_cold = self.plain_cold;
+        fresh.standalone = self.standalone;
         fresh.eager_affine_crash = self.eager_affine_crash;
         fresh.range_logical_triangular_crash = self.range_logical_triangular_crash;
         fresh.chain_distress_probe_iters = self.chain_distress_probe_iters;
@@ -3225,6 +3233,99 @@ impl FloatLp {
         // Warm bases elsewhere in the tree now predate this matrix: arm the dual
         // simplex's entry bound-flip repair for every later solve on this LP.
         self.cut_slots_live.set(true);
+        true
+    }
+
+    /// Replace this LP's objective IN PLACE, keeping the lowered matrix, the
+    /// bounds and any equilibration.
+    ///
+    /// The resulting cost state is exactly what [`Self::from_model`] builds for
+    /// `objective`/`sense` over the same model: a repeated column overwrites
+    /// (the `from_model` convention), Maximize is stored negated, and the
+    /// cost-dependent tolerance scales (`cost_scale`, `scale`, and in the
+    /// equilibrated frame `scost_scale`/`sscale`) are recomputed the way the
+    /// constructor and [`Self::equilibrate`] compute them. An armed objective
+    /// cutoff belongs to the old objective and is cleared.
+    ///
+    /// This is what lets a caller that bounds many linear forms over one
+    /// fixed matrix (an `LpSession`'s OBBT and bound queries) lower the matrix
+    /// once instead of once per query.
+    ///
+    /// `false` (and no change) when an entry is non-finite or out of range, or
+    /// when the equilibrated frame would not keep a new cost a normal `f64`
+    /// (the same SAFE test `equilibrate` applies); the caller lowers afresh.
+    pub(crate) fn set_objective(&mut self, objective: &[(u32, f64)], sense: Sense) -> bool {
+        // Must match `equilibrate`'s SAFE exponent bound.
+        const SAFE: i32 = 900;
+        for &(c, a) in objective {
+            if !a.is_finite() || c as usize >= self.n {
+                return false;
+            }
+            if !self.cexp.is_empty()
+                && a != 0.0
+                && (bexp(a) + i32::from(self.cexp[c as usize])).abs() > SAFE
+            {
+                return false;
+            }
+        }
+        let flip = matches!(sense, Sense::Maximize);
+        self.cost.fill(0.0);
+        let mut cost_scale = 1.0f64;
+        for &(c, a) in objective {
+            self.cost[c as usize] = if flip { -a } else { a };
+            cost_scale = cost_scale.max(a.abs());
+        }
+        self.cost_scale = cost_scale;
+        // `from_model` grows `scale` from 1.0 over exactly the matrix entries,
+        // the finite row bounds and the objective, i.e. the max of the three.
+        self.scale = self.mat_scale.max(self.rhs_scale).max(cost_scale);
+        self.sense = sense;
+        if !self.cexp.is_empty() {
+            let mut scost = 1.0f64;
+            for j in 0..self.n {
+                scost = scost.max((self.cost[j] * self.val_mul[j]).abs());
+            }
+            let mut sscale = self.smat_scale;
+            for j in 0..self.cols {
+                for b in [
+                    self.lower[j] * self.bnd_mul[j],
+                    self.upper[j] * self.bnd_mul[j],
+                ] {
+                    if b.is_finite() {
+                        sscale = sscale.max(b.abs());
+                    }
+                }
+            }
+            self.scost_scale = scost;
+            self.sscale = sscale.max(scost);
+        }
+        self.cutoff.set(f64::INFINITY);
+        true
+    }
+
+    /// `true` when [`Self::equilibrate`] installed a scaled frame.
+    #[cfg(test)]
+    pub(crate) fn is_equilibrated(&self) -> bool {
+        !self.cexp.is_empty()
+    }
+
+    /// Address of the lowered matrix storage: equal across calls exactly when
+    /// the same lowering is still in use (no fresh `from_model`).
+    #[cfg(test)]
+    pub(crate) fn matrix_identity(&self) -> usize {
+        self.col_val.as_ptr() as usize
+    }
+
+    /// Narrow structural column `j`'s stored bounds in place, as a model
+    /// `set_col_bounds` followed by a fresh lowering would. Refused (`false`,
+    /// no change) on an equilibrated LP, whose scaled frame and SAFE test were
+    /// fixed against the old bounds; the caller lowers afresh then.
+    pub(crate) fn set_structural_bounds(&mut self, j: usize, lower: f64, upper: f64) -> bool {
+        if j >= self.n || lower.is_nan() || upper.is_nan() || !self.cexp.is_empty() {
+            return false;
+        }
+        self.lower[j] = lower;
+        self.upper[j] = upper;
         true
     }
 
@@ -6403,8 +6504,24 @@ impl Simplex {
     /// The refactor cadence this solve pivots under: `lu_refactor_every()`
     /// (Lever A1b) when the FT engine backs a tall-not-wide LP, the
     /// historical size policy everywhere else.
+    /// Pivots between scheduled refactorizations.
+    ///
+    /// The tall-LU band's 20 (see `lu_refactor_every`) was measured on
+    /// branch-and-bound node re-solves, where few pivots run per solve and the
+    /// Forrest-Tomlin update dominates (qiu: refactor 1.44 s against update
+    /// 5.77 s). A STANDALONE solve (`FloatLp::standalone`) is the opposite
+    /// regime on a dense factor: thousands of pivots, each refactorization the
+    /// dominant cost. On NY's CIFAR-100 relaxation `hard-six` w2 (6,303 x 4,284,
+    /// 1.85 M nonzeros, 10,331 primal pivots) refactoring every 20 spent 31-36 s
+    /// of a 44-54 s solve; every 50, 14.3 s of 26.4 s; 100 and 200 gave 24.3 s
+    /// and 24.7 s, same optimum. On the paired-difference probe (dual simplex,
+    /// 3,930 rows) 20 -> 50 was 6.2 -> 4.5 s and 100/200 were slower than 50.
+    /// Standalone solves therefore take the general cadence, which is 50 in
+    /// this band: the shipped default before 2026-08-11, so no untried drift
+    /// regime. Drift-triggered refactorizations and the end-of-solve verify
+    /// are unchanged.
     fn refactor_cadence(&self, lp: &FloatLp) -> usize {
-        if self.lu.is_some() && lp.tall_lu() && self.m < REFACTOR_TALL_ROWS {
+        if self.lu.is_some() && lp.tall_lu() && self.m < REFACTOR_TALL_ROWS && !lp.standalone {
             lu_refactor_every()
         } else {
             refactor_every(self.m)
@@ -14380,5 +14497,162 @@ mod equilibration_kernel_tests {
                 FloatLp::from_model(&f.model, &unit_costs(&f), Sense::Minimize).expect("lowers");
             assert!(!lp.scaled(), "equilibration must ship OFF by default");
         }
+    }
+}
+
+#[cfg(test)]
+mod set_objective_tests {
+    use super::*;
+    use crate::tune::{activate_caller, Knob, Profile, Setting};
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// A signed dyadic in {±1/4, ..., ±2}.
+        fn dyadic(&mut self) -> f64 {
+            let v = (1 + self.below(8)) as f64 / 4.0;
+            if self.below(2) == 0 {
+                v
+            } else {
+                -v
+            }
+        }
+    }
+
+    /// Covering rows over `[0,4]^n` (feasible at x = 2), plus a few rows with
+    /// widely spread magnitudes so the forced equilibration has work to do.
+    fn lp_model(rng: &mut Rng) -> Model {
+        let mut model = Model::new();
+        let cols: Vec<Col> = (0..16).map(|_| model.add_col(0.0, 4.0)).collect();
+        for r in 0..10 {
+            let mut coeffs = Vec::new();
+            for &c in &cols {
+                if rng.below(5) < 3 {
+                    let scale = if r < 3 { 2f64.powi(30) } else { 1.0 };
+                    coeffs.push((c, rng.dyadic().abs() * scale));
+                }
+            }
+            if coeffs.is_empty() {
+                coeffs.push((cols[0], 1.0));
+            }
+            let lb: f64 = coeffs.iter().map(|&(_, a)| a).sum();
+            model.add_row(lb, f64::INFINITY, &coeffs);
+        }
+        model
+    }
+
+    fn objective(rng: &mut Rng, n: usize) -> Vec<(u32, f64)> {
+        let mut out = Vec::new();
+        for j in 0..n as u32 {
+            if rng.below(3) > 0 {
+                out.push((j, rng.dyadic()));
+            }
+        }
+        out
+    }
+
+    fn value(lp: &FloatLp, cand: &Candidate) -> f64 {
+        (0..lp.n).map(|j| lp.cost[j] * cand.values[j]).sum()
+    }
+
+    fn assert_same_cost_state(reused: &FloatLp, fresh: &FloatLp) {
+        assert_eq!(reused.cost, fresh.cost);
+        assert_eq!(reused.cost_scale.to_bits(), fresh.cost_scale.to_bits());
+        assert_eq!(reused.scale.to_bits(), fresh.scale.to_bits());
+        assert_eq!(reused.scost_scale.to_bits(), fresh.scost_scale.to_bits());
+        assert_eq!(reused.sscale.to_bits(), fresh.sscale.to_bits());
+        assert_eq!(reused.sense, fresh.sense);
+    }
+
+    fn reused_matches_fresh(equilibrate: bool) {
+        let _scaling = equilibrate
+            .then(|| activate_caller(Profile::EMPTY.with(Knob::Scale, Setting::Count(1))));
+        for seed in 1..=8u64 {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let model = lp_model(&mut rng);
+            let first = objective(&mut rng, model.num_cols());
+            let mut reused = FloatLp::from_model(&model, &first, Sense::Minimize).unwrap();
+            assert_eq!(reused.is_equilibrated(), equilibrate, "seed {seed}");
+            reused.plain_cold = true;
+            for round in 0..6 {
+                let sense = if round % 2 == 0 {
+                    Sense::Minimize
+                } else {
+                    Sense::Maximize
+                };
+                let obj = objective(&mut rng, model.num_cols());
+                reused.cutoff.set(-1e300);
+                assert!(reused.set_objective(&obj, sense));
+                assert_eq!(reused.cutoff.get(), f64::INFINITY, "stale cutoff cleared");
+                let mut fresh = FloatLp::from_model(&model, &obj, sense).unwrap();
+                fresh.plain_cold = true;
+                assert_same_cost_state(&reused, &fresh);
+                let a = reused.solve(None);
+                let b = fresh.solve(None);
+                assert_eq!(a.status, b.status, "seed {seed} round {round}");
+                if a.status == SimplexStatus::Optimal {
+                    let (za, zb) = (value(&reused, &a), value(&fresh, &b));
+                    assert!(
+                        (za - zb).abs() <= 1e-6 * (1.0 + zb.abs()),
+                        "seed {seed} round {round}: {za} vs {zb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_objective_matches_a_fresh_lowering() {
+        reused_matches_fresh(false);
+    }
+
+    #[test]
+    fn set_objective_matches_a_fresh_lowering_when_equilibrated() {
+        reused_matches_fresh(true);
+    }
+
+    #[test]
+    fn set_objective_keeps_the_overwrite_convention_and_refuses_bad_entries() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let y = model.add_col(0.0, 1.0);
+        model.add_row(1.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
+        let mut lp = FloatLp::from_model(&model, &[(0, 1.0)], Sense::Minimize).unwrap();
+        let duplicate = [(0, 3.0), (0, 2.0), (1, 1.0)];
+        assert!(lp.set_objective(&duplicate, Sense::Minimize));
+        let fresh = FloatLp::from_model(&model, &duplicate, Sense::Minimize).unwrap();
+        assert_same_cost_state(&lp, &fresh);
+        let before = lp.cost.clone();
+        assert!(!lp.set_objective(&[(0, f64::NAN)], Sense::Minimize));
+        assert!(!lp.set_objective(&[(7, 1.0)], Sense::Minimize));
+        assert_eq!(lp.cost, before, "a refused objective changes nothing");
+    }
+
+    #[test]
+    fn structural_bounds_update_in_place_only_without_equilibration() {
+        let mut rng = Rng(42);
+        let mut model = lp_model(&mut rng);
+        let obj = objective(&mut rng, model.num_cols());
+        let mut lp = FloatLp::from_model(&model, &obj, Sense::Minimize).unwrap();
+        assert!(lp.set_structural_bounds(3, 1.0, 3.5));
+        model.set_col_bounds(Col(3), 1.0, 3.5);
+        let fresh = FloatLp::from_model(&model, &obj, Sense::Minimize).unwrap();
+        assert_eq!(lp.lower, fresh.lower);
+        assert_eq!(lp.upper, fresh.upper);
+        assert!(!lp.set_structural_bounds(99, 0.0, 1.0));
+        let _scaling = activate_caller(Profile::EMPTY.with(Knob::Scale, Setting::Count(1)));
+        let mut scaled = FloatLp::from_model(&model, &obj, Sense::Minimize).unwrap();
+        assert!(scaled.is_equilibrated());
+        assert!(!scaled.set_structural_bounds(3, 1.5, 3.0));
     }
 }

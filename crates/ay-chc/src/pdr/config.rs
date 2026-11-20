@@ -75,7 +75,7 @@ impl LiaFarkasTemplateSurface {
     }
 }
 
-/// Oracle backend of the Spacer lane (`DESIGN_spacer_pob_lemma_pipeline.md` §3.4).
+/// Oracle backend of the Spacer lane (the development design notes at `9598c4206`, §3.4).
 ///
 /// `Session` records the requested incremental route. The current oracle
 /// retains the legacy query path, and the selection degrades to `Legacy` while

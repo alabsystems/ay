@@ -93,28 +93,7 @@ fn configure_ephemeral_bv_sat_solver(
     // preprocessing and restart-time inprocessing cannot amortize across
     // queries here; on large QF_ABV encodings, probing/vivification can spend
     // the whole timeout before the theory result is known.
-    //
-    // Experiment knob (#dt-array-fc-lazy): a huge Tseitin bit-blast (20M+ vars)
-    // benefits from a ONE-SHOT bounded preprocessing pass that collapses
-    // definitional vars (like z3's bit-blaster). `--bv-preprocess=quick` runs
-    // the CHEAP passes (BVE/subsumption) but skips the expensive HTR/probing
-    // that motivated disabling preprocessing here (they are gated by
-    // preprocessing_quick_mode and bounded by preprocess_timed_out()).
-    // `=full` also runs the expensive passes. Default (unset) preserves the
-    // no-preprocessing behavior exactly.
-    match ay_core::misc_cli_flags().bv_preprocess.as_deref() {
-        Some("quick") => {
-            solver.set_preprocess_enabled(true);
-            solver.set_full_preprocessing(false);
-        }
-        Some("full") => {
-            solver.set_preprocess_enabled(true);
-            solver.set_full_preprocessing(true);
-        }
-        _ => {
-            solver.set_preprocess_enabled(false);
-        }
-    }
+    solver.set_preprocess_enabled(false);
     solver.disable_all_inprocessing();
     solver.set_congruence_enabled(false);
     solver.set_condition_enabled(false);
@@ -154,6 +133,31 @@ pub(in crate::executor) mod forced_blast_cut {
 
     pub(super) fn take() -> Option<BlastCut> {
         FORCED.with(Cell::take)
+    }
+}
+
+/// A stop landing during the eager clause load, for tests: the next eager
+/// clause load on this thread raises the armed flag once it has finished
+/// loading, as a deadline or interrupt arriving mid-load would be seen.
+#[cfg(test)]
+pub(in crate::executor) mod stop_during_clause_load {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static ARMED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    /// Arm (or disarm) the next clause load on this thread.
+    pub(in crate::executor) fn arm(flag: Option<Arc<AtomicBool>>) {
+        ARMED.with(|armed| *armed.borrow_mut() = flag);
+    }
+
+    pub(super) fn fire() {
+        if let Some(flag) = ARMED.with(|armed| armed.borrow_mut().take()) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -558,6 +562,13 @@ impl Executor {
         }
         let encoding = &owner;
         let mut recorded_blast_stop = None;
+        // Whether this solve reached a SAT search: set only once the whole
+        // encoding (bit-blast, SAT construction and the clause load) is in
+        // the solver, immediately before the solve call. The incremental path
+        // counts as reached: it interleaves encoding and search. An Unknown
+        // before it that a stop published is an encoding the stop cut short
+        // (`bv_encodings_stopped_before_search`).
+        let mut search_entered = false;
         let mut trace_caller = None;
         let result = (|| {
             // Certificate export is deliberately a fresh, eager per-check mode.
@@ -1028,6 +1039,8 @@ impl Executor {
             // Tseitin/BvSolver/SatSolver state management. This path only encodes NEW
             // assertions incrementally and adds definitional clauses globally.
             if config.incremental {
+                search_entered = true;
+                self.bv_sat_searches_entered = self.bv_sat_searches_entered.saturating_add(1);
                 let result = self.solve_bv_incremental_inner(&config, proof_enabled, encoding);
                 return self.fail_close_incomplete_finite_array_sat(result);
             }
@@ -1506,6 +1519,7 @@ impl Executor {
             // congruence is sound for UNSAT only — any CDCL SAT below must be
             // degraded to Unknown while `congruence_bail` is set.
             let mut congruence_bail = euf_bv_congruence_bail;
+            let mut non_bv_congruence_bail = None;
             if config.non_bv_congruence {
                 let congruence_outcome = self.generate_non_bv_euf_congruence(
                     &term_bits,
@@ -1515,6 +1529,7 @@ impl Executor {
                     &mut all_clauses,
                     assumptions,
                 );
+                non_bv_congruence_bail = congruence_outcome.bail;
                 congruence_bail = CongruenceBail::merge(congruence_bail, congruence_outcome.bail);
                 if congruence_bail.is_some() && ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace non-bv-congruence-bailed");
@@ -1563,6 +1578,9 @@ impl Executor {
             }
 
             // --- Phase 10: SAT solving ---
+            // Still encoding: the SAT solver's construction and the clause
+            // load below are part of the encoding; `search_entered` is set
+            // after the load.
             phase_trace!("phase10-sat");
             if phase_trace_start.is_some() {
                 let total_lits: usize = all_clauses.iter().map(|c| c.literals().len()).sum();
@@ -1737,6 +1755,27 @@ impl Executor {
                     solver.add_clause_prenormalized(&lit_buf);
                 }
             }
+            #[cfg(test)]
+            stop_during_clause_load::fire();
+            // The clause load (one call per clause, ~10M on a deep BMC
+            // unrolling) does not poll. A stop that landed during it ended
+            // the encoding, not a search: report it as such rather than let
+            // the solve call return Unknown at its first poll
+            // (DR-CHC-BV-LANE-E-GOVERNED-20261118).
+            if !encoding.open() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return self.abort_bv_encoding();
+            }
+            if self.should_abort_theory_loop() {
+                if let Some((_, original)) = var_subst {
+                    self.ctx.assertions = original;
+                }
+                return Ok(SolveResult::Unknown);
+            }
+            search_entered = true;
+            self.bv_sat_searches_entered = self.bv_sat_searches_entered.saturating_add(1);
 
             // When assumptions are present, use solve_with_assumptions for unsat core
             // extraction. Otherwise use the standard solve() path.
@@ -1899,6 +1938,10 @@ impl Executor {
             let mut solve_result;
 
             let mut spent = ChainSpend::NONE;
+            // The delayed-op state after its refinement loop, kept for the
+            // lazy congruence completion below (#bv-congruence-lazy): a
+            // re-solve there can disturb an op that is still abstract.
+            let mut delayed_for_audit = None;
 
             if has_delayed_ops {
                 let mut ds = delayed_state
@@ -2236,6 +2279,7 @@ impl Executor {
                     current_result = SatResult::Unknown;
                 }
                 solve_result = current_result;
+                delayed_for_audit = Some(ds);
                 self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
             } else {
                 // Bound the learned-clause DB on the long naked solve (#dt-array-fc-lazy),
@@ -2307,6 +2351,45 @@ impl Executor {
                     max_cegar_iterations,
                     &mut spent,
                 );
+            }
+
+            // #bv-congruence-lazy (AY-SMT-7): a BV-return congruence pass
+            // that stopped at its count cap is completed lazily — the model
+            // is checked against every pair the full pass would have
+            // emitted, and only the violated pairs' clauses are added —
+            // instead of withholding every SAT. Only when that pass alone
+            // bailed (the non-BV pass and the array axioms have no lazy
+            // completion here).
+            if euf_bv_congruence_bail == Some(CongruenceBail::Count)
+                && non_bv_congruence_bail.is_none()
+                && !config.array_axioms
+                && matches!(solve_result, SatResult::Sat(_))
+            {
+                let (refined, remaining, added_any) = self.refine_capped_bv_congruence(
+                    solve_result,
+                    &term_bits,
+                    &bv_bool_to_var,
+                    var_offset,
+                    assumptions,
+                    &mut solver,
+                    &mut spent,
+                );
+                solve_result = refined;
+                congruence_bail = remaining;
+                // A re-solve may break a delayed op the loop above left
+                // abstract: keep the bail unless every op still holds.
+                if added_any && congruence_bail.is_none() {
+                    if let (Some(ds), SatResult::Sat(model)) =
+                        (delayed_for_audit.as_mut(), &solve_result)
+                    {
+                        if ds.has_unresolved() {
+                            let (cheap, circuits) = ds.check(model, var_offset);
+                            if !cheap.is_empty() || !circuits.is_empty() {
+                                congruence_bail = Some(CongruenceBail::Count);
+                            }
+                        }
+                    }
+                }
             }
 
             if !self.finite_array_expansion.is_complete()
@@ -2636,7 +2719,7 @@ impl Executor {
             .as_ref()
             .is_some_and(consuming_trace::TraceCaller::stopped);
         drop(trace_caller);
-        if result.is_ok() && (trace_stopped || !owner.open()) {
+        let result = if result.is_ok() && (trace_stopped || !owner.open()) {
             let aborted = self.abort_bv_encoding();
             // The original blast's sticky cause outlives temporary memory
             // readings and raw flag resets during cleanup.
@@ -2646,7 +2729,28 @@ impl Executor {
             aborted
         } else {
             result
+        };
+        // Counted from the stop this solve actually published (the blast's
+        // recorded cut, or the origin `should_abort_theory_loop` /
+        // `abort_bv_encoding` published), not from a reading taken after the
+        // solve returned: a non-stop Unknown whose deadline expires a moment
+        // later is not an encoding cut.
+        if !search_entered
+            && matches!(result, Ok(SolveResult::Unknown))
+            && (recorded_blast_stop.is_some()
+                || matches!(
+                    self.unknown_origin(),
+                    Some(
+                        UnknownOrigin::InterruptFlag
+                            | UnknownOrigin::SolveDeadline
+                            | UnknownOrigin::MemoryBudget
+                    )
+                ))
+        {
+            self.bv_encodings_stopped_before_search =
+                self.bv_encodings_stopped_before_search.saturating_add(1);
         }
+        result
     }
 
     /// Finalize a BV UNSAT result: save proof state, set result, build proof.

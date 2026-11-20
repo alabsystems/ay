@@ -15,6 +15,7 @@ use crate::engine_result::ValidationEvidence;
 use crate::kind::{KindConfig, KindResult, KindSolver};
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::{Counterexample, CounterexampleStep, InvariantModel, PdrConfig, PdrSolver};
+use crate::portfolio::engine_memory::{EngineMemoryLane, LaneMemoryLimits};
 use crate::portfolio::types::{BudgetPolicy, EngineType};
 use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver, PreprocessSummary};
 use crate::smt::{SmtResult, SmtValue};
@@ -690,7 +691,7 @@ fn has_relational_array_pair(problem: &ChcProblem) -> bool {
 
 /// Multi-predicate relational Houdini over equality candidates — increment **I1**
 /// of the gold safe-side invariant-synthesis build (see
-/// the development design notes).
+/// the development design notes at `8dd63d700`).
 ///
 /// ARRAY EXTENSION (`#chc25-array-relational`): when the problem carries
 /// Array-sorted predicate arguments (the llreve two-copy relational-equivalence
@@ -4661,6 +4662,235 @@ fn clamp_bv_lane_staged_probe_config(
     Some(config)
 }
 
+/// Memory-lane label of Lane E (original-problem BV BMC) in the governor's
+/// census and shed log.
+const ORIGINAL_BV_BMC_MEMORY_LANE: &str = "bv-original-bmc";
+
+/// Memory-lane labels of the BV lanes' on-thread preprocessing: Lane A's
+/// BvToBool, Lane B's and Lane D's BvToInt, Lane C's and the BV+array
+/// route's Lane N BV-native build.
+const BV_BOOL_PREP_MEMORY_LANE: &str = "bv-bool-prep";
+const BV_INT_PREP_MEMORY_LANE: &str = "bv-int-prep";
+const BV_NATIVE_PREP_MEMORY_LANE: &str = "bv-native-prep";
+
+/// Lane E's memory lane: the accounting group, entered on the lane thread,
+/// and the token its soft share and the governor's shed cancel — a child of
+/// the lane's token that only the BMC search observes, so a memory stop never
+/// reaches the source validation of a counterexample already found.
+struct OriginalBvBmcMemoryLane {
+    bmc_cancel: crate::CancellationToken,
+    lane: Option<EngineMemoryLane>,
+}
+
+/// Lane E: bounded counterexample search on the original BV problem, its
+/// BMC run inside its own memory lane (`bv-original-bmc`).
+///
+/// Every depth is bit-blasted from the whole unrolled prefix, so the lane's
+/// CNF and SAT clause store grow with depth: measured 10.8M clauses (about
+/// 3.3 GB resident) at depth 2 of `s3_srvr_2_BUG`, a sawtooth of re-blasts
+/// that took the process past its 5 GB ceiling in 8-30 s while the memory
+/// governor, blind to this lane, shed the productive BMC and
+/// `non_inlined_pdr` lanes instead (DR-CHC-BV-LANE-E-GOVERNED-20261118).
+/// In its memory lane the allocator charges every byte the lane's thread
+/// allocates — the bit-blaster's CNF and the SAT solver's clauses included —
+/// so crossing the soft share cancels the BMC's token (`memory.bmc_cancel`,
+/// this search only; the BMC polls it in the bit-blaster's encoding guard
+/// and between depths), and the governor sheds this lane when it is the
+/// fattest. Either way the search answers `Unknown`. The memory lane is
+/// closed before a found counterexample is source-validated under `cancel`,
+/// which no memory stop touches: a validated counterexample is sound however
+/// much memory its search used.
+fn run_original_bv_bmc_lane(
+    problem: ChcProblem,
+    route_deadline: Instant,
+    cancel: &crate::CancellationToken,
+    memory: OriginalBvBmcMemoryLane,
+    verbose: bool,
+) -> PortfolioResult {
+    if verbose {
+        safe_eprintln!("Adaptive: BV original BMC lane (Lane E) thread started");
+    }
+    let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(remaining) = bv_lane_remaining(route_deadline, &memory.bmc_cancel) else {
+            return crate::engine_result::ChcEngineResult::Unknown;
+        };
+        let bmc_plan = original_bv_bmc_lane_plan(&problem, remaining);
+        if verbose {
+            safe_eprintln!(
+                "Adaptive: BV original BMC lane plan: mode={}, max_depth={}, budget={:.1}s, per_depth={:.3}s",
+                bmc_plan.mode.label(),
+                bmc_plan.max_depth,
+                bmc_plan.time_budget.as_secs_f64(),
+                bmc_plan.per_depth_timeout.as_secs_f64(),
+            );
+        }
+        let bmc = crate::bmc::BmcSolver::new(
+            problem.clone(),
+            BmcConfig {
+                smt_lane: crate::smt::SmtLane::Verification,
+                base: ChcEngineConfig {
+                    verbose,
+                    cancellation_token: Some(memory.bmc_cancel.child()),
+                },
+                max_depth: bmc_plan.max_depth,
+                per_depth_timeout: Some(bmc_plan.per_depth_timeout),
+                time_budget: Some(bmc_plan.time_budget),
+                enable_k_induction: false,
+                enable_adaptive_stepping: false,
+                acyclic_safe: false,
+                prefer_exact_acyclic_first: false,
+                proof_cross_check: false,
+                memory_budget: None,
+                ts_probe_clamp: None,
+                soft_time_budget: None,
+                probe_extension_deadline: None,
+                resume_frontier: None,
+                sweep_past_spurious_sat: true,
+            },
+        );
+        bmc.solve()
+    }))
+    .unwrap_or_else(|payload| {
+        safe_eprintln!(
+            "Adaptive: BV original BMC lane (Lane E) panicked: {}",
+            bv_lane_panic_message(payload.as_ref())
+        );
+        crate::engine_result::ChcEngineResult::Unknown
+    });
+    finish_original_bv_bmc_lane(problem, found, route_deadline, cancel, memory, verbose)
+}
+
+/// Close Lane E's memory lane, then source-validate a counterexample the BMC
+/// found, under the lane token `cancel` (never tripped by the memory lane).
+/// Anything but a validated counterexample answers `Unknown`.
+fn finish_original_bv_bmc_lane(
+    problem: ChcProblem,
+    found: crate::engine_result::ChcEngineResult,
+    route_deadline: Instant,
+    cancel: &crate::CancellationToken,
+    memory: OriginalBvBmcMemoryLane,
+    verbose: bool,
+) -> PortfolioResult {
+    if let Some(lane) = memory.lane {
+        if verbose && lane.tripped() {
+            safe_eprintln!(
+                "Adaptive: BV original BMC lane (Lane E) stopped by its memory lane (shed={}, peak={} MiB, counterexample={})",
+                lane.shed(),
+                lane.peak_mib(),
+                matches!(found, crate::engine_result::ChcEngineResult::Unsafe(_)),
+            );
+        }
+        // Validation is not charged to (or stopped by) the search's share.
+        drop(lane);
+    }
+    let crate::engine_result::ChcEngineResult::Unsafe(cex) = found else {
+        return PortfolioResult::Unknown;
+    };
+    let validated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(validation_budget) = bv_lane_remaining(route_deadline, cancel) else {
+            return PortfolioResult::Unknown;
+        };
+        let validation_budget = validation_budget.min(Duration::from_secs(3));
+        // BMC witnesses are keyed to `problem`'s
+        // original clause indices and predicate ids.
+        let mut verifier = PdrSolver::new(
+            problem,
+            PdrConfig {
+                verbose,
+                solve_timeout: Some(validation_budget),
+                cancellation_token: Some(cancel.child()),
+                disable_array_scalarization: true,
+                preserve_original_clauses: true,
+                ..PdrConfig::default()
+            },
+        );
+        verifier.set_validation_deadline(validation_budget);
+        match verifier.verify_counterexample(&cex) {
+            crate::CexVerificationResult::Valid => {
+                if verbose {
+                    safe_eprintln!(
+                        "Adaptive: BV original BMC lane source-validated counterexample (steps={}, validation_budget={:.1}s)",
+                        cex.steps.len(),
+                        validation_budget.as_secs_f64(),
+                    );
+                }
+                PortfolioResult::Unsafe(cex)
+            }
+            crate::CexVerificationResult::Spurious => {
+                if verbose {
+                    safe_eprintln!(
+                        "Adaptive: BV original BMC lane rejected spurious counterexample"
+                    );
+                }
+                PortfolioResult::Unknown
+            }
+            crate::CexVerificationResult::Unknown => {
+                if verbose {
+                    safe_eprintln!(
+                        "Adaptive: BV original BMC lane rejected counterexample with inconclusive source validation"
+                    );
+                }
+                PortfolioResult::Unknown
+            }
+        }
+    }))
+    .unwrap_or_else(|payload| {
+        safe_eprintln!(
+            "Adaptive: BV original BMC lane (Lane E) validation panicked: {}",
+            bv_lane_panic_message(payload.as_ref())
+        );
+        PortfolioResult::Unknown
+    });
+    reject_late_bv_lane_result(validated, route_deadline, cancel)
+}
+
+fn bv_lane_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Enter Lane E's memory lane on the calling (lane) thread. Its soft share
+/// and the governor's shed cancel a child of `cancel` that only the BMC
+/// search observes.
+fn enter_original_bv_bmc_memory_lane(
+    cancel: &crate::CancellationToken,
+    limits: Option<LaneMemoryLimits>,
+) -> OriginalBvBmcMemoryLane {
+    let bmc_cancel = cancel.child();
+    let lane = EngineMemoryLane::enter(ORIGINAL_BV_BMC_MEMORY_LANE, limits, &bmc_cancel);
+    OriginalBvBmcMemoryLane { bmc_cancel, lane }
+}
+
+/// Run one lane's on-thread preprocessing (LVE, condensation, inlining, the
+/// BV transform) inside its own memory lane named `label`, so the governor's
+/// census sees it and can shed it (measured: 2.9-4.2 s and a few hundred MB
+/// per lane, previously unlabelled). Crossing the lane share, or being shed,
+/// cancels `cancel` — the whole BV lane, since it cannot continue without its
+/// preprocessed problem — and answers `None` (the lane publishes `Unknown`),
+/// including when the hard share unwound the build. Any other panic is
+/// propagated unchanged.
+fn preprocess_in_bv_memory_lane<T>(
+    label: &'static str,
+    cancel: &crate::CancellationToken,
+    memory_limits: Option<LaneMemoryLimits>,
+    build: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    let memory = EngineMemoryLane::enter(label, memory_limits, cancel);
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+    let tripped = memory.as_ref().is_some_and(EngineMemoryLane::tripped);
+    drop(memory);
+    match built {
+        _ if tripped => None,
+        Ok(built) => built,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 fn run_bv_lane_with_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
     // Worker threads do not inherit either thread-local deadline. Install both
     // absolute scopes so every nested SMT context and solver construction sees
@@ -6655,11 +6885,18 @@ impl AdaptivePortfolio {
                                 reject_late_bv_lane_result(result, route_deadline, &cancel_a);
                             let _ = tx_a.send(("BvToBool", result));
                         };
-                        let Some(summary) = PreprocessSummary::build_with_limits(
-                            problem_a,
-                            verbose,
-                            Some(route_deadline),
+                        let Some(summary) = preprocess_in_bv_memory_lane(
+                            BV_BOOL_PREP_MEMORY_LANE,
                             &cancel_a,
+                            LaneMemoryLimits::from_process_limit(),
+                            || {
+                                PreprocessSummary::build_with_limits(
+                                    problem_a,
+                                    verbose,
+                                    Some(route_deadline),
+                                    &cancel_a,
+                                )
+                            },
                         ) else {
                             publish(PortfolioResult::Unknown);
                             return;
@@ -6719,14 +6956,19 @@ impl AdaptivePortfolio {
                         publish("BvToInt", PortfolioResult::Unknown);
                         return;
                     }
-                    let Some(relaxed_summary) =
-                        PreprocessSummary::build_int_relaxed_with_limits(
-                            problem_b.clone(),
-                            verbose,
-                            Some(route_deadline),
-                            &cancel_b,
-                        )
-                    else {
+                    let Some(relaxed_summary) = preprocess_in_bv_memory_lane(
+                        BV_INT_PREP_MEMORY_LANE,
+                        &cancel_b,
+                        LaneMemoryLimits::from_process_limit(),
+                        || {
+                            PreprocessSummary::build_int_relaxed_with_limits(
+                                problem_b.clone(),
+                                verbose,
+                                Some(route_deadline),
+                                &cancel_b,
+                            )
+                        },
+                    ) else {
                         publish("BvToInt", PortfolioResult::Unknown);
                         return;
                     };
@@ -6828,11 +7070,18 @@ impl AdaptivePortfolio {
                     }
 
                     // Phase 2: Exact BvToInt + KIND.
-                    let Some(summary) = PreprocessSummary::build_int_only_with_limits(
-                        problem_b,
-                        verbose,
-                        Some(route_deadline),
+                    let Some(summary) = preprocess_in_bv_memory_lane(
+                        BV_INT_PREP_MEMORY_LANE,
                         &cancel_b,
+                        LaneMemoryLimits::from_process_limit(),
+                        || {
+                            PreprocessSummary::build_int_only_with_limits(
+                                problem_b,
+                                verbose,
+                                Some(route_deadline),
+                                &cancel_b,
+                            )
+                        },
                     ) else {
                         publish("BvToInt", PortfolioResult::Unknown);
                         return;
@@ -6956,12 +7205,19 @@ impl AdaptivePortfolio {
                                         remaining.as_secs_f64()
                                     );
                                 }
-                                let Some(refined_summary) = PreprocessSummary::build_int_with_decompose_limit_with_limits(
-                                    original_problem,
-                                    verbose,
-                                    64,
-                                    Some(route_deadline),
+                                let Some(refined_summary) = preprocess_in_bv_memory_lane(
+                                    BV_INT_PREP_MEMORY_LANE,
                                     &cancel_b,
+                                    LaneMemoryLimits::from_process_limit(),
+                                    || {
+                                        PreprocessSummary::build_int_with_decompose_limit_with_limits(
+                                            original_problem,
+                                            verbose,
+                                            64,
+                                            Some(route_deadline),
+                                            &cancel_b,
+                                        )
+                                    },
                                 ) else {
                                     publish("BvToInt-refined", PortfolioResult::Unknown);
                                     return;
@@ -7003,11 +7259,18 @@ impl AdaptivePortfolio {
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _t_preproc = Instant::now();
-                        let Some(summary) = PreprocessSummary::build_bv_native_with_limits(
-                            problem_c,
-                            verbose,
-                            Some(route_deadline),
+                        let Some(summary) = preprocess_in_bv_memory_lane(
+                            BV_NATIVE_PREP_MEMORY_LANE,
                             &cancel_c,
+                            LaneMemoryLimits::from_process_limit(),
+                            || {
+                                PreprocessSummary::build_bv_native_with_limits(
+                                    problem_c,
+                                    verbose,
+                                    Some(route_deadline),
+                                    &cancel_c,
+                                )
+                            },
                         ) else {
                             return PortfolioResult::Unknown;
                         };
@@ -7055,125 +7318,17 @@ impl AdaptivePortfolio {
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
                 run_bv_lane_with_deadline(route_deadline, || {
-                    if verbose {
-                        safe_eprintln!("Adaptive: BV original BMC lane (Lane E) thread started");
-                    }
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_e) else {
-                            return PortfolioResult::Unknown;
-                        };
-                        let bmc_plan = original_bv_bmc_lane_plan(&problem_e, remaining);
-                        if verbose {
-                            safe_eprintln!(
-                                "Adaptive: BV original BMC lane plan: mode={}, max_depth={}, budget={:.1}s, per_depth={:.3}s",
-                                bmc_plan.mode.label(),
-                                bmc_plan.max_depth,
-                                bmc_plan.time_budget.as_secs_f64(),
-                                bmc_plan.per_depth_timeout.as_secs_f64(),
-                            );
-                        }
-                        let bmc = crate::bmc::BmcSolver::new(
-                            problem_e.clone(),
-                            BmcConfig {
-                                smt_lane: crate::smt::SmtLane::Verification,
-                                base: ChcEngineConfig {
-                                    verbose,
-                                    cancellation_token: Some(cancel_e.child()),
-                                },
-                                max_depth: bmc_plan.max_depth,
-                                per_depth_timeout: Some(bmc_plan.per_depth_timeout),
-                                time_budget: Some(bmc_plan.time_budget),
-                                enable_k_induction: false,
-                                enable_adaptive_stepping: false,
-                                acyclic_safe: false,
-                                prefer_exact_acyclic_first: false,
-                                proof_cross_check: false,
-                                memory_budget: None,
-                                ts_probe_clamp: None,
-                                soft_time_budget: None,
-                                probe_extension_deadline: None,
-                                resume_frontier: None,
-                                sweep_past_spurious_sat: true,
-                            },
-                        );
-                        match bmc.solve() {
-                            crate::engine_result::ChcEngineResult::Unsafe(cex) => {
-                                let Some(validation_budget) =
-                                    bv_lane_remaining(route_deadline, &cancel_e)
-                                else {
-                                    return PortfolioResult::Unknown;
-                                };
-                                let validation_budget =
-                                    validation_budget.min(Duration::from_secs(3));
-                                // BMC witnesses are keyed to `problem_e`'s
-                                // original clause indices and predicate ids.
-                                let mut verifier = PdrSolver::new(
-                                    problem_e,
-                                    PdrConfig {
-                                        verbose,
-                                        solve_timeout: Some(validation_budget),
-                                        cancellation_token: Some(cancel_e.child()),
-                                        disable_array_scalarization: true,
-                                        preserve_original_clauses: true,
-                                        ..PdrConfig::default()
-                                    },
-                                );
-                                verifier.set_validation_deadline(validation_budget);
-                                match verifier.verify_counterexample(&cex) {
-                                    crate::CexVerificationResult::Valid => {
-                                        if verbose {
-                                            safe_eprintln!(
-                                                "Adaptive: BV original BMC lane source-validated counterexample (steps={}, validation_budget={:.1}s)",
-                                                cex.steps.len(),
-                                                validation_budget.as_secs_f64(),
-                                            );
-                                        }
-                                        PortfolioResult::Unsafe(cex)
-                                    }
-                                    crate::CexVerificationResult::Spurious => {
-                                        if verbose {
-                                            safe_eprintln!(
-                                                "Adaptive: BV original BMC lane rejected spurious counterexample"
-                                            );
-                                        }
-                                        PortfolioResult::Unknown
-                                    }
-                                    crate::CexVerificationResult::Unknown => {
-                                        if verbose {
-                                            safe_eprintln!(
-                                                "Adaptive: BV original BMC lane rejected counterexample with inconclusive source validation"
-                                            );
-                                        }
-                                        PortfolioResult::Unknown
-                                    }
-                                }
-                            }
-                            crate::engine_result::ChcEngineResult::Safe(_)
-                            | crate::engine_result::ChcEngineResult::Unknown
-                            | crate::engine_result::ChcEngineResult::NotApplicable => {
-                                PortfolioResult::Unknown
-                            }
-                        }
-                    }));
-                    let result = match result {
-                        Ok(result) => result,
-                        Err(payload) => {
-                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = payload.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            };
-                            safe_eprintln!(
-                                "Adaptive: BV original BMC lane (Lane E) panicked: {}",
-                                msg
-                            );
-                            PortfolioResult::Unknown
-                        }
-                    };
-                    let result =
-                        reject_late_bv_lane_result(result, route_deadline, &cancel_e);
+                    let memory = enter_original_bv_bmc_memory_lane(
+                        &cancel_e,
+                        LaneMemoryLimits::from_process_limit(),
+                    );
+                    let result = run_original_bv_bmc_lane(
+                        problem_e,
+                        route_deadline,
+                        &cancel_e,
+                        memory,
+                        verbose,
+                    );
                     let _ = tx_e.send(("BvOriginalBmc", result));
                 });
             });
@@ -7196,14 +7351,19 @@ impl AdaptivePortfolio {
                             );
                             let _ = tx_d.send(("BvRelaxed", result));
                         };
-                        let Some(summary) =
-                            PreprocessSummary::build_int_relaxed_with_limits(
-                                problem_d,
-                                verbose,
-                                Some(route_deadline),
-                                &cancel_d,
-                            )
-                        else {
+                        let Some(summary) = preprocess_in_bv_memory_lane(
+                            BV_INT_PREP_MEMORY_LANE,
+                            &cancel_d,
+                            LaneMemoryLimits::from_process_limit(),
+                            || {
+                                PreprocessSummary::build_int_relaxed_with_limits(
+                                    problem_d,
+                                    verbose,
+                                    Some(route_deadline),
+                                    &cancel_d,
+                                )
+                            },
+                        ) else {
                             publish(PortfolioResult::Unknown);
                             return;
                         };
@@ -7485,11 +7645,18 @@ impl AdaptivePortfolio {
                         safe_eprintln!("Adaptive: BV+array Lane N (BV-native) thread started");
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let Some(summary) = PreprocessSummary::build_bv_native_with_limits(
-                            problem_native,
-                            verbose,
-                            Some(route_deadline),
+                        let Some(summary) = preprocess_in_bv_memory_lane(
+                            BV_NATIVE_PREP_MEMORY_LANE,
                             &cancel_n,
+                            LaneMemoryLimits::from_process_limit(),
+                            || {
+                                PreprocessSummary::build_bv_native_with_limits(
+                                    problem_native,
+                                    verbose,
+                                    Some(route_deadline),
+                                    &cancel_n,
+                                )
+                            },
                         ) else {
                             return PortfolioResult::Unknown;
                         };
@@ -7846,6 +8013,168 @@ mod tests {
                 path.display()
             )
         })
+    }
+
+    const LANE_E_UNSAFE_BV: &str = r#"
+(set-logic HORN)
+(declare-fun Inv ((_ BitVec 8)) Bool)
+(assert (Inv #x00))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (Inv x) (Inv (bvadd x #x01)))))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (and (Inv x) (= x #x02)) false)))
+(check-sat)
+"#;
+
+    /// Lane E runs its search in its own memory lane: crossing its soft share
+    /// cancels the search's token (not the lane's) and the lane answers
+    /// `Unknown` (the allocator charges every byte its thread allocates — the
+    /// bit-blaster's CNF and the SAT clause store included); with room it
+    /// finds and source-validates the counterexample as before
+    /// (DR-CHC-BV-LANE-E-GOVERNED-20261118).
+    #[test]
+    fn original_bv_bmc_lane_runs_in_its_memory_lane() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let limits = Some(LaneMemoryLimits {
+            soft: 1024 * 1024,
+            hard: usize::MAX / 2,
+        });
+
+        let roomy = crate::CancellationToken::new();
+        let memory = enter_original_bv_bmc_memory_lane(&roomy, limits);
+        assert!(ay_sys::memory_group_census()
+            .iter()
+            .any(|usage| usage.label == ORIGINAL_BV_BMC_MEMORY_LANE));
+        let result = run_original_bv_bmc_lane(
+            parse_problem(LANE_E_UNSAFE_BV),
+            deadline,
+            &roomy,
+            memory,
+            false,
+        );
+        assert!(
+            matches!(result, PortfolioResult::Unsafe(_)),
+            "got {result:?}"
+        );
+        assert!(!roomy.is_cancelled());
+
+        let starved = crate::CancellationToken::new();
+        let memory = enter_original_bv_bmc_memory_lane(&starved, limits);
+        // A thread-local synthetic charge past the soft share (unit tests do
+        // not run under the counting allocator): what the lane's CNF and SAT
+        // clause store cost on a 10M-clause depth.
+        ay_sys::charge_current_for_testing(2 * 1024 * 1024);
+        assert!(
+            memory.bmc_cancel.is_cancelled(),
+            "the lane's soft share must cancel the search's token"
+        );
+        assert!(
+            !starved.is_cancelled(),
+            "a memory stop must not cancel the lane token validation runs under"
+        );
+        let result = run_original_bv_bmc_lane(
+            parse_problem(LANE_E_UNSAFE_BV),
+            deadline,
+            &starved,
+            memory,
+            false,
+        );
+        assert!(
+            matches!(result, PortfolioResult::Unknown),
+            "an over-share Lane E must answer Unknown, got {result:?}"
+        );
+    }
+
+    /// A counterexample the search found keeps its source validation and
+    /// its verdict when the memory lane tripped around it: validation runs
+    /// after the memory lane closed, under the lane token the trip never
+    /// touches (a validated counterexample is sound whatever its search
+    /// cost).
+    #[test]
+    fn original_bv_bmc_lane_keeps_a_counterexample_found_before_a_trip() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let limits = Some(LaneMemoryLimits {
+            soft: 1024 * 1024,
+            hard: usize::MAX / 2,
+        });
+        let roomy = crate::CancellationToken::new();
+        let PortfolioResult::Unsafe(cex) = run_original_bv_bmc_lane(
+            parse_problem(LANE_E_UNSAFE_BV),
+            deadline,
+            &roomy,
+            enter_original_bv_bmc_memory_lane(&roomy, limits),
+            false,
+        ) else {
+            panic!("the fixture is unsafe within its depth");
+        };
+
+        let lane = crate::CancellationToken::new();
+        let memory = enter_original_bv_bmc_memory_lane(&lane, limits);
+        ay_sys::charge_current_for_testing(2 * 1024 * 1024);
+        assert!(memory.lane.as_ref().is_some_and(EngineMemoryLane::tripped));
+        let result = finish_original_bv_bmc_lane(
+            parse_problem(LANE_E_UNSAFE_BV),
+            crate::engine_result::ChcEngineResult::Unsafe(cex),
+            deadline,
+            &lane,
+            memory,
+            false,
+        );
+        assert!(
+            matches!(result, PortfolioResult::Unsafe(_)),
+            "a validated counterexample must survive the trip, got {result:?}"
+        );
+
+        // A trip with no counterexample stays Unknown.
+        let memory = enter_original_bv_bmc_memory_lane(&lane, limits);
+        ay_sys::charge_current_for_testing(2 * 1024 * 1024);
+        let result = finish_original_bv_bmc_lane(
+            parse_problem(LANE_E_UNSAFE_BV),
+            crate::engine_result::ChcEngineResult::Unknown,
+            deadline,
+            &lane,
+            memory,
+            false,
+        );
+        assert!(matches!(result, PortfolioResult::Unknown), "got {result:?}");
+    }
+
+    /// Lane B/C preprocessing runs in a named memory lane: an over-share build
+    /// answers `None` and cancels the lane; a build within its share passes
+    /// through untouched; a panic that is not the memory lane's propagates.
+    #[test]
+    fn bv_lane_preprocessing_runs_in_its_memory_lane() {
+        let roomy = crate::CancellationToken::new();
+        let limits = Some(LaneMemoryLimits {
+            soft: 1024 * 1024,
+            hard: usize::MAX / 2,
+        });
+        let built = preprocess_in_bv_memory_lane(BV_INT_PREP_MEMORY_LANE, &roomy, limits, || {
+            assert!(ay_sys::memory_group_census()
+                .iter()
+                .any(|usage| usage.label == BV_INT_PREP_MEMORY_LANE));
+            Some(7)
+        });
+        assert_eq!(built, Some(7));
+        assert!(!roomy.is_cancelled());
+
+        let over = crate::CancellationToken::new();
+        let built = preprocess_in_bv_memory_lane(BV_NATIVE_PREP_MEMORY_LANE, &over, limits, || {
+            // A thread-local synthetic charge: no real allocation or process
+            // limit is changed by this controlled soft-trip.
+            ay_sys::charge_current_for_testing(2 * 1024 * 1024);
+            Some(7)
+        });
+        assert_eq!(built, None, "an over-share build must not be used");
+        assert!(over.is_cancelled());
+
+        let other = crate::CancellationToken::new();
+        let panicked = std::panic::catch_unwind(|| {
+            preprocess_in_bv_memory_lane::<()>(BV_INT_PREP_MEMORY_LANE, &other, limits, || {
+                panic!("not a memory stop")
+            })
+        });
+        assert!(panicked.is_err(), "a non-memory panic must propagate");
     }
 
     #[test]

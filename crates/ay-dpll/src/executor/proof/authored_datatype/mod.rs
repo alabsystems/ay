@@ -4,6 +4,7 @@
 
 use super::*;
 
+mod projected_word;
 mod transport;
 
 #[derive(Clone)]
@@ -496,6 +497,16 @@ impl Executor {
             }
         }
         if self.try_authored_selector_transport(proof, &candidate_scope, &leaves, &selector_decls) {
+            return;
+        }
+        if let Some(candidate) =
+            self.refute_projected_word_equality(&candidate_scope, &leaves, &selector_decls)
+        {
+            // The raw assumption already contains selector(constructor(field)).
+            // A source alias on the folded field would print that selector a
+            // second time, both in the assumption and in the bit-blast lemma.
+            self.purge_surface_overrides_for_certified_proof(&candidate);
+            *proof = candidate;
             return;
         }
         // No candidate installed: withdraw the transactional registration.

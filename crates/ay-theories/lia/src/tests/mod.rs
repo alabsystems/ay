@@ -25,7 +25,6 @@ mod nonintegral_constant_rows;
 mod offset_propagation;
 mod perf_hot_loop;
 mod probe_hypothesis_premise;
-mod probe_quickxplain;
 mod rational;
 mod sent_equality_closure;
 mod verification;

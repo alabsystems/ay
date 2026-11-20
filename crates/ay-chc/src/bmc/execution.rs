@@ -28,7 +28,17 @@ pub(super) enum AttemptStop {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BatchFailure {
     Unavailable,
+    /// The batch's local (per-depth) deadline passed: before the executor ran
+    /// (the caller's SMT build, any theory), during a SAT search, or on a
+    /// path that reports no BV encoding stop.
     LocalDeadline,
+    /// The local deadline passed while the executor was still bit-blasting
+    /// this batch's BV encoding (clause load included) and no SAT search was
+    /// entered: `Executor::bv_encodings_stopped_before_search` moved and
+    /// `Executor::bv_sat_searches_entered` did not. A deeper BMC level
+    /// re-encodes a strictly larger prefix, so it cannot meet the same
+    /// per-depth deadline either.
+    EncodingDeadline,
     Stopped(AttemptStop),
 }
 
@@ -103,14 +113,19 @@ impl BmcSolver {
             BatchFailure::Stopped(_) => {
                 Some(SingleExecutorOutcome::Solved(ChcEngineResult::Unknown))
             }
-            BatchFailure::LocalDeadline => Some(SingleExecutorOutcome::RetryFresh {
-                start_depth: first_unchecked_depth.unwrap_or(k),
-                consecutive_unsat: if first_unchecked_depth.is_some() {
-                    0
-                } else {
-                    consecutive_unsat
-                },
-            }),
+            // The fresh fallback re-encodes this same depth from scratch with
+            // its own slice; only the fresh sweep itself stops on an
+            // encoding-phase deadline.
+            BatchFailure::LocalDeadline | BatchFailure::EncodingDeadline => {
+                Some(SingleExecutorOutcome::RetryFresh {
+                    start_depth: first_unchecked_depth.unwrap_or(k),
+                    consecutive_unsat: if first_unchecked_depth.is_some() {
+                        0
+                    } else {
+                        consecutive_unsat
+                    },
+                })
+            }
         }
     }
 
@@ -121,7 +136,12 @@ impl BmcSolver {
         deadline: Option<Instant>,
         mut observe: impl FnMut(BatchPhase, Option<&AtomicBool>),
     ) -> Result<Vec<String>, BatchFailure> {
+        // A deadline that passed before the executor ran stays LocalDeadline:
+        // the caller's SMT build is not a BV encoding, and a stall there (a
+        // loaded host) must not end a sweep.
         self.batch_admission(deadline)?;
+        let encodings_stopped_before = exec.bv_encodings_stopped_before_search();
+        let searches_entered_before = exec.bv_sat_searches_entered();
         let deadline = self.execution_deadline(deadline);
         let memory = memory::Budget::capture(self.config.memory_budget, None);
         if !memory.constrain(exec) {
@@ -182,9 +202,55 @@ impl BmcSolver {
                 },
             );
         }
-        self.batch_admission(deadline)?;
-        landing?;
-        result
+        let outcome = self.batch_admission(deadline).and(landing).and(result);
+        #[cfg(test)]
+        if forced_encoding_deadline::take() {
+            return Err(BatchFailure::EncodingDeadline);
+        }
+        outcome.map_err(|failure| {
+            classify_local_deadline(
+                failure,
+                exec.bv_encodings_stopped_before_search() > encodings_stopped_before,
+                exec.bv_sat_searches_entered() > searches_entered_before,
+            )
+        })
+    }
+}
+
+/// A batch's `LocalDeadline` is an `EncodingDeadline` exactly when the batch
+/// stopped a BV encoding before its search (`encoding_cut`) and entered no
+/// SAT search at all (`searched`): a command that searched spent part of its
+/// slice searching, which a deeper level need not repeat. Every other failure
+/// passes through.
+fn classify_local_deadline(
+    failure: BatchFailure,
+    encoding_cut: bool,
+    searched: bool,
+) -> BatchFailure {
+    match failure {
+        BatchFailure::LocalDeadline if encoding_cut && !searched => BatchFailure::EncodingDeadline,
+        other => other,
+    }
+}
+
+/// A forced `EncodingDeadline`, for tests: the next controlled batch on this
+/// thread fails with it after executing (ay-dpll's encoding cut hooks are
+/// test-only in that crate, so the sweep's reaction is tested from here).
+#[cfg(test)]
+pub(super) mod forced_encoding_deadline {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Force (or clear) the next batch's encoding deadline on this thread.
+    pub(in crate::bmc) fn force(on: bool) {
+        FORCED.with(|forced| forced.set(on));
+    }
+
+    pub(super) fn take() -> bool {
+        FORCED.with(Cell::take)
     }
 }
 

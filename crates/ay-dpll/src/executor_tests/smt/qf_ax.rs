@@ -523,3 +523,68 @@ fn test_executor_qf_ax_uninterpreted_sort_model_keeps_point_writes() {
 
 // QF_UFLIA get-value Tests
 // ========================
+
+#[test]
+fn array_lambda_equality_checks_the_original_live_cell_under_both_polarities() {
+    for (source_value, relation, expected) in [
+        (10, "=", "unsat"),
+        (7, "=", "sat"),
+        (7, "distinct", "unsat"),
+        (10, "distinct", "sat"),
+    ] {
+        let input = format!(
+            r#"
+            (set-logic ALL)
+            (declare-const f (Array Int Int))
+            (assert (= (select f 1) {source_value}))
+            (assert ({relation} (lambda ((x Int)) (ite (= x 1) (select f x) 0))
+                                (lambda ((x Int)) (ite (= x 1) 7 0))))
+            (check-sat)
+        "#
+        );
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&parse(&input).unwrap()).unwrap();
+        assert_eq!(outputs, [expected], "{input}");
+    }
+}
+
+#[test]
+fn array_lambda_equality_respects_each_singletons_key_and_fallback() {
+    for (left_value, right_key, right_value, fallback, expected) in [
+        (10, 2, 10, 0, "unsat"), // Two different live cells.
+        (0, 2, 0, 0, "sat"),     // Both writes leave the shared default.
+        (10, 1, 10, 3, "unsat"), // Agree at the live index only.
+    ] {
+        let input = format!(
+            r#"(set-logic ALL)
+               (declare-const f (Array Int Int))
+               (assert (= (select f 1) {left_value}))
+               (assert (= (lambda ((x Int)) (ite (= x 1) (select f x) 0))
+                          (lambda ((y Int)) (ite (= y {right_key}) {right_value} {fallback}))))
+               (check-sat)"#
+        );
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&parse(&input).unwrap()).unwrap();
+        assert_eq!(outputs, [expected], "{input}");
+    }
+}
+
+#[test]
+fn array_lambda_equality_cannot_validate_a_retry_model_at_one_ghost_index() {
+    let input = r#"(set-logic ALL)
+        (declare-const f (Array Int Int))
+        (assert (= (select f 1) 10))
+        (declare-const y Int)
+        (assert (= y 8))
+        (declare-const key Int)
+        (assert (= key 1))
+        (assert (= (lambda ((x Int)) (ite (or (= x 1) (= x 2)) (select f x) 0))
+                   (lambda ((y Int)) (ite (= y 3) 10 0))))
+        (check-sat)"#;
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&parse(input).unwrap()).unwrap();
+    assert!(
+        outputs == ["unsat"] || outputs == ["unknown"],
+        "{outputs:?}"
+    );
+}

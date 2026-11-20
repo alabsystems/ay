@@ -14,7 +14,7 @@ Each `<key>/` holds one dumped PDR query stream:
 
 | key | instance | source |
 |---|---|---|
-| om1relays | sally `oral_messages/om1_with_relays_agreement_000` (LRA) | microbenchmark dump, 3,000 scripts (`MICROBENCH_QUERY_REPLAY_2026-09-18.md`) |
+| om1relays | sally `oral_messages/om1_with_relays_agreement_000` (LRA) | microbenchmark dump, 3,000 scripts (the development design notes at `9598c4206`) |
 | ak_s1min | sally `azadmanesh-kieckhafer/scenario1_min_received_000` (LRA) | microbenchmark dump, 727 scripts |
 | s3_srvr_4 | vmt `cav12/s3_srvr_4.cil_000` (LRA) | `AY_CHC_SESSION_DUMP` recorder, Rung 1 board run (binary `ay-sess1-20260922` = b797bf825, 60 s, `--competition`), 903 routed queries |
 | pushpop_repros | `repros/lra-pushpop-false-unsat-2026-09-18/*.smt2` (plain files) | the ay-dpll inc-engine false-UNSAT repros; replayed as push/pop scripts |

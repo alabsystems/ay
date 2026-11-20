@@ -2849,7 +2849,6 @@ mod rollback_artifact_tests {
         executor.cegar_pending_lemma = Some(TermId(9));
         executor.qfax_retry_done = true;
         executor.uflia_congruence_retry_done = true;
-        executor.uflia_model_repair_done = true;
         executor.sat_validated_by_mod_div_or_branch = true;
         executor.defer_model_validation = true;
         executor.skip_model_eval = true;
@@ -2873,7 +2872,6 @@ mod rollback_artifact_tests {
         executor.cegar_pending_lemma = None;
         executor.qfax_retry_done = false;
         executor.uflia_congruence_retry_done = false;
-        executor.uflia_model_repair_done = false;
         executor.sat_validated_by_mod_div_or_branch = false;
         executor.defer_model_validation = false;
         executor.skip_model_eval = false;
@@ -2913,7 +2911,6 @@ mod rollback_artifact_tests {
         assert_eq!(executor.cegar_pending_lemma, Some(TermId(9)));
         assert!(executor.qfax_retry_done);
         assert!(executor.uflia_congruence_retry_done);
-        assert!(executor.uflia_model_repair_done);
         assert!(executor.sat_validated_by_mod_div_or_branch);
         assert!(executor.defer_model_validation);
         assert!(executor.skip_model_eval);

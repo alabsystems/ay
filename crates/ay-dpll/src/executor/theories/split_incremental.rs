@@ -41,7 +41,7 @@ use super::freeze_var_if_needed;
 /// disequality split pair `x<y` / `x>y` aliased onto two dead selectors is
 /// TRUE ∧ TRUE: the LRA theory reports a conflict and the engine published a
 /// false `unsat` (2026-09-18, `repros/lra-pushpop-false-unsat-2026-09-18/`,
-/// the development design notes). Aliasing a LIVE selector
+/// the development design notes at `9598c4206`). Aliasing a LIVE selector
 /// (assumed false) instead silently pins the atom false.
 ///
 /// Every index `>= total_num_vars()` is unallocated, so this floor can never
@@ -638,6 +638,53 @@ pub(in crate::executor) fn encode_bool_uf_arg_atoms(
     encoded
 }
 
+/// Materialize a bound refinement request into a term atom.
+///
+/// Constructs the appropriate `<=` or `>=` atom from the request's variable,
+/// bound value, and optional RHS term. Integer bounds are floor/ceil rounded.
+///
+/// Relative lower refinements preserve the raw `>=` surface form instead of
+/// routing through `mk_ge()`, which canonicalizes to `(<= rhs lhs)`. LRA uses
+/// the original `lhs - rhs` direction to reuse the same slack row on replay;
+/// flipping the operands re-registers the atom under the opposite slack and can
+/// cause the same relative refinement to be rediscovered on the next split-loop
+/// pass.
+fn materialize_bound_refinement_atom_term(
+    terms: &mut TermStore,
+    request: &BoundRefinementRequest,
+) -> TermId {
+    let bound_term = if request.is_integer {
+        let int_bound = if request.is_upper {
+            request.bound_value.floor().to_integer()
+        } else {
+            request.bound_value.ceil().to_integer()
+        };
+        terms.mk_int(int_bound)
+    } else {
+        terms.mk_rational(request.bound_value.clone())
+    };
+    let rhs_term = if let Some(rhs) = request.rhs_term {
+        if num_traits::Zero::is_zero(&request.bound_value) {
+            rhs
+        } else {
+            terms.mk_add(vec![rhs, bound_term])
+        }
+    } else {
+        bound_term
+    };
+    if request.is_upper {
+        terms.mk_le(request.variable, rhs_term)
+    } else if request.rhs_term.is_some() {
+        terms.mk_app(
+            ay_core::Symbol::named(">="),
+            vec![request.variable, rhs_term],
+            ay_core::Sort::Bool,
+        )
+    } else {
+        terms.mk_ge(request.variable, rhs_term)
+    }
+}
+
 /// Replay pending bound refinements into the persistent incremental SAT solver.
 ///
 /// Returns `false` if a reason literal is unmapped; duplicate clauses are skipped.
@@ -657,7 +704,7 @@ pub(in crate::executor) fn replay_incremental_bound_refinements(
         if !added_refinement_clauses.insert(key) {
             continue;
         }
-        let atom = crate::bound_refinement::materialize_bound_refinement_atom_term(terms, request);
+        let atom = materialize_bound_refinement_atom_term(terms, request);
         let bound_var = ensure_incremental_atom_encoded(
             terms,
             solver,

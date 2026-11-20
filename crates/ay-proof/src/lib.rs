@@ -169,7 +169,6 @@ pub use checker::recognize_regex_intersect_empty;
 pub use checker::recognize_regex_length_lower_bound;
 pub use checker::recognize_rounding_mode_domain;
 pub use checker::recognize_seq_extensional_companion_contradiction;
-pub use checker::recognize_seq_ground_eval;
 pub use checker::recognize_string_concat_cancellation;
 pub use checker::recognize_string_containment_identity;
 pub use checker::recognize_string_ground_eval;
@@ -222,11 +221,13 @@ pub use checker::{
     recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_ground_eval_with_progress,
     recognize_fp_ground_eval_without_enumeration_with_progress, recognize_fp_rounding_mode_domain,
 };
+pub use checker::{recognize_seq_ground_eval, recognize_seq_ground_eval_with_progress};
 pub use checker::{recognize_set_card_chain_recurrence, recognize_subset_theory_lemma};
 pub use checker::{MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_WORK_PER_LEMMA};
 pub use congruence_derivation::{
-    close_congruence_derivation, congruence_derivation_renders, plan_euf_congruence_derivation,
-    CongruenceDerivation,
+    close_congruence_derivation, congruence_derivation_renders_within,
+    plan_euf_congruence_derivation, CongruenceDerivation, DerivationRender,
+    DERIVATION_RENDER_WORK_BUDGET,
 };
 pub use definition_bridge::{plan_definitional_bridge, DefinitionBridge, MAX_BRIDGE_CANDIDATES};
 pub use exact_division_sweeps::{
@@ -312,6 +313,40 @@ pub fn format_term_alethe_with_overrides(
     overrides: &ay_core::kani_compat::DetHashMap<TermId, String>,
 ) -> String {
     AlethePrinter::new_with_overrides(terms, Some(overrides)).format_term(term)
+}
+
+/// [`format_term_alethe_with_overrides`] (or [`format_term_alethe`] when
+/// `overrides` is `None`), produced only when the rendering is at most
+/// `max_bytes` long and `keep_going` (polled at term boundaries) never
+/// answers `false`.
+///
+/// Byte-exact: the printer streams assembled renderings, so
+/// a `not`/`ite`/`let`/quantifier is written straight into the output instead
+/// of being assembled and cached, and the work it charges is exactly the
+/// bytes it writes. `Some(text)` is therefore returned exactly when the
+/// unbounded renderers' text is at most `max_bytes` long (and it is that
+/// text), and the rendering stops at the first term boundary past the cap:
+/// memory and time grow with `max_bytes`, not with the term's TREE size (a
+/// `let`-shared DAG of a few thousand nodes can spell 1e14 bytes,
+/// DR-PROOF-RENDER-BUDGET-20261118).
+#[must_use]
+pub fn format_term_alethe_bounded(
+    terms: &TermStore,
+    term: TermId,
+    overrides: Option<&ay_core::kani_compat::DetHashMap<TermId, String>>,
+    max_bytes: u64,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Option<String> {
+    // A renderability check (`PrinterPurpose`): a single term's rendering
+    // reaches none of the gates that purpose changes, so the text is the
+    // unbounded renderers' byte for byte; the purpose only keeps every
+    // bounded render the producers run under one flag.
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(max_bytes))
+        .with_assembled_rendering(alethe_printer::AssembledRendering::Streamed)
+        .as_renderability_check()
+        .with_emission_progress(keep_going);
+    let text = printer.format_term(term);
+    (!printer.work_budget_exhausted()).then_some(text)
 }
 
 /// Export a proof to Alethe format.
@@ -723,7 +758,10 @@ pub fn try_export_alethe_with_authored_surfaces_to_with_progress<W: std::io::Wri
     work_budget: Option<u64>,
     keep_going: &mut dyn FnMut() -> bool,
 ) -> Result<(), AletheStreamError> {
+    // A budget-exhausted export is refused at the next step, so nothing
+    // assembled past exhaustion is read (DR-PROOF-RENDER-BUDGET-20261118).
     let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget)
+        .with_assembled_rendering(alethe_printer::AssembledRendering::CachedWithinBudget)
         .with_emission_progress(keep_going)
         .with_authored_surfaces(surfaces);
     export_alethe_with_printer_to(out, proof, terms, problem_assertions, &printer)

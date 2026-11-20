@@ -10,6 +10,7 @@ use num_integer::Integer;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
+use crate::cert::{check_branch_derivation, CertificateError, Multiplier};
 use crate::model::{Col, Model, Row};
 use crate::BoundSide;
 
@@ -32,6 +33,31 @@ pub enum IntegerCutProof {
         unrounded_bound: BigRational,
         /// Positive scaling after integer rounding.
         output_scale: BigRational,
+    },
+    /// VIPR-style "unsplit" over one elementary integer disjunction
+    /// (Cheung, Gleixner and Steffy, *Verifying Integer Programming Results*,
+    /// IPCO 2017): every integer point has `x_column <= floor` or
+    /// `x_column >= floor + 1`, and each branch separately derives the cut.
+    ///
+    /// Each branch is a list of positive multipliers over the caller model's
+    /// row facts and column-bound facts. Column facts are priced at the
+    /// caller's own exact box, except that `column`'s upper bound is
+    /// `min(ub, floor)` in `low` and its lower bound is `max(lb, floor + 1)`
+    /// in `high`. A branch either combines to exactly the cut's coefficients
+    /// with a bound at least the cut's `lb`, or to a Farkas contradiction
+    /// (the branch is empty). Only `column`'s integrality is a premise: the
+    /// other columns may be continuous, which is what lets this rule certify
+    /// mixed-integer rounding, Gomory and disjunctive cuts on big-M
+    /// indicator rows that [`Self::SourceRowRounding`] must refuse.
+    ElementarySplit {
+        /// Integral caller-model column the disjunction splits.
+        column: Col,
+        /// The split point `k`: branches `x <= k` and `x >= k + 1`.
+        floor: BigInt,
+        /// Derivation on the `x_column <= floor` branch.
+        low: Vec<Multiplier>,
+        /// Derivation on the `x_column >= floor + 1` branch.
+        high: Vec<Multiplier>,
     },
 }
 
@@ -159,13 +185,21 @@ impl CertifiedIntegerCut {
         deadline: Option<Instant>,
     ) -> Result<(), IntegerCutVerificationError> {
         poll(deadline)?;
-        let IntegerCutProof::SourceRowRounding {
-            row,
-            side,
-            multiplier,
-            unrounded_bound,
-            output_scale,
-        } = &self.proof;
+        let (row, side, multiplier, unrounded_bound, output_scale) = match &self.proof {
+            IntegerCutProof::SourceRowRounding {
+                row,
+                side,
+                multiplier,
+                unrounded_bound,
+                output_scale,
+            } => (row, side, multiplier, unrounded_bound, output_scale),
+            IntegerCutProof::ElementarySplit {
+                column,
+                floor,
+                low,
+                high,
+            } => return self.verify_split(model, *column, floor, low, high, deadline),
+        };
         if !multiplier.denom().is_positive()
             || !output_scale.denom().is_positive()
             || !unrounded_bound.denom().is_positive()
@@ -208,6 +242,116 @@ impl CertifiedIntegerCut {
             BigRational::from_integer(unrounded_bound.numer().div_ceil(unrounded_bound.denom()));
         if self.lb > rounded * output_scale {
             return Err(IntegerCutVerificationError::InvalidConclusion);
+        }
+        poll(deadline)
+    }
+
+    /// Replay an [`IntegerCutProof::ElementarySplit`] against `model`.
+    ///
+    /// The only integrality premise is `column`'s; both branch boxes are
+    /// rebuilt here from the caller's own column bounds, so an artifact cannot
+    /// smuggle in a narrower box than the recipient actually has.
+    fn verify_split(
+        &self,
+        model: &Model,
+        column: Col,
+        floor: &BigInt,
+        low: &[Multiplier],
+        high: &[Multiplier],
+        deadline: Option<Instant>,
+    ) -> Result<(), IntegerCutVerificationError> {
+        if self.coeffs.is_empty() || !self.lb.denom().is_positive() {
+            return Err(IntegerCutVerificationError::InvalidConclusion);
+        }
+        let mut previous = None;
+        for (index, (c, a)) in self.coeffs.iter().enumerate() {
+            if index & 0xff == 0 {
+                poll(deadline)?;
+            }
+            if !a.denom().is_positive()
+                || a.is_zero()
+                || previous.is_some_and(|old| old >= *c)
+                || *c as usize >= model.num_cols()
+            {
+                return Err(IntegerCutVerificationError::InvalidConclusion);
+            }
+            previous = Some(*c);
+        }
+        if model.col_at(column.index()).is_none() {
+            return Err(IntegerCutVerificationError::SourceChanged);
+        }
+        if !model.col_kind(column).is_integral() {
+            return Err(IntegerCutVerificationError::NonIntegralPremise);
+        }
+        let n = model.num_cols();
+        let mut col_lb = Vec::with_capacity(n);
+        let mut col_ub = Vec::with_capacity(n);
+        for j in 0..n {
+            if j & 0xff == 0 {
+                poll(deadline)?;
+            }
+            let (lower, upper) = model.col_bounds(Col(j as u32));
+            if lower.is_nan() || upper.is_nan() {
+                return Err(IntegerCutVerificationError::SourceChanged);
+            }
+            col_lb.push(crate::model::exact(lower));
+            col_ub.push(crate::model::exact(upper));
+        }
+        let split_low = BigRational::from_integer(floor.clone());
+        let split_high = BigRational::from_integer(floor + 1);
+        let j = column.index();
+        // Charge the verifier's work in coarse units against the original
+        // absolute deadline (and the deterministic test budget).
+        let mut pending = 0usize;
+        let mut work = |units: usize| -> Result<(), CertificateError> {
+            pending = pending.saturating_add(units.max(1));
+            if pending >= 0x100 {
+                pending = 0;
+                poll(deadline).map_err(|_| CertificateError::DeadlineExceeded)?;
+            }
+            Ok(())
+        };
+        for branch in [BoundSide::Upper, BoundSide::Lower] {
+            let (multipliers, original) = match branch {
+                BoundSide::Upper => (low, col_ub[j].clone()),
+                BoundSide::Lower => (high, col_lb[j].clone()),
+            };
+            let tightened = match (branch, original.clone()) {
+                (BoundSide::Upper, Some(u)) => u.min(split_low.clone()),
+                (BoundSide::Upper, None) => split_low.clone(),
+                (BoundSide::Lower, Some(l)) => l.max(split_high.clone()),
+                (BoundSide::Lower, None) => split_high.clone(),
+            };
+            match branch {
+                BoundSide::Upper => col_ub[j] = Some(tightened),
+                BoundSide::Lower => col_lb[j] = Some(tightened),
+            }
+            let checked = check_branch_derivation(
+                multipliers,
+                model,
+                &col_lb,
+                &col_ub,
+                &self.coeffs,
+                &self.lb,
+                &mut work,
+            );
+            match branch {
+                BoundSide::Upper => col_ub[j] = original,
+                BoundSide::Lower => col_lb[j] = original,
+            }
+            match checked {
+                Ok(_) => {}
+                Err(CertificateError::DeadlineExceeded) => {
+                    return Err(IntegerCutVerificationError::Interrupted)
+                }
+                Err(
+                    CertificateError::MissingFact { .. }
+                    | CertificateError::InfiniteBound { .. }
+                    | CertificateError::MalformedModel { .. }
+                    | CertificateError::MalformedBoundOverride { .. },
+                ) => return Err(IntegerCutVerificationError::SourceChanged),
+                Err(_) => return Err(IntegerCutVerificationError::InvalidConclusion),
+            }
         }
         poll(deadline)
     }
@@ -411,7 +555,10 @@ mod tests {
                     multiplier,
                     unrounded_bound,
                     ..
-                } = &mut negative_before.proof;
+                } = &mut negative_before.proof
+                else {
+                    panic!("rank-one reconstruction yields a rounding proof");
+                };
                 *multiplier = -multiplier.clone();
                 *unrounded_bound = -unrounded_bound.clone();
                 assert_eq!(
@@ -424,7 +571,10 @@ mod tests {
                 }
                 negative_after.lb = BigRational::one();
                 let IntegerCutProof::SourceRowRounding { output_scale, .. } =
-                    &mut negative_after.proof;
+                    &mut negative_after.proof
+                else {
+                    panic!("rank-one reconstruction yields a rounding proof");
+                };
                 *output_scale = -output_scale.clone();
                 assert_eq!(
                     negative_after.verify(&model),

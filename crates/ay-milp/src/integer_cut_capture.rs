@@ -32,10 +32,34 @@ pub struct CutHarvestSummary {
     pub interrupted: bool,
 }
 
+/// An actual adopted root-cut side, as the lower row `coeffs·x >= lb` in the
+/// caller's column space. Retained only so an explicit, caller-budgeted proof
+/// search can try it later; it confers no authority by itself.
+pub(crate) type AdoptedSide = (
+    Vec<(u32, num_rational::BigRational)>,
+    num_rational::BigRational,
+);
+
+/// Result of [`crate::BabSession::certify_cuts_by_split`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SplitCertificationReport {
+    /// Retained unsupported sides whose proof search ran to an answer.
+    pub attempted: usize,
+    /// Of those, sides now exported as verified split cuts.
+    pub certified: usize,
+    /// Sides still retained for a later call (not reached before the deadline).
+    pub remaining: usize,
+    /// The deadline stopped the search before every retained side was tried.
+    pub interrupted: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CutBatch {
     pub(crate) cuts: Vec<CertifiedIntegerCut>,
     pub(crate) summary: CutHarvestSummary,
+    /// Adopted sides the finish-time rank-one checker could not certify.
+    pub(crate) unsupported: Vec<AdoptedSide>,
 }
 
 #[derive(Debug, Default)]
@@ -200,14 +224,18 @@ impl NativeCutLease {
             // Proof reconstruction consumes only the original remaining budget
             // after the search finishes; harvesting never launches a solve.
             for (coeffs, lb) in std::mem::take(&mut self.adopted) {
-                match CertifiedIntegerCut::reconstruct(source, coeffs, lb, deadline) {
+                match CertifiedIntegerCut::reconstruct(source, coeffs.clone(), lb.clone(), deadline)
+                {
                     Ok(Some(cut)) => self.pending.cuts.push(cut),
                     Ok(None)
                     | Err(
                         IntegerCutVerificationError::SourceChanged
                         | IntegerCutVerificationError::NonIntegralPremise
                         | IntegerCutVerificationError::InvalidConclusion,
-                    ) => self.pending.summary.unsupported_sides += 1,
+                    ) => {
+                        self.pending.summary.unsupported_sides += 1;
+                        self.pending.unsupported.push((coeffs, lb));
+                    }
                     Err(IntegerCutVerificationError::Interrupted) => {
                         self.pending.summary.interrupted = true;
                         break;

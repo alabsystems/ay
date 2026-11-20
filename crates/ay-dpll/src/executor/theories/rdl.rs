@@ -322,7 +322,7 @@ impl Executor {
         // the ACTUAL constants, and any atom that does not fit exactly sends the
         // whole problem to the exact lane rather than being rounded.
         let fast = reachable.iter().all(|&atom| {
-            crate::executor::diff_logic::collect_comparison(&self.ctx.terms, atom)
+            crate::executor::dl_atom::collect_comparison(&self.ctx.terms, atom)
                 .is_none_or(|a| ay_diff_logic::IStar::fits_fast_lane(&a.c).is_some())
         });
         if rdl_engine_debug() {
@@ -534,7 +534,7 @@ impl Executor {
         // WEIGHT-LANE SELECTION, the same test as the Real lane: `IStar` keeps
         // every slack computation in registers, `RStar` pays a BigRational
         // allocation each. Measured on queen33-1 (skeptic re-measurement in
-        // the development design notes §3.1): 82% of
+        // the development design notes at 9598c4206, §3.1): 82% of
         // the DL lane's worker time on `RStar` is `BigUint::gcd`/`reduce`
         // inside `assert_edge`'s slack arithmetic, and the same instance
         // relabelled to the IStar lane runs >= 3.4x more decisions per CPU
@@ -544,7 +544,7 @@ impl Executor {
         // report `Unsupported`, which falls back to `solve_lia` — never a
         // rounded weight.
         let fast = reachable.iter().all(|&atom| {
-            crate::executor::diff_logic::collect_comparison(&self.ctx.terms, atom)
+            crate::executor::dl_atom::collect_comparison(&self.ctx.terms, atom)
                 .is_none_or(|a| ay_diff_logic::IStar::fits_fast_lane(&a.c).is_some())
         });
         if fast {
@@ -664,8 +664,8 @@ mod routing_tests {
         exec.statistics().get_int("lia_checks").is_some()
     }
 
-    /// Disjunctive, so the `:ay-diff-logic` conjunctive pre-check cannot take
-    /// it; every atom is a pure Int difference atom, so `solve_idl` does.
+    /// Disjunctive, and every atom is a pure Int difference atom, so
+    /// `solve_idl` takes it.
     const IDL_SAT: &str = "(set-logic QF_IDL)
          (declare-fun x () Int)
          (declare-fun y () Int)

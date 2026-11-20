@@ -22,7 +22,10 @@
 //!    Note: a variable appearing once in the body and once in the head
 //!    at the same position is a frame condition (passthrough) and is NOT
 //!    a cross-predicate dependency. Only body-to-body sharing triggers this.
-//! 3. Iterate to fixpoint (since liveness propagates through predicate calls).
+//! 3. Close under (c): liveness is reachability over positions linked by a
+//!    shared variable, so a position is live iff its connected component
+//!    holds a seed (a, b or d). The components come from one union-find pass
+//!    over each clause's variable occurrences (`analysis.rs`).
 //! 4. Remove dead positions from predicate declarations and rewrite clauses.
 //!
 //! # Back-translation
@@ -81,11 +84,10 @@ impl DeadParamEliminator {
         let mut total_eliminated = 0;
 
         for pred in problem.predicates() {
-            let live_set = live.get(&pred.id);
             let mut mapping = Vec::with_capacity(pred.arity());
             let mut new_idx = 0;
             for old_idx in 0..pred.arity() {
-                if live_set.map_or(false, |s| s.contains(&old_idx)) {
+                if live.is_live(pred.id, old_idx) {
                     mapping.push(Some(new_idx));
                     new_idx += 1;
                 } else {
@@ -162,6 +164,8 @@ impl DeadParamEliminator {
         (new_problem, position_map)
     }
     /// Rewrite a clause by removing dead argument positions from predicate applications.
+    /// `compute_live_positions` already asserted every application's arity, so each
+    /// mapping covers its arguments exactly.
     fn rewrite_clause(
         &self,
         clause: &HornClause,
@@ -177,7 +181,7 @@ impl DeadParamEliminator {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, arg)| {
-                        if i < mapping.len() && mapping[i].is_some() {
+                        if mapping[i].is_some() {
                             Some(arg.clone())
                         } else {
                             None
@@ -197,7 +201,7 @@ impl DeadParamEliminator {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, arg)| {
-                        if i < mapping.len() && mapping[i].is_some() {
+                        if mapping[i].is_some() {
                             Some(arg.clone())
                         } else {
                             None

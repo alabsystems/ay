@@ -53,6 +53,11 @@ pub enum LpError {
     #[error("unbounded")]
     Unbounded,
 
+    /// The instance is too large for this solver's dense tableau, or an
+    /// allocation for it failed. No conclusion about the instance.
+    #[error("resource limit: {0}")]
+    ResourceLimit(String),
+
     /// Solver hit the iteration limit before reaching a conclusion.
     #[error("iteration limit reached")]
     IterationLimit,

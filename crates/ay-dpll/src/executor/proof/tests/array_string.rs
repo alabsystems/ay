@@ -156,7 +156,6 @@ fn test_array_row2_indirect_store_proof_structure() {
 /// validation window. Those axioms are solver-generated, not part of the user's
 /// claim; before #selfcert-authored they counted as "unverified" and degraded
 /// EVERY QF_AX sat to `unknown` (0/60 self-certified on the SMT-LIB sample).
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_certifies_qf_ax_sat_against_authored_assertions() {
     let commands = parse(
@@ -189,7 +188,6 @@ fn self_check_certifies_qf_ax_sat_against_authored_assertions() {
 /// have no model value and the authored definitions evaluate to `Unknown`. The
 /// gate closes the authored window under those definitions (a model extension)
 /// and certifies the substituted window.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_certifies_store_flattened_sat_via_definitional_closure() {
     let commands = parse(
@@ -228,7 +226,6 @@ fn self_check_certifies_store_flattened_sat_via_definitional_closure() {
 /// chains below are provably equal under pairwise-distinct indices, and AY's
 /// array lemmas for that shape are still emitted as `trust`, so `--self-check`
 /// must degrade to `unknown` rather than emit an uncertified `unsat`.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_authored_rescue_never_manufactures_sat() {
     let commands = parse(

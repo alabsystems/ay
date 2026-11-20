@@ -36,6 +36,7 @@ mod delayed;
 mod delayed_solver;
 mod division;
 mod gates;
+pub mod known_bits;
 mod offset_equality;
 mod shifts;
 mod state;

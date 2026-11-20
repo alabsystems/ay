@@ -1961,6 +1961,47 @@ fn test_bmc_per_depth_fresh_respects_zero_per_depth_timeout() {
     );
 }
 
+/// A depth whose BV encoding missed its per-depth slice (ay-dpll cut the
+/// bit-blast before any SAT search: `BatchFailure::EncodingDeadline`) stops
+/// the fresh sweep there: depth k+1 re-encodes a strictly larger prefix under
+/// the same slice (DR-CHC-BV-LANE-E-GOVERNED-20261118: the sawtooth of
+/// ever-larger failed re-blasts that ran Lane E out of memory). A local
+/// deadline that is not an encoding cut (the zero-slice test above) keeps
+/// sweeping.
+#[test]
+fn test_bmc_per_depth_fresh_stops_when_encoding_misses_its_slice() {
+    let solver = BmcSolver::new(create_simple_unsafe_problem(), BmcConfig::default());
+    let queries: Vec<_> = solver.problem.queries().collect();
+
+    super::execution::forced_encoding_deadline::force(true);
+    let result = solver
+        .solve_per_depth_fresh(&queries, 10, 0, 0, false)
+        .expect("fresh executor path should execute");
+    super::execution::forced_encoding_deadline::force(false);
+
+    assert!(matches!(result, ChcEngineResult::Unknown), "got {result:?}");
+    let stats = solver.stats();
+    assert_eq!(
+        stats.encoding_missed_depth,
+        Some(0),
+        "the sweep must stop at the first depth whose encoding missed its slice"
+    );
+    assert!(stats.budget_exhausted);
+    assert_eq!(solver.proven_unsat_prefix(), 0, "frontier: nothing proven");
+
+    // With no missed encoding, the same sweep runs to the counterexample.
+    let solver = BmcSolver::new(create_simple_unsafe_problem(), BmcConfig::default());
+    let queries: Vec<_> = solver.problem.queries().collect();
+    let result = solver
+        .solve_per_depth_fresh(&queries, 10, 0, 0, false)
+        .expect("fresh executor path should execute");
+    assert!(
+        matches!(result, ChcEngineResult::Unsafe(_)),
+        "got {result:?}"
+    );
+    assert_eq!(solver.stats().encoding_missed_depth, None);
+}
+
 /// End-to-end solve should stay on the executor path and return `Unknown`
 /// when each depth gets a zero timeout.
 #[test]
@@ -5306,12 +5347,12 @@ fn tree_refutation_handles_multi_premise_query() {
     );
 }
 
-/// Lever L2 (`LRA_L2_bmc_real_lane_2026-09-24.md`, `DPLL_LRA_perf_2026-09-23.md`
+/// Lever L2 (the development design notes at `9598c4206`, the development design notes at `9598c4206`
 /// §2.3-§2.5): T6's BMC counterexample-search policy
 /// (`BmcSolver::configure_cex_search_executor`) — BCP-time LRA implied bounds
 /// off plus forbidding the #9505 every-decision theory-branching mode — was
 /// tuned entirely on Int/Bool transition systems
-/// (`BMC_T6_model_search_2026-09-19.md`: DRAGON/FIREFLY/MESI/peterson/metros,
+/// (the development design notes at `9598c4206`: DRAGON/FIREFLY/MESI/peterson/metros,
 /// all QF_LIA). The same lanes also run on pure-Real (QF_LRA) transition
 /// systems, where the corpus knob A/B found leaving the every-decision mode
 /// off actively hurts (theory propagations fall to about a third and several

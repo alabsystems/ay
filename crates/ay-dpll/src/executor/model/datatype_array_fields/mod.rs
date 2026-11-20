@@ -33,7 +33,6 @@ pub(super) use normalization::{
 };
 #[cfg(test)]
 use normalization::{same_array_value, same_datatype_array_value, same_value};
-#[cfg(test)]
 pub(super) use parser::sexpr_items;
 pub(super) use parser::{
     parse_bounded_typed_array_text, TypedArrayParseBudget, MAX_TYPED_ARRAY_DEPTH,

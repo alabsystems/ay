@@ -86,6 +86,17 @@ pub(super) fn preflight_problem_source_identity(
     control: &mut GroundValidationControl<'_>,
     problem: &ChcProblem,
 ) -> Result<(), ChcGroundDerivationArtifactError> {
+    preflight(control, problem, false).map(|_| ())
+}
+
+/// Structural accounting is shared with playback and native validation. Only a
+/// wire caller carrying the remaining grant into both canonical sorts can
+/// replace the original conservative all-nodes reservation.
+pub(super) fn preflight(
+    control: &mut GroundValidationControl<'_>,
+    problem: &ChcProblem,
+    metered_wire: bool,
+) -> Result<Option<usize>, ChcGroundDerivationArtifactError> {
     control.poll().map_err(interruption_error)?;
     let mut work = 0usize;
     let mut priced = PricedDatatypes::default();
@@ -111,8 +122,14 @@ pub(super) fn preflight_problem_source_identity(
     let sort_work = work
         .checked_mul(sort_rounds)
         .ok_or_else(|| source_identity_error("whole-problem canonical sort work overflow"))?;
+    let remaining = whole_source_work_limit(control) - work;
+    if metered_wire && sort_work > remaining {
+        control.poll().map_err(interruption_error)?;
+        return Ok(Some(remaining));
+    }
     charge_source_identity_work(control, &mut work, sort_work)?;
-    control.poll().map_err(interruption_error)
+    control.poll().map_err(interruption_error)?;
+    Ok(None)
 }
 
 fn preflight_declarations(

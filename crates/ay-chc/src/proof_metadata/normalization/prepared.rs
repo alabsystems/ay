@@ -7,17 +7,17 @@ use super::{ChcProblem, NORMALIZED_CHC_INPUT_SCHEMA};
 use ay_core::original_query::{QueryError, WorkBudget};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-mod bytes;
+pub(super) mod bytes;
 mod digest;
 mod expression;
 mod input;
 mod operators;
-mod order;
+pub(super) mod order;
 mod spelling;
 #[cfg(test)]
 mod tests;
 
-trait Control {
+pub(super) trait Control {
     fn offer(&mut self, work: usize, bytes: usize) -> Result<(), QueryError>;
     fn exhausted(&mut self) -> QueryError;
 }

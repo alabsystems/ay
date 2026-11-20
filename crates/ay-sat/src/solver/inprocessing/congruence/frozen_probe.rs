@@ -10,7 +10,7 @@
 //! stale watchers, saves phases and charges search ticks, and every later pass
 //! sizes its budget from those ticks and walks those watch lists: one probe
 //! made the whole run differ from the run without a proof (the posture screen,
-//! competition/proof-posture-parity/LEDGER.md). These probes assign on the
+//! competition/proof-posture-parity/LEDGER.md at 9598c4206). These probes assign on the
 //! trail, so the VeriPB hint walk reads their reasons as it always did, but
 //! propagate by reading the watch lists, never changing them.
 

@@ -259,7 +259,7 @@ fn explicit_adaptive_execution_mode_keeps_parallel_portfolio() {
     assert_eq!(portfolio.timeout, None);
 }
 
-/// LRA-Lin unsafe side (`LRA_BMC_unsafe_2026-09-22.md`): on a Real-sorted
+/// LRA-Lin unsafe side (the development design notes at `9598c4206`): on a Real-sorted
 /// problem the portfolio BMC is the only counterexample engine and must run
 /// at the full wave share, not as the 2 s staged probe; Int problems keep the
 /// probe.

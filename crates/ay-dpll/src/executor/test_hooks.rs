@@ -50,19 +50,4 @@ impl Executor {
     pub(crate) fn force_optimization_post_emit_objective_flip_for_test(&self) {
         self.forced_optimization_post_emit_objective_flip.set(true);
     }
-
-    /// Test-only: record whether the Phase 5 diff-logic engine decided the most
-    /// recent solve. No-op outside tests.
-    pub(crate) fn record_diff_logic_decided_for_test(&self, decided: bool) {
-        #[cfg(test)]
-        self.last_diff_logic_decided.set(decided);
-        #[cfg(not(test))]
-        let _ = decided;
-    }
-
-    /// Test-only: whether the Phase 5 diff-logic engine decided the last solve.
-    #[cfg(test)]
-    pub(crate) fn last_diff_logic_decided_for_test(&self) -> bool {
-        self.last_diff_logic_decided.get()
-    }
 }

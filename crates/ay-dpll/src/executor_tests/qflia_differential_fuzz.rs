@@ -315,27 +315,6 @@ struct FuzzStats {
     unknown: usize,
 }
 
-/// Run an explicitly requested extended campaign.
-///
-/// The `qflia_differential_campaign` example is the non-test entry point; unit
-/// tests below keep their fixed, bounded seed sets.
-#[allow(dead_code)]
-pub(crate) fn run_campaign(
-    seeds: u64,
-    z3: Option<&std::path::Path>,
-    check_incremental: bool,
-) -> (usize, usize, usize) {
-    let mut stats = FuzzStats {
-        sat: 0,
-        unsat: 0,
-        unknown: 0,
-    };
-    for seed in 0..seeds {
-        run_seed(seed, z3, check_incremental, &mut stats);
-    }
-    (stats.sat, stats.unsat, stats.unknown)
-}
-
 fn run_seed(
     seed: u64,
     z3: Option<&std::path::Path>,

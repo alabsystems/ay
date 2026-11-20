@@ -25,6 +25,7 @@ mod forced_expression_sign;
 mod forced_expression_zero_coeff;
 mod implied_not_tighter;
 mod implied_propagation_entailment;
+mod implied_side_generations;
 mod incremental_bounds;
 mod jit_propagation;
 mod jit_snapshot_persistence;
@@ -34,7 +35,6 @@ mod offset_relevance;
 mod optimality_certificate;
 mod propagation_reason_audit;
 mod retract_unjustified;
-mod unit_pivot_pref;
 mod unjustified_exports;
 mod warm_simplex_state;
 

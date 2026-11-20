@@ -50,7 +50,7 @@
 //!   fallback chain. A query the pipeline decides therefore keeps exactly the
 //!   verdict and the evidence it had without this pass. Measured on the
 //!   2026-09-30 verification (report
-//!   `2026-09-30-qe-ground-first-verify.md`): running first in this posture
+//!   the development design notes at `9598c4206`): running first in this posture
 //!   replaced carcara-valid certificates with documents carcara rejects.
 //!
 //! # Publication in the fallback slot

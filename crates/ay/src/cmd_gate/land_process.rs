@@ -34,6 +34,38 @@ pub(super) struct Step {
 }
 
 impl Step {
+    pub(super) const ADMISSION_PREFIX: [&'static str; 4] =
+        ["--wait-timeout", "1800", "--mem-gb", "8"];
+    const COMPILER_PREFIX: [&'static str; 3] = ["--", "targo", "--unverified"];
+
+    /// Ordinary Targo arguments, after the actual native admission boundary.
+    pub(super) fn compiler_payload(&self) -> Option<&[String]> {
+        if self.program != "build-slot"
+            || !self
+                .args
+                .iter()
+                .take(Self::ADMISSION_PREFIX.len())
+                .map(String::as_str)
+                .eq(Self::ADMISSION_PREFIX)
+        {
+            return None;
+        }
+        let prefix = Self::ADMISSION_PREFIX.len() + usize::from(self.exclusive_admission());
+        let compiler = self.args.get(prefix..)?;
+        compiler
+            .iter()
+            .take(Self::COMPILER_PREFIX.len())
+            .map(String::as_str)
+            .eq(Self::COMPILER_PREFIX)
+            .then(|| &compiler[Self::COMPILER_PREFIX.len()..])
+    }
+
+    fn exclusive_admission(&self) -> bool {
+        self.args
+            .get(Self::ADMISSION_PREFIX.len())
+            .is_some_and(|arg| arg == "--exclusive")
+    }
+
     pub(super) fn new(program: &str, args: &[&str]) -> Self {
         Self {
             program: program.into(),
@@ -45,7 +77,7 @@ impl Step {
     /// `targo metadata` with the checked-in lockfile: the resolution check of a
     /// version-only landing, and the planner's conservative read when the
     /// feature-resolved one fails. It compiles nothing, so it takes no
-    /// build-slot admission, and Targo refuses `--unverified` on it.
+    /// machine admission, and Targo refuses `--unverified` on it.
     pub(super) fn metadata() -> Self {
         Self {
             kind: StepKind::Metadata,
@@ -59,8 +91,8 @@ impl Step {
     /// Scheduling metadata only. The actual shared lease remains mandatory.
     pub(super) fn needs_quiet_host(&self) -> bool {
         self.kind == StepKind::RustTests
-            && self.program == "build-slot"
-            && self.args.first().is_some_and(|arg| arg == "--exclusive")
+            && self.compiler_payload().is_some()
+            && self.exclusive_admission()
     }
 
     /// Prepare the same test targets and feature graph under shared admission.
@@ -69,18 +101,17 @@ impl Step {
         if !self.needs_quiet_host() {
             return None;
         }
-        let mut args = self.args[1..].to_vec();
-        // The first separator belongs to build-slot. The next starts arguments
-        // for the test executable and must be left to the runtime step.
-        if let Some(harness_start) = args.iter().skip(1).position(|arg| arg == "--") {
-            args.truncate(harness_start + 1);
+        let mut args = self.compiler_payload()?.to_vec();
+        if let Some(harness_start) = args.iter().position(|arg| arg == "--") {
+            args.truncate(harness_start);
         }
         args.push("--no-run".into());
-        Some(Self {
-            program: self.program.clone(),
-            args,
-            kind: StepKind::RustTestBuild,
-        })
+        let mut step = Self::compiler(args);
+        if step.exclusive_admission() {
+            step.args.remove(Self::ADMISSION_PREFIX.len());
+        }
+        step.kind = StepKind::RustTestBuild;
+        Some(step)
     }
 
     pub(super) fn compiler(args: Vec<String>) -> Self {
@@ -90,8 +121,8 @@ impl Step {
             StepKind::Command
         };
         // These targets execute real benchmark planners, which correctly refuse
-        // concurrent compiler work. Take the existing shared pool's exclusive
-        // lease for that target, rather than bypassing its production fence.
+        // concurrent compiler work. Reserve exclusive admission from the same
+        // authority that admits ordinary builds.
         let cli_benchmark_controls = args
             .windows(2)
             .any(|pair| matches!(pair[0].as_str(), "-p" | "--package") && pair[1] == "ay")
@@ -101,11 +132,14 @@ impl Step {
         let parity_benchmark_controls = args.windows(2).any(|pair| {
             matches!(pair[0].as_str(), "-p" | "--package") && pair[1] == "ay-z3-parity"
         }) && args.iter().any(|arg| arg == "--bins");
-        let mut command = Vec::new();
+        let mut command = Self::ADMISSION_PREFIX.map(String::from).to_vec();
         if kind == StepKind::RustTests && (cli_benchmark_controls || parity_benchmark_controls) {
             command.push("--exclusive".into());
         }
-        command.extend(["--".into(), "targo".into(), "--unverified".into()]);
+        // build-slot holds the aterm ledger claim on managed hosts and owns
+        // the canonical legacy pool on hosts without the ledger. A nested
+        // resource-fixed command would select its own admission authority.
+        command.extend(Self::COMPILER_PREFIX.map(String::from));
         command.extend(args);
         Self {
             program: "build-slot".into(),
@@ -276,15 +310,36 @@ impl Runner {
         } else {
             None
         };
+        // Observational only: the existing regular-file capture is readable
+        // while the owned command runs. Coverage still requires its exit.
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "test_output_capture", "path": log.path(),
+                "temporary": true, "command": step,
+            })
+        );
         let status = command.stdout(Stdio::from(log.reopen()?)).status()?;
         let output = std::fs::read(log.path())?;
         std::io::stdout().write_all(&output)?;
         self.result(step, status)?;
+        let failure_log = if !status.success() {
+            let (_output, path) = log.keep().with_context(|| {
+                format!("retain test output after {} failed: {status}", step.program)
+            })?;
+            Some(path)
+        } else {
+            None
+        };
         if let Some(library) = library {
             library.verify()?;
         }
-        if !status.success() {
-            bail!("{} failed: {status}", step.program);
+        if let Some(path) = failure_log {
+            bail!(
+                "{} failed: {status}; test output retained at {}",
+                step.program,
+                path.display()
+            );
         }
         let passed = passed_tests(&output);
         println!(

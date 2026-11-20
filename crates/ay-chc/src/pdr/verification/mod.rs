@@ -33,6 +33,8 @@ mod model_recheck;
 mod model_safety;
 mod transition;
 
+pub(crate) use concrete::{ConcreteAnswer, ConcreteBudget, ConcreteStop};
+
 use crate::expr::evaluate_expr;
 use crate::smt::{SmtContext, SmtResult, SmtValue};
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};

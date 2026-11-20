@@ -106,7 +106,11 @@ fn ensure_trace_available(trace: &ClauseTrace) -> Result<(), ClauseTraceResoluti
     if trace.is_truncated() {
         return Err(ClauseTraceResolutionError::Truncated);
     }
-    if trace.proof_work_exhausted() {
+    // A plainly exhausted trace was discarded mid-search and cannot be
+    // complete. A literals-only exhausted trace kept the full clause
+    // sequence (hints stripped): admission only reaches the repair lanes,
+    // and the independent DAG replay remains the sole authority.
+    if trace.proof_work_exhausted() && !trace.literals_only_recording() {
         return Err(ClauseTraceResolutionError::ProofWorkExhausted);
     }
     Ok(())
@@ -284,7 +288,13 @@ fn validate_entry_structure(
             validate_original_entry(entry_index, entry)?;
             continue;
         }
-        if entry.resolution_hints.is_empty() && unit_premises.is_empty() {
+        // A literals-only trace (post-#A2b-degradation) records no hints by
+        // construction; its rows reach the repair lanes with empty
+        // candidates instead of being structurally refused here.
+        if entry.resolution_hints.is_empty()
+            && unit_premises.is_empty()
+            && !trace.literals_only_recording()
+        {
             return Err(ClauseTraceResolutionError::UnhintedDerivedClause {
                 entry_index,
                 id: entry.id,

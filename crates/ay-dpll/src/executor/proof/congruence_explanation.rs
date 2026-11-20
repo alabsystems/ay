@@ -247,7 +247,10 @@ impl Executor {
         let_confined: Option<&DetHashMap<TermId, String>>,
     ) -> bool {
         let overrides = let_confined.or(self.last_proof_term_overrides.as_ref());
-        if !ay_proof::congruence_derivation_renders(&self.ctx.terms, overrides, derivation) {
+        if !self
+            .congruence_derivation_renders_until_stopped(overrides, derivation)
+            .renders()
+        {
             return true;
         }
         let Some(overrides) = overrides else {

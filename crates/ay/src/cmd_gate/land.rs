@@ -66,7 +66,7 @@ pub(super) fn run(args: LandArgs) -> Result<i32> {
     }
     // Reject ambient policy replacements rather than silently modifying the
     // caller's environment. Targo provenance and explicit resource caps pass
-    // through unchanged, and build-slot bounds compiler concurrency.
+    // through unchanged, and native fixed admission bounds compiler concurrency.
     #[expect(
         clippy::unnecessary_debug_formatting,
         reason = "caller-controlled environment names retain exact quoting and escaping"

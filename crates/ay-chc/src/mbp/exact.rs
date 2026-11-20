@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Exact, under-approximating model-based projection (Workstream B R2,
-//! `DESIGN_spacer_pob_lemma_pipeline.md` §4.1.3–§4.1.4).
+//! the development design notes at `9598c4206`, §4.1.3–§4.1.4).
 //!
 //! [`Mbp::project_exact`] computes, for a formula `φ`, variables `X` and a model
 //! `M ⊨ φ`, a conjunction of literals `ψ` with

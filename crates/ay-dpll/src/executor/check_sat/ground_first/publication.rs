@@ -17,7 +17,7 @@
 //! AY's own certificate line said `foreign_assumes=yes ay_self_checkable=no`
 //! beside `unsat_admission=strict-proof`, and carcara answered `invalid`
 //! where the ordinary pipeline's document for the same file is `valid`
-//! (verification report `2026-09-30-qe-ground-first-verify.md`, 2 green
+//! (verification report the development design notes at `9598c4206`, 2 green
 //! certificates lost and 4 more invalid documents on the headline sample).
 //!
 //! The spellings therefore travel with the proof, and the installation is

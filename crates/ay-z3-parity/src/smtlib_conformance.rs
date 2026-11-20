@@ -41,7 +41,9 @@ mod gate_integrity;
 mod language_semantics;
 mod lexical_grammar;
 mod logic_registry;
+mod observed_json;
 mod official_corpus;
+use observed_json::{read_hashed_json, same_observed_regular_file};
 mod provision;
 mod qualify;
 mod reference_inventory;
@@ -54,6 +56,7 @@ mod stock_python;
 mod theory_registry;
 mod unknown_policy;
 mod unsat_proofs;
+mod worklist;
 mod z3_behavioral;
 mod z3_source_inventory;
 
@@ -725,7 +728,11 @@ fn canonical_profile_for(release: reference_platform::Release) -> Result<Profile
 }
 
 fn canonical_profile_sha256() -> Result<String, String> {
-    let bytes = serde_json::to_vec(&canonical_profile()?)
+    profile_sha256(&canonical_profile()?)
+}
+
+fn profile_sha256(profile: &Profile) -> Result<String, String> {
+    let bytes = serde_json::to_vec(profile)
         .map_err(|error| format!("serializing canonical profile: {error}"))?;
     Ok(sha256_bytes(&bytes))
 }
@@ -2318,7 +2325,22 @@ struct ParsedResourceEnvelope {
     timeout: Duration,
 }
 
+#[derive(Clone, Copy)]
+enum ResourceEnvelopeUse {
+    Qualification,
+    Observation,
+}
+
 fn parse_resource_envelope(value: &str) -> Result<ParsedResourceEnvelope, String> {
+    parse_resource_envelope_for(value, ResourceEnvelopeUse::Qualification)
+}
+
+fn parse_resource_envelope_for(
+    value: &str,
+    usage: ResourceEnvelopeUse,
+) -> Result<ParsedResourceEnvelope, String> {
+    const NATIVE_ENFORCEMENT: &str = "ay-resource-v1:native-rss-watchdog-zero-grace";
+
     validate_text(value, "resource_envelope")?;
     let fields = value
         .strip_prefix("oom-guard-v2:")
@@ -2369,7 +2391,10 @@ fn parse_resource_envelope(value: &str) -> Result<ParsedResourceEnvelope, String
     if timeout_ns == 0 {
         return Err("resource_envelope timeout_ns must be positive".to_string());
     }
-    if values["enforcement"] != ENFORCEMENT_RSS_WATCHDOG_V1 {
+    let enforcement = values["enforcement"];
+    let observed_native =
+        matches!(usage, ResourceEnvelopeUse::Observation) && enforcement == NATIVE_ENFORCEMENT;
+    if enforcement != ENFORCEMENT_RSS_WATCHDOG_V1 && !observed_native {
         return Err(format!(
             "resource_envelope enforcement must be {ENFORCEMENT_RSS_WATCHDOG_V1}"
         ));
@@ -2840,6 +2865,9 @@ Qualification workflow:
       Provision dependencies and run every registered conformance owner plus
       repeated complete-corpus performance comparisons. Use --plan first to
       see the work; missing and obsolete coverage remains a nonzero result.
+  qualify-status DIR [--stage ID | --gaps] [--json]
+      Inspect bounded stage journals and recorded refusals without replay.
+      Valid gaps exit 0; malformed or missing recorded-pass evidence does not.
   qualify-check QUALIFICATION.json
       Authenticate journals and reports, replay correctness and consumer cases,
       and recompute retained performance. Timing reproduction needs a new run.
@@ -2862,6 +2890,7 @@ COMMANDS:
       Authenticate current source bytes, public declarations and catalogs.
   current-abi --source DIR --ay-library FILE --out FILE
   current-abi-check FILE
+  abi-gaps FILE [--function Z3_NAME] [--against FILE] [--json]
       Measure exports, types and linked consumers; retain untested semantics.
   current-behavior --inventory FILE --ay FILE --out FILE
   current-behavior-check FILE
@@ -2912,6 +2941,9 @@ COMMANDS:
       Authenticate the pinned 3,661-file Z3 5.3.3 source tree, retain source
       registration owners and the complete registration-candidate scan.
       Snapshot authentication alone does not close unresolved source owners.
+
+  official-corpus-gaps --checkpoint RECORDS.jsonl --corpus-manifest CORPUS.json
+      [--worklist NEW_JSONL]  Inspect the completed prefix of a v2 corpus run.
 
   official-corpus-manifest <corpus-root> --archive-root <path>
                            --record-metadata <path> --out <path>
@@ -3036,15 +3068,16 @@ COMMANDS:
 
   run official-corpus <manifest> --receipt <path> --results <path>
                       --corpus-manifest <path> [--ay <path>] [--z3 <path>]
-                      [--timeout <seconds>]
+                      [--carcara <path>] [--timeout <seconds>] [--resume]
       Run every immutable corpus file and decision query against authenticated
       AY and exact Z3 5.3.3 under the campaign's one-job `_oom_guard.py`
       envelope. AY additionally receives the planned `--memory` budget plus
       `--self-check --strict-proofs`. Exact ordered verdict parity, clean
       execution, and a second full archive/member/materialization closure scan
-      are mandatory. This receipt does not independently certify models or
-      proofs; the separately registered `results.sat-models` and
-      `results.unsat-proofs` gates own those universal obligations.
+      are mandatory. Each retained decision needs independent evidence on
+      its exact query. Resume uses the same evaluator, contract, manifest,
+      tools, output paths and watchdog envelope. It checks retained decisions
+      and certificates before appending to the durable prefix.
       Per-file/per-query results remain in the content-addressed external
       results artifact; completion checks rerun the entire corpus. No
       multi-gigabyte corpus content is committed.
@@ -3145,12 +3178,14 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "provision-corpus-verify-child" => provision::corpus_verify_child(rest),
         "qualify" => qualify::run(rest),
         "qualify-check" => qualify::check(rest),
+        "qualify-status" => qualify::status_command(rest),
         "dominate" => domination::run(rest),
         "dominate-check" => domination::check(rest),
         "current-release-inventory" => current_release::run(rest),
         "current-release-check" => current_release::check(rest),
         "current-abi" => current_abi::run(rest),
         "current-abi-check" => current_abi::check(rest),
+        "abi-gaps" => current_abi::gaps::run(rest),
         "current-behavior" => current_behavior::run(rest),
         "current-behavior-check" => current_behavior::check(rest),
         "current-abi-build-child" => current_abi::build_child(rest),
@@ -3167,6 +3202,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
         "attach" => attach_command(rest),
         "source-snapshot" => reference_inventory::snapshot(rest),
         "official-corpus-manifest" => official_corpus::create_manifest(rest),
+        "official-corpus-gaps" => official_corpus::gaps(rest),
         "z3-source-snapshot" => require_current_z3_validator(z3_source_inventory::VALIDATOR_ID)
             .and_then(|()| z3_source_inventory::snapshot(rest)),
         "run" => run_validator_command(rest),

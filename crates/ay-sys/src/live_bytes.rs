@@ -19,7 +19,7 @@
 //! With the CHC portfolio's engines running in parallel that line was the
 //! largest single cost in the process (28-39% of active samples at the
 //! instruction after the `ldadd`,
-//! the development design notes); on
+//! the development design notes at `9598c4206`); on
 //! `faulty__barthe!_000` it held the portfolio's 2 s BMC probe to depth 6-7,
 //! where the striped counter lets it reach depth 11.
 //!

@@ -282,6 +282,7 @@ fn test_dead_param_array_sort() {
 }
 
 mod frame_conditions;
+mod liveness;
 mod projection;
 
 /// Test: Body-to-body cross-predicate join variable must stay live.

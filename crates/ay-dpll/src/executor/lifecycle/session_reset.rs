@@ -93,6 +93,8 @@ struct HostConfiguration {
     #[cfg(test)]
     test_force_non_bv_congruence_bail: Option<theories::TestCongruenceBail>,
     #[cfg(test)]
+    test_euf_bv_congruence_clause_cap: Option<usize>,
+    #[cfg(test)]
     last_applied_sat_random_seed: Cell<Option<u64>>,
     #[cfg(test)]
     last_applied_dpll_random_seed: Cell<Option<u64>>,
@@ -106,8 +108,6 @@ struct HostConfiguration {
     forced_maxsmt_post_emit_soft_flip: Cell<bool>,
     #[cfg(test)]
     forced_optimization_post_emit_objective_flip: Cell<bool>,
-    #[cfg(test)]
-    last_diff_logic_decided: Cell<bool>,
     #[cfg(debug_assertions)]
     auflia_persistent_shadow: bool,
     #[cfg(debug_assertions)]
@@ -162,6 +162,8 @@ impl HostConfiguration {
             #[cfg(test)]
             test_force_non_bv_congruence_bail: previous.test_force_non_bv_congruence_bail,
             #[cfg(test)]
+            test_euf_bv_congruence_clause_cap: previous.test_euf_bv_congruence_clause_cap,
+            #[cfg(test)]
             last_applied_sat_random_seed: previous.last_applied_sat_random_seed,
             #[cfg(test)]
             last_applied_dpll_random_seed: previous.last_applied_dpll_random_seed,
@@ -176,8 +178,6 @@ impl HostConfiguration {
             #[cfg(test)]
             forced_optimization_post_emit_objective_flip: previous
                 .forced_optimization_post_emit_objective_flip,
-            #[cfg(test)]
-            last_diff_logic_decided: previous.last_diff_logic_decided,
             #[cfg(debug_assertions)]
             auflia_persistent_shadow: previous.auflia_persistent_shadow,
             #[cfg(debug_assertions)]
@@ -231,6 +231,7 @@ impl HostConfiguration {
         #[cfg(test)]
         {
             executor.test_force_non_bv_congruence_bail = self.test_force_non_bv_congruence_bail;
+            executor.test_euf_bv_congruence_clause_cap = self.test_euf_bv_congruence_clause_cap;
             executor.last_applied_sat_random_seed = self.last_applied_sat_random_seed;
             executor.last_applied_dpll_random_seed = self.last_applied_dpll_random_seed;
             executor.last_oll_core_rounds = self.last_oll_core_rounds;
@@ -239,7 +240,6 @@ impl HostConfiguration {
             executor.forced_maxsmt_post_emit_soft_flip = self.forced_maxsmt_post_emit_soft_flip;
             executor.forced_optimization_post_emit_objective_flip =
                 self.forced_optimization_post_emit_objective_flip;
-            executor.last_diff_logic_decided = self.last_diff_logic_decided;
         }
         #[cfg(debug_assertions)]
         {

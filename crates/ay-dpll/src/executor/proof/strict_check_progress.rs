@@ -5,7 +5,6 @@
 //! One caller-owned resource and cancellation envelope for strict proof checks.
 
 use ay_core::{Proof, TermId};
-#[cfg(feature = "proof-checker")]
 use ay_proof::PartialProofCheck;
 use ay_proof::{DatatypeMemberSignature, ProofCheckError, ProofQuality};
 
@@ -21,6 +20,11 @@ use poll::strided_memory_poll;
 
 #[path = "strict_check_progress/solve_stop.rs"]
 mod solve_stop;
+
+#[path = "strict_check_progress/render_stop.rs"]
+mod render_stop;
+#[cfg(test)]
+pub(in crate::executor) use render_stop::RENDER_CHECKS;
 
 #[path = "strict_check_progress/caller.rs"]
 mod caller;
@@ -260,7 +264,6 @@ fn record_walk_stop(executor: &Executor, meter: &StrictCheckMeter) {
 /// goes false and no `ProofQuality` is published. That can only WITHDRAW a
 /// self-certification, never grant one, so no verdict can become more accepting
 /// than it is today.
-#[cfg(feature = "proof-checker")]
 pub(in crate::executor) fn check_partial_with_executor_progress(
     executor: &Executor,
     proof: &Proof,
@@ -278,7 +281,6 @@ pub(in crate::executor) fn check_partial_with_executor_progress(
 /// can drive the BUDGET limb without a 350M-charge proof. Production has
 /// exactly one caller, the wrapper above, which passes
 /// [`StrictCheckMeter::production`].
-#[cfg(feature = "proof-checker")]
 fn check_partial_with_executor_progress_and_meter(
     executor: &Executor,
     proof: &Proof,
@@ -296,7 +298,6 @@ fn check_partial_with_executor_progress_and_meter(
 /// post-walk poll this wrapper used to add is gone. The admission poll keeps
 /// a caller that is ALREADY stopping from starting a walk whose steps might
 /// never call back (`ProofStep::Resolution` is validated unmetered).
-#[cfg(feature = "proof-checker")]
 fn check_partial_under_controls(
     executor: &Executor,
     proof: &Proof,
@@ -375,7 +376,6 @@ fn check_partial_under_controls(
 /// A bare `bool` at three call sites is exactly the kind of parameter that gets
 /// passed the wrong way round once and then stays wrong, and here the wrong way
 /// round silently re-adds the unmetered Skolem walk this amendment removes.
-#[cfg(feature = "proof-checker")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::executor) enum WantQuality {
     Yes,
@@ -406,7 +406,6 @@ pub(in crate::executor) enum WantQuality {
 /// checker's own per-step budgets (`checker::lra_farkas`, `checker::nia_*`)
 /// raise it too, and those predate the envelope. Only the meter knows whether
 /// IT was the one that refused, so it reports that here as a separate fact.
-#[cfg(feature = "proof-checker")]
 pub(in crate::executor) struct MeteredPartialCheck {
     /// Step accounting, always populated (`check_proof_partial`'s contract).
     pub(in crate::executor) summary: PartialProofCheck,
@@ -435,7 +434,6 @@ pub(in crate::executor) struct MeteredPartialCheck {
     pub(in crate::executor) envelope_refusal: Option<StrictCheckRefusal>,
 }
 
-#[cfg(feature = "proof-checker")]
 impl MeteredPartialCheck {
     /// Whether the caller-owned envelope (either limb) refused the walk.
     pub(in crate::executor) fn envelope_refused(&self) -> bool {
@@ -451,10 +449,10 @@ mod tests;
 #[path = "strict_check_progress/solve_stop_tests.rs"]
 mod solve_stop_tests;
 
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 #[path = "strict_check_progress/completion_tests.rs"]
 mod completion_tests;
 
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 #[path = "strict_check_progress/original_owner_tests.rs"]
 mod original_owner_tests;

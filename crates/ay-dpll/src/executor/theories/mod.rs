@@ -31,6 +31,7 @@ mod bv_axioms_non_bv;
 mod bv_cegar_array;
 pub(in crate::executor) mod bv_cnf_dump;
 mod bv_config;
+mod bv_congruence_refine;
 mod bv_encoding;
 mod bv_eval;
 mod bv_eval_bool;

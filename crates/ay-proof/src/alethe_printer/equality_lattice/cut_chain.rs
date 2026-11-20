@@ -80,7 +80,8 @@ pub(crate) fn lia_cut_chain_lowering_supported(
     if !matches!(kind, ay_core::TheoryLemmaKind::IntCgCutChain) {
         return false;
     }
-    let printer = AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(MAX_WORK));
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, overrides, Some(MAX_WORK))
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     screen_admits(&printer, printer.cut_chain_plan(clause))
 }
 

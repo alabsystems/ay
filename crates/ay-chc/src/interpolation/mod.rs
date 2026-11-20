@@ -264,7 +264,7 @@ pub(crate) fn interpolating_sat_constraints(
     b_constraints: &[ChcExpr],
     shared_vars: &FxHashSet<String>,
 ) -> InterpolatingSatResult {
-    // Contract C-M2 (Workstream D, DESIGN_lra_interp_tpa.md §9): the plain
+    // Contract C-M2 (Workstream D, the development design notes at 9598c4206, §9): the plain
     // entry is always bounded -- by the thread's SMT/solve deadline when one
     // is installed (every portfolio engine runs under one), else by
     // `PLAIN_CASCADE_DEFAULT_BUDGET`. Unbounded, the strategy legs' own

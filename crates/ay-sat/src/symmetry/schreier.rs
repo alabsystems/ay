@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 //! Random Schreier–Sims over sparse permutations of variables.
 //!
-//! Step 2 of `competition/proof-posture-parity/PLAN-symmetry-fixing.md`: the
+//! Step 2 of `competition/proof-posture-parity/PLAN-symmetry-fixing.md` at `9598c4206`: the
 //! stabilizer chain that Satsuma's fix-and-cut walks (`dejavu::groups::
 //! random_schreier`). A permutation is stored by its support; the chain keeps
 //! one Schreier vector per base point, so a coset representative is

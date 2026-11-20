@@ -94,14 +94,12 @@ impl LpSession {
             Sense::Maximize => -1.0_f64,
         };
         let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, w * scale)).collect();
-        let Some(mut lp) = self.float_lp(&scaled, Sense::Minimize) else {
-            return Ok(None);
-        };
-        lp.plain_cold = true;
         let deadline = self.opts.effective_deadline(Instant::now());
         #[cfg(test)]
         OBSERVATIONS.with(|o| o.set((o.get().0 + 1, o.get().1)));
-        let candidate = lp.solve(deadline);
+        let Some(candidate) = self.cached_float_solve(&scaled, Sense::Minimize, deadline) else {
+            return Ok(None);
+        };
         if candidate.status != SimplexStatus::Optimal {
             return Ok(None);
         }

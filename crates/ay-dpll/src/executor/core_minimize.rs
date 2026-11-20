@@ -97,6 +97,10 @@ mod term_order;
 #[cfg(test)]
 mod tests;
 
+/// Largest deletion scan the general (non-EUF) minimizer starts: the size of
+/// the scan's start set, see `minimize_assumption_core_inner`.
+const GENERAL_MINIMIZE_CAP: usize = 32;
+
 /// Below this much remaining wall budget the pass does not start: the risk of
 /// blowing the output window outweighs any shrink.
 const MIN_REMAINING_TO_SHRINK: Duration = Duration::from_secs(5);
@@ -543,7 +547,6 @@ impl Executor {
         // a second, general minimizer risks disturbing a banked division for no
         // measured gain — the original gate excluded them on purpose and this
         // generalization must preserve that.
-        const GENERAL_MINIMIZE_CAP: usize = 32;
         let dt_owned = matches!(
             category,
             LogicCategory::QfDt
@@ -560,12 +563,35 @@ impl Executor {
         // source — see `minimize_assumption_core`'s verdict save/restore — and it
         // was latent in the EUF path too, so the kill switch is now an escape
         // hatch (`--dpll-no-uc-minimize-general`) rather than an opt-in.
+        // The cap bounds the deletion SCAN, and the scan runs over the start
+        // set: the certified harvest when it is a proper subset of the named
+        // assumptions (see `start` below), the whole set otherwise. Until
+        // 2026-11-18 the cap was applied to the NAMED count instead, so every
+        // instance with more than 32 named assertions kept its harvest
+        // unreduced however small the harvest was: measured on SMT-COMP 2026
+        // uc-qf-linearintarith, cores of 19 of 39, 11 of 55, 9 of 107 and 11
+        // of 45 left at that size where opensmt and yices2 publish 9, 7, 7
+        // and 9 (AY-SMT-4).
+        let combined_members: HashSet<TermId> = combined.iter().copied().collect();
+        let scan_len = self
+            .last_assumption_core
+            .as_ref()
+            .map(|core| core.iter().copied().collect::<HashSet<TermId>>())
+            .filter(|core| {
+                !core.is_empty()
+                    && core.len() < combined_members.len()
+                    && core.iter().all(|t| combined_members.contains(t))
+            })
+            .map_or(combined_members.len(), |core| core.len());
         let general_ok = !euf_like
             && !dt_owned
             && !ay_core::theory_disable_flags().no_uc_minimize_general
-            && combined.len() <= GENERAL_MINIMIZE_CAP;
+            && scan_len <= GENERAL_MINIMIZE_CAP;
         if !euf_like && !general_ok {
-            decline!(format!("category={category:?} len={}", combined.len()));
+            decline!(format!(
+                "category={category:?} len={} scan={scan_len}",
+                combined.len()
+            ));
         }
         // Array containment rule (see ARRAY_SCOPED_RESCUE_CAP): scoped subset
         // re-solves on array content only when the rescue was affordable.

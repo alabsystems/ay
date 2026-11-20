@@ -590,6 +590,38 @@ fn emitted_bitvector_operator_vocabulary_round_trips() {
     }
 }
 
+/// AY-SMT-10: models and invariants written with the SMT-LIB 2.7 conversion
+/// names read back as the same expressions as the older names.
+#[test]
+fn smtlib_2_7_bitvector_conversion_names_read_back() {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::BitVec(8), ChcSort::Int]);
+    let read = |body: &str| {
+        let source = format!("(define-fun Inv ((x (_ BitVec 8)) (n Int)) Bool {body})");
+        let model = InvariantModel::parse_smtlib(&source, &problem)
+            .unwrap_or_else(|error| panic!("body `{body}` failed: {error}"));
+        model.get(&inv).expect("Inv interpretation").formula.clone()
+    };
+    assert_eq!(
+        read("(= ((_ int_to_bv 8) n) x)"),
+        read("(= ((_ int2bv 8) n) x)")
+    );
+    assert_eq!(read("(= (ubv_to_int x) n)"), read("(= (bv2nat x) n)"));
+    let signed = read("(= (sbv_to_int x) n)");
+    let mut model = ay_core::kani_compat::DetHashMap::default();
+    model.insert("x".to_string(), crate::SmtValue::BitVec(0xff, 8));
+    model.insert("n".to_string(), crate::SmtValue::Int(-1));
+    assert_eq!(
+        crate::expr::evaluate_expr(&signed, &model),
+        Some(crate::SmtValue::Bool(true))
+    );
+    model.insert("n".to_string(), crate::SmtValue::Int(255));
+    assert_eq!(
+        crate::expr::evaluate_expr(&signed, &model),
+        Some(crate::SmtValue::Bool(false))
+    );
+}
+
 fn expression_contains_op(expression: &ChcExpr, expected: ChcOp) -> bool {
     match expression {
         ChcExpr::Op(actual, args) => {

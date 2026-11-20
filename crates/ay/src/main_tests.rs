@@ -1635,7 +1635,8 @@ fn z3_mode_is_detected_before_the_fork_including_argv0_injection() {
     ])));
 }
 
-/// T8 (the development design notes): the executors ay-chc builds for its
+/// T8 (the development design notes at
+/// `9598c4206`): the executors ay-chc builds for its
 /// SEARCH queries inherit the CLI executor's EFFECTIVE proof-cycle posture —
 /// shed under `--competition` / `--no-proof` / `--z3-mode`, never under a proof
 /// or certificate demand, never on a plain solve.

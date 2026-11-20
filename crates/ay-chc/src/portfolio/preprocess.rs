@@ -16,7 +16,7 @@ use crate::transform::{
     PcSplitter, SymbolSplitter, TransformMemoryReport, TransformationPipeline,
     TransformationResult, ValidityWitness,
 };
-use crate::{ChcExpr, ChcProblem, ChcSort, ClauseHead};
+use crate::{ChcExpr, ChcProblem, ChcSort};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -273,34 +273,6 @@ fn condense_stage_uncached_with_boundary(
         pipeline = pipeline.with(SymbolSplitter::new().with_verbose(verbose));
     }
     pipeline.transform(problem)
-}
-
-/// Bounded-cost guard for the trailing `DeadParamEliminator` on the large
-/// BV+array DAG class (item 4a). The slicer's per-fixpoint-iteration cost is
-/// dominated by the per-clause `positions²` flow-edge scan, so bound the sum
-/// of squared per-clause argument-position counts (plus a clause-count cap).
-fn dead_param_cost_bounded(problem: &ChcProblem) -> bool {
-    const MAX_CLAUSES: usize = 16_384;
-    const MAX_POSITION_PAIRS: u64 = 1 << 29;
-    if problem.clauses().len() > MAX_CLAUSES {
-        return false;
-    }
-    let mut total: u64 = 0;
-    for clause in problem.clauses() {
-        let mut positions = 0usize;
-        for (_, args) in &clause.body.predicates {
-            positions += args.len();
-        }
-        if let ClauseHead::Predicate(_, args) = &clause.head {
-            positions += args.len();
-        }
-        let p = positions as u64;
-        total = total.saturating_add(p.saturating_mul(p));
-        if total > MAX_POSITION_PAIRS {
-            return false;
-        }
-    }
-    true
 }
 
 pub(crate) fn portfolio_clause_inliner(problem: &ChcProblem, verbose: bool) -> ClauseInliner {
@@ -936,7 +908,7 @@ impl PreprocessSummary {
 
     /// Bounded-cost forwarding-only preprocessing (item 4, heavy-memory
     /// "235-relation" class): the clause-local [`ArrayStoreForwarder`] plus
-    /// ONE trailing cost-bounded [`DeadParamEliminator`] (arity slicing). The
+    /// ONE trailing [`DeadParamEliminator`] (arity slicing, linear). The
     /// slicer also runs when forwarding was a no-op — select-only
     /// threaded-memory encodings carry dead memory params without a single
     /// store. No other pass runs — this is the cheap combination safe to
@@ -1036,33 +1008,8 @@ impl PreprocessSummary {
         }
         let dt_changed = !dt_result.transform_memory().is_identity_grade();
         let rewrote_something = forwarding_changed || concretization_changed || dt_changed;
-        let run_dead_param = dead_param_cost_bounded(&dt_result.problem);
-        if !boundary_open() {
-            return None;
-        }
-        if !run_dead_param {
-            if !rewrote_something {
-                return Some(Self::from_parts(
-                    problem.clone(),
-                    problem,
-                    Box::new(IdentityBackTranslator),
-                    false,
-                ));
-            }
-            return Some(Self::from_parts(
-                problem,
-                dt_result.problem,
-                Box::new(CompositeBackTranslator {
-                    inner: vec![
-                        dt_result.back_translator,
-                        conc_result.back_translator,
-                        forward_result.back_translator,
-                    ],
-                }),
-                false,
-            ));
-        }
-        // The trailing cost-bounded arity slicer runs even when forwarding was
+        // The trailing arity slicer (linear in the problem size,
+        // DR-CHC-DPE-UNION-FIND-20261118) runs even when forwarding was
         // a no-op: select-only threaded-memory encodings (zero stores, e.g.
         // the read-only type-indexed table relations of the coroutine
         // "235-relation" instances) still carry dead memory params that the
@@ -1232,6 +1179,7 @@ impl PreprocessSummary {
 mod tests {
     use super::*;
     use crate::transform::TransformObligation;
+    use crate::ClauseHead;
 
     #[test]
     fn array_forwarding_limits_reject_pre_cancelled_preprocessing() {
@@ -1551,7 +1499,7 @@ mod tests {
         }
     }
 
-    /// Select-only shapes (zero stores) still get the trailing cost-bounded
+    /// Select-only shapes (zero stores) still get the trailing
     /// arity slicer: forwarding no-ops but dead threaded memory params are
     /// collapsed (the coroutine "235-relation" instances carry read-only
     /// table arrays without a single store).

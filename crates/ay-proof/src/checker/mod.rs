@@ -123,7 +123,7 @@ mod rounding_mode;
 mod seq_extensional_companion;
 pub use seq_extensional_companion::recognize as recognize_seq_extensional_companion_contradiction;
 mod seq_ground;
-pub use seq_ground::recognize_seq_ground_eval;
+pub use seq_ground::{recognize_seq_ground_eval, recognize_seq_ground_eval_with_progress};
 #[path = "set_axiom.rs"]
 mod set_axiom;
 #[path = "set_card_chain.rs"]

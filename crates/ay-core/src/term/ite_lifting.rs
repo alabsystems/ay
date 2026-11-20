@@ -484,6 +484,9 @@ impl TermStore {
                         || self.contains_liftable_ite(*then_t, ctx)
                         || self.contains_liftable_ite(*else_t, ctx)
                 }
+                // Its second argument is scoped by the lambda index. Shannon
+                // expansion outside that binder changes a pointwise choice.
+                TermData::App(Symbol::Named(name), _) if name == "lambda-array" => false,
                 TermData::App(_, args) => {
                     args.iter().any(|&arg| self.contains_liftable_ite(arg, ctx))
                 }
@@ -594,6 +597,9 @@ impl TermStore {
                         rebuilt
                     }
                 }
+                // A single global definition cannot represent a term whose
+                // value depends on the lambda index.
+                TermData::App(Symbol::Named(name), _) if name == "lambda-array" => term,
                 TermData::App(sym, args) => {
                     let new_args: Vec<TermId> = args
                         .iter()

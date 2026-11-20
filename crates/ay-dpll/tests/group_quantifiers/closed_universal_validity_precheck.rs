@@ -71,6 +71,19 @@ fn closed_false_universal_with_array_ext_forall_is_unsat() {
     assert_unsat(smt, "closed false universal beside array-ext forall");
 }
 
+#[test]
+fn vacuous_universal_preserves_the_bounded_existential_verdict() {
+    for (rhs, expected) in [(1, "unsat"), (2, "sat")] {
+        let query = format!(
+            "(set-logic LIA)
+             (assert (forall ((v Int)) true))
+             (assert (exists ((x Int)) (and (<= 0 x) (<= x 100000) (= (* 2 x) {rhs}))))
+             (check-sat)"
+        );
+        assert_eq!(crate::common::solve_vec(&query), [expected], "2*x = {rhs}");
+    }
+}
+
 /// A closed false universal alone (no other quantifiers). Must be UNSAT.
 #[test]
 #[timeout(20000)]

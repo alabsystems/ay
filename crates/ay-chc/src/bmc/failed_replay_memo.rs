@@ -9,7 +9,7 @@
 //! engines rediscover the same witness-less counterexample, or the adaptive
 //! layer re-validates what the portfolio already tried, the same fruitless
 //! replay was paid again each time (trex02: five 10 s replays, 53% of the
-//! wall; the development design notes).
+//! wall; the development design notes at `9598c4206`).
 //!
 //! An entry records the problem, the depth hint, and the budget the attempt
 //! demonstrably had: `min(nominal budget, elapsed + MIN_REPLAY_BUDGET)`,

@@ -44,7 +44,7 @@ RHS
 ENDATA
 ";
     let err = parse_mps(input).unwrap_err();
-    assert!(matches!(err, LpError::InvalidInstance(_)));
+    assert!(matches!(err, LpError::Parse { line: 5, .. }), "{err:?}");
 }
 
 #[test]
@@ -85,7 +85,9 @@ RHS
 ENDATA
 ";
     let p = parse_mps(input).expect("parse");
-    assert_eq!(p.variables[0].kind, VarKind::Integer);
+    // The checker's type of a marker column with no BOUNDS entry: binary.
+    assert_eq!(p.variables[0].kind, VarKind::Binary);
+    assert_eq!((p.variables[0].lower, p.variables[0].upper), (0.0, 1.0));
     assert_eq!(p.variables[1].kind, VarKind::Continuous);
 }
 
@@ -143,8 +145,10 @@ ENDATA
     ));
 }
 
+/// A repeated objective entry of a column is refused: the MIPLIB checker
+/// keeps the last value, other readers sum (review finding on 200554215).
 #[test]
-fn test_parse_mps_accumulates_continued_objective_entries() {
+fn test_parse_mps_refuses_repeated_objective_entries() {
     let input = "\
 NAME SUMOBJ
 ROWS
@@ -157,8 +161,10 @@ RHS
     RHS C1 4.0
 ENDATA
 ";
-    let p = parse_mps(input).expect("parse");
-    assert_eq!(p.variables[0].obj_coeff, 4.0);
+    assert!(matches!(
+        parse_mps(input),
+        Err(LpError::Parse { line: 7, .. })
+    ));
 }
 
 #[test]
@@ -218,4 +224,136 @@ fn test_parse_mps_rejects_finite_ranges_whose_derived_bound_overflows() {
             "{row_kind} range overflow must be rejected"
         );
     }
+}
+
+fn parse_err_line(input: &str) -> usize {
+    match parse_mps(input) {
+        Err(LpError::Parse { line, .. }) => line,
+        other => panic!("expected a parse refusal, got {other:?}"),
+    }
+}
+
+/// The MIPLIB checker's default: an integer column of a marker section that
+/// no BOUNDS entry touches is in [0, 1]; a bound entry other than `UP 1`
+/// first resets its upper bound to +inf.
+#[test]
+fn test_parse_mps_marker_integer_default_bounds_follow_the_checker() {
+    let input = "\
+NAME INTB
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    M 'MARKER' 'INTORG'
+    A OBJ 1 C1 1
+    B OBJ 1 C1 1
+    C OBJ 1 C1 1
+    D OBJ 1 C1 1
+    M 'MARKER' 'INTEND'
+    E OBJ 1 C1 1
+RHS
+    RHS C1 3
+BOUNDS
+ UP BND B 1
+ LO BND C 2
+ UP BND D 7
+ENDATA
+";
+    let p = parse_mps(input).expect("parse");
+    let bounds: Vec<(f64, f64)> = p.variables.iter().map(|v| (v.lower, v.upper)).collect();
+    assert_eq!(
+        bounds,
+        vec![
+            (0.0, 1.0),
+            (0.0, 1.0),
+            (2.0, f64::INFINITY),
+            (0.0, 7.0),
+            (0.0, f64::INFINITY)
+        ]
+    );
+    let kinds: Vec<VarKind> = p.variables.iter().map(|v| v.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            VarKind::Binary,
+            VarKind::Binary,
+            VarKind::Integer,
+            VarKind::Integer,
+            VarKind::Continuous
+        ]
+    );
+}
+
+/// Constructs MPS readers disagree on are refused, each at its line.
+#[test]
+fn test_parse_mps_refuses_what_readers_disagree_on() {
+    let head = "NAME R\nROWS\n N OBJ\n L C1\nCOLUMNS\n";
+    // Lower-case marker words (the checker ignores the line, others do not).
+    assert_eq!(
+        parse_err_line(&format!(
+            "{head}    M 'MARKER' 'intorg'\n    X OBJ 1 C1 1\nENDATA\n"
+        )),
+        6
+    );
+    // Non-contiguous column records.
+    assert_eq!(
+        parse_err_line(&format!(
+            "{head}    XX OBJ 1 C1 1\n    YY OBJ 1 C1 1\n    XX C1 1 C1 1\nENDATA\n"
+        )),
+        8
+    );
+    // A second RHS set.
+    assert_eq!(
+        parse_err_line(&format!(
+            "{head}    X OBJ 1 C1 1\nRHS\n    RHS1 C1 1\n    RHS2 C1 2\nENDATA\n"
+        )),
+        9
+    );
+    // A second BOUNDS set.
+    assert_eq!(
+        parse_err_line(&format!(
+            "{head}    X OBJ 1 C1 1\nBOUNDS\n UP B1 X 1\n UP B2 X 2\nENDATA\n"
+        )),
+        9
+    );
+    // UP below 0 with lower bound 0 (0 in the checker, -inf elsewhere).
+    assert_eq!(
+        parse_err_line(&format!(
+            "{head}    X OBJ 1 C1 1\nBOUNDS\n UP BND X -1\nENDATA\n"
+        )),
+        8
+    );
+    // ... accepted once a lower bound other than 0 is given.
+    let p = parse_mps(&format!(
+        "{head}    X OBJ 1 C1 1\nBOUNDS\n UP BND X -1\n MI BND X\nENDATA\n"
+    ))
+    .expect("parse");
+    assert_eq!(
+        (p.variables[0].lower, p.variables[0].upper),
+        (f64::NEG_INFINITY, -1.0)
+    );
+}
+
+/// A column whose name contains MARKER is a column; entries of extra `N`
+/// rows are ignored, as in the checker.
+#[test]
+fn test_parse_mps_marker_named_column_and_free_rows() {
+    let input = "\
+NAME FREE
+ROWS
+ N OBJ
+ N SPARE
+ L C1
+COLUMNS
+    MARKER1 OBJ 1 C1 1
+    MARKER1 SPARE 5
+RHS
+    RHS C1 3
+ENDATA
+";
+    let p = parse_mps(input).expect("parse");
+    assert_eq!(p.variables.len(), 1);
+    assert_eq!(p.variables[0].kind, VarKind::Continuous);
+    assert_eq!(p.constraints.len(), 1);
+    assert_eq!(p.constraints[0].coeffs, vec![(0, 1.0)]);
 }

@@ -213,3 +213,178 @@ fn integer_cut_shadow_control_rows_are_not_advertised_as_real_cuts() {
     );
     assert_eq!(session.cut_harvest_summary().adopted_root_sides, 0);
 }
+
+/// One hidden ReLU layer lowered the way NY lowers it: per unit, a
+/// continuous post-activation `y`, a binary phase `z`, and the big-M rows
+/// `y >= h`, `y <= h - l(1 - z)`, `y <= u z` with `h = w·x + b` and
+/// interval pre-activation bounds `l < 0 < u`. Every coefficient is dyadic,
+/// so exact network evaluations are exact model points.
+const RELU_UNITS: [([f64; 2], f64, f64); 4] = [
+    ([1.0, -0.75], 0.25, 1.0),
+    ([-0.5, 1.0], 0.125, -0.75),
+    ([0.75, 0.5], -0.25, 0.5),
+    ([-1.0, -0.25], 0.375, 0.75),
+];
+
+fn relu_network() -> Model {
+    relu_network_with(false)
+}
+
+/// `relaxed` declares each phase column continuous in [0, 1]: the LP
+/// relaxation of the same rows.
+fn relu_network_with(relaxed: bool) -> Model {
+    let mut model = Model::new();
+    let x = [model.add_col(-1.0, 1.0), model.add_col(-1.0, 1.0)];
+    let mut objective = Vec::new();
+    for (w, b, c) in RELU_UNITS {
+        let l = b - w[0].abs() - w[1].abs();
+        let u = b + w[0].abs() + w[1].abs();
+        assert!(l < 0.0 && 0.0 < u, "every unit must be unstable");
+        let y = model.add_col(0.0, u);
+        let z = if relaxed {
+            model.add_col(0.0, 1.0)
+        } else {
+            model.add_binary_col()
+        };
+        // y - w·x >= b
+        model.add_row(b, f64::INFINITY, &[(y, 1.0), (x[0], -w[0]), (x[1], -w[1])]);
+        // y - w·x - l z <= b - l
+        model.add_row(
+            f64::NEG_INFINITY,
+            b - l,
+            &[(y, 1.0), (x[0], -w[0]), (x[1], -w[1]), (z, -l)],
+        );
+        // y - u z <= 0
+        model.add_row(f64::NEG_INFINITY, 0.0, &[(y, 1.0), (z, -u)]);
+        objective.push((y, c));
+    }
+    model.set_objective(&objective, Sense::Maximize);
+    model
+}
+
+/// The exact network point for input `(x0, x1)`: `[x0, x1, y_1, z_1, ...]`.
+fn relu_point(x0: f64, x1: f64) -> Vec<BigRational> {
+    let q = |v: f64| BigRational::from_float(v).expect("finite dyadic");
+    let mut point = vec![q(x0), q(x1)];
+    for (w, b, _) in RELU_UNITS {
+        let h = q(w[0]) * q(x0) + q(w[1]) * q(x1) + q(b);
+        let active = h > BigRational::from_integer(0.into());
+        point.push(if active {
+            h
+        } else {
+            BigRational::from_integer(0.into())
+        });
+        point.push(BigRational::from_integer(i32::from(active).into()));
+    }
+    point
+}
+
+#[test]
+fn integer_cut_big_m_relu_root_cuts_export_through_split_proofs() {
+    let source = relu_network();
+    let mut session = BabSession::new(source.clone(), &options()).expect("session");
+    let outcome = session.check().expect("actual native tree");
+    assert!(matches!(outcome, Outcome::Optimal { .. }), "{outcome:?}");
+    let before = session.cut_harvest_summary();
+    assert!(before.native_tree_finished, "{before:?}");
+    assert!(
+        before.unsupported_sides > 0,
+        "big-M rows mix continuous columns, so rank-one rounding must leave \
+         adopted sides unsupported: {before:?}"
+    );
+    let rank_one = session.harvest_cuts();
+    let report =
+        session.certify_cuts_by_split(Some(std::time::Instant::now() + Duration::from_secs(60)));
+    let after = session.cut_harvest_summary();
+    let split_cuts = session.harvest_cuts();
+    eprintln!(
+        "before={before:?} rank_one={} report={report:?} after={after:?}",
+        rank_one.len()
+    );
+    assert!(!report.interrupted && report.remaining == 0, "{report:?}");
+    assert_eq!(report.attempted, before.unsupported_sides, "{report:?}");
+    assert!(
+        report.certified > 0,
+        "split proofs must export some big-M cut: {report:?}"
+    );
+    assert_eq!(split_cuts.len(), report.certified);
+    assert_eq!(
+        after.certified_sides,
+        before.certified_sides + report.certified
+    );
+    assert_eq!(
+        after.unsupported_sides,
+        before.unsupported_sides - report.certified
+    );
+    assert_eq!(
+        session.certify_cuts_by_split(None).attempted,
+        0,
+        "tried sides are not retried"
+    );
+
+    // Every exported cut holds at every exact network evaluation on a grid
+    // (these are integer-feasible model points), independently of its proof.
+    let grid: Vec<f64> = (-4..=4).map(|k| f64::from(k) * 0.25).collect();
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            let point = relu_point(a, b);
+            source
+                .check_point(&point)
+                .expect("network point is feasible");
+            points.push(point);
+        }
+    }
+    let mut separates_some_lp_point = false;
+    for cut in &split_cuts {
+        assert!(
+            matches!(cut.proof, ay_milp::IntegerCutProof::ElementarySplit { .. }),
+            "{:?}",
+            cut.proof
+        );
+        cut.verify(&source)
+            .expect("independent caller-model replay");
+        for point in &points {
+            let activity: BigRational = cut
+                .coeffs
+                .iter()
+                .map(|(c, a)| a * &point[*c as usize])
+                .sum();
+            assert!(activity >= cut.lb, "cut violated at a network point");
+        }
+        // A narrower sibling (one phase fixed either way) keeps every premise.
+        let z = source.col_at(3).unwrap();
+        for phase in [0.0, 1.0] {
+            let mut child = source.clone();
+            child.fix_col(z, phase);
+            cut.verify(&child)
+                .expect("source-global cut survives a sibling box");
+        }
+        // The exact LP optimum of the cut's own form over the relaxation lies
+        // below `lb`: the cut is a genuine integer consequence, not an LP row.
+        let mut relaxation = relu_network_with(true);
+        let t = relaxation.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let mut tie = vec![(t, -1.0)];
+        let mut dyadic = true;
+        for (c, a) in &cut.coeffs {
+            let f = num_traits::ToPrimitive::to_f64(a).unwrap_or(f64::NAN);
+            dyadic &= BigRational::from_float(f).as_ref() == Some(a);
+            tie.push((relaxation.col_at(*c as usize).unwrap(), f));
+        }
+        if dyadic {
+            relaxation.add_row(0.0, 0.0, &tie);
+            let mut lp = ay_milp::LpSession::new(&relaxation, &SolveOpts::new()).unwrap();
+            if let Outcome::Optimal { value, .. } = lp.optimize(t, Sense::Minimize).unwrap() {
+                separates_some_lp_point |= value < cut.lb;
+            }
+        }
+    }
+    assert!(
+        separates_some_lp_point,
+        "some exported cut must cut the LP relaxation"
+    );
+    // Mutation and scope changes invalidate the retained sides too.
+    let _ = session.check().unwrap();
+    session.push().unwrap();
+    assert_eq!(session.certify_cuts_by_split(None).attempted, 0);
+}

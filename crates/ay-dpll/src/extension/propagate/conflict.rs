@@ -25,8 +25,8 @@ pub(crate) enum ConflictOrigin {
 
 /// Result of mapping a validated theory conflict to SAT literals.
 /// `Falsified` requires every literal to be false in the current SAT context.
-/// A named variable can still be unassigned after minting or backtracking;
-/// a complete mapping alone grants no conflict-analysis authority.
+/// A named variable can still be unassigned after backtracking; a complete
+/// mapping alone grants no conflict-analysis authority.
 pub(crate) enum MappedConflict {
     Falsified(Vec<Literal>),
     Lemma(Vec<Literal>),
@@ -222,32 +222,13 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         true
     }
 
-    pub(super) fn map_conflict_clause(
+    /// Map a theory conflict to SAT literals. A conflict naming a term with no
+    /// SAT variable maps to a partial clause and fails closed (`None`).
+    pub(crate) fn map_conflict_clause(
         &mut self,
         conflict: &[TheoryLit],
         origin: ConflictOrigin,
         ctx: &dyn SolverContext,
-    ) -> Option<MappedConflict> {
-        self.map_conflict_clause_minting(
-            conflict,
-            origin,
-            ctx,
-            super::super::check::mint_theory_vars_enabled(),
-        )
-    }
-
-    /// Map a theory conflict to SAT literals, optionally minting
-    /// variables for unencoded terms (#6846 BCP parity with the
-    /// `check()` path in `extension/check.rs`). Farkas-origin
-    /// conflicts never mint: their coefficient vector is aligned to
-    /// the original literal list and the proof path is unchanged, so
-    /// a partial Farkas mapping keeps failing closed.
-    pub(crate) fn map_conflict_clause_minting(
-        &mut self,
-        conflict: &[TheoryLit],
-        origin: ConflictOrigin,
-        ctx: &dyn SolverContext,
-        mint_enabled: bool,
     ) -> Option<MappedConflict> {
         let clause: Vec<Literal> = conflict
             .iter()
@@ -255,26 +236,6 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             .collect();
         if clause.len() == conflict.len() {
             return Some(MappedConflict::from_clause(clause, ctx));
-        }
-        if mint_enabled && matches!(origin, ConflictOrigin::Plain) {
-            let mut minted_clause = Vec::with_capacity(conflict.len());
-            let mut complete = true;
-            for term in conflict {
-                match self.term_to_literal_minting(term.term, !term.value, ctx, true) {
-                    Some(literal) => minted_clause.push(literal),
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                }
-            }
-            if complete {
-                tracing::debug!(
-                    lits = minted_clause.len(),
-                    "#6846: minted SAT variables for an otherwise-partial BCP theory conflict"
-                );
-                return Some(MappedConflict::from_clause(minted_clause, ctx));
-            }
         }
         self.partial_clause_count += 1;
         crate::combined_solvers::theory_stats::inc_partial_clauses();

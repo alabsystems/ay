@@ -25,7 +25,7 @@
 //! else changes. Outside the scope the refusal stands, so a caller that
 //! retries a refused export another way (the API's canonical rescue) and a
 //! producer that asks whether a fragment renders
-//! (`congruence_derivation_renders`) see exactly what they saw before. An
+//! (`congruence_derivation_renders_within`) see exactly what they saw before. An
 //! `assume` has no hole and still refuses.
 
 use super::*;

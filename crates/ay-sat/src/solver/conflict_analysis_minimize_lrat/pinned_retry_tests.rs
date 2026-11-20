@@ -125,16 +125,53 @@ fn script(solver: &mut Solver) -> Vec<Vec<Observed>> {
     seen
 }
 
+fn without_budget(
+    seen: &[Vec<Observed>],
+) -> Vec<Vec<(Vec<usize>, usize, Vec<(u64, i8)>, Vec<(u64, i8)>, bool)>> {
+    seen.iter()
+        .map(|step| {
+            step.iter()
+                .map(|o| {
+                    (
+                        o.pinned.clone(),
+                        o.cursor,
+                        o.level0_ids.clone(),
+                        o.unit_ids.clone(),
+                        o.completed,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn assert_budgets_never_lower(more: &[Vec<Observed>], less: &[Vec<Observed>]) {
+    for (step_m, step_l) in more.iter().zip(less) {
+        for (m, l) in step_m.iter().zip(step_l) {
+            assert!(
+                m.budget >= l.budget,
+                "memoized budget {:?} below rescanned {:?}",
+                m.budget,
+                l.budget
+            );
+        }
+    }
+}
+
 /// The short retry has exactly the full retry's effect on every branch:
-/// the same pinned list, cursor, recorded proof ids, waste charge and return
-/// value after every call of every materializer.
+/// the same pinned list, cursor, recorded proof ids and return value after
+/// every call of every materializer. Only the waste charge differs, by
+/// design (DR-AY-SAT-PIN-MEMO-CHARGE-20261119): a memo-hit retry rescans
+/// nothing and charges nothing, so the short run's remaining budget is
+/// never below the full run's.
 #[test]
 fn the_short_retry_has_the_full_retrys_effect() {
     let mut short = trace_solver();
     let mut full = trace_solver();
     let short_seen = script(&mut short);
     let full_seen = with_full_pinned_retry(|| script(&mut full));
-    assert_eq!(short_seen, full_seen);
+    assert_eq!(without_budget(&short_seen), without_budget(&full_seen));
+    assert_budgets_never_lower(&short_seen, &full_seen);
 
     // Anti-vacuity: the script reached the retry's branches.
     let last = short_seen
@@ -211,18 +248,28 @@ fn a_retry_in_a_solver_that_writes_no_proof_attempts_no_addition() {
 }
 
 /// The stay-pinned memo has exactly the unmemoized short retry's effect:
-/// same pinned list, cursor, recorded proof ids, waste charge and return
-/// value after every call of every materializer, across the same script
+/// same pinned list, cursor, recorded proof ids and return value after
+/// every call of every materializer, across the same script
 /// that reaches every retry branch — including the steps that must defeat
 /// the memo (a recorded proof id, a reason becoming a unit clause, a lost
-/// reason), so a stale memo would diverge here.
+/// reason), so a stale memo would diverge here. Only the waste charge
+/// differs (DR-AY-SAT-PIN-MEMO-CHARGE-20261119): memo hits charge nothing,
+/// so the memoized run's remaining budget is never below the plain run's,
+/// and strictly above it once a memo has engaged.
 #[test]
 fn the_stay_pinned_memo_has_the_unmemoized_retrys_effect() {
     let mut memoized = trace_solver();
     let mut plain = trace_solver();
     let memoized_seen = script(&mut memoized);
     let plain_seen = with_pin_memo_disabled(|| script(&mut plain));
-    assert_eq!(memoized_seen, plain_seen);
+    assert_eq!(without_budget(&memoized_seen), without_budget(&plain_seen));
+    assert_budgets_never_lower(&memoized_seen, &plain_seen);
+    let memoized_last = memoized_seen.last().and_then(|s| s.last()).expect("steps");
+    let plain_last = plain_seen.last().and_then(|s| s.last()).expect("steps");
+    assert!(
+        memoized_last.budget > plain_last.budget,
+        "the memo saved charge by the end of the script"
+    );
 
     // Anti-vacuity: the memo actually engaged for the slots that stay
     // pinned, and the slot the script resolves ends with no memo.
@@ -242,6 +289,56 @@ fn the_stay_pinned_memo_has_the_unmemoized_retrys_effect() {
         memoized.cold.lrat_pin_retry_memo_fingerprint[TARGETS[0]], 0,
         "the slot that gained a proof id has no memo"
     );
+}
+
+/// A memo-hit retry rescans nothing — it reads the fingerprint inputs and
+/// answers "stays pinned" — so it must not debit the #A2b bookkeeping
+/// budget. Measured on cruise-control (QF_LIRA, default posture): 275
+/// permanently pinned slots retried ~680 times each charged ~187k of the
+/// 250k budget and poisoned the clause trace before main search, forcing
+/// an ~11.6 s reconfirmation solve for work the memo had already skipped.
+#[test]
+fn memoized_pin_retries_charge_no_bookkeeping_budget() {
+    let mut solver = trace_solver();
+    solver.materialize_level0_unit_proofs();
+    assert_eq!(
+        solver.cold.lrat_level0_unit_materialize_pinned.len(),
+        TARGETS.len()
+    );
+    // First retry round computes the short retry and stores the memos; it
+    // is real scan work and stays charged.
+    solver.materialize_level0_unit_proofs();
+    let settled = solver.cold.proof_bookkeeping_budget;
+    assert!(matches!(settled, Some(left) if left < 1_000_000 && left > 0));
+    for _ in 0..50 {
+        solver.materialize_level0_unit_proofs();
+        solver.materialize_level0_minimize_unit_proofs();
+        let _ = solver.materialize_level0_unit_proofs_interruptible();
+    }
+    assert_eq!(
+        solver.cold.proof_bookkeeping_budget, settled,
+        "memo-hit retries must not charge the budget"
+    );
+    assert_eq!(
+        solver.cold.lrat_level0_unit_materialize_pinned.len(),
+        TARGETS.len()
+    );
+
+    // Negative twin: with the memo disabled every retry rescans and the
+    // charge keeps firing, so the budget strictly falls.
+    let mut plain = trace_solver();
+    with_pin_memo_disabled(|| {
+        plain.materialize_level0_unit_proofs();
+        plain.materialize_level0_unit_proofs();
+        let before = plain.cold.proof_bookkeeping_budget;
+        for _ in 0..10 {
+            plain.materialize_level0_unit_proofs();
+        }
+        assert!(
+            plain.cold.proof_bookkeeping_budget < before,
+            "unmemoized retries still charge"
+        );
+    });
 }
 
 /// NEGATIVE TWIN: with a proof output a retry can succeed, so it stays the

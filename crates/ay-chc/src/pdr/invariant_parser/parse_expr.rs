@@ -398,7 +398,9 @@ impl<'a> InvariantParser<'a> {
                     | "bvsmod" | "bvand" | "bvor" | "bvxor" | "bvnand" | "bvnor" | "bvxnor"
                     | "bvshl" | "bvlshr" | "bvashr" | "bvult" | "bvule" | "bvugt" | "bvuge"
                     | "bvslt" | "bvsle" | "bvsgt" | "bvsge" | "bvcomp" | "concat" | "bvnot"
-                    | "bvneg" | "bv2nat" | "bv2int" => self.parse_named_bv_application(&op, vars),
+                    | "bvneg" | "bv2nat" | "bv2int" | "ubv_to_int" | "sbv_to_int" => {
+                        self.parse_named_bv_application(&op, vars)
+                    }
                     "/" => {
                         // Real division: (/ num denom)
                         let num = self.parse_expr(vars)?;
@@ -513,7 +515,16 @@ impl<'a> InvariantParser<'a> {
             "bvsge" => (ChcOp::BvSGe, 2),
             "bvcomp" => (ChcOp::BvComp, 2),
             "concat" => (ChcOp::BvConcat, 2),
-            "bv2nat" | "bv2int" => (ChcOp::Bv2Nat, 1),
+            // `ubv_to_int` is the SMT-LIB 2.7 name of `bv2nat`.
+            "bv2nat" | "bv2int" | "ubv_to_int" => (ChcOp::Bv2Nat, 1),
+            "sbv_to_int" => {
+                let [arg]: [ChcExpr; 1] = args.try_into().map_err(|_| {
+                    ChcError::Parse("`sbv_to_int` requires exactly 1 argument".into())
+                })?;
+                return ChcExpr::sbv_to_int(arg).ok_or_else(|| {
+                    ChcError::Parse("`sbv_to_int` requires a bitvector argument".into())
+                });
+            }
             _ => {
                 return Err(ChcError::Parse(format!(
                     "unsupported bitvector operator `{name}`"
@@ -632,7 +643,8 @@ impl<'a> InvariantParser<'a> {
                 }
                 ChcOp::BvRepeat(repeat)
             }
-            "int2bv" => {
+            // `int_to_bv` is the SMT-LIB 2.7 name of `int2bv`.
+            "int2bv" | "int_to_bv" => {
                 if indices.len() != 1 {
                     return Err(ChcError::Parse(format!(
                         "(_ {name} n) requires exactly 1 index"

@@ -423,7 +423,7 @@ impl AlethePrinter<'_> {
         if let Some(steps) = surface_literal::same_printed_term_steps(id, left, right) {
             return Ok(steps);
         }
-        let canonical = crate::render_term_canonical(self.terms, canonical_term);
+        let canonical = self.render_canonical(canonical_term);
         // The authored `-2` beside the canonical `(- 2)` of a constant this
         // position holds: one term, which pinned carcara's `refl` re-derives.
         if let Some(steps) = surface_literal::negative_literal_shorthand_steps(

@@ -31,7 +31,6 @@ impl Executor {
     ///
     /// Strict mode is deliberately UNTOUCHED: it keeps its two existing strict
     /// walks (already metered) so no strict-mode statistic moves.
-    #[cfg(feature = "proof-checker")]
     pub(in crate::executor) fn run_internal_proof_check_and_measure(&mut self, proof: &Proof) {
         if self.strict_proofs_enabled() {
             self.run_internal_proof_check(proof);
@@ -71,7 +70,6 @@ impl Executor {
         self.last_proof_quality = quality;
     }
 
-    #[cfg(feature = "proof-checker")]
     pub(in crate::executor) fn run_internal_proof_check(&mut self, proof: &Proof) {
         // Strict mode (#4420): when enabled, reject trust and hole steps.
         // This gates on the SMT-LIB option `(set-option :check-proofs-strict true)`.
@@ -125,7 +123,6 @@ impl Executor {
     /// here, so every rejected or cancelled walk reported
     /// `checked_steps == total_steps` on a hole-free proof, whether it had
     /// validated one step or all of them.
-    #[cfg(feature = "proof-checker")]
     fn record_partial_check_outcome(
         &mut self,
         summary: PartialProofCheck,
@@ -145,7 +142,6 @@ impl Executor {
         self.record_proof_check_stats(1, summary);
     }
 
-    #[cfg(feature = "proof-checker")]
     fn proof_shape_summary(proof: &Proof) -> PartialProofCheck {
         let total_steps = proof.steps.len() as u32;
         let skipped_hole_steps = proof
@@ -169,7 +165,6 @@ impl Executor {
         }
     }
 
-    #[cfg(feature = "proof-checker")]
     fn record_proof_check_stats(&mut self, failures: u64, summary: PartialProofCheck) {
         // Record whether the internal checker accepted the refutation with no
         // errors. `--self-check` consults this (plus hole-freeness) before it

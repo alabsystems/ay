@@ -4,7 +4,7 @@
 //! Unit tests for the front probe's per-depth budget policy
 //! (`BmcSolver::ts_depth_cap`, `ts_probe_admit_next_depth`,
 //! `enter_probe_extension` / `leave_probe_extension`); see
-//! the development design notes.
+//! the development design notes at `9598c4206`.
 
 use super::{BmcConfig, BmcSolver};
 use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};
@@ -483,7 +483,7 @@ fn problem_fingerprint_is_structural() {
     );
 }
 
-/// Real-sorted TS lane per-depth cap (`LRA_BMC_unsafe_2026-09-22.md`):
+/// Real-sorted TS lane per-depth cap (the development design notes at `9598c4206`):
 /// `max(2 s, 8 × last decided depth)`, Int systems uncapped.
 #[test]
 fn real_sorted_ts_lane_caps_a_depth_at_its_trend() {

@@ -419,19 +419,139 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
         }
     }
 
+    let row_bounds = row_type
+        .iter()
+        .enumerate()
+        .map(|(r, ty)| row_interval(*ty, &rhs[r], ranges[r].as_ref()))
+        .collect::<Vec<_>>();
     build(
         name,
         sense,
-        &row_type,
+        &row_bounds,
         &row_names,
-        obj_row,
         col_names,
         cols,
         &obj_coeff,
         nz,
-        &rhs,
-        &ranges,
         &obj_offset,
+    )
+}
+
+/// The interval `[lo, hi]` (`None` = infinite) of a row of type `ty` with
+/// right-hand side `rhs` and an optional RANGES value; `None` for a free row.
+fn row_interval(
+    ty: RowType,
+    rhs: &BigRational,
+    range: Option<&BigRational>,
+) -> Option<(Option<BigRational>, Option<BigRational>)> {
+    let (lo, hi) = match ty {
+        RowType::Free => return None, // the objective, or a row that constrains nothing
+        RowType::Le => (None, Some(rhs.clone())),
+        RowType::Ge => (Some(rhs.clone()), None),
+        RowType::Eq => (Some(rhs.clone()), Some(rhs.clone())),
+    };
+    // RANGES turns a one-sided row into a two-sided one. The sign convention for `E` rows is
+    // the format's, not mine: a positive range extends upward, a negative one downward.
+    Some(match (range, ty) {
+        (None, _) => (lo, hi),
+        (Some(g), RowType::Le) => (Some(rhs - g.abs()), hi),
+        (Some(g), RowType::Ge) => (lo, Some(rhs + g.abs())),
+        (Some(g), RowType::Eq) => {
+            if g.is_negative() {
+                (Some(rhs + g), Some(rhs.clone()))
+            } else {
+                (Some(rhs.clone()), Some(rhs + g))
+            }
+        }
+        (Some(_), RowType::Free) => return None,
+    })
+}
+
+/// One column of a model given to [`model_from_exact`].
+#[derive(Debug, Clone)]
+pub struct RationalColumn {
+    /// The column's name.
+    pub name: String,
+    /// Lower bound (`None` for none).
+    pub lower: Option<BigRational>,
+    /// Upper bound (`None` for none).
+    pub upper: Option<BigRational>,
+    /// Whether the column is integer.
+    pub integral: bool,
+    /// Objective coefficient.
+    pub objective: BigRational,
+}
+
+/// One constraint row of a model given to [`model_from_exact`]:
+/// `lower <= sum(coeffs) <= upper`, `None` for an open side.
+#[derive(Debug, Clone)]
+pub struct RationalRow {
+    /// The row's name.
+    pub name: String,
+    /// `(column index, coefficient)` pairs; a repeated column is summed.
+    pub coeffs: Vec<(usize, BigRational)>,
+    /// Lower side (`None` for none).
+    pub lower: Option<BigRational>,
+    /// Upper side (`None` for none).
+    pub upper: Option<BigRational>,
+}
+
+/// Build the model another reader read exactly, so that this engine solves
+/// the model that reader's caller prints and checks.
+///
+/// Every number reaches [`build`] as the rational given, the same path a
+/// number of [`read_mps`] takes: a value an `f64` holds goes to the float
+/// lane as is, any other is scaled into one or kept in the exact side-store
+/// (module docs). Nothing is rounded on the way in. Columns keep their order,
+/// so column `j` of the result is `columns[j]`.
+///
+/// # Errors
+/// [`MpsError`] (line 0) for a coefficient naming no column, or a row
+/// [`read_mps`] would refuse (a number with no finite nonzero `f64`
+/// representation even as advice).
+pub fn model_from_exact(
+    name: &str,
+    sense: Sense,
+    columns: &[RationalColumn],
+    rows: &[RationalRow],
+    offset: &BigRational,
+) -> Result<MpsProblem, MpsError> {
+    let cols = columns
+        .iter()
+        .map(|c| ColBuild {
+            lb: c.lower.clone(),
+            ub: c.upper.clone(),
+            integral: c.integral,
+            lb_set: true,
+        })
+        .collect();
+    let obj_coeff: Vec<BigRational> = columns.iter().map(|c| c.objective.clone()).collect();
+    let mut row_bounds = Vec::with_capacity(rows.len());
+    let mut row_names = Vec::with_capacity(rows.len());
+    let mut nz = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        row_bounds.push(Some((row.lower.clone(), row.upper.clone())));
+        row_names.push(row.name.clone());
+        for (c, v) in &row.coeffs {
+            if *c >= columns.len() {
+                return Err(err(
+                    0,
+                    &format!("row `{}` names column {c} of {}", row.name, columns.len()),
+                ));
+            }
+            nz.push((r, *c, v.clone()));
+        }
+    }
+    build(
+        name.to_string(),
+        sense,
+        &row_bounds,
+        &row_names,
+        columns.iter().map(|c| c.name.clone()).collect(),
+        cols,
+        &obj_coeff,
+        nz,
+        offset,
     )
 }
 
@@ -446,15 +566,12 @@ pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
 fn build(
     name: String,
     sense: Sense,
-    row_type: &[RowType],
+    row_bounds: &[Option<(Option<BigRational>, Option<BigRational>)>],
     row_names: &[String],
-    _obj_row: Option<usize>,
     col_names: Vec<String>,
     cols: Vec<ColBuild>,
     obj_coeff: &[BigRational],
     nz: Vec<(usize, usize, BigRational)>,
-    rhs: &[BigRational],
-    ranges: &[Option<BigRational>],
     obj_offset: &BigRational,
 ) -> Result<MpsProblem, MpsError> {
     let mut model = Model::new();
@@ -514,32 +631,14 @@ fn build(
     }
 
     // ---- constraint rows ----
-    let mut by_row: Vec<Vec<(usize, BigRational)>> = vec![Vec::new(); row_type.len()];
+    let mut by_row: Vec<Vec<(usize, BigRational)>> = vec![Vec::new(); row_bounds.len()];
     for (r, c, v) in nz {
         by_row[r].push((c, v));
     }
     let mut kept_names = Vec::new();
-    for (r, ty) in row_type.iter().enumerate() {
-        let (lo, hi) = match ty {
-            RowType::Free => continue, // the objective, or a row that constrains nothing
-            RowType::Le => (None, Some(rhs[r].clone())),
-            RowType::Ge => (Some(rhs[r].clone()), None),
-            RowType::Eq => (Some(rhs[r].clone()), Some(rhs[r].clone())),
-        };
-        // RANGES turns a one-sided row into a two-sided one. The sign convention for `E` rows is
-        // the format's, not mine: a positive range extends upward, a negative one downward.
-        let (lo, hi) = match (&ranges[r], ty) {
-            (None, _) => (lo, hi),
-            (Some(g), RowType::Le) => (Some(&rhs[r] - g.abs()), hi),
-            (Some(g), RowType::Ge) => (lo, Some(&rhs[r] + g.abs())),
-            (Some(g), RowType::Eq) => {
-                if g.is_negative() {
-                    (Some(&rhs[r] + g), Some(rhs[r].clone()))
-                } else {
-                    (Some(rhs[r].clone()), Some(&rhs[r] + g))
-                }
-            }
-            (Some(_), RowType::Free) => unreachable!("free rows are skipped above"),
+    for (r, bounds) in row_bounds.iter().enumerate() {
+        let Some((lo, hi)) = bounds else {
+            continue; // the objective, or a row that constrains nothing
         };
         add_scaled_row(
             &mut model,

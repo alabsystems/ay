@@ -29,7 +29,7 @@
 //! # Soundness posture (load-bearing)
 //!
 //! * **Fail closed, everywhere.** Atom recognition reuses the existing,
-//!   well-tested [`super::diff_logic`] routines (`collect_comparison` /
+//!   [`super::dl_atom`] routines (`collect_comparison` /
 //!   `linearize` / `try_atomic_leaf`). Any Boolean atom that carries arithmetic
 //!   content but is not a pure DL atom marks the solver *unsupported* for the
 //!   current scope, and `check()` then answers `Unknown` — never an
@@ -67,7 +67,7 @@ use ay_diff_logic::DlWeight;
 use ay_diff_logic::{AssertOutcome, DiffAtom, Entailment, IncrementalDiffGraph};
 use num_rational::BigRational;
 
-use super::diff_logic::{collect_comparison, negate_op, CollectedAtom};
+use super::dl_atom::{collect_comparison, negate_op, CollectedAtom};
 
 /// Vertex reserved for the implicit zero variable `Z`, so the var-vs-const form
 /// `x ⋈ c` can be modelled as `x − Z ⋈ c` exactly as

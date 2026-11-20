@@ -27,8 +27,11 @@ pub fn checked_array_read_lowering_supported(
     {
         return false;
     }
+    // The whole remaining allowance: exhaustion zeroes it in every
+    // assembly mode, so nothing assembled past it is read.
     let printer =
-        AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, Some(*remaining_work));
+        AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, Some(*remaining_work))
+            .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     let rendered = dialect::discarding_notes(|| match kind {
         TheoryLemmaKind::ArraySelectStore { index_eq } => printer
             .format_array_select_store(ProofId(0), clause, *index_eq)

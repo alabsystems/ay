@@ -79,7 +79,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 /// The 17 om1relays queries the ay-dpll push/pop lane answered `unsat`
 /// (all satisfiable) in the 2026-09-18 microbenchmark (§5.1 of
-/// `MICROBENCH_QUERY_REPLAY_2026-09-18.md`; design §7.3 (ii)).
+/// the development design notes at `9598c4206`; design §7.3 (ii)).
 const OM1_FLAGGED: [&str; 17] = [
     "q_000024_19",
     "q_000082_19",

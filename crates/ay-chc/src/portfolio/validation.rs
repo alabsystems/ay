@@ -30,6 +30,14 @@ mod predicate_free_tests;
 #[path = "validation/exact_rewrites.rs"]
 mod exact_rewrites;
 
+#[path = "validation/monolithic.rs"]
+mod monolithic;
+pub(super) use monolithic::MonolithicVerdict;
+
+#[cfg(test)]
+#[path = "validation/monolithic_tests.rs"]
+mod monolithic_tests;
+
 #[cfg(test)]
 #[path = "validation/exact_rewrites_tests.rs"]
 mod exact_rewrites_tests;

@@ -16,6 +16,8 @@ use crate::api::Solver;
 use crate::executor::NativeSoftQueryBinding;
 use crate::{ExecutorError, UnknownReason};
 
+mod enumerate_bool;
+
 /// Whether a native feasibility call is the caller-visible authored decision
 /// or one probe inside a composite API operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

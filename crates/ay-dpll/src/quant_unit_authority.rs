@@ -379,7 +379,7 @@ pub(crate) enum EnumerativeAdmission {
 ///
 /// A global default was tried and reverted: corpus-wide, uniform, 779 files in
 /// both arms, it was **net −1** (the development design notes
-/// 2026-09-11-guarded-enumerative-ab.md`) while being worth **+65 of 200** on
+/// 2026-09-11-guarded-enumerative-ab.md` at `9598c4206`) while being worth **+65 of 200** on
 /// `BV 2018-Preiner-cav18`. An effect with that shape needs a predicate, not a
 /// default.
 ///

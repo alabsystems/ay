@@ -553,42 +553,46 @@ impl KindSolver {
         }
     }
 
-    /// Convert a k-inductive invariant to 1-inductive, falling back to the original.
+    /// Convert an invariant that is `depth`-inductive to a 1-inductive one,
+    /// falling back to the original.
     ///
-    /// When k > 0, attempts interpolation-based conversion via [`k_to_1_inductive::convert`].
-    /// Returns the original invariant if conversion fails or k == 0.
+    /// `depth` is the induction depth in the converter's convention
+    /// ([`crate::k_to_1_inductive::convert_with_timeout`]): the number of
+    /// transitions in the induction check `inv(x0..x{depth-1}) ∧ Tr^depth ∧
+    /// ¬inv(x{depth})`. Kind's loop index `k` checks with `k + 1` transitions,
+    /// so its callers pass `k + 1`; a `depth <= 1` invariant is already
+    /// 1-inductive and is returned unchanged (DR-CHC-KIND-K-TO-1-DEPTH-20261118).
     pub(super) fn strengthen_to_1_inductive(
         &self,
         inv: &ChcExpr,
-        k: usize,
+        depth: usize,
         ts: &TransitionSystem,
         run_start: ay_core::time::Instant,
     ) -> ChcExpr {
-        if k > 0 {
-            let convert_timeout = self
-                .stage_timeout_for_run(run_start, crate::k_to_1_inductive::DEFAULT_CONVERT_TIMEOUT);
-            if convert_timeout.is_zero() {
+        if depth <= 1 {
+            return inv.clone();
+        }
+        let convert_timeout =
+            self.stage_timeout_for_run(run_start, crate::k_to_1_inductive::DEFAULT_CONVERT_TIMEOUT);
+        if convert_timeout.is_zero() {
+            if self.config.base.verbose {
+                safe_eprintln!(
+                    "KIND: skipping k-to-1 conversion at depth={} (budget exhausted)",
+                    depth
+                );
+            }
+            return inv.clone();
+        }
+        crate::k_to_1_inductive::convert_with_timeout(inv, depth, ts, convert_timeout)
+            .unwrap_or_else(|| {
                 if self.config.base.verbose {
                     safe_eprintln!(
-                        "KIND: skipping k-to-1 conversion at k={} (budget exhausted)",
-                        k
+                        "KIND: k-to-1 conversion failed at depth={}, using k-inductive invariant",
+                        depth
                     );
                 }
-                return inv.clone();
-            }
-            crate::k_to_1_inductive::convert_with_timeout(inv, k, ts, convert_timeout)
-                .unwrap_or_else(|| {
-                    if self.config.base.verbose {
-                        safe_eprintln!(
-                            "KIND: k-to-1 conversion failed at k={}, using k-inductive invariant",
-                            k
-                        );
-                    }
-                    inv.clone()
-                })
-        } else {
-            inv.clone()
-        }
+                inv.clone()
+            })
     }
 
     /// Return true only for non-empty models over the original predicate

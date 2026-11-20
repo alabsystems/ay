@@ -790,34 +790,6 @@ fn uflia_detour_resume_reserve() -> std::time::Duration {
 /// that overhead). Below this the speculation is skipped entirely.
 const UFLIA_DETOUR_EXTEND_MIN: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Inc5 #fused-detour: FUSED detour arm (`--uflia-fused-detour=1`, default
-/// OFF — flags-off byte-identical). Process-cached env read.
-///
-/// the development design notes §2 Inc5 +
-/// the development design notes When enabled, the
-/// hybrid's post-detour slot replaces the ISOLATED eager resume with the
-/// z3-regime experiment: the eager split-loop macro (live TheoryExtension —
-/// LIA bound props consumed at BCP) instantiated on the SHARED
-/// `persistent_sat` — RETAINING eager1's and the detour's learned clauses —
-/// with relevancy-HARD ON via the flag-respecting
-/// `split_eager_relevancy_hard` seam and the wander-abort trip-wire
-/// disarmed for the fused arm only. EUF lazy explanations stay OFF (the
-/// arithmetic-combo carve-out in the combiner is untouched: the fused arm
-/// creates `TheoryCombiner::uf_lia` exactly like eager1), and the
-/// `lia_bcp_dirty`-class change-gating in the extension propagate path is
-/// untouched.
-///
-/// Shared-solver ext→ext safety (brief open question 1, CLEARED): the
-/// same-solver ext→ext restart-across-arena-rebuild gate tests
-/// (ay-sat solver/tests/ext_restart_arena_rebuild.rs) approve this
-/// embodiment — the NO_REASON normalization in `preprocess_reset` covers the
-/// stale-arena-reason hazard in every arm-transition direction this slot
-/// exercises (eager1 ext → detour plain → fused ext).
-fn uflia_fused_detour_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| ay_core::misc_cli_flags().uflia_fused_detour)
-}
-
 /// UFLIA model extraction shared by ALL split-loop invocations of the hybrid
 /// (#relevancy-lazy-routing): the eager attempt, the bounded lazy detour, the
 /// speculative detour extension, and the eager resume must apply the
@@ -6107,7 +6079,6 @@ impl Executor {
         // lanes' pipeline invocations (heuristic-only either way, but keep the
         // default path byte-identical).
         self.split_eager_wander_abort = false;
-        self.split_eager_relevancy_hard = false;
         self.split_lazy_relevancy_hard = false;
         self.split_lazy_detour_conflict_budget = None;
         // Term-level caches carried from each round's combiner into the next,
@@ -6124,25 +6095,12 @@ impl Executor {
                 // HARD — the design prototype's regime for the branch-space-
                 // bound Hash family) and, if that comes back undecided,
                 // RESUMES the eager arm for the remainder of the budget.
-                // #uflia-model-repair (route `eager`, the default): the ONE
-                // targeted repair re-solve forces the eager arm as a single
-                // full-window run — no wander-abort reroute, no detour, no
-                // resume. On the model-rejection tail every rejected
-                // candidate came from an eager-family arm while the detour
-                // theory-spins its window, so the remnant budget goes to the
-                // one arm that can re-find a (now trap-blocked) candidate.
-                // The flag can only be `true` under `AY_UFLIA_MODEL_REPAIR=1`
-                // and only for that single re-solve; default off is
-                // byte-identical.
                 // L2 (combined-theory-engine campaign): the lazy-DT-AUFLIA lane
                 // under `AY_DT_LAZY_AUFLIA_EAGER` forces the EAGER arm — the
                 // sparse on-demand DT axioms make the residual eager-tractable,
                 // so the hybrid's lazy detour is pure wasted wall (see the field
-                // doc). Same override shape as `uflia_repair_eager_direct`; both
-                // only change trajectory, never a verdict.
-                let _uflia_arm = if this.uflia_repair_eager_direct
-                    || this.dt_lazy_auflia_eager_arm
-                {
+                // doc). This only changes trajectory, never a verdict.
+                let _uflia_arm = if this.dt_lazy_auflia_eager_arm {
                     UfliaSplitArm::Eager
                 } else {
                     uflia_split_arm()
@@ -6159,19 +6117,8 @@ impl Executor {
                 // arms retain their full UNSAT verification and SAT model gates.
                 // The debug force-eager differential never arms the demand
                 // lane, so its control solve remains byte-identical.
-                // #uflia-model-repair: the ONE targeted repair re-solve
-                // (`uflia_targeted_model_repair_resolve`) routes the hybrid
-                // detour-direct — the eager first attempt's boolean re-wander
-                // is the measured burn on the model-rejection tail, while the
-                // relevancy-hard detour reaches the N-O accept points where
-                // the armed congruence-repair scan / finite-domain rescue
-                // run. Piggybacks the demand lane's existing lazy-first
-                // scheduling seam (soundness note there applies verbatim).
-                // The flag can only be `true` under `AY_UFLIA_MODEL_REPAIR=1`
-                // and only for that single re-solve; default off is
-                // byte-identical.
-                let _uflia_demand_first = _uflia_arm == UfliaSplitArm::Hybrid
-                    && (this.demand_lane_armed() || this.uflia_repair_detour_direct);
+                let _uflia_demand_first =
+                    _uflia_arm == UfliaSplitArm::Hybrid && this.demand_lane_armed();
                 // Single definition of the eager DPLL(T) attempt, stamped for
                 // BOTH the first attempt and (hybrid only) the post-detour
                 // eager RESUME so the two invocations can never drift apart.
@@ -6669,56 +6616,6 @@ impl Executor {
                     // tripped a stale clause-arena offset panic in the
                     // extension CDCL loop; isolation is the sanctioned clean
                     // re-run seam and sidesteps that entirely).
-                    //
-                    // Inc5 #fused-detour (`--uflia-fused-detour=1`, default
-                    // off): the slot instead runs the FUSED arm — the same
-                    // eager split-loop macro, but on the SHARED persistent
-                    // solver (no `with_isolated_incremental_state`), RETAINING
-                    // eager1's and the detour's learned clauses, with
-                    // relevancy-HARD forced through the flag-respecting
-                    // `split_eager_relevancy_hard` seam and the wander-abort
-                    // disarmed for the fused arm only (`split_eager_wander_
-                    // abort` stays false here, re-stamped per round by the
-                    // macro). This is the z3-regime experiment: live theory
-                    // propagation (eager1's half) + relevancy-hard decision
-                    // restriction (the detour's half) in ONE arm. The
-                    // ext→ext/plain→ext stale-arena hazard this re-enters is
-                    // covered by the NO_REASON normalization, gated by the
-                    // same-solver restart tests in ay-sat
-                    // ext_restart_arena_rebuild.rs (brief question 1 CLEARED).
-                    //
-                    // Brief question 3 (counter insulation on the shared
-                    // solver): yes, by construction — the eager macro
-                    // re-installs the deterministic conflict/decision budgets
-                    // EVERY round RELATIVE to the solver's live counters
-                    // (`num_conflicts() + allowance`), so the conflicts and
-                    // decisions eager1/the detour already consumed never
-                    // shrink the fused arm's headroom; the wander trip-wire is
-                    // re-armed/disarmed per round from the executor flag
-                    // (false here), so stale trip baselines cannot fire; and
-                    // the detour's caps were already restored above (the OUTER
-                    // budget restore at detour/extension exit is kept). The
-                    // saved-budget restore below re-stamps the outer values
-                    // after the fused arm for the same hygiene. Nothing leaks
-                    // to later check-sats either: this whole closure runs on
-                    // `with_deferred_postprocessing`'s isolated incremental
-                    // state, discarded at exit, and the unconditional
-                    // post-attempt teardown resets every routing flag.
-                    //
-                    // Brief question 4: the fused arm's UNSAT path ALWAYS
-                    // routes through `verify_unsat_after_splits` (the macro's
-                    // cross-arm guard keys on the fused flag), so a
-                    // propositional UNSAT leaning on prior-arm clauses is
-                    // accepted only after a FRESH isolated re-derivation from
-                    // the ORIGINAL assertions — the stale-clause backstop,
-                    // unweakened.
-                    //
-                    // Soundness envelope (unchanged): the fused arm is the
-                    // same complete, gate-validated eager pipeline; every SAT
-                    // flows through the unchanged model-validation gates and
-                    // every UNSAT through verify-before-accept, so flipping
-                    // this flag can only move verdicts between `unknown` and a
-                    // gate-validated decided verdict.
                     if _uflia_hybrid_trip
                         && matches!(result, Ok(SolveResult::Unknown))
                         && !solve_deadline.expired()
@@ -6727,37 +6624,11 @@ impl Executor {
                         })
                     {
                         this.split_eager_wander_abort = false;
-                        if uflia_fused_detour_enabled() {
-                            this.split_eager_relevancy_hard = true;
-                            if let Some(t0) = _uflia_phase_t0 {
-                                safe_eprintln!(
-                                    "[uflia-phase] fused-start elapsed={:.2}s",
-                                    t0.elapsed().as_secs_f64()
-                                );
-                            }
-                            let fused_result = uflia_eager_attempt!(this);
-                            this.split_eager_relevancy_hard = false;
-                            // Mirror the detour/extension exits: re-stamp the
-                            // attempt-entry deterministic budgets on the shared
-                            // solver (outer budget restore kept — see brief
-                            // question 3 above).
-                            if let Some(state) = this.incr_theory_state.as_mut() {
-                                if let Some(solver) = state.persistent_sat.as_mut() {
-                                    let (cb, db) =
-                                        _uflia_saved_budgets.unwrap_or((None, None));
-                                    solver.set_conflict_budget(cb);
-                                    solver.set_decision_budget(db);
-                                }
-                            }
-                            uflia_phase!(this, "fused-done", fused_result);
-                            result = fused_result;
-                        } else {
-                            result = this.with_isolated_incremental_state(None, |exec| {
-                                let r = uflia_eager_attempt!(exec);
-                                uflia_phase!(exec, "resume-done", r);
-                                r
-                            });
-                        }
+                        result = this.with_isolated_incremental_state(None, |exec| {
+                            let r = uflia_eager_attempt!(exec);
+                            uflia_phase!(exec, "resume-done", r);
+                            r
+                        });
                     }
                 }
                 result
@@ -6765,10 +6636,7 @@ impl Executor {
         // #relevancy-lazy-routing: unconditional post-attempt reset (control
         // always returns here, even when the closure early-returned past its
         // inline resets) — the flags must never leak into other lanes.
-        // Inc5 #fused-detour: `split_eager_relevancy_hard` joins the teardown
-        // (brief seam table: post-attempt flag reset).
         self.split_eager_wander_abort = false;
-        self.split_eager_relevancy_hard = false;
         self.split_lazy_relevancy_hard = false;
         self.split_lazy_detour_conflict_budget = None;
         // Also disarm the trip-wire on the shared persistent solver: the eager
@@ -7482,11 +7350,10 @@ impl Executor {
         // (#6813). Rebuilding the combined solver each check-sat preserves
         // soundness while we keep the pure fast path for non-incremental solves.
         if !self.incremental_mode
-            && (ay_core::misc_cli_flags().force_array_euf
-                || !crate::term_helpers::has_substantive_int_constraints(
-                    &self.ctx.terms,
-                    &self.ctx.assertions,
-                ))
+            && !crate::term_helpers::has_substantive_int_constraints(
+                &self.ctx.terms,
+                &self.ctx.assertions,
+            )
         {
             // Only route to Array+EUF if at least one assertion actually
             // involves array operations (select/store/array-sorted terms).

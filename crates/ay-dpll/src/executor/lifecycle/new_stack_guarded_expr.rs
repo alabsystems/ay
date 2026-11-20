@@ -29,17 +29,11 @@ macro_rules! new_stack_guarded_expr {
             branch_assign_scoped_fixpoint: false,
             arm_uflia_congruence_repair: false,
             split_eager_wander_abort: false,
-            split_eager_relevancy_hard: false,
             split_lazy_relevancy_hard: false,
             split_lazy_detour_conflict_budget: None,
             uflia_congruence_lane: false,
             uflia_congruence_gate_rejected: false,
             uflia_congruence_retry_done: false,
-            uflia_repair_candidates: Vec::new(),
-            uflia_repair_conflict_tables: Vec::new(),
-            uflia_model_repair_done: false,
-            uflia_repair_detour_direct: false,
-            uflia_repair_eager_direct: false,
             dt_lazy_auflia_eager_arm: false,
             dt_frontier_tester_diet_armed: false,
             dt_lazy_lane_suppressed_for_scoped_probe: false,
@@ -194,6 +188,8 @@ macro_rules! new_stack_guarded_expr {
             #[cfg(test)]
             test_force_non_bv_congruence_bail: None,
             #[cfg(test)]
+            test_euf_bv_congruence_clause_cap: None,
+            #[cfg(test)]
             test_panic_in_quantified_trace_retry: false,
             #[cfg(test)]
             test_panic_in_deep_qe_retry: false,
@@ -249,6 +245,8 @@ macro_rules! new_stack_guarded_expr {
             self_check: false,
             competition_mode: false,
             last_bv_drat_self_cert: false,
+            bv_encodings_stopped_before_search: 0,
+            bv_sat_searches_entered: 0,
             dt_array_injectivity_gate_bypass: false,
             last_degrade_was_datatype_array: false,
             dt_pre_lift_assertions: Vec::new(),
@@ -356,8 +354,6 @@ macro_rules! new_stack_guarded_expr {
             forced_maxsmt_post_emit_soft_flip: Cell::new(false),
             #[cfg(test)]
             forced_optimization_post_emit_objective_flip: Cell::new(false),
-            #[cfg(test)]
-            last_diff_logic_decided: Cell::new(false),
             lemma_persistence: false,
             lemma_cache: lemma_cache::LemmaCache::new(),
             unbounded_objectives: HashMap::default(),

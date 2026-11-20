@@ -230,7 +230,7 @@ fn exhausted_trace_does_not_reactivate_after_lrat_writer_detach() {
 }
 
 #[test]
-fn exhausted_trace_stays_inert_through_later_root_unsat() {
+fn exhausted_trace_records_literals_only_through_later_root_unsat() {
     let mut solver = Solver::new(1);
     solver.enable_clause_trace();
     solver.set_proof_bookkeeping_budget(Some(0));
@@ -243,13 +243,58 @@ fn exhausted_trace_stays_inert_through_later_root_unsat() {
     assert!(solver.add_clause(vec![x.negated()]));
     assert!(matches!(solver.solve().into_inner(), SatResult::Unsat(_)));
 
+    // Degradation keeps recording literals (no hints) so reconstruction
+    // repair lanes get a complete clause sequence ending in the empty
+    // clause; LRAT bookkeeping itself stays off.
     let trace = solver.clause_trace();
     assert!(trace.is_some_and(|trace| {
-        trace.proof_work_exhausted() && trace.is_empty() && !trace.has_empty_clause()
+        trace.proof_work_exhausted()
+            && trace.literals_only_recording()
+            && !trace.is_empty()
+            && trace.has_empty_clause()
+            && trace
+                .entries()
+                .into_iter()
+                .all(|entry| entry.resolution_hints.is_empty())
     }));
     assert!(!solver.clause_trace_enabled());
     assert!(solver.take_proof_writer_without_artifact().is_none());
     assert!(!solver.cold.lrat_enabled);
+}
+
+/// The conditional (assumption) UNSAT finalization stamps the same query
+/// marker onto a literals-only trace: split-loop SMT refutations close
+/// through `finalize_conditional_unsat_proof`, not the base path.
+#[test]
+fn exhausted_trace_records_literals_only_through_conditional_unsat() {
+    let mut solver = Solver::new(2);
+    solver.enable_clause_trace();
+    solver.set_proof_bookkeeping_budget(Some(0));
+    if let Some(trace) = solver.cold.clause_trace.as_mut() {
+        trace.mark_proof_work_exhausted();
+    }
+    solver.degrade_proof_bookkeeping_after_exhaustion();
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    assert!(solver.add_clause(vec![a, b]));
+    assert!(solver.add_clause(vec![a.negated(), b]));
+    let result = solver.solve_with_assumptions(&[b.negated()]);
+    assert!(
+        result.is_unsat(),
+        "conditional solve should be UNSAT, got {result:?}"
+    );
+
+    let trace = solver.clause_trace();
+    assert!(trace.is_some_and(|trace| {
+        trace.proof_work_exhausted()
+            && trace.literals_only_recording()
+            && !trace.is_empty()
+            && trace.has_empty_clause()
+            && trace
+                .entries()
+                .into_iter()
+                .all(|entry| entry.resolution_hints.is_empty())
+    }));
 }
 
 #[test]
@@ -395,11 +440,13 @@ fn clause_trace_snapshots_preserve_persistent_solver_ownership() {
 /// This is the measurement the 2026-09-08 closure diagnosis asserted without
 /// taking: it called the exhausted population "a propositional refutation AY
 /// recorded and then deliberately discarded" while its own instrument reported
-/// `clause_trace_entries=0`, because the clear had already happened. Mutating
-/// `snapshot_before_exhaustion_clear` to run AFTER `clear_entries` makes every
-/// assertion below fail with zeroes.
+/// `clause_trace_entries=0`, because the clear had already happened.
+/// Degradation now retains the entries literals-only, and the census still
+/// records what hinted recording held at the strip: mutating
+/// `snapshot_before_exhaustion_clear` to run AFTER the strip would misreport
+/// the hint census (`learned_with_hints`) as zero.
 #[test]
-fn exhaustion_snapshot_records_what_the_clear_destroyed() {
+fn exhaustion_snapshot_records_what_hinted_recording_held() {
     let mut solver = Solver::new(4);
     solver.enable_clause_trace();
     let a = Literal::positive(Variable(0));
@@ -418,10 +465,15 @@ fn exhaustion_snapshot_records_what_the_clear_destroyed() {
     let trace = solver
         .clause_trace()
         .expect("the trace survives the degrade");
-    assert_eq!(trace.len(), 0, "entries are cleared");
+    assert_eq!(trace.len(), recorded, "entries are retained literals-only");
+    assert!(trace.literals_only_recording());
+    assert!(trace
+        .entries()
+        .into_iter()
+        .all(|entry| entry.resolution_hints.is_empty()));
     let snap = trace
         .exhaustion_snapshot()
-        .expect("the clear must leave its census behind");
+        .expect("the strip must leave its census behind");
     assert_eq!(snap.entries as usize, recorded);
     assert_eq!(snap.originals as usize, recorded);
     assert_eq!(snap.learned, 0);

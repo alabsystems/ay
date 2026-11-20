@@ -77,6 +77,7 @@ struct TestSelection {
 #[derive(Default)]
 struct Selection {
     unit: bool,
+    integration_compile: bool,
     cli_all: bool,
     cli_entry: bool,
     cli_modules: BTreeSet<String>,
@@ -335,6 +336,50 @@ pub(super) fn select(
         let Some(selection) = selected.get(&package.name) else {
             continue;
         };
+        if selection.integration_compile && !broad {
+            let mut args = test_args(package);
+            args[0] = "check".into();
+            args.extend(strings(&["--profile", "test", "--tests"]));
+            steps.push(Step::compiler(args));
+        }
+        if selection.unit && package.name != "ay" {
+            // The test harness omits cfg(not(test)) production paths.
+            // A library dependency compiles that library, not its companion
+            // executable. Do not require the package to be independent.
+            for target in package
+                .targets
+                .iter()
+                .filter(|target| target.kind.iter().any(|kind| kind == "bin"))
+            {
+                let changed_entry = paths
+                    .iter()
+                    .filter(|path| !scope.unchanged.contains(*path))
+                    .any(|path| {
+                        local_paths::physical_input(&root.join(path))
+                            == local_paths::physical_input(&target.src_path)
+                    });
+                // Opt-in development tools are not part of the default binary
+                // surface. A directly changed entry still needs its exact
+                // declared feature set, rather than silently compiling zero.
+                if !target.required_features.is_empty() && !changed_entry {
+                    continue;
+                }
+                let mut args = strings(&[
+                    "build",
+                    "--profile",
+                    "test",
+                    "--locked",
+                    "-p",
+                    &package.name,
+                    "--bin",
+                    &target.name,
+                ]);
+                if !target.required_features.is_empty() {
+                    args.extend(["--features".into(), target.required_features.join(",")]);
+                }
+                steps.push(Step::compiler(args));
+            }
+        }
         if selection.unit {
             let mut args = test_args(package);
             if package
@@ -666,6 +711,25 @@ fn select_test(
         .collect();
     let entry = selected.entry(package.name.clone()).or_default();
     if direct.is_empty() {
+        if !path.exists()
+            && path.extension().is_some_and(|extension| extension == "rs")
+            && tests
+                .iter()
+                .all(|target| target.required_features.is_empty())
+            && package
+                .manifest_path
+                .parent()
+                .is_some_and(|directory| path.parent() == Some(directory.join("tests").as_path()))
+        {
+            // An auto-discovered standalone test disappeared. There is no
+            // remaining runtime owner for it. Compile all surviving tests so
+            // a live test's import of the removed file still fails closed,
+            // without executing every unrelated solver workload. Feature-gated
+            // targets retain the existing explicit feature/runtime selection:
+            // a default --tests check cannot establish their compilation.
+            entry.integration_compile = true;
+            return;
+        }
         for target in tests {
             entry
                 .integration

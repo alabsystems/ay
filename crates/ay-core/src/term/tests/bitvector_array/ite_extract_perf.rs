@@ -1205,3 +1205,80 @@ fn test_ite_lifting_deep_shared_ite_dag_is_linear_not_exponential() {
         "deep shared-ite lifting must be O(DAG); took {elapsed:?}"
     );
 }
+
+#[test]
+fn lambda_index_dependent_ite_never_escapes_into_global_conditions() {
+    let mut terms = TermStore::new();
+    let index = terms.mk_var("i", Sort::Int);
+    let pivot = terms.mk_var("p", Sort::Int);
+    let guard = terms.mk_le(index, pivot);
+    let seven = terms.mk_int(7.into());
+    let body = terms.mk_ite(guard, index, seven);
+    let lambda = terms.mk_lambda_array(index, body);
+    let target = terms.mk_var("function", Sort::array(Sort::Int, Sort::Int));
+    let root = terms.mk_eq(lambda, target);
+    assert_eq!(terms.lift_arithmetic_ite(root), root);
+    let mut definitions = Vec::new();
+    assert_eq!(
+        terms.name_non_bool_ites_all(&[root], &mut definitions),
+        vec![root]
+    );
+    assert!(definitions.is_empty());
+    // The same conditional used freely outside a binder can still be lifted.
+    let _outside = terms.name_non_bool_ites_all(&[body], &mut definitions);
+    assert!(!definitions.is_empty());
+}
+
+#[test]
+fn array_lambda_equality_rewrites_only_capture_free_projections_and_singleton_updates() {
+    let mut t = TermStore::new();
+    let array = t.mk_var("a", Sort::array(Sort::Int, Sort::Int));
+    let other = t.mk_var("b", Sort::array(Sort::Int, Sort::Int));
+    let index = t.mk_var("i", Sort::Int);
+    let key = t.mk_int(3.into());
+    let zero = t.mk_int(0.into());
+    let select = t.mk_select(array, index);
+    let eta = t.mk_lambda_array(index, select);
+    // A one-sided definition retains its binder for snapshot construction.
+    assert!(t.array_lambda_equality_values(eta, other).is_none());
+    assert!(t.array_lambda_equality_values(other, eta).is_none());
+    let other_select = t.mk_select(other, index);
+    let other_eta = t.mk_lambda_array(index, other_select);
+    assert_eq!(
+        t.array_lambda_equality_values(eta, other_eta),
+        Some((array, other))
+    );
+    let eq = t.mk_eq(index, key);
+    let empty = t.mk_const_array(Sort::Int, t.false_term());
+    let singleton = t.mk_store(empty, key, t.true_term());
+    let member = t.mk_select(singleton, index);
+    for guard in [eq, member] {
+        let body = t.mk_ite(guard, select, zero);
+        let lambda = t.mk_lambda_array(index, body);
+        let seven = t.mk_int(7.into());
+        let rhs_body = t.mk_ite(guard, seven, zero);
+        let rhs = t.mk_lambda_array(index, rhs_body);
+        let actual = t.mk_eq(lambda, rhs);
+        let at_key = t.mk_select(array, key);
+        let expected = t.mk_eq(at_key, seven);
+        assert_eq!(actual, expected);
+        let uniform = t.mk_lambda_array(index, zero);
+        let at_key_matches_default = t.mk_eq(at_key, zero);
+        assert_eq!(t.mk_eq(lambda, uniform), at_key_matches_default);
+        assert_eq!(t.mk_eq(uniform, lambda), at_key_matches_default);
+        let different_fallback = t.mk_ite(guard, seven, key);
+        let different = t.mk_lambda_array(index, different_fallback);
+        let left_base = t.mk_const_array(Sort::Int, zero);
+        let right_base = t.mk_const_array(Sort::Int, key);
+        let left_store = t.mk_store(left_base, key, at_key);
+        let right_store = t.mk_store(right_base, key, seven);
+        assert_eq!(
+            t.array_lambda_equality_values(lambda, different),
+            Some((left_store, right_store))
+        );
+    }
+    let dependent_owner = t.mk_ite(eq, array, other);
+    let nested_read = t.mk_select(dependent_owner, index);
+    let nested = t.mk_lambda_array(index, nested_read);
+    assert!(t.array_lambda_equality_values(nested, other).is_none());
+}

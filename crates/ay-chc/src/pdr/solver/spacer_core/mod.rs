@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Spacer-faithful lemma side of the PDR blocking loop (Workstream B,
-//! the development design notes §4.2).
+//! the development design notes at `9598c4206`, §4.2).
 //!
 //! Owner: **WP-B1-L** (lemma core). This module tree was declared in the
 //! skeleton commit by WP-B1-S with the frozen §3 signatures; bodies marked

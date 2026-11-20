@@ -403,20 +403,14 @@ impl ArraySolver<'_> {
             return TheoryResult::Unknown;
         }
 
-        // ROW2 extended via store chain following.
-        //
-        // #k1-explain-memo: `check_row2_extended` is `&self` — the equality
-        // graph, assignments, and external-fact maps are provably immutable
-        // for the duration of the call (no `&mut self` alias can exist), which
-        // is exactly the `eq_paths_cache` soundness precondition established
-        // for `propagate_equalities_impl`. Activating the window here dedups
-        // the per-candidate-pair `explain_equal/distinct_if_provable` BFS
-        // recomputations that dominated final_check on axiom-expanded AUFLIA
-        // re-solves (A1 chain shape: O(pairs x graph) hash-churn, >30s wall).
-        if let Some(result) = {
-            let _eq_paths_cache_guard = eq_paths_cache::activate();
-            self.check_row2_extended()
-        } {
+        // These scans share one snapshot of the asserted graph, assignments,
+        // registered terms and external reasons. The store-chain witnesses
+        // can mark a model equality as requested, but that bookkeeping is
+        // independent of every cached explanation. Reuse the same paths and
+        // candidate pairs through the broad witness, then drop the window
+        // before resuming mutable queue and interface processing.
+        let explanation_window = eq_paths_cache::activate();
+        if let Some(result) = self.check_row2_extended() {
             match result {
                 TheoryResult::Unsat(_) => {
                     tracing::debug!("arrays final_check: ROW2-extended conflict");
@@ -522,12 +516,7 @@ impl ArraySolver<'_> {
             }
         }
 
-        // #k1-explain-memo: `&self` read-only scan — see check_row2_extended
-        // note above for the memo-window soundness argument.
-        if let Some(result) = {
-            let _eq_paths_cache_guard = eq_paths_cache::activate();
-            self.check_store_permutation_select_conflicts()
-        } {
+        if let Some(result) = self.check_store_permutation_select_conflicts() {
             match result {
                 TheoryResult::Unsat(_) => {
                     tracing::debug!("arrays final_check: store-permutation-select conflict");
@@ -552,12 +541,7 @@ impl ArraySolver<'_> {
         }
 
         // Nested select conflicts (3D arrays via recursive simplification).
-        // #k1-explain-memo: `&self` read-only scan — see check_row2_extended
-        // note above for the memo-window soundness argument.
-        if let Some(result) = {
-            let _eq_paths_cache_guard = eq_paths_cache::activate();
-            self.check_nested_select_conflicts()
-        } {
+        if let Some(result) = self.check_nested_select_conflicts() {
             match result {
                 TheoryResult::Unsat(_) => {
                     tracing::debug!("arrays final_check: nested-select conflict");
@@ -623,6 +607,8 @@ impl ArraySolver<'_> {
                 }
             }
         }
+
+        drop(explanation_window);
 
         // #8615: Check interrupt before expensive event-driven queue population.
         if self.interrupted_or_deadline() {

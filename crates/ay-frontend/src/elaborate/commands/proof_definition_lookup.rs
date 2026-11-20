@@ -30,14 +30,23 @@ impl Context {
         let [info] = self.symbol_candidates(name)? else {
             return None;
         };
+        // The constant-time refusals come first. `effective_declaration_kind`
+        // scans every live symbol, and a caller that walks the whole symbol
+        // table (`nullary_definition_premises`, run during UNSAT proof
+        // assembly) made that scan quadratic in the symbol count: every
+        // `:named` label is a `Defined` nullary binding, so with 17,653 labels
+        // one proof assembly spent over 10 s here and the reduced-core recheck
+        // of the SMT-COMP unsat-core track ran out of its budget (AY-SMT-4).
+        // The predicate is a conjunction of side-effect-free tests, so the
+        // order changes the cost only, never the answer.
         if info.declaration_kind() != DeclarationKind::Defined
-            || self.effective_declaration_kind(info.declaration_id())
-                != Some(DeclarationKind::Defined)
+            || info.is_named_label()
             || !info.arg_sorts.is_empty()
             || self.is_recursive_fun(name)
             || self.is_internal_symbol(name)
             || self.adopted_macro_interp(name).is_some()
-            || info.is_named_label()
+            || self.effective_declaration_kind(info.declaration_id())
+                != Some(DeclarationKind::Defined)
         {
             return None;
         }

@@ -26,6 +26,7 @@
 mod bit_blast;
 mod distribute_forall;
 mod eq_diffvar;
+pub(crate) mod finite_bool;
 mod flatten_and;
 pub(crate) mod fp_literal;
 mod guarded_eq_mining;

@@ -44,7 +44,7 @@ fn run_pb_solve(args: &[&str], file: &NamedTempFile) -> (std::process::ExitStatu
 
 /// The checker for this suite, or `None` when the machine has none.
 ///
-/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` (scrub
+/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` at `9598c4206` (scrub
 /// log, 2026-07-18) records keeping `/tmp/veripb-3/bin/veripb` in as "the
 /// neutral candidate". Neutral it is — machine-independent, so it survives into
 /// a public snapshot — but neutral is not IDENTIFIED: nothing in this repo

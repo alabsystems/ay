@@ -22,8 +22,14 @@ use super::*;
 use std::ffi::OsString;
 use std::io::Read;
 
+#[path = "official_corpus/checkpoint_gaps.rs"]
+mod checkpoint_gaps;
+pub(super) use checkpoint_gaps::gaps;
+
 #[path = "official_corpus_records.rs"]
 mod records;
+#[path = "official_corpus/resume.rs"]
+mod resume;
 #[path = "sat_evidence.rs"]
 mod sat_evidence;
 #[path = "official_corpus_stream.rs"]
@@ -35,7 +41,9 @@ pub(super) const VALIDATOR_ID: &str = "builtin.official-corpus-z3-5.3.3.v1";
 const DIMENSION_ID: &str = "coverage.corpus";
 const REQUIREMENT_ID: &str = "coverage.corpus.closed-query-manifest";
 const CORPUS_MANIFEST_SCHEMA: &str = "ay-official-smtlib-corpus-manifest/v1";
-const RUN_RESULTS_SCHEMA: &str = "ay-official-smtlib-corpus-results/v3";
+const CHECKPOINT_CORPUS_MANIFEST_SCHEMA: &str = "ay-official-smtlib-corpus-manifest/v2";
+const LEGACY_RUN_RESULTS_SCHEMA: &str = "ay-official-smtlib-corpus-results/v3";
+const RUN_RESULTS_SCHEMA: &str = "ay-official-smtlib-corpus-results/v4";
 const MAX_QUERY_PROOF_BYTES: u64 = 64 * 1024 * 1024;
 const RECORD_ID: &str = "11061097";
 const RECORD_DOI: &str = "10.5281/zenodo.11061097";
@@ -97,6 +105,16 @@ struct CorpusArchive {
     checksum: String,
 }
 
+/// Require a real value when a v2-only field is present. On v1, the schema's
+/// readers reject presence and continue to accept exactly the legacy fields.
+fn deserialize_checkpoint_field<'de, D, T>(input: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(input).map(Some)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusFile {
@@ -104,6 +122,20 @@ struct CorpusFile {
     size: u64,
     sha256: String,
     queries: Vec<CorpusQuery>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    echoes: Option<Vec<CorpusEcho>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusEcho {
+    byte_start: u64,
+    byte_end: u64,
+    command_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -234,12 +266,33 @@ struct EvidenceTranscript {
     stderr: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CheckerProblemKind {
+    CanonicalFp32RneV1,
+    Z3RemainderV1,
+    ScopedPlainV1,
+    ScopedSignedV1,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct QueryEvidence {
     status: EvidenceStatus,
     reason: String,
     problem: Option<Artifact>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    checker_problem: Option<Artifact>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    checker_problem_kind: Option<CheckerProblemKind>,
     proof: Option<Artifact>,
     producer: Option<EvidenceTranscript>,
     checker: Option<EvidenceTranscript>,
@@ -261,11 +314,25 @@ impl QueryEvidence {
             }
             .to_string(),
             problem: None,
+            checker_problem: None,
+            checker_problem_kind: None,
             proof: None,
             producer: None,
             checker: None,
             sat: None,
         }
+    }
+
+    fn has_proof_evidence(&self) -> bool {
+        self.problem.is_some() || self.has_certificate_artifacts()
+    }
+
+    fn has_certificate_artifacts(&self) -> bool {
+        self.checker_problem.is_some()
+            || self.checker_problem_kind.is_some()
+            || self.proof.is_some()
+            || self.producer.is_some()
+            || self.checker.is_some()
     }
 
     fn satisfies(&self, verdict: Option<CorpusVerdict>) -> bool {
@@ -299,11 +366,45 @@ enum FileOutcome {
 struct FileRun {
     path: String,
     input_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    input_size: Option<u64>,
     query_count: usize,
     ay: ProcessRun,
     z3: ProcessRun,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    echo_streams: Option<RecordedEchoStreams>,
     queries: Vec<QueryRun>,
     outcome: FileOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedEchoStreams {
+    ay: Option<EvidenceTranscript>,
+    z3: Option<EvidenceTranscript>,
+}
+
+impl FileRun {
+    fn has_extended_observation_fields(&self) -> bool {
+        self.echo_streams.is_some()
+            || self.queries.iter().any(|query| {
+                let evidence = &query.evidence;
+                evidence.checker_problem.is_some()
+                    || evidence.checker_problem_kind.is_some()
+                    || evidence
+                        .sat
+                        .as_ref()
+                        .is_some_and(sat_evidence::Evidence::has_checkpoint_fields)
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -365,6 +466,8 @@ struct CorpusRunResults {
     corpus_root: String,
     ay_sha256: String,
     z3_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evaluator_sha256: Option<String>,
     resource_envelope: String,
     ay_mode: String,
     z3_mode: String,
@@ -386,6 +489,24 @@ struct SemanticExecution {
     cases: CaseCounts,
     case_results: Vec<ValidatorCase>,
     run_results: CorpusRunResults,
+}
+
+enum SemanticAccess<'a> {
+    Replay,
+    Fresh(&'a resume::Campaign),
+    Resume(&'a resume::Campaign),
+    Published(&'a resume::Campaign, &'a CorpusRunResults),
+}
+
+impl SemanticAccess<'_> {
+    fn custody(&self) -> Option<&resume::Campaign> {
+        match self {
+            Self::Replay => None,
+            Self::Fresh(campaign) | Self::Resume(campaign) | Self::Published(campaign, _) => {
+                Some(campaign)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -578,8 +699,9 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         .ok_or("official-corpus requires subject.ay_executable")?;
     let ay = options
         .ay
+        .clone()
         .unwrap_or_else(|| artifact_path(&loaded.base, &subject.path));
-    let z3 = match options.z3 {
+    let z3 = match options.z3.clone() {
         Some(path) => path,
         None => {
             reference_artifact_path(&loaded.contract.profile.z3_overlay.reference_executable.path)?
@@ -587,13 +709,28 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
     };
     let (corpus_manifest, corpus_bytes) = load_corpus_manifest(&options.corpus_manifest)?;
     let corpus_manifest_sha256 = sha256_bytes(&corpus_bytes);
-    let evidence_directory = options.results.with_extension("evidence");
-    fs::create_dir(&evidence_directory).map_err(|error| {
-        format!(
-            "create new query evidence directory {}: {error}",
-            evidence_directory.display()
-        )
-    })?;
+    let manifest_relative = existing_relative_artifact(&loaded.base, &options.corpus_manifest)?;
+    let validator = current_validator(VALIDATOR_ID, ValidatorKind::OfficialCorpus)?;
+    let custody = resume::Campaign::open(
+        &options,
+        &loaded.base,
+        &loaded.sha256,
+        &validator.sha256,
+        &corpus_manifest_sha256,
+    )?;
+    let published = if options.resume && resume::publication_exists(&custody.results)? {
+        let bytes = resume::read_publication(&custody.results, MAX_CORPUS_RESULTS_BYTES)?;
+        let results: CorpusRunResults = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid published official corpus results: {error}"))?;
+        Some((results, bytes))
+    } else {
+        None
+    };
+    let access = match (&published, options.resume) {
+        (Some((results, _)), _) => SemanticAccess::Published(&custody, results),
+        (None, true) => SemanticAccess::Resume(&custody),
+        (None, false) => SemanticAccess::Fresh(&custody),
+    };
     let checker_source = options
         .carcara
         .or_else(|| std::env::var_os("CARCARA_PATH").map(PathBuf::from))
@@ -611,16 +748,37 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         parsed.timeout,
         Some(envelope),
         &loaded.base,
-        &evidence_directory,
+        &custody.evidence,
         checker_source.as_deref(),
+        access,
     )?;
-    let results_bytes = serde_json::to_vec(&execution.run_results)
-        .map_err(|error| format!("serializing official corpus results: {error}"))?;
-    atomic_write_new(&options.results, &results_bytes)?;
+    if execution.run_results.evaluator_sha256.as_deref() != Some(validator.sha256.as_str())
+        || sha256_file(
+            Path::new(&validator.path),
+            "official corpus evaluator at publication",
+        )? != validator.sha256
+    {
+        return Err("official corpus evaluator changed before receipt publication".into());
+    }
+    custody.check()?;
+    let results_bytes = if let Some((_, bytes)) = published {
+        bytes
+    } else {
+        let bytes = serde_json::to_vec(&execution.run_results)
+            .map_err(|error| format!("serializing official corpus results: {error}"))?;
+        atomic_write_new(&custody.results, &bytes)?;
+        bytes
+    };
 
-    let manifest_relative = existing_relative_artifact(&loaded.base, &options.corpus_manifest)?;
-    let results_relative = existing_relative_artifact(&loaded.base, &options.results)?;
+    let results_relative = existing_relative_artifact(&loaded.base, &custody.results)?;
     let results_sha256 = sha256_bytes(&results_bytes);
+    if sha256_bytes(&resume::read_publication(
+        &custody.results,
+        MAX_CORPUS_RESULTS_BYTES,
+    )?) != results_sha256
+    {
+        return Err("official corpus results changed before receipt publication".into());
+    }
     let reference_inputs = vec![
         manifest_reference_input(
             &corpus_manifest,
@@ -630,6 +788,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         results_reference_input(
             &loaded.contract,
             &corpus_manifest,
+            &execution.run_results,
             results_relative,
             results_sha256,
         ),
@@ -642,7 +801,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         dimension_id: DIMENSION_ID.to_string(),
         requirement_ids: vec![REQUIREMENT_ID.to_string()],
         inventory_sha256: dimension.inventory.sha256.clone(),
-        validator: current_validator(VALIDATOR_ID, ValidatorKind::OfficialCorpus)?,
+        validator,
         subject: ReceiptSubject {
             ay_executable_sha256: Some(subject.sha256.clone()),
             ay_shared_library_sha256: loaded
@@ -671,9 +830,26 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         cases: execution.cases,
         case_results: execution.case_results,
     };
+    custody.check()?;
+    if options.resume && resume::publication_exists(&custody.receipt)? {
+        let bytes = resume::read_publication(&custody.receipt, MAX_VALIDATOR_RECEIPT_BYTES)?;
+        let observed: ValidatorReceipt = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid existing official corpus receipt: {error}"))?;
+        if observed != receipt {
+            return Err("existing official corpus receipt differs from validated results".into());
+        }
+        return report_written_receipt(
+            &loaded,
+            &custody.receipt,
+            &receipt,
+            "official-corpus",
+            &report,
+            &bytes,
+        );
+    }
     write_receipt_and_report(
         &loaded,
-        &options.receipt,
+        &custody.receipt,
         &receipt,
         "official-corpus",
         &report,
@@ -740,6 +916,13 @@ pub(super) fn validate_and_replay(
     let (manifest, manifest_bytes) = manifest_from_reference(receipt, context.manifest_dir, 0)?;
     validate_manifest_reference(&receipt.reference_inputs[0], &manifest, &manifest_bytes)?;
     let (results, result_bytes) = results_from_reference(receipt, context.manifest_dir, 1)?;
+    if results
+        .evaluator_sha256
+        .as_ref()
+        .is_some_and(|evaluator| evaluator != &receipt.validator.sha256)
+    {
+        return Err("official corpus results and validator evaluator differ".into());
+    }
     if receipt.auxiliary_tools != corpus_auxiliary_tools(&results)? {
         return Err("official corpus independent checker authority drift".to_string());
     }
@@ -812,6 +995,7 @@ pub(super) fn validate_and_replay(
             context.manifest_dir,
             replay_directory.path(),
             retained_checker.as_deref(),
+            SemanticAccess::Replay,
         )?;
         if semantic_signature(&live.run_results) != semantic_signature(&results) {
             return Err(format!(
@@ -993,6 +1177,7 @@ struct RunArgs {
     z3: Option<PathBuf>,
     carcara: Option<PathBuf>,
     timeout_secs: u64,
+    resume: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -1004,6 +1189,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut z3 = None;
     let mut carcara = None;
     let mut timeout_secs = 10u64;
+    let mut resume = false;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -1050,6 +1236,12 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                     return Err("--timeout must be between 1 and 3600 seconds".to_string());
                 }
             }
+            "--resume" => {
+                if resume {
+                    return Err("official-corpus takes at most one --resume".into());
+                }
+                resume = true;
+            }
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown official-corpus flag {flag:?}"));
             }
@@ -1070,6 +1262,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         z3,
         carcara,
         timeout_secs,
+        resume,
     })
 }
 
@@ -1158,10 +1351,27 @@ fn source_from_metadata(bytes: &[u8]) -> Result<CorpusSource, String> {
 }
 
 fn validate_manifest(manifest: &OfficialCorpusManifest) -> Result<(), String> {
+    validate_manifest_for_use(manifest, ManifestUse::LegacyReceipt)
+}
+
+#[derive(Clone, Copy)]
+enum ManifestUse {
+    LegacyReceipt,
+    Checkpoint,
+}
+
+fn validate_manifest_for_use(
+    manifest: &OfficialCorpusManifest,
+    usage: ManifestUse,
+) -> Result<(), String> {
     if sha256_bytes(SOURCE_SELECTION_DESCRIPTOR.as_bytes()) != EXPECTED_SOURCE_SELECTION_SHA256 {
         return Err("compiled official corpus source-selection identity drift".to_string());
     }
-    if manifest.schema != CORPUS_MANIFEST_SCHEMA || manifest.profile_id != PROFILE_ID {
+    let indexed_echoes = matches!(usage, ManifestUse::Checkpoint)
+        && manifest.schema == CHECKPOINT_CORPUS_MANIFEST_SCHEMA;
+    if (!indexed_echoes && manifest.schema != CORPUS_MANIFEST_SCHEMA)
+        || manifest.profile_id != PROFILE_ID
+    {
         return Err("official corpus manifest schema or profile drift".to_string());
     }
     let source = &manifest.source;
@@ -1244,12 +1454,14 @@ fn validate_manifest(manifest: &OfficialCorpusManifest) -> Result<(), String> {
             return Err(format!("official corpus path {:?} is not .smt2", file.path));
         }
         seen_divisions.insert(division.to_string());
+        let mut previous_query_end = 0;
         for (index, query) in file.queries.iter().enumerate() {
             if query.ordinal != index + 1
                 || !matches!(
                     query.command.as_str(),
                     "check-sat" | "check-sat-assuming" | "check-sat-using"
                 )
+                || (indexed_echoes && query.byte_start < previous_query_end)
                 || query.byte_start >= query.byte_end
                 || query.byte_end > file.size
             {
@@ -1257,6 +1469,29 @@ fn validate_manifest(manifest: &OfficialCorpusManifest) -> Result<(), String> {
             }
             validate_sha256(&query.command_sha256, "query command sha256")?;
             validate_sha256(&query.prefix_sha256, "query prefix sha256")?;
+            previous_query_end = query.byte_end;
+        }
+        let echoes = file.echoes.as_deref().unwrap_or_default();
+        if file.echoes.is_some() && (!indexed_echoes || echoes.is_empty()) {
+            return Err("invalid echo spans for the official corpus manifest schema".into());
+        }
+        let mut previous_echo_end = 0;
+        for echo in echoes {
+            let following = file
+                .queries
+                .partition_point(|query| query.byte_end <= echo.byte_start);
+            if echo.byte_start < previous_echo_end
+                || echo.byte_start >= echo.byte_end
+                || echo.byte_end > file.size
+                || file
+                    .queries
+                    .get(following)
+                    .is_some_and(|query| query.byte_start < echo.byte_end)
+            {
+                return Err(format!("malformed echo command span in {:?}", file.path));
+            }
+            validate_sha256(&echo.command_sha256, "echo command sha256")?;
+            previous_echo_end = echo.byte_end;
         }
         query_count = query_count
             .checked_add(file.queries.len())
@@ -1535,6 +1770,7 @@ fn parse_tar_stream(
                 size,
                 sha256: scanned.sha256,
                 queries: scanned.queries,
+                echoes: None,
             });
         } else {
             let mut limited = reader.by_ref().take(size);
@@ -1746,6 +1982,7 @@ fn collect_corpus_files(root: &Path) -> Result<Vec<CorpusFile>, String> {
             size: scanned.size,
             sha256: scanned.sha256,
             queries: scanned.queries,
+            echoes: None,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1929,6 +2166,7 @@ fn execute_semantic(
     artifact_base: &Path,
     evidence_directory: &Path,
     checker_source: Option<&Path>,
+    access: SemanticAccess<'_>,
 ) -> Result<SemanticExecution, String> {
     let subject = contract
         .subject
@@ -1962,9 +2200,16 @@ fn execute_semantic(
 
     provision::authenticate_corpus_manifest(manifest_path, manifest_sha256, Some(&resources))?;
 
+    if let Some(custody) = access.custody() {
+        custody.check()?;
+    }
+    let attempt = tempfile::Builder::new()
+        .prefix("attempt-")
+        .tempdir_in(evidence_directory)
+        .map_err(|error| format!("create fresh official corpus attempt: {error}"))?;
     let (checker, checker_identity, checker_error) = prepare_corpus_checker(
         checker_source,
-        evidence_directory,
+        attempt.path(),
         artifact_base,
         &resources,
         timeout,
@@ -1988,6 +2233,10 @@ fn execute_semantic(
         corpus_root: manifest.corpus_root.clone(),
         ay_sha256: subject.sha256.clone(),
         z3_sha256: z3_sha256.clone(),
+        evaluator_sha256: Some(sha256_file(
+            &std::env::current_exe().map_err(|error| error.to_string())?,
+            "official corpus evaluator",
+        )?),
         resource_envelope,
         ay_mode: "solve --quiet --competition --strict-proofs --self-check --memory <planned-MiB> <file>; rss-watchdog".to_string(),
         z3_mode: "z3-5.3.3 -smt2 <file>; rss-watchdog".to_string(),
@@ -2008,13 +2257,87 @@ fn execute_semantic(
     let root = PathBuf::from(&manifest.corpus_root);
     let record_path = evidence_directory.join("records.jsonl");
     let relative = future_relative_output(artifact_base, &record_path)?;
-    let mut writer = records::Writer::create(
-        &record_path,
-        relative,
-        &records::Header::new(&run_results, manifest.files.len()),
-    )?;
+    let authority = RetainedReplay {
+        base: artifact_base,
+        ay: &staged_ay.path,
+        z3: &staged_z3.path,
+        checker: checker_path.as_deref(),
+        checker_sha256: run_results
+            .checker
+            .as_ref()
+            .map(|tool| tool.sha256.as_str()),
+        resources: &resources,
+        timeout,
+    };
+    let header = records::Header::new(&run_results, manifest.files.len());
+    if let SemanticAccess::Published(custody, published) = &access {
+        if published.schema != RUN_RESULTS_SCHEMA
+            || published.evaluator_sha256 != run_results.evaluator_sha256
+            || published.artifact_root != run_results.artifact_root
+            || published.records.artifact.path != relative
+            || published.checker.as_ref().map(|checker| &checker.sha256)
+                != run_results.checker.as_ref().map(|checker| &checker.sha256)
+        {
+            return Err("published results differ from the exact official corpus producer".into());
+        }
+        if !resume::publication_exists(&record_path)? {
+            return Err("published results are missing their official corpus record stream".into());
+        }
+        validate_run_results(
+            published,
+            contract,
+            inventory_sha256,
+            manifest,
+            manifest_sha256,
+            artifact_base,
+        )?;
+        records::visit(
+            &published.records,
+            artifact_base,
+            &header,
+            |index, result| authority.replay(&result, &manifest.files[index], &root),
+        )?;
+        custody.check()?;
+        provision::authenticate_corpus_manifest(manifest_path, manifest_sha256, Some(&resources))?;
+        authority.check_tools(&subject.sha256, z3_sha256)?;
+        return semantic_execution((**published).clone(), &manifest.selection_sha256);
+    }
     let mut counts = CorpusRunCounts::default();
-    for file in &manifest.files {
+    let mut writer = match &access {
+        SemanticAccess::Resume(custody) if resume::publication_exists(&record_path)? => {
+            let writer = records::Writer::resume(
+                &record_path,
+                relative,
+                &header,
+                |index, result| {
+                    let file = &manifest.files[index];
+                    validate_file_result(
+                        result,
+                        file,
+                        &manifest.corpus_root,
+                        artifact_base,
+                        &run_results.artifact_root,
+                        run_results.checker.as_ref(),
+                    )?;
+                    authority.replay(result, file, &root)?;
+                    accumulate_run_counts(&mut counts, result)
+                },
+                || {
+                    custody.check()?;
+                    authority.check_tools(&subject.sha256, z3_sha256)
+                },
+            )?;
+            eprintln!(
+                "official corpus verified {} retained rows",
+                counts.files_total
+            );
+            writer
+        }
+        _ => records::Writer::create(&record_path, relative, &header)?,
+    };
+    let attempt = attempt.keep();
+    sync_corpus_directory(evidence_directory)?;
+    for file in &manifest.files[counts.files_total..] {
         let mut result = run_file(
             &resources,
             &staged_ay.path,
@@ -2031,13 +2354,11 @@ fn execute_semantic(
             &staged_ay.path,
             &staged_z3.path,
             checker_path.as_deref(),
-            evidence_directory,
+            &attempt,
             artifact_base,
             timeout,
         );
-        // Persist the observed row even if its subsequent consistency check
-        // exposes a harness defect. No later solver runs before that check.
-        writer.append(&result)?;
+        result.input_size = Some(file.size);
         validate_file_result(
             &result,
             file,
@@ -2046,6 +2367,13 @@ fn execute_semantic(
             &run_results.artifact_root,
             run_results.checker.as_ref(),
         )?;
+        if let Some(custody) = access.custody() {
+            custody.check()?;
+        }
+        // Sync the attempt's new query directory entries before its row
+        // becomes durable in the checkpoint.
+        sync_corpus_directory(&attempt)?;
+        writer.append(&result)?;
         accumulate_run_counts(&mut counts, &result)?;
         if counts.files_total == 1
             || counts.files_total % 1_000 == 0
@@ -2062,11 +2390,7 @@ fn execute_semantic(
             );
         }
     }
-    if sha256_file(&staged_ay.path, "staged AY after official corpus")? != subject.sha256
-        || sha256_file(&staged_z3.path, "staged Z3 after official corpus")? != *z3_sha256
-    {
-        return Err("authenticated solver bytes changed during official corpus run".to_string());
-    }
+    authority.check_tools(&subject.sha256, z3_sha256)?;
     // A second full closure scan detects mutation, deletion, replacement, or
     // additions that happened while the long campaign was running.
     provision::authenticate_corpus_manifest(manifest_path, manifest_sha256, Some(&resources))?;
@@ -2080,13 +2404,35 @@ fn execute_semantic(
         manifest_sha256,
         artifact_base,
     )?;
-    let case_results = aggregate_cases(&run_results.counts, &manifest.selection_sha256);
+    semantic_execution(run_results, &manifest.selection_sha256)
+}
+
+fn semantic_execution(
+    run_results: CorpusRunResults,
+    selection: &str,
+) -> Result<SemanticExecution, String> {
+    let case_results = aggregate_cases(&run_results.counts, selection);
     Ok(SemanticExecution {
         result: overall_validator_result(&case_results),
         cases: case_counts_from_rows(&case_results)?,
         case_results,
         run_results,
     })
+}
+
+fn sync_corpus_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist official corpus directory {}: {error}",
+                path.display()
+            )
+        })?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn corpus_auxiliary_tools(results: &CorpusRunResults) -> Result<Vec<AuxiliaryTool>, String> {
@@ -2162,6 +2508,9 @@ fn prepare_corpus_checker(
         let target = directory.join("carcara.bin");
         fs::copy(&staged.path, &target)
             .map_err(|error| format!("retain corpus Carcara: {error}"))?;
+        fs::File::open(&target)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("persist corpus Carcara: {error}"))?;
         if sha256_file(&target, "retained corpus Carcara")? != authority.sha256 {
             return Err("retained corpus Carcara digest changed".to_string());
         }
@@ -2399,6 +2748,10 @@ fn certify_file_queries(
             evidence.status = EvidenceStatus::Rejected;
             let proof_bytes =
                 read_bounded_bytes(&proof, MAX_QUERY_PROOF_BYTES, "query Alethe proof", true)?;
+            fs::File::open(&proof)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("persist query Alethe proof: {error}"))?;
+            sync_corpus_directory(&query_directory)?;
             evidence.proof = Some(Artifact {
                 path: existing_relative_artifact(base, &proof)?,
                 sha256: sha256_bytes(&proof_bytes),
@@ -2682,41 +3035,61 @@ fn replay_retained_proofs(
         base,
         &records::Header::new(results, results.counts.files_total),
         |_, file| {
-            for query in &file.queries {
-                if query.evidence.status == EvidenceStatus::AcceptedSat {
-                    sat_evidence::replay(
-                        query
-                            .evidence
-                            .sat
-                            .as_ref()
-                            .ok_or("retained SAT evidence missing")?,
-                        base,
-                        &z3.as_ref().ok_or("retained model checker missing")?.path,
-                        &resources,
-                        timeout,
-                    )?;
-                    continue;
-                }
-                if query.evidence.status != EvidenceStatus::AcceptedUnsat {
-                    continue;
-                }
-                let evidence = &query.evidence;
-                let problem = evidence
+            replay_accepted_row(
+                &file,
+                base,
+                z3.as_ref().map(|tool| tool.path.as_path()),
+                staged.as_ref().map(|tool| tool.path.as_path()),
+                &resources,
+                timeout,
+            )
+        },
+    )
+}
+
+fn replay_accepted_row(
+    file: &FileRun,
+    base: &Path,
+    z3: Option<&Path>,
+    checker: Option<&Path>,
+    resources: &PlannedResources,
+    timeout: Duration,
+) -> Result<(), String> {
+    for query in &file.queries {
+        match query.evidence.status {
+            EvidenceStatus::AcceptedSat => sat_evidence::replay(
+                query
+                    .evidence
+                    .sat
+                    .as_ref()
+                    .ok_or("retained SAT evidence missing")?,
+                base,
+                z3.ok_or("retained model checker missing")?,
+                resources,
+                timeout,
+            )?,
+            EvidenceStatus::AcceptedUnsat => {
+                let problem = query
+                    .evidence
                     .problem
                     .as_ref()
                     .ok_or("retained query problem missing")?;
-                let proof = evidence
+                let proof = query
+                    .evidence
                     .proof
                     .as_ref()
                     .ok_or("retained query proof missing")?;
+                let directory = tempfile::tempdir()
+                    .map_err(|error| format!("create private UNSAT replay directory: {error}"))?;
+                let problem_path = directory.path().join("problem.smt2");
+                let proof_path = directory.path().join("proof.alethe");
+                stage_replay_artifact(base, problem, &problem_path, MAX_IN_MEMORY_QUERY_BYTES)?;
+                stage_replay_artifact(base, proof, &proof_path, MAX_QUERY_PROOF_BYTES)?;
                 let observed = evidence_transcript(run_query_checker(
-                    &staged
-                        .as_ref()
-                        .ok_or("retained proof checker missing")?
-                        .path,
-                    &resolve_relative_evidence_path(base, &proof.path)?,
-                    &resolve_relative_evidence_path(base, &problem.path)?,
-                    &resources,
+                    checker.ok_or("retained proof checker missing")?,
+                    &proof_path,
+                    &problem_path,
+                    resources,
                     timeout,
                 )?);
                 if !observed.process.is_complete()
@@ -2729,9 +3102,121 @@ fn replay_retained_proofs(
                     ));
                 }
             }
-            Ok(())
-        },
-    )
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn stage_replay_artifact(
+    base: &Path,
+    artifact: &Artifact,
+    stage: &Path,
+    limit: u64,
+) -> Result<(), String> {
+    let input = resolve_relative_evidence_path(base, &artifact.path)?;
+    let bytes = read_bounded_bytes(&input, limit, "retained corpus proof input", true)?;
+    if sha256_bytes(&bytes) != artifact.sha256 {
+        return Err(format!(
+            "retained corpus proof input digest changed: {}",
+            artifact.path
+        ));
+    }
+    fs::write(stage, bytes)
+        .map_err(|error| format!("stage authenticated corpus proof input: {error}"))
+}
+
+struct RetainedReplay<'a> {
+    base: &'a Path,
+    ay: &'a Path,
+    z3: &'a Path,
+    checker: Option<&'a Path>,
+    checker_sha256: Option<&'a str>,
+    resources: &'a PlannedResources,
+    timeout: Duration,
+}
+
+impl RetainedReplay<'_> {
+    fn replay(&self, result: &FileRun, file: &CorpusFile, root: &Path) -> Result<(), String> {
+        replay_accepted_row(
+            result,
+            self.base,
+            Some(self.z3),
+            self.checker,
+            self.resources,
+            self.timeout,
+        )?;
+        // A certificate proves its logical claim. Clean child execution,
+        // the reference decision and shared unknown need live observations.
+        if requires_decision_replay(result) {
+            let path = root.join(&file.path);
+            check_retained_decision_input(&path, file)?;
+            let current = run_file(self.resources, self.ay, self.z3, &path, file, self.timeout);
+            check_retained_decision_input(&path, file)?;
+            if !same_decision_observation(&result.ay, &current.ay)
+                || !same_decision_observation(&result.z3, &current.z3)
+            {
+                return Err(format!(
+                    "retained official corpus decision did not replay: {}",
+                    file.path
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_tools(&self, ay_sha256: &str, z3_sha256: &str) -> Result<(), String> {
+        if sha256_file(self.ay, "staged AY after official corpus")? != ay_sha256
+            || sha256_file(self.z3, "staged Z3 after official corpus")? != z3_sha256
+        {
+            return Err("authenticated solver bytes changed during official corpus run".into());
+        }
+        if let Some((checker, digest)) = self.checker.zip(self.checker_sha256) {
+            if sha256_file(checker, "staged official corpus checker")? != digest {
+                return Err(
+                    "authenticated checker bytes changed during official corpus run".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn requires_decision_replay(result: &FileRun) -> bool {
+    result.outcome == FileOutcome::Pass
+        || result
+            .queries
+            .iter()
+            .any(|query| query.outcome == QueryOutcome::Pass)
+}
+
+fn check_retained_decision_input(path: &Path, file: &CorpusFile) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.len() != file.size
+        || sha256_file(path, "official corpus retained decision input")? != file.sha256
+    {
+        return Err(format!(
+            "official corpus decision input changed: {}",
+            file.path
+        ));
+    }
+    Ok(())
+}
+
+fn same_decision_observation(retained: &ProcessRun, observed: &ProcessRun) -> bool {
+    // Compare decision and process facts independently of runtime measurements.
+    retained.verdicts == observed.verdicts
+        && retained.exit_code == observed.exit_code
+        && retained.stdin_complete == observed.stdin_complete
+        && retained.timed_out == observed.timed_out
+        && retained.memout == observed.memout
+        && retained.stdout_truncated == observed.stdout_truncated
+        && retained.stderr_truncated == observed.stderr_truncated
+        && retained.stdout_utf8 == observed.stdout_utf8
+        && retained.stderr_utf8 == observed.stderr_utf8
+        && retained.error_diagnostic == observed.error_diagnostic
+        && retained.harness_error == observed.harness_error
 }
 
 fn run_file(
@@ -2861,9 +3346,11 @@ fn classify_file(file: &CorpusFile, ay: ProcessRun, z3: ProcessRun) -> FileRun {
     FileRun {
         path: file.path.clone(),
         input_sha256: file.sha256.clone(),
+        input_size: None,
         query_count: file.queries.len(),
         ay,
         z3,
+        echo_streams: None,
         queries,
         outcome,
     }
@@ -2979,8 +3466,12 @@ fn validate_run_results(
     manifest_sha256: &str,
     artifact_base: &Path,
 ) -> Result<(), String> {
-    if results.schema != RUN_RESULTS_SCHEMA
-        || results.campaign_id != contract.campaign_id
+    match (results.schema.as_str(), &results.evaluator_sha256) {
+        (LEGACY_RUN_RESULTS_SCHEMA, None) => {}
+        (RUN_RESULTS_SCHEMA, Some(evaluator)) => validate_sha256(evaluator, "corpus evaluator")?,
+        _ => return Err("official corpus results schema or producer binding mismatch".into()),
+    }
+    if results.campaign_id != contract.campaign_id
         || results.profile_id != PROFILE_ID
         || results.profile_sha256 != canonical_profile_sha256()?
         || results.inventory_sha256 != inventory_sha256
@@ -3019,10 +3510,8 @@ fn validate_run_results(
         if results.checker_error.is_some() {
             return Err("official corpus checker authority drift".to_string());
         }
-        let path = resolve_relative_evidence_path(artifact_base, &checker.path)?;
-        if !Path::new(&checker.path).starts_with(&results.artifact_root)
-            || sha256_file(&path, "retained independent checker")? != checker.sha256
-        {
+        let path = corpus_artifact_path(artifact_base, &results.artifact_root, checker)?;
+        if sha256_file(&path, "retained independent checker")? != checker.sha256 {
             return Err("retained independent checker digest/path drift".to_string());
         }
         let identity = results
@@ -3074,9 +3563,51 @@ fn validate_file_result(
     artifact_root: &str,
     checker: Option<&Artifact>,
 ) -> Result<(), String> {
+    require_file_result_identity(result, file)?;
+    for (query_result, query) in result.queries.iter().zip(&file.queries) {
+        for artifact in [
+            query_result.evidence.problem.as_ref(),
+            query_result.evidence.proof.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            corpus_artifact_path(artifact_base, artifact_root, artifact)?;
+        }
+        if let Some(model) = &query_result.evidence.sat {
+            for artifact in model.artifacts().into_iter().flatten() {
+                corpus_artifact_path(artifact_base, artifact_root, artifact)?;
+            }
+        }
+        let source = if matches!(
+            query_result.evidence.status,
+            EvidenceStatus::AcceptedUnsat | EvidenceStatus::AcceptedSat
+        ) {
+            read_query_prefix(&PathBuf::from(corpus_root).join(&file.path), file, query)?
+        } else {
+            Vec::new()
+        };
+        validate_query_evidence(query, query_result, file, &source, artifact_base, checker)?;
+    }
+    require_recorded_classification(result, file)
+}
+
+fn corpus_artifact_path(base: &Path, root: &str, artifact: &Artifact) -> Result<PathBuf, String> {
+    let path = resolve_relative_evidence_path(base, &artifact.path)?;
+    if !Path::new(&artifact.path).starts_with(root) || path != base.join(&artifact.path) {
+        return Err(format!(
+            "corpus artifact escapes or redirects its evidence path: {}",
+            artifact.path
+        ));
+    }
+    Ok(path)
+}
+
+fn require_file_result_identity(result: &FileRun, file: &CorpusFile) -> Result<(), String> {
     let expected_input_sha256 = file.sha256.as_str();
     if result.path != file.path
         || result.input_sha256.as_str() != expected_input_sha256
+        || result.input_size.is_some_and(|size| size != file.size)
         || result.query_count != file.queries.len()
         || result.queries.len() != file.queries.len()
     {
@@ -3095,44 +3626,23 @@ fn validate_file_result(
                 file.path
             ));
         }
-        for artifact in [
-            query_result.evidence.problem.as_ref(),
-            query_result.evidence.proof.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !Path::new(&artifact.path).starts_with(artifact_root) {
-                return Err("query proof artifact escapes its evidence root".to_string());
-            }
-        }
-        if let Some(model) = &query_result.evidence.sat {
-            for artifact in model.artifacts().into_iter().flatten() {
-                if !Path::new(&artifact.path).starts_with(artifact_root) {
-                    return Err("query model artifact escapes its evidence root".to_string());
-                }
-            }
-        }
-        let source = if matches!(
-            query_result.evidence.status,
-            EvidenceStatus::AcceptedUnsat | EvidenceStatus::AcceptedSat
-        ) {
-            read_query_prefix(&PathBuf::from(corpus_root).join(&file.path), file, query)?
-        } else {
-            Vec::new()
-        };
-        validate_query_evidence(query, query_result, file, &source, artifact_base, checker)?;
     }
-    let mut canonical = classify_file(file, result.ay.clone(), result.z3.clone());
-    for (expected, actual) in canonical.queries.iter_mut().zip(&result.queries) {
-        expected.evidence = actual.evidence.clone();
-        expected.outcome = query_outcome(expected.z3, expected.ay, &expected.evidence);
-        expected.certification =
-            format!("{:?}: {}", actual.evidence.status, actual.evidence.reason);
-    }
-    canonical.outcome =
-        classify_file_outcome(file, &canonical.ay, &canonical.z3, &canonical.queries);
-    if canonical.queries != result.queries || canonical.outcome != result.outcome {
+    Ok(())
+}
+
+fn require_recorded_classification(result: &FileRun, file: &CorpusFile) -> Result<(), String> {
+    let queries_agree = result.queries.iter().all(|query| {
+        let z3 = result.z3.verdicts.get(query.ordinal - 1).copied();
+        let ay = result.ay.verdicts.get(query.ordinal - 1).copied();
+        query.z3 == z3
+            && query.ay == ay
+            && query.outcome == query_outcome(z3, ay, &query.evidence)
+            && query.certification
+                == format!("{:?}: {}", query.evidence.status, query.evidence.reason)
+    });
+    if !queries_agree
+        || classify_file_outcome(file, &result.ay, &result.z3, &result.queries) != result.outcome
+    {
         return Err(format!(
             "official corpus result classification was forged for {:?}",
             file.path
@@ -3424,6 +3934,7 @@ fn manifest_reference_input(
 fn results_reference_input(
     contract: &Contract,
     manifest: &OfficialCorpusManifest,
+    results: &CorpusRunResults,
     path: String,
     artifact_sha256: String,
 ) -> ReferenceInput {
@@ -3435,7 +3946,7 @@ fn results_reference_input(
         selection: "one retained result row for every immutable manifest file and query"
             .to_string(),
         item_count: manifest.query_count,
-        digest_kind: "ay-official-smtlib-corpus-results/v3-json-sha256".to_string(),
+        digest_kind: format!("{}-json-sha256", results.schema),
         selection_sha256: artifact_sha256.clone(),
         snapshot: Artifact {
             path,
@@ -3461,12 +3972,13 @@ fn validate_results_reference(
     input: &ReferenceInput,
     contract: &Contract,
     manifest: &OfficialCorpusManifest,
-    _results: &CorpusRunResults,
+    results: &CorpusRunResults,
     bytes: &[u8],
 ) -> Result<(), String> {
     let expected = results_reference_input(
         contract,
         manifest,
+        results,
         input.snapshot.path.clone(),
         sha256_bytes(bytes),
     );
@@ -3512,8 +4024,19 @@ fn write_receipt_and_report(
 ) -> Result<i32, String> {
     let bytes = pretty_json(receipt)?;
     atomic_write_new(path, &bytes)?;
+    report_written_receipt(loaded, path, receipt, label, report, &bytes)
+}
+
+fn report_written_receipt(
+    loaded: &LoadedContract,
+    path: &Path,
+    receipt: &ValidatorReceipt,
+    label: &str,
+    report: &AuditReport,
+    bytes: &[u8],
+) -> Result<i32, String> {
     let relative = future_relative_output(&loaded.base, path)?;
-    let receipt_sha256 = sha256_bytes(&bytes);
+    let receipt_sha256 = sha256_bytes(bytes);
     println!(
         "{label}={} receipt={} sha256={}",
         if receipt.result == ValidatorResult::Pass {
@@ -3577,6 +4100,7 @@ mod tests {
             size: bytes.len() as u64,
             sha256: sha256_bytes(bytes),
             queries: scan_queries(bytes).unwrap(),
+            echoes: None,
         }
     }
 
@@ -3677,6 +4201,27 @@ mod tests {
             observed_ns: 1,
             verdicts: vec![verdict],
         }
+    }
+
+    #[test]
+    fn retained_shared_unknown_requires_fresh_bilateral_observation() {
+        let file = query_file(b"(check-sat)");
+        let recorded = classify_file(
+            &file,
+            completed_process(CorpusVerdict::Unknown),
+            completed_process(CorpusVerdict::Unknown),
+        );
+        assert!(requires_decision_replay(&recorded));
+        assert_eq!(recorded.queries[0].outcome, QueryOutcome::Pass);
+        let mut fresh = completed_process(CorpusVerdict::Unknown);
+        fresh.observed_ns = 760;
+        assert!(same_decision_observation(&recorded.z3, &fresh));
+        assert!(!same_decision_observation(
+            &recorded.z3,
+            &completed_process(CorpusVerdict::Sat),
+        ));
+        fresh.timed_out = true;
+        assert!(!same_decision_observation(&recorded.z3, &fresh));
     }
 
     #[test]

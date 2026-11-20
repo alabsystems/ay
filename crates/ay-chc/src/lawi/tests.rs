@@ -5,6 +5,7 @@
 use super::art::{AbstractReachabilityTree, ArtLocation};
 use super::covering::CoveringRelation;
 use super::path_encoding::art_edge_formula_at;
+use super::solver::test_hooks::{force_itp_unknown, forced_unknown_fired, ForcedItpUnknown};
 use super::solver::{LawiConfig, LawiSolver};
 use crate::smt::{SmtContext, SmtResult};
 use crate::transition_system::TransitionSystem;
@@ -496,5 +497,356 @@ fn lawi_solver_returns_not_applicable_for_non_linear() {
     assert!(
         matches!(result, ChcEngineResult::Unknown),
         "non-linear problem should return Unknown, got {result:?}",
+    );
+}
+
+// --- Refinement soundness (cav12 transmitter.5: Safe(true) on an unsafe task) ---
+
+/// x = 0 ∧ y = 0; x < 3 ⇒ (x+1, y+1); x ≠ y ⇒ false. Safe: x = y.
+/// The query edge has no clause-local variable.
+fn lockstep_counters_safe() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int, ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let y = ChcVar::new("y", ChcSort::Int);
+    let args = || vec![ChcExpr::var(x.clone()), ChcExpr::var(y.clone())];
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and(
+            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0)),
+            ChcExpr::eq(ChcExpr::var(y.clone()), ChcExpr::int(0)),
+        )),
+        ClauseHead::Predicate(inv, args()),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, args())],
+            Some(ChcExpr::lt(ChcExpr::var(x.clone()), ChcExpr::int(3))),
+        ),
+        ClauseHead::Predicate(
+            inv,
+            vec![
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+                ChcExpr::add(ChcExpr::var(y.clone()), ChcExpr::int(1)),
+            ],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, args())],
+            Some(ChcExpr::not(ChcExpr::eq(
+                ChcExpr::var(x.clone()),
+                ChcExpr::var(y.clone()),
+            ))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+/// Clears the injected interpolation fault when the test ends.
+struct ForcedItpGuard;
+
+impl ForcedItpGuard {
+    fn install(boundary: usize, suppress_fallback: bool) -> Self {
+        Self::install_limited(boundary, suppress_fallback, usize::MAX)
+    }
+
+    fn install_limited(boundary: usize, suppress_fallback: bool, max_fires: usize) -> Self {
+        force_itp_unknown(Some(ForcedItpUnknown {
+            boundary,
+            suppress_fallback,
+            max_fires,
+        }));
+        Self
+    }
+}
+
+impl Drop for ForcedItpGuard {
+    fn drop(&mut self) {
+        force_itp_unknown(None);
+    }
+}
+
+/// A Safe result must be finished, well-labeled, and a model the original
+/// clauses accept.
+fn assert_sound_safe(problem: &ChcProblem, solver: &LawiSolver, result: &ChcEngineResult) {
+    let ChcEngineResult::Safe(model) = result else {
+        return;
+    };
+    assert_eq!(
+        solver.unfinished_vertex_count(),
+        0,
+        "Safe with an unfinished ART"
+    );
+    assert!(
+        solver.well_labeling_violations().is_empty(),
+        "Safe over a labeling that is not well-labeled: {:?}",
+        solver.well_labeling_violations()
+    );
+    let mut verifier = crate::PdrSolver::new(problem.clone(), crate::PdrConfig::default());
+    assert!(
+        verifier.verify_model(model),
+        "LAWI Safe model must be inductive"
+    );
+}
+
+#[test]
+fn lawi_interpolation_gap_never_yields_an_unsound_safe() {
+    // Before the fix a gap at a boundary returned a partial `Refined`, the
+    // error vertex was dropped, and covering closed over a `true` label. Now
+    // the error vertex is abandoned: the labeling stays well-labeled, and
+    // Safe needs every abandoned vertex covered or refuted after all.
+    for problem in [bounded_increment_safe(), lockstep_counters_safe()] {
+        for boundary in 1..=4 {
+            let _fault = ForcedItpGuard::install(boundary, true);
+            let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+            let result = solver.solve();
+            assert!(
+                solver.well_labeling_violations().is_empty(),
+                "gap at boundary {boundary}: labeling not well-labeled: {:?}",
+                solver.well_labeling_violations()
+            );
+            if forced_unknown_fired() > 0 {
+                assert!(
+                    matches!(result, ChcEngineResult::Unknown | ChcEngineResult::Safe(_)),
+                    "a forced interpolation gap at boundary {boundary}: got {result:?}",
+                );
+            } else {
+                // The ART closed before any path reached this boundary.
+                assert!(
+                    matches!(result, ChcEngineResult::Safe(_)),
+                    "no gap was hit at boundary {boundary}, expected Safe, got {result:?}",
+                );
+            }
+            assert_sound_safe(&problem, &solver, &result);
+            if boundary == 1 {
+                assert!(
+                    forced_unknown_fired() > 0,
+                    "every refinement past the root crosses boundary 1"
+                );
+                // Boundary 1 fails on every path of length >= 2: nothing can
+                // refute those error vertices.
+                assert!(
+                    matches!(result, ChcEngineResult::Unknown),
+                    "gap at boundary 1 on every path must end Unknown, got {result:?}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn lawi_abandoned_error_path_does_not_stop_the_search() {
+    // x = 0; x -> x + 1; x >= 3 -> false. Unsafe at depth 3. Every path of
+    // length >= 2 loses its boundary-1 interpolant, so the error vertices at
+    // depth 2 and 3 are abandoned; with covering off LAWI goes on to the
+    // feasible depth-4 path. Before, the first gap ended LAWI with Unknown.
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(inv, vec![ChcExpr::var(x.clone())])]),
+        ClauseHead::Predicate(
+            inv,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1))],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::ge(ChcExpr::var(x), ChcExpr::int(3))),
+        ),
+        ClauseHead::False,
+    ));
+    let _fault = ForcedItpGuard::install(1, true);
+    let config = LawiConfig {
+        covering_candidate_limit: 0,
+        max_vertices: 64,
+        ..LawiConfig::default()
+    };
+    let mut solver = LawiSolver::new(problem.clone(), config);
+    let result = solver.solve();
+    assert!(
+        forced_unknown_fired() >= 2,
+        "the depth-2 and depth-3 paths hit the forced gap"
+    );
+    assert!(
+        solver.abandoned_error_count() >= 2,
+        "both spurious paths were abandoned"
+    );
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("LAWI must search past abandoned error paths, got {result:?}");
+    };
+    assert_ground_evidence(&problem, &cex);
+}
+
+#[test]
+fn lawi_one_off_gap_keeps_safe_sound() {
+    // A single gap (the first boundary-1 call) abandons one error vertex;
+    // later refinements may strengthen its parent enough to refute it.
+    // Whatever happens, a Safe has no open abandoned vertex and is sound.
+    for problem in [bounded_increment_safe(), lockstep_counters_safe()] {
+        let _fault = ForcedItpGuard::install_limited(1, true, 1);
+        let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+        let result = solver.solve();
+        assert_eq!(forced_unknown_fired(), 1);
+        assert!(
+            matches!(result, ChcEngineResult::Unknown | ChcEngineResult::Safe(_)),
+            "safe problem with one gap: got {result:?}",
+        );
+        assert!(solver.well_labeling_violations().is_empty());
+        if matches!(result, ChcEngineResult::Safe(_)) {
+            assert_eq!(solver.abandoned_error_count(), 0, "Safe with an open error");
+        }
+        assert_sound_safe(&problem, &solver, &result);
+    }
+}
+
+/// Init Inv(5, 7); Inv(v1, v0) ∧ v1 > 0 ⇒ Inv(v1 - 5, v0);
+/// Inv(v1, v0) ∧ v1 < 1 ⇒ false. The clause variables are named like the
+/// canonical state variables but sit in swapped positions: the first
+/// argument goes 5 → 0, so the system is unsafe at depth 1. Renaming the
+/// arguments one at a time captured `v1` into the second position, which
+/// never drops below 7, and the encoding read the system as safe.
+fn swapped_canonical_names_unsafe() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int, ChcSort::Int]);
+    let v0 = ChcVar::new("v0", ChcSort::Int);
+    let v1 = ChcVar::new("v1", ChcSort::Int);
+    let swapped = || vec![ChcExpr::var(v1.clone()), ChcExpr::var(v0.clone())];
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(inv, vec![ChcExpr::int(5), ChcExpr::int(7)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, swapped())],
+            Some(ChcExpr::gt(ChcExpr::var(v1.clone()), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(
+            inv,
+            vec![
+                ChcExpr::sub(ChcExpr::var(v1.clone()), ChcExpr::int(5)),
+                ChcExpr::var(v0.clone()),
+            ],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, swapped())],
+            Some(ChcExpr::lt(ChcExpr::var(v1.clone()), ChcExpr::int(1))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+#[test]
+fn lawi_clause_variables_named_like_state_variables_are_not_captured() {
+    let problem = swapped_canonical_names_unsafe();
+    let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+    let result = solver.solve();
+    let ChcEngineResult::Unsafe(cex) = result else {
+        panic!("first argument reaches 0 after one step, got {result:?}");
+    };
+    assert_ground_evidence(&problem, &cex);
+}
+
+#[test]
+fn lawi_interpolation_gap_on_unsafe_problem_never_safe() {
+    let problem = unbounded_increment_unsafe();
+    for boundary in 1..=3 {
+        let _fault = ForcedItpGuard::install(boundary, true);
+        let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+        let result = solver.solve();
+        assert!(
+            matches!(
+                result,
+                ChcEngineResult::Unsafe(_) | ChcEngineResult::Unknown
+            ),
+            "unsafe problem with a gap at boundary {boundary}: got {result:?}",
+        );
+    }
+}
+
+#[test]
+fn lawi_last_boundary_fallback_keeps_refining_soundly() {
+    // With the `¬query` fallback the forced gap at the last boundary is
+    // filled by the weakest valid interpolant; any Safe must still be sound.
+    for problem in [bounded_increment_safe(), lockstep_counters_safe()] {
+        for boundary in 1..=4 {
+            let _fault = ForcedItpGuard::install(boundary, false);
+            let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+            let result = solver.solve();
+            assert!(
+                matches!(result, ChcEngineResult::Safe(_) | ChcEngineResult::Unknown),
+                "safe problem, gap at boundary {boundary}: got {result:?}",
+            );
+            assert_sound_safe(&problem, &solver, &result);
+        }
+    }
+}
+
+#[test]
+fn lawi_chained_refinement_is_well_labeled() {
+    for problem in [bounded_increment_safe(), lockstep_counters_safe()] {
+        let mut solver = LawiSolver::new(problem.clone(), LawiConfig::default());
+        let result = solver.solve();
+        assert!(
+            matches!(result, ChcEngineResult::Safe(_)),
+            "expected Safe, got {result:?}",
+        );
+        assert_sound_safe(&problem, &solver, &result);
+    }
+}
+
+#[test]
+fn lawi_last_boundary_fallback_only_without_clause_locals() {
+    // Query edge over state variables only: ¬query is a valid interpolant.
+    let solver = LawiSolver::new(lockstep_counters_safe(), LawiConfig::default());
+    let fallback = solver.last_boundary_fallback_for(2, 3);
+    assert!(
+        fallback.is_some(),
+        "a local-free query edge takes the ¬query fallback"
+    );
+
+    // Inv(x) ∧ x = z + z ∧ z > 10 ⇒ false: the query edge has the local z,
+    // the interpolant would be ¬∃z. query, and no fallback is taken.
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let z = ChcVar::new("z", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(inv, vec![ChcExpr::var(x.clone())])], None),
+        ClauseHead::Predicate(
+            inv,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(2))],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::and(
+                ChcExpr::eq(
+                    ChcExpr::var(x),
+                    ChcExpr::add(ChcExpr::var(z.clone()), ChcExpr::var(z.clone())),
+                ),
+                ChcExpr::gt(ChcExpr::var(z), ChcExpr::int(10)),
+            )),
+        ),
+        ClauseHead::False,
+    ));
+    let solver = LawiSolver::new(problem, LawiConfig::default());
+    assert!(
+        solver.last_boundary_fallback_for(2, 3).is_none(),
+        "a query edge with a clause-local variable must not take the fallback",
     );
 }

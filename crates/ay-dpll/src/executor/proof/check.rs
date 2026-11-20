@@ -11,7 +11,6 @@
 
 use super::super::Executor;
 use ay_core::{AletheRule, Proof, ProofStep, TermId};
-#[cfg(feature = "proof-checker")]
 use ay_proof::PartialProofCheck;
 use ay_proof::{ProofCheckError, ProofQuality};
 #[path = "check/declarations.rs"]
@@ -29,12 +28,13 @@ pub(in crate::executor) use self::strict_memo::{StrictWalkKey, StrictWalkMemo};
 #[path = "strict_check_progress.rs"]
 mod strict_check_progress;
 use self::strict_check_progress::check_with_executor_progress;
-#[cfg(feature = "proof-checker")]
 use self::strict_check_progress::{
     check_partial_with_executor_progress, MeteredPartialCheck, WantQuality,
 };
 
 pub(super) use self::strict_check_progress::check_bounded_with_executor_progress;
+#[cfg(test)]
+pub(super) use self::strict_check_progress::RENDER_CHECKS;
 pub(in crate::executor) use self::strict_check_progress::{
     check_proof_gate_under_controls, check_proof_gate_with_executor_progress,
 };
@@ -65,17 +65,12 @@ pub(in crate::executor) enum EmptyClauseDerivation {
     /// certify it), but do not treat it as broken (never repair it).
     ///
     /// Only the metered checker can learn "I was stopped".
-    #[cfg(feature = "proof-checker")]
     Undetermined,
 }
 
-#[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_FAILURES_KEY: &str = "proof_checker_failures";
-#[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_SKIPPED_HOLE_STEPS_KEY: &str = "proof_checker_skipped_hole_steps";
-#[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_CHECKED_STEPS_KEY: &str = "proof_checker_checked_steps";
-#[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_TOTAL_STEPS_KEY: &str = "proof_checker_total_steps";
 
 /// Allocation-aware collector used by the runtime firewall diagnostic.
@@ -246,6 +241,16 @@ impl Executor {
             (
                 "cert.nested_corroboration_solves",
                 accounting.nested_corroboration_solves,
+            ),
+            ("cert.nested_guard_solves", accounting.nested_guard_solves),
+            ("cert.nested_guard_nanos", accounting.nested_guard_nanos),
+            (
+                "cert.nested_reconfirm_solves",
+                accounting.nested_reconfirm_solves,
+            ),
+            (
+                "cert.nested_reconfirm_nanos",
+                accounting.nested_reconfirm_nanos,
             ),
             (
                 "cert.nested_corroboration_nanos",
@@ -1402,161 +1407,152 @@ impl Executor {
     /// internal checker fully verified: `proof_check_ok`, a nonempty proof, and
     /// no trust/`Hole` placeholder (`skipped_hole_steps == 0`). This is the
     /// certification `--self-check` requires before emitting `unsat`.
-    ///
-    /// Without `proof-checker`, this conservatively returns `false`.
     /// Reconstruction-suppressed verdicts also return `false` even if an
     /// internal diagnostic proof remains retained: it is not authored-scope
     /// publication authority.
     pub(in crate::executor) fn unsat_proof_self_certified(&self) -> bool {
-        #[cfg(feature = "proof-checker")]
-        {
-            if self.last_unsat_proof_reconstruction_suppressed {
-                return false;
-            }
-            let Some(proof) = self.last_proof.as_ref() else {
-                return false;
-            };
-            // Reject `Hole`/`Trust` steps; `Assume` remains valid for problem hypotheses.
-            // For example, LIA `not-exists` residue wrong-UNSAT emits one Trust step.
-            // Trust-kind theory lemmas require the same fail-closed treatment.
-            // A `TheoryLemma` whose `kind.is_trust()` (i.e. `Generic`) is ALSO
-            // an untrusted step: the Alethe printer renders it as `:rule trust`
-            // (alethe_printer.rs), so it is a certificate-free "believe the
-            // solver" claim exactly like `Step{Trust}`. The original check
-            // missed it, so `--self-check` emitted a bare `unsat` alongside a
-            // carcara-INVALID `:rule trust` proof — a direct violation of the
-            // "only emit what AY can verify itself" contract (#selfcert-leak).
-            let has_untrusted_step = proof.steps.iter().any(|s| {
-                matches!(
-                    s,
-                    ProofStep::Step {
-                        rule: AletheRule::Hole,
-                        ..
-                    } | ProofStep::Step {
-                        rule: AletheRule::Trust,
-                        ..
-                    }
-                ) || matches!(
-                    s,
-                    ProofStep::TheoryLemma { kind, .. } if kind.is_trust()
-                )
-            });
-            if has_untrusted_step {
-                return false;
-            }
-            // Fail-closed re-validation of the ground string/regex lane. The
-            // self-check gate consults the PARTIAL (non-strict) checker, so a
-            // `StringGroundEval` lemma would otherwise be admitted on the
-            // strength of the classifier alone. Re-run the checker's own
-            // independent evaluator here: a lemma whose clause has no literal
-            // the evaluator proves TRUE is not a tautology, and the UNSAT must
-            // degrade to `unknown` rather than ship on a mislabelled step.
-            let unvalidated_string_lemma = proof.steps.iter().any(|s| {
-                matches!(
-                    s,
-                    ProofStep::TheoryLemma {
-                        kind: ay_core::TheoryLemmaKind::StringGroundEval,
-                        clause,
-                        ..
-                    } if !ay_proof::recognize_string_ground_eval(&self.ctx.terms, clause)
-                )
-            });
-            if unvalidated_string_lemma {
-                return false;
-            }
-            // Same fail-closed re-validation for the SYMBOLIC regex lane
-            // (#regex-cert). `--self-check` consults the PARTIAL checker, so a
-            // `RegexIntersectEmpty` lemma would otherwise ship on the strength
-            // of the classifier alone. Re-run the checker's own independent
-            // derivative-product emptiness decision here: a lemma whose clause
-            // has no `str.in_re` group the checker proves EMPTY is not a
-            // tautology, and the UNSAT must degrade to `unknown`.
-            let unvalidated_regex_lemma = proof.steps.iter().any(|s| {
-                matches!(
-                    s,
-                    ProofStep::TheoryLemma {
-                        kind: ay_core::TheoryLemmaKind::RegexIntersectEmpty,
-                        clause,
-                        ..
-                    } if !ay_proof::recognize_regex_intersect_empty(&self.ctx.terms, clause)
-                )
-            });
-            if unvalidated_regex_lemma {
-                return false;
-            }
-            // Same fail-closed re-validation for the str.len length-lemma lane
-            // (#selfcert-strlen). `--self-check` consults the PARTIAL checker, so
-            // a `StringLengthLemma` retagged from an injected length axiom would
-            // otherwise ship on the strength of the emitter's classifier alone.
-            // Re-run the checker's own independent structural re-derivation of the
-            // exact identity: a lemma whose clause carries no universally-valid
-            // str.len theorem is not a tautology, and the UNSAT must degrade to
-            // `unknown` rather than ship on a mislabelled leaf.
-            let unvalidated_str_len_lemma = proof.steps.iter().any(|s| {
-                matches!(
-                    s,
-                    ProofStep::TheoryLemma {
-                        kind: ay_core::TheoryLemmaKind::StringLengthLemma,
-                        clause,
-                        ..
-                    } if !ay_proof::recognize_string_length_lemma(&self.ctx.terms, clause)
-                )
-            });
-            if unvalidated_str_len_lemma {
-                return false;
-            }
-            // Same fail-closed re-validation for the array extensionality lane
-            // (#ext-diff-cert), and here it is the LOAD-BEARING check rather
-            // than a belt-and-braces one: unlike every other array kind, the
-            // Skolemized extensionality clause
-            // `(= a b) ∨ ¬(= (select a k) (select b k))` is NOT a tautology —
-            // it is a conservative extension, valid only because `k` is a fresh
-            // witness bound to exactly this pair. The PARTIAL checker admits a
-            // theory lemma on its recorded kind, so without this re-validation a
-            // mere relabelling would be enough to ship a bare `unsat`. Re-run
-            // the checker's own provenance decision (introduction present, bound
-            // once, pair matches, symbol absent from the problem); anything it
-            // cannot establish degrades the UNSAT to `unknown`.
-            if !self.unsat_proof_extensionality_certified(proof) {
-                return false;
-            }
-            // Leak-2: an `assume` on the empty-clause path whose term is not
-            // backed by the problem's provenance (not an original asserted
-            // formula, and not a quantifier instantiation tracing back to an
-            // asserted `forall`) is a laundered free axiom — an external
-            // checker accepts it blindly, so it is exactly as unverified as a
-            // `trust` step. Reject it so `--self-check` degrades to `unknown`
-            // instead of emitting a bare `unsat` alongside an uncheckable
-            // proof (e.g. an injected `seq.len` identity assumed as `true`).
-            if self.unsat_proof_terminal_foreign_assume() {
-                return false;
-            }
-            // TIER-0 leak: a proof referencing sequence-theory content
-            // (`Seq`-sorted terms) is not independently checkable — carcara
-            // rejects the `Seq` sort, no firewall-Lean lemma covers sequences,
-            // and there is no DRAT lane. A clean `la_generic`/`resolution`
-            // refutation over `seq.nth` terms (zero hole/trust, no foreign
-            // assume) would otherwise self-certify and ship a bare `unsat`
-            // alongside a proof no external checker can confirm. Degrade to
-            // `unknown` instead.
-            if self.unsat_proof_references_uncheckable_seq_theory()
-                && !self.is_current_authenticated_seq_extensional_companion_proof(proof)
-            {
-                return false;
-            }
-            // The internal checker accepted it AND it genuinely derives the
-            // empty clause (false) from the assumptions.
-            self.proof_check_ok
-                && self
-                    .proof_check_result
-                    .as_ref()
-                    .is_some_and(|c| c.total_steps > 0)
-                && self.proof_derives_valid_empty_clause(proof)
+        if self.last_unsat_proof_reconstruction_suppressed {
+            return false;
         }
-        #[cfg(not(feature = "proof-checker"))]
-        {
-            false
+        let Some(proof) = self.last_proof.as_ref() else {
+            return false;
+        };
+        // Reject `Hole`/`Trust` steps; `Assume` remains valid for problem hypotheses.
+        // For example, LIA `not-exists` residue wrong-UNSAT emits one Trust step.
+        // Trust-kind theory lemmas require the same fail-closed treatment.
+        // A `TheoryLemma` whose `kind.is_trust()` (i.e. `Generic`) is ALSO
+        // an untrusted step: the Alethe printer renders it as `:rule trust`
+        // (alethe_printer.rs), so it is a certificate-free "believe the
+        // solver" claim exactly like `Step{Trust}`. The original check
+        // missed it, so `--self-check` emitted a bare `unsat` alongside a
+        // carcara-INVALID `:rule trust` proof — a direct violation of the
+        // "only emit what AY can verify itself" contract (#selfcert-leak).
+        let has_untrusted_step = proof.steps.iter().any(|s| {
+            matches!(
+                s,
+                ProofStep::Step {
+                    rule: AletheRule::Hole,
+                    ..
+                } | ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    ..
+                }
+            ) || matches!(
+                s,
+                ProofStep::TheoryLemma { kind, .. } if kind.is_trust()
+            )
+        });
+        if has_untrusted_step {
+            return false;
         }
+        // Fail-closed re-validation of the ground string/regex lane. The
+        // self-check gate consults the PARTIAL (non-strict) checker, so a
+        // `StringGroundEval` lemma would otherwise be admitted on the
+        // strength of the classifier alone. Re-run the checker's own
+        // independent evaluator here: a lemma whose clause has no literal
+        // the evaluator proves TRUE is not a tautology, and the UNSAT must
+        // degrade to `unknown` rather than ship on a mislabelled step.
+        let unvalidated_string_lemma = proof.steps.iter().any(|s| {
+            matches!(
+                s,
+                ProofStep::TheoryLemma {
+                    kind: ay_core::TheoryLemmaKind::StringGroundEval,
+                    clause,
+                    ..
+                } if !ay_proof::recognize_string_ground_eval(&self.ctx.terms, clause)
+            )
+        });
+        if unvalidated_string_lemma {
+            return false;
+        }
+        // Same fail-closed re-validation for the SYMBOLIC regex lane
+        // (#regex-cert). `--self-check` consults the PARTIAL checker, so a
+        // `RegexIntersectEmpty` lemma would otherwise ship on the strength
+        // of the classifier alone. Re-run the checker's own independent
+        // derivative-product emptiness decision here: a lemma whose clause
+        // has no `str.in_re` group the checker proves EMPTY is not a
+        // tautology, and the UNSAT must degrade to `unknown`.
+        let unvalidated_regex_lemma = proof.steps.iter().any(|s| {
+            matches!(
+                s,
+                ProofStep::TheoryLemma {
+                    kind: ay_core::TheoryLemmaKind::RegexIntersectEmpty,
+                    clause,
+                    ..
+                } if !ay_proof::recognize_regex_intersect_empty(&self.ctx.terms, clause)
+            )
+        });
+        if unvalidated_regex_lemma {
+            return false;
+        }
+        // Same fail-closed re-validation for the str.len length-lemma lane
+        // (#selfcert-strlen). `--self-check` consults the PARTIAL checker, so
+        // a `StringLengthLemma` retagged from an injected length axiom would
+        // otherwise ship on the strength of the emitter's classifier alone.
+        // Re-run the checker's own independent structural re-derivation of the
+        // exact identity: a lemma whose clause carries no universally-valid
+        // str.len theorem is not a tautology, and the UNSAT must degrade to
+        // `unknown` rather than ship on a mislabelled leaf.
+        let unvalidated_str_len_lemma = proof.steps.iter().any(|s| {
+            matches!(
+                s,
+                ProofStep::TheoryLemma {
+                    kind: ay_core::TheoryLemmaKind::StringLengthLemma,
+                    clause,
+                    ..
+                } if !ay_proof::recognize_string_length_lemma(&self.ctx.terms, clause)
+            )
+        });
+        if unvalidated_str_len_lemma {
+            return false;
+        }
+        // Same fail-closed re-validation for the array extensionality lane
+        // (#ext-diff-cert), and here it is the LOAD-BEARING check rather
+        // than a belt-and-braces one: unlike every other array kind, the
+        // Skolemized extensionality clause
+        // `(= a b) ∨ ¬(= (select a k) (select b k))` is NOT a tautology —
+        // it is a conservative extension, valid only because `k` is a fresh
+        // witness bound to exactly this pair. The PARTIAL checker admits a
+        // theory lemma on its recorded kind, so without this re-validation a
+        // mere relabelling would be enough to ship a bare `unsat`. Re-run
+        // the checker's own provenance decision (introduction present, bound
+        // once, pair matches, symbol absent from the problem); anything it
+        // cannot establish degrades the UNSAT to `unknown`.
+        if !self.unsat_proof_extensionality_certified(proof) {
+            return false;
+        }
+        // Leak-2: an `assume` on the empty-clause path whose term is not
+        // backed by the problem's provenance (not an original asserted
+        // formula, and not a quantifier instantiation tracing back to an
+        // asserted `forall`) is a laundered free axiom — an external
+        // checker accepts it blindly, so it is exactly as unverified as a
+        // `trust` step. Reject it so `--self-check` degrades to `unknown`
+        // instead of emitting a bare `unsat` alongside an uncheckable
+        // proof (e.g. an injected `seq.len` identity assumed as `true`).
+        if self.unsat_proof_terminal_foreign_assume() {
+            return false;
+        }
+        // TIER-0 leak: a proof referencing sequence-theory content
+        // (`Seq`-sorted terms) is not independently checkable — carcara
+        // rejects the `Seq` sort, no firewall-Lean lemma covers sequences,
+        // and there is no DRAT lane. A clean `la_generic`/`resolution`
+        // refutation over `seq.nth` terms (zero hole/trust, no foreign
+        // assume) would otherwise self-certify and ship a bare `unsat`
+        // alongside a proof no external checker can confirm. Degrade to
+        // `unknown` instead.
+        if self.unsat_proof_references_uncheckable_seq_theory()
+            && !self.is_current_authenticated_seq_extensional_companion_proof(proof)
+        {
+            return false;
+        }
+        // The internal checker accepted it AND it genuinely derives the
+        // empty clause (false) from the assumptions.
+        self.proof_check_ok
+            && self
+                .proof_check_result
+                .as_ref()
+                .is_some_and(|c| c.total_steps > 0)
+            && self.proof_derives_valid_empty_clause(proof)
     }
 }
 
@@ -1576,7 +1572,6 @@ impl Executor {
 /// proceeds (through its own separately-metered re-validation) on
 /// `BudgetRefused` — but that difference belongs to the publication gate, not
 /// to this classification.
-#[cfg(feature = "proof-checker")]
 pub(super) fn classify_empty_clause_walk(
     error: Option<&ProofCheckError>,
     envelope_refused: bool,

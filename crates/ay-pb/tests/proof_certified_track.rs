@@ -270,7 +270,7 @@ fn verify_with_local_veripb_unchecked_deletions(test_name: &str, opb: &str, proo
 
 /// The checker for this suite, or `None` when the machine has none.
 ///
-/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` (scrub
+/// Was one of the two `find_local_veripb` copies `publish/DECISIONS.md` at `9598c4206` (scrub
 /// log, 2026-07-18) records keeping `/tmp/veripb-3/bin/veripb` in as "the
 /// neutral candidate". Neutral it is — machine-independent, so it survives into
 /// a public snapshot — but neutral is not IDENTIFIED: nothing in this repo
@@ -1382,4 +1382,107 @@ min: +1 x1 +2 x2 ;\n\
         "conclusion BOUNDS 0 0;",
         Some("soli ~x1 ~x2;"),
     );
+}
+
+/// AY-SAT-7: after the proof-logged slice, a certified decision solve runs
+/// the uncertified search routes (clique witness arm, symmetry arm,
+/// portfolio) and commits a verified SAT assignment as a solution proof.
+/// Before the change the phase after the slice ran the native CDCL alone,
+/// which does not find army10.14ls (PB06, prestwich) within the budget; the
+/// run ended `s UNKNOWN` with no proof file.
+///
+/// Deterministic: `--cert-native-cap-ms 0` gives the proof-logged slice no
+/// time, so the answer can only come from the phase after it, and
+/// `--cert-debug` names the search route that gave it (which one of them
+/// wins is the routes' business, not this test's). The budget (60 s) is far
+/// above their time (seconds), and nothing is asserted about time.
+#[test]
+fn test_standalone_cli_dec_proof_uses_search_routes_after_the_proof_slice() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instances/army10.14ls.opb");
+    let proof_path = unique_temp_path("army10-dec-cert", "pbp");
+    let proof_arg = proof_path.to_string_lossy().into_owned();
+    let (status, stdout, stderr) = run_standalone_ay_pb(
+        &[
+            "--timeout",
+            "60000",
+            "--cert-native-cap-ms",
+            "0",
+            "--cert-debug",
+            "--proof",
+            &proof_arg,
+        ],
+        &input,
+    );
+    assert!(
+        stdout.lines().any(|line| line == "s SATISFIABLE"),
+        "status={status:?}\nstdout={}\nstderr={stderr}",
+        stdout
+            .lines()
+            .filter(|l| !l.starts_with("v "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        stderr.lines().any(|line| {
+            line.strip_prefix("c dec-cert search route: ")
+                .and_then(|rest| rest.strip_suffix(" -> Satisfiable"))
+                .is_some_and(|route| {
+                    ["clique", "symmetry", "portfolio", "portfolio-parallel"].contains(&route)
+                })
+        }),
+        "a search route must have answered after the slice: stderr={stderr}"
+    );
+    let proof = fs::read_to_string(&proof_path).expect("a SAT answer must leave its proof");
+    assert!(
+        proof.lines().any(|line| line.starts_with("conclusion SAT")),
+        "the proof must conclude SAT: {}",
+        &proof[proof.len().saturating_sub(400)..]
+    );
+    if let Some(_veripb) = find_local_veripb() {
+        let opb = fs::read_to_string(&input).expect("read fixture");
+        verify_with_local_veripb("army10_dec_cert", &opb, &proof);
+    }
+    let _ = fs::remove_file(&proof_path);
+}
+
+/// AY-SAT-7: factor-size=9-P=379-Q=521 (PB06, roussel; OPT-LIN, infeasible:
+/// 197459 = 379 x 521 has no factor pair of 9-bit numbers). Without
+/// `--proof` it ends `s UNSATISFIABLE` in 0.3 s; with `--proof` it ended
+/// `s UNKNOWN`: the optimization proof solver (legacy writer) found no
+/// refutation in the whole budget and the portfolio's UNSAT is uncertified.
+/// The decision proof tap now refutes the constraints and the proof
+/// concludes `BOUNDS INF INF`.
+#[test]
+fn test_standalone_cli_opt_proof_certifies_an_infeasible_instance() {
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/instances/factor-size9-P379-Q521.opb");
+    let proof_path = unique_temp_path("factor-opt-cert", "pbp");
+    let proof_arg = proof_path.to_string_lossy().into_owned();
+    let (status, stdout, stderr) = run_standalone_ay_pb(
+        &["--timeout", "60000", "--cert-debug", "--proof", &proof_arg],
+        &input,
+    );
+    assert!(
+        stdout.lines().any(|line| line == "s UNSATISFIABLE"),
+        "status={status:?}\nstdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "c opt-lin-cert route: infeasible (decision proof tap)"),
+        "stderr={stderr}"
+    );
+    let proof = fs::read_to_string(&proof_path).expect("an UNSAT answer must leave its proof");
+    assert!(
+        proof
+            .lines()
+            .any(|line| line == "conclusion BOUNDS INF INF;"),
+        "{}",
+        &proof[proof.len().saturating_sub(400)..]
+    );
+    if let Some(_veripb) = find_local_veripb() {
+        let opb = fs::read_to_string(&input).expect("read fixture");
+        verify_with_local_veripb("factor_opt_cert", &opb, &proof);
+    }
+    let _ = fs::remove_file(&proof_path);
 }

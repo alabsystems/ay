@@ -11,7 +11,7 @@ Solve — decide, enumerate, count, simplify.
   simplify      SMT-LIB2 AST simplification
 
 Prove & trust — certificates in, certificates out.
-  check         Verify DRAT/LRAT/DPR/SR proofs and SAT models
+  check         Verify DRAT/LRAT/DPR/SR/VeriPB proofs and SAT models
   diagnose      Diagnose a wrong answer: validate, cross-check z3, explain
 
 Formats — native front ends beyond SMT-LIB.

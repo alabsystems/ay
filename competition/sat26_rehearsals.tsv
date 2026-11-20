@@ -3,7 +3,8 @@
 # competition/prepare_sat26_submission.sh refuses to cut any other commit (see
 # competition/sat26_rehearsal_gate.py) unless it is given --allow-unrehearsed REASON.
 # The first two rows were transcribed from those rehearsals' printed summaries
-# (competition/proof-posture-parity/README.md); rehearsed_utc is when each summary was read.
+# (recorded in competition/proof-posture-parity/README.md, deleted on 2026-11-20; git
+# history keeps it at 9598c4206); rehearsed_utc is when each summary was read.
 
 commit	rehearsed_utc	rustc	binary_sha256	binary_bytes	pgo_profiles
 55204ced0ebd7a2a8dced4066d4d1e781facb4c6	2026-09-13T12:48:16Z	rustc 1.97.1 (8bab26f4f 2026-07-14)	ed4fbda52d6dfa347f2033728279e7d6e5697ca970eff720717be055152f1ae5	86315568	40

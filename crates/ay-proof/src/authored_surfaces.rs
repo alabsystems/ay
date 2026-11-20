@@ -23,7 +23,7 @@ use super::{
     export_alethe_with_printer_to, render_unverifiable, AlethePrintError, AletheStreamError,
     HashMap, Proof, TermId, TermStore,
 };
-use crate::alethe_printer::{AlethePrinter, CompleteBlastAsk};
+use crate::alethe_printer::{AlethePrinter, AssembledRendering, CompleteBlastAsk};
 
 /// Authored spellings the Alethe printer consults beyond the term overrides.
 #[derive(Clone, Copy, Debug, Default)]
@@ -280,6 +280,7 @@ pub fn try_export_alethe_with_authored_surfaces_until(
     stop: &dyn Fn() -> bool,
 ) -> Result<String, AlethePrintError> {
     let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget)
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget)
         .with_authored_surfaces(surfaces)
         .asking_complete_blast(CompleteBlastAsk::AskedUntil(stop));
     rendered(|output| {
@@ -318,6 +319,7 @@ pub fn try_export_alethe_with_authored_surfaces_within_solve(
     solve: AskingSolve<'_>,
 ) -> Result<String, AlethePrintError> {
     let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget)
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget)
         .with_authored_surfaces(surfaces)
         .asking_complete_blast(CompleteBlastAsk::AskedUntil(solve.stop))
         .reading_support_declines(solve.declines);

@@ -618,3 +618,173 @@ fn test_kind_skips_array_problems() {
         "Kind must return NotApplicable for array-sorted problems (#8675), got {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Induction depth handed to the k→1 converter (DR-CHC-KIND-K-TO-1-DEPTH-20261118).
+//
+// At loop k the forward check is ¬Q(x0..xk) ∧ Tr^(k+1) ∧ Q(x{k+1}) and the
+// backward check is Init(x0) ∧ Tr^(k+1) ∧ ¬Init(x1..x{k+1}): an UNSAT one
+// proves the property (k+1)-inductive. convert_with_timeout takes
+// "k-inductive" (k transitions; k <= 1 returns the input), so passing the
+// loop index hands a 2-inductive property over as already inductive and
+// the Safe falls through to the deferred ¬query, which is not 1-inductive.
+//
+// Both fixtures keep init NOT closed under Tr, so backward induction cannot
+// close at loop 0 (where `Init` itself is the 1-inductive witness).
+// ---------------------------------------------------------------------------
+
+fn int_var(name: &str) -> ChcVar {
+    ChcVar::new(name, ChcSort::Int)
+}
+
+/// `Inv(a, b)`: init `a = 0 ∧ b = -1`, `Tr` swaps a and b, query `a > 0`.
+/// `a <= 0` is 2-inductive (and 3-inductive) but not 1-inductive (`b` is
+/// unconstrained by it); backward induction also first closes at loop 1,
+/// but forward runs first in each loop, so this pins the forward path.
+fn make_two_inductive_swap_problem() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int, ChcSort::Int]);
+    let (a, b) = (int_var("a"), int_var("b"));
+    let (va, vb) = (ChcExpr::var(a), ChcExpr::var(b));
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and(
+            ChcExpr::eq(va.clone(), ChcExpr::int(0)),
+            ChcExpr::eq(vb.clone(), ChcExpr::int(-1)),
+        )),
+        ClauseHead::Predicate(inv, vec![va.clone(), vb.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(inv, vec![va.clone(), vb.clone()])]),
+        ClauseHead::Predicate(inv, vec![vb.clone(), va.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![va.clone(), vb])],
+            Some(ChcExpr::gt(va, ChcExpr::int(0))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+/// `Inv(a, b, c)`: init `a = 0 ∧ b = -1 ∧ c = 0`; `Tr` swaps a and b when
+/// `c <= 0` and otherwise counts `c` down; query `a > 0`.
+///
+/// Forward induction never closes: `a = 0, b = 1, c = n` walks n + 1 ¬Q
+/// states into Q. Backward induction closes at loop 1 (the reachable states
+/// alternate `(0,-1,0)`, `(-1,0,0)`), so ¬Init is 2-inductive on the reversed
+/// system and only the backward Safe path can publish.
+fn make_backward_two_inductive_problem() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int; 3]);
+    let (a, b, c) = (int_var("a"), int_var("b"), int_var("c"));
+    let (va, vb, vc) = (ChcExpr::var(a), ChcExpr::var(b), ChcExpr::var(c));
+    let state = vec![va.clone(), vb.clone(), vc.clone()];
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and_all([
+            ChcExpr::eq(va.clone(), ChcExpr::int(0)),
+            ChcExpr::eq(vb.clone(), ChcExpr::int(-1)),
+            ChcExpr::eq(vc.clone(), ChcExpr::int(0)),
+        ])),
+        ClauseHead::Predicate(inv, state.clone()),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, state.clone())],
+            Some(ChcExpr::le(vc.clone(), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(inv, vec![vb.clone(), va.clone(), vc.clone()]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, state.clone())],
+            Some(ChcExpr::gt(vc.clone(), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(inv, vec![va.clone(), vb, ChcExpr::sub(vc, ChcExpr::int(1))]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(inv, state)], Some(ChcExpr::gt(va, ChcExpr::int(0)))),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+fn kind_depth_config() -> KindConfig {
+    KindConfig::with_engine_config(
+        6,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(20),
+        false,
+        None,
+    )
+}
+
+/// Kind must publish a 1-inductive witness, not the deferred `¬query`.
+fn assert_kind_safe_with_one_inductive_model(problem: ChcProblem, label: &str) {
+    let mut solver = KindSolver::new(problem.clone(), kind_depth_config());
+    let result = solver.solve();
+    let KindResult::Safe(model) = result else {
+        panic!("{label}: expected Safe, got {result:?}");
+    };
+    let mut verifier = crate::PdrSolver::new(
+        problem,
+        crate::PdrConfig {
+            strict_proofs: true,
+            preserve_original_clauses: true,
+            ..crate::PdrConfig::default()
+        },
+    );
+    assert!(
+        verifier.verify_model_per_rule(&model, std::time::Duration::from_secs(2)),
+        "{label}: Kind's Safe model must be 1-inductive on the original CHC, got {model:?}"
+    );
+}
+
+#[test]
+fn test_kind_forward_two_inductive_publishes_one_inductive_witness() {
+    let problem = make_two_inductive_swap_problem();
+    let ts = TransitionSystem::from_chc_problem(&problem).expect("extract transition system");
+    // Fixture guard: init is not closed under Tr, ¬Q is not 1-inductive.
+    let not_q = ChcExpr::not(ts.query_raw().clone());
+    let mut ctx = crate::smt::SmtContext::new();
+    let not_one_inductive = ChcExpr::and_all([
+        not_q.clone(),
+        ts.transition_at(0),
+        ChcExpr::not(ts.send_through_time(&not_q, 1)),
+    ]);
+    assert!(ctx.check_sat(&not_one_inductive).is_sat());
+    assert_kind_safe_with_one_inductive_model(problem, "forward 2-inductive swap");
+}
+
+#[test]
+fn test_kind_backward_two_inductive_publishes_one_inductive_witness() {
+    let problem = make_backward_two_inductive_problem();
+    let ts = TransitionSystem::from_chc_problem(&problem).expect("extract transition system");
+    // Fixture guard: Init ∧ Tr ∧ ¬Init' is SAT, so the loop-0 backward
+    // shortcut (Init itself is inductive) cannot fire.
+    let mut ctx = crate::smt::SmtContext::new();
+    let init_not_closed = ChcExpr::and_all([ts.init_at(0), ts.transition_at(0), ts.neg_init_at(1)]);
+    assert!(ctx.check_sat(&init_not_closed).is_sat());
+    assert_kind_safe_with_one_inductive_model(problem, "backward 2-inductive");
+}
+
+/// The converter receives the true induction depth: at loop 1 a 2-inductive
+/// `¬Q` comes back strengthened to a 1-inductive invariant.
+#[test]
+fn test_strengthen_to_1_inductive_converts_depth_two() {
+    let problem = make_two_inductive_swap_problem();
+    let ts = TransitionSystem::from_chc_problem(&problem).expect("extract transition system");
+    let solver = KindSolver::new(problem, kind_depth_config());
+    let not_q = ChcExpr::not(ts.query_raw().clone());
+    let start = ay_core::time::Instant::now();
+    // Depth 1 means "already 1-inductive": returned unchanged.
+    assert_eq!(
+        solver.strengthen_to_1_inductive(&not_q, 1, &ts, start),
+        not_q
+    );
+    let converted = solver.strengthen_to_1_inductive(&not_q, 2, &ts, start);
+    assert!(
+        solver.verify_invariant_init_query(&ts, &converted, start),
+        "depth-2 conversion must yield a 1-inductive invariant, got {converted}"
+    );
+}

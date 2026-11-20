@@ -90,6 +90,13 @@ pub enum SolverError {
         /// Description of why the argument is invalid
         message: String,
     },
+    /// A Boolean enumeration stopped before it could retain its authenticated
+    /// query binding. No models or completeness evidence were published.
+    #[error("Boolean enumeration stopped before source binding: {0}")]
+    BoolEnumerationStopped(crate::UnknownReason),
+    /// A finite scalar enumeration stopped before it retained its query binding.
+    #[error("finite scalar enumeration stopped: {0}")]
+    FiniteEnumerationStopped(crate::UnknownReason),
     /// Invalid quantifier trigger/pattern specification.
     #[error("invalid trigger for {operation}: {message}")]
     InvalidTrigger {

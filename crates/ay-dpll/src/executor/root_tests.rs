@@ -7,9 +7,6 @@ use super::*;
 #[path = "maxsmt_tests.rs"]
 mod maxsmt_tests;
 
-#[path = "diff_logic_tests.rs"]
-mod diff_logic_tests;
-
 #[path = "competition_mode_tests.rs"]
 mod competition_mode_tests;
 

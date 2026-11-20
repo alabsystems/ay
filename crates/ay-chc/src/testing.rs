@@ -41,7 +41,7 @@ pub fn pdr_solve_problem(problem: &ChcProblem, config: PdrConfig) -> PdrResult {
 }
 
 /// Board-level counters of one direct PDR solve (Workstream B locks L-V/L2;
-/// `DESIGN_spacer_pob_lemma_pipeline.md` §6 S11).
+/// the development design notes at `9598c4206`, §6 S11).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PdrTestStats {
     /// Lemmas in the frames at the end of the solve.

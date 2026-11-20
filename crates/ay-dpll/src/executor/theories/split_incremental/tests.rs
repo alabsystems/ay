@@ -11,18 +11,22 @@ use super::lemmas::{
 use super::{
     add_extra_blocking_clauses, bias_split_clause_vars, encode_and_add_split_clause,
     encode_split_pair_incremental, ensure_incremental_atom_encoded,
-    map_conflict_to_blocking_clause, replay_incremental_bound_refinements, BlockingClauseResult,
-    BoundRefinementReplayKey,
+    map_conflict_to_blocking_clause, materialize_bound_refinement_atom_term,
+    replay_incremental_bound_refinements, BlockingClauseResult, BoundRefinementReplayKey,
 };
 use crate::incremental_proof_cache::{
     IncrementalNegationCache, PendingOriginalClauseAuthority, TheoryLemmaSeenSet,
 };
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_core::{BoundRefinementRequest, Sort, TermStore, TheoryConflict, TheoryLemma, TheoryLit};
+use ay_core::{
+    BoundRefinementRequest, Sort, Symbol, TermData, TermStore, TheoryConflict, TheoryLemma,
+    TheoryLit,
+};
 use ay_sat::{Literal as SatLiteral, SatResult, Solver as SatSolver, Variable as SatVariable};
 use num_bigint::BigInt;
 use num_rational::BigRational;
+use num_traits::Zero;
 
 struct DuplicateReplayCheckpoint {
     clauses: usize,
@@ -898,8 +902,8 @@ fn string_lemma_returns_the_exact_flattened_sat_clause() {
     let p = terms.mk_var("p", Sort::Bool);
     let q = terms.mk_var("q", Sort::Bool);
     let r = terms.mk_var("r", Sort::Bool);
-    let inner = terms.mk_app(ay_core::Symbol::named("or"), [q, r], Sort::Bool);
-    let outer = terms.mk_app(ay_core::Symbol::named("or"), [p, inner], Sort::Bool);
+    let inner = terms.mk_app(Symbol::named("or"), [q, r], Sort::Bool);
+    let outer = terms.mk_app(Symbol::named("or"), [p, inner], Sort::Bool);
     let mut solver = SatSolver::new(0);
     solver.enable_clause_trace();
     let mut term_to_var = super::HashMap::default();
@@ -939,7 +943,7 @@ fn ensure_incremental_atom_encoded_preserves_not_polarity_from_eq_coerce_issue_8
     let x = terms.mk_var("x", Sort::Bool);
     let eq_false = terms.mk_eq_coerce(x, terms.false_term());
     assert!(
-        matches!(terms.get(eq_false), ay_core::TermData::Not(inner) if *inner == x),
+        matches!(terms.get(eq_false), TermData::Not(inner) if *inner == x),
         "mk_eq_coerce(x, false) should simplify to Not(x) for this regression"
     );
 
@@ -1210,4 +1214,52 @@ fn primary_checked_conflict_blocks_only_within_its_scope() {
     solver.add_clause(vec![SatLiteral::positive(SatVariable::new(0))]);
     solver.add_clause(vec![SatLiteral::positive(SatVariable::new(1))]);
     assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
+}
+
+#[test]
+fn test_materialize_relative_lower_refinement_preserves_ge_surface_form() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let atom = materialize_bound_refinement_atom_term(
+        &mut terms,
+        &BoundRefinementRequest {
+            variable: x,
+            rhs_term: Some(y),
+            bound_value: BigRational::zero(),
+            is_upper: false,
+            is_integer: false,
+            reason: Vec::new(),
+        },
+    );
+
+    assert_eq!(
+        terms.get(atom),
+        &TermData::App(Symbol::named(">="), vec![x, y]),
+        "relative lower refinement replay must preserve lhs-rhs direction"
+    );
+}
+
+#[test]
+fn test_materialize_direct_lower_refinement_stays_canonicalized() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let atom = materialize_bound_refinement_atom_term(
+        &mut terms,
+        &BoundRefinementRequest {
+            variable: x,
+            rhs_term: None,
+            bound_value: BigRational::from_integer(3.into()),
+            is_upper: false,
+            is_integer: false,
+            reason: Vec::new(),
+        },
+    );
+    let three = terms.mk_rational(BigRational::from_integer(3.into()));
+
+    assert_eq!(
+        terms.get(atom),
+        &TermData::App(Symbol::named("<="), vec![three, x]),
+        "direct lower refinements should keep the canonical <= form"
+    );
 }

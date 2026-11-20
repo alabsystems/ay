@@ -666,6 +666,75 @@ impl CertifiedRow {
     }
 }
 
+/// What one branch of a split proof established over its exact box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchConclusion {
+    /// The combination is exactly `target·x >= d` with `d >= target_lb`.
+    Dominates,
+    /// The combination is a Farkas contradiction: the branch box is empty.
+    Empty,
+}
+
+/// Check one branch of a split (disjunctive) derivation.
+///
+/// `multipliers` are positive multipliers over `model`'s row facts and column
+/// facts; column facts are priced at the explicit exact box `col_lb`/`col_ub`
+/// (the model box intersected with the branch's disjunction side), exactly as
+/// a tree-certificate leaf is priced. The branch is accepted when its oriented
+/// combination `coeffs·x + constant >= 0` is either
+///
+/// * the target row: `coeffs == target` coefficient-for-coefficient and
+///   `-constant >= target_lb`, so `target·x >= target_lb` holds on the branch; or
+/// * a contradiction: every coefficient zero and `constant < 0`.
+///
+/// Nothing is weakened implicitly: a coefficient that differs from `target`
+/// anywhere (including a column the target does not mention) is a mismatch.
+/// `work` receives the same cooperative charges as the public verifiers.
+pub(crate) fn check_branch_derivation<F>(
+    multipliers: &[Multiplier],
+    model: &Model,
+    col_lb: &[Option<BigRational>],
+    col_ub: &[Option<BigRational>],
+    target: &[(u32, BigRational)],
+    target_lb: &BigRational,
+    work: &mut F,
+) -> Result<BranchConclusion, CertificateError>
+where
+    F: FnMut(usize) -> Result<(), CertificateError> + ?Sized,
+{
+    let combo = combine_bounded_with_work(multipliers, model, Some((col_lb, col_ub)), work)?;
+    if combo.coeffs.iter().all(Rational::is_zero) {
+        return if combo.constant.is_negative() {
+            Ok(BranchConclusion::Empty)
+        } else {
+            Err(CertificateError::NotContradictory)
+        };
+    }
+    work(model.num_cols())?;
+    let mut want = vec![Rational::zero(); model.num_cols()];
+    for &(c, ref a) in target {
+        let slot = want
+            .get_mut(c as usize)
+            .ok_or(CertificateError::CoefficientMismatch { col: c as usize })?;
+        *slot += &Rational::from(a);
+    }
+    for (col, (combined, wanted)) in combo.coeffs.iter().zip(&want).enumerate() {
+        if col & 0xff == 0 {
+            work(0x100.min(want.len().saturating_sub(col)))?;
+        }
+        if combined != wanted {
+            return Err(CertificateError::CoefficientMismatch { col });
+        }
+    }
+    // `target·x >= -constant`; the branch proves the target row when that
+    // derived bound is at least the claimed one.
+    if (-combo.constant).to_big() >= *target_lb {
+        Ok(BranchConclusion::Dominates)
+    } else {
+        Err(CertificateError::ConstantMismatch)
+    }
+}
+
 /// Intersect exact branch assumptions into the model's own exact column box.
 ///
 /// This deliberately mirrors the tree verifier's bound walk. The helper is

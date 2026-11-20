@@ -600,13 +600,10 @@ struct LaneLatches {
     uflia_congruence_lane: bool,
     uflia_congruence_gate_rejected: bool,
     uflia_congruence_retry_done: bool,
-    uflia_model_repair_done: bool,
     qfax_retry_done: bool,
     qfax_refinement_clause: Option<Vec<(TermId, bool)>>,
     last_rejected_array_assertion: Option<TermId>,
     unrepaired_model_candidate: Option<Model>,
-    uflia_repair_candidates: Vec<Model>,
-    uflia_repair_conflict_tables: Vec<String>,
     recorded_var_substitutions: DetHashMap<TermId, TermId>,
     row_seeded_terms: DetHashSet<TermId>,
     array_axiom_scope: Option<(DetHashSet<TermId>, usize)>,
@@ -668,18 +665,10 @@ impl LaneLatches {
                 &mut executor.uflia_congruence_retry_done,
                 false,
             ),
-            uflia_model_repair_done: std::mem::replace(
-                &mut executor.uflia_model_repair_done,
-                false,
-            ),
             qfax_retry_done: std::mem::replace(&mut executor.qfax_retry_done, false),
             qfax_refinement_clause: executor.qfax_refinement_clause.take(),
             last_rejected_array_assertion: executor.last_rejected_array_assertion.take(),
             unrepaired_model_candidate: executor.unrepaired_model_candidate.take(),
-            uflia_repair_candidates: std::mem::take(&mut executor.uflia_repair_candidates),
-            uflia_repair_conflict_tables: std::mem::take(
-                &mut executor.uflia_repair_conflict_tables,
-            ),
             recorded_var_substitutions: std::mem::take(&mut executor.recorded_var_substitutions),
             row_seeded_terms: std::mem::take(&mut executor.row_seeded_terms),
             array_axiom_scope: executor.array_axiom_scope.take(),
@@ -718,13 +707,10 @@ impl LaneLatches {
         executor.uflia_congruence_lane = self.uflia_congruence_lane;
         executor.uflia_congruence_gate_rejected = self.uflia_congruence_gate_rejected;
         executor.uflia_congruence_retry_done = self.uflia_congruence_retry_done;
-        executor.uflia_model_repair_done = self.uflia_model_repair_done;
         executor.qfax_retry_done = self.qfax_retry_done;
         executor.qfax_refinement_clause = self.qfax_refinement_clause;
         executor.last_rejected_array_assertion = self.last_rejected_array_assertion;
         executor.unrepaired_model_candidate = self.unrepaired_model_candidate;
-        executor.uflia_repair_candidates = self.uflia_repair_candidates;
-        executor.uflia_repair_conflict_tables = self.uflia_repair_conflict_tables;
         executor.recorded_var_substitutions = self.recorded_var_substitutions;
         executor.row_seeded_terms = self.row_seeded_terms;
         executor.array_axiom_scope = self.array_axiom_scope;

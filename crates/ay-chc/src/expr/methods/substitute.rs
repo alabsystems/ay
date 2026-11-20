@@ -260,7 +260,7 @@ impl ChcExpr {
     /// expression's variables come from ONE clause (one sort per name) or from
     /// the canonical `__p<i>_a<j>` vocabulary (unique per predicate position),
     /// so no PDR frame lemma may keep a clause local under its source name: the
-    /// 2026-09-19 audit (PDR_typed_subst_2026-09-19.md) missed three that did
+    /// 2026-09-19 audit (the development design notes at 9598c4206) missed three that did
     /// (#5805). The debug tripwire below turns such a misuse into a test failure.
     pub(crate) fn substitute_name_map(&self, map: &FxHashMap<String, Self>) -> Self {
         if map.is_empty() {

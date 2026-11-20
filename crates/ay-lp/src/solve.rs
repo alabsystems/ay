@@ -28,23 +28,116 @@ const MAX_NODES: usize = 4096;
 /// itself an integer-feasible ray certificate, so the solver fails closed with
 /// [`LpError::Unsupported`] instead of claiming MIP unboundedness.
 pub fn solve(problem: &Problem) -> Result<Solution, LpError> {
+    solve_with_incumbents(problem, &mut |_| {})
+}
+
+/// [`solve`], reporting every improving integer-feasible incumbent to
+/// `on_incumbent` as soon as branch-and-bound finds it.
+///
+/// Each reported point has passed the same bound and row feasibility check
+/// that admits it as an incumbent. When the search later stops with an error
+/// (node or iteration limit, [`LpError::ResourceLimit`]), the last reported
+/// point is still a feasible solution; it is only not proven optimal.
+///
+/// # Errors
+///
+/// As [`solve`].
+pub fn solve_with_incumbents(
+    problem: &Problem,
+    on_incumbent: &mut dyn FnMut(&Solution),
+) -> Result<Solution, LpError> {
     if !problem.has_integer_vars() {
         return solve_lp_relaxation(problem);
     }
     let mut state = BnbState {
         incumbent: None,
         nodes_explored: 0,
+        on_incumbent,
     };
     branch_and_bound(problem, &mut state)?;
     state.incumbent.ok_or(LpError::Infeasible)
 }
 
-struct BnbState {
-    incumbent: Option<Solution>,
-    nodes_explored: usize,
+/// Absolute tolerance of [`check_point`], scaled by the row's magnitude.
+const POINT_TOL: f64 = 1e-9;
+
+/// Checks that `values` (one per variable, in `problem` order) is a feasible
+/// point of `problem` and returns its objective value.
+///
+/// Stricter than the branch-and-bound acceptance test, and independent of
+/// whichever solver produced the point: every value must be finite; integer
+/// and binary variables must hold exact integers inside their bounds; other
+/// bounds and every row must hold within `1e-9` times the magnitude of the
+/// row (at least 1). The MIPLIB checker the competitions use accepts at
+/// `1e-6`. A point that passes here therefore passes there when `problem`
+/// is the checker's model of the file: for MPS input that is
+/// [`crate::parse_mps`]'s reading, which applies the checker's defaults (an
+/// integer column of a marker section with no BOUNDS entry is in `[0, 1]`)
+/// and refuses the constructs on which MPS readers disagree. For a
+/// `Problem` built some other way the check is against that `Problem` only.
+///
+/// # Errors
+///
+/// A message naming the first variable or row that fails.
+pub fn check_point(problem: &Problem, values: &[f64]) -> Result<f64, String> {
+    if values.len() != problem.variables.len() {
+        return Err(format!(
+            "{} values for {} variables",
+            values.len(),
+            problem.variables.len()
+        ));
+    }
+    for (var, &value) in problem.variables.iter().zip(values) {
+        if !value.is_finite() {
+            return Err(format!("variable '{}' is not finite", var.name));
+        }
+        if var.is_integral() && value.fract() != 0.0 {
+            return Err(format!("variable '{}' = {value} is not integral", var.name));
+        }
+        let (lower, upper) = effective_solution_bounds(var);
+        let tol = POINT_TOL * value.abs().max(1.0);
+        if (lower.is_finite() && value < lower - tol) || (upper.is_finite() && value > upper + tol)
+        {
+            return Err(format!(
+                "variable '{}' = {value} is outside [{lower}, {upper}]",
+                var.name
+            ));
+        }
+    }
+    for row in &problem.constraints {
+        let mut lhs = 0.0f64;
+        let mut scale = row.rhs.abs().max(1.0);
+        for &(idx, coef) in &row.coeffs {
+            let term = coef * values.get(idx).copied().unwrap_or(f64::NAN);
+            lhs += term;
+            scale = scale.max(term.abs());
+        }
+        if !lhs.is_finite() {
+            return Err(format!("row '{}' activity is not finite", row.name));
+        }
+        let tol = POINT_TOL * scale;
+        let ok = match row.kind {
+            RowKind::Le => lhs <= row.rhs + tol,
+            RowKind::Ge => lhs >= row.rhs - tol,
+            RowKind::Eq => (lhs - row.rhs).abs() <= tol,
+        };
+        if !ok {
+            return Err(format!(
+                "row '{}' activity {lhs} violates {:?} {}",
+                row.name, row.kind, row.rhs
+            ));
+        }
+    }
+    objective_from_values(problem, values).ok_or_else(|| "objective is not finite".to_string())
 }
 
-fn branch_and_bound(problem: &Problem, state: &mut BnbState) -> Result<(), LpError> {
+struct BnbState<'a> {
+    incumbent: Option<Solution>,
+    nodes_explored: usize,
+    on_incumbent: &'a mut dyn FnMut(&Solution),
+}
+
+fn branch_and_bound(problem: &Problem, state: &mut BnbState<'_>) -> Result<(), LpError> {
     state.nodes_explored += 1;
     if state.nodes_explored > MAX_NODES {
         return Err(LpError::IterationLimit);
@@ -78,6 +171,7 @@ fn branch_and_bound(problem: &Problem, state: &mut BnbState) -> Result<(), LpErr
             return Ok(());
         };
         if is_better_incumbent(problem.sense, &state.incumbent, candidate.objective) {
+            (state.on_incumbent)(&candidate);
             state.incumbent = Some(candidate);
         }
         return Ok(());

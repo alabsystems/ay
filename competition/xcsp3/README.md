@@ -31,8 +31,13 @@ MiniZinc solvers; a later CPMpy may, so the version is part of the entry.
   `minizinc`; with AY they are decomposed. Correct, slower.
 - Constraints CPMpy's reader does not support end with its own
   `s UNSUPPORTED`.
-- Every limit of `ay flatzinc solve` carries over (see
-  the development design notes, the MiniZinc items).
+- Every limit of `ay flatzinc solve` carries over. Two that MiniZinc Challenge
+  instances hit (measured 2026-11-13 on `268ebff6e252`): the CP back end
+  preallocates at most 2^20 order literals over the declared integer domains
+  (`MAX_PREALLOCATED_ORDER_LITERALS`, `crates/ay-cp/src/encoder.rs`) and
+  answers UNKNOWN beyond that, and a variable-by-variable `int_times` or
+  `int_div` is supported only as a table of at most 10,000 values, beyond which
+  `ay flatzinc solve` falls back to the SMT translation without a message.
 
 ## Measured
 

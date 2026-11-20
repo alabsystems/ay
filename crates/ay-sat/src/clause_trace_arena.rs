@@ -98,6 +98,7 @@ impl ClauseTrace {
             budget_bytes: DEFAULT_BUDGET_BYTES,
             is_truncated: false,
             proof_work_exhausted: false,
+            literals_only: false,
             exhaustion_snapshot: None,
             hint_omissions: HintOmissionCounters::default(),
             solver_num_vars: None,
@@ -215,6 +216,14 @@ impl ClauseTrace {
             self.mark_proof_work_exhausted();
             return;
         }
+        // Literals-only recording (post-#A2b-degradation): hints are the
+        // bookkeeping work the budget exists to bound, so they are dropped
+        // here no matter what the caller computed.
+        let resolution_hints: &[u64] = if self.literals_only {
+            &[]
+        } else {
+            resolution_hints
+        };
         if clause.is_empty() {
             self.has_empty = true;
         }
@@ -375,6 +384,9 @@ impl ClauseTrace {
     /// missing or the compact replacement cannot fit the retained budget.
     pub fn set_resolution_hints(&mut self, id: u64, resolution_hints: Vec<u64>) -> bool {
         self.solver_num_vars = None;
+        if self.literals_only {
+            return false;
+        }
         let Some(index) = self.meta.iter().rposition(|entry| entry.id == id) else {
             tracing::warn!(
                 clause_id = id,
@@ -495,6 +507,25 @@ impl ClauseTrace {
     /// Drop all recorded entries and release their arena allocations.
     ///
     /// The proof-exhausted and empty-clause markers remain set.
+    /// Switch to literals-only recording at #A2b degradation: drop every
+    /// recorded hint (the expensive part of trace bookkeeping) but keep
+    /// entries, literals, originals and the empty-clause marker, so the
+    /// trace stays a complete clause sequence for reconstruction repair.
+    /// Later additions are recorded hint-free by the add paths.
+    pub fn strip_hints_for_literals_only_recording(&mut self) {
+        self.solver_num_vars = None;
+        self.literals_only = true;
+        self.hint_pool = Vec::new();
+        for entry in &mut self.meta {
+            entry.hints_off = 0;
+            entry.hints_len = 0;
+        }
+        for (_, entry) in &mut self.deletions {
+            entry.hints_off = 0;
+            entry.hints_len = 0;
+        }
+    }
+
     pub fn clear_entries(&mut self) {
         self.solver_num_vars = None;
         self.meta = Vec::new();

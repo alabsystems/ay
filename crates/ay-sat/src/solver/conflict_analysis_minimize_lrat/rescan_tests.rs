@@ -82,12 +82,16 @@ fn entries(solver: &Solver) -> TraceRows {
 }
 
 #[test]
-fn one_pin_pays_one_visit_not_the_materialized_suffix_in_both_passes() {
+fn one_pin_pays_one_rescan_then_memo_hits_are_free_in_both_passes() {
     for pass in [Pass::Minimize, Pass::Root] {
         let mut solver = pinned_fixture();
         let before = entries(&solver);
         solver.set_proof_bookkeeping_budget(Some(4));
-        for remaining in [3, 2, 1] {
+        // The first retry rescans the pin and pays one unit (not the
+        // materialized suffix). Later retries hit the stay-pinned memo:
+        // still one visited entry each, but no rescan and no charge
+        // (DR-AY-SAT-PIN-MEMO-CHARGE-20261119).
+        for remaining in [3, 3, 3] {
             let visited = pass.visited(&solver);
             pass.run(&mut solver);
             assert_eq!(pass.visited(&solver) - visited, 1, "{pass:?}");

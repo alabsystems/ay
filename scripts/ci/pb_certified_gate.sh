@@ -191,7 +191,7 @@ note_fail() { echo "FAIL $*" >&2; fail=1; }
 echo "== phase 2/6: pinned checker"
 
 # ABSENT is not MISMATCHED. The public snapshot ships the pin but not the patch
-# file (a private fork's delta; publish/DECISIONS.md, 2026-09-25). With no file
+# file (a private fork's delta; publish/DECISIONS.md at 9598c4206, 2026-09-25). With no file
 # there is no second identity to disagree with the pin: the build id below is
 # keyed by VERIPB_PATCH_SHA256 either way, and phases 3 and 4 vet whatever
 # checker is used. An absent patch cannot BUILD, so that branch refuses as
@@ -440,8 +440,8 @@ done < "$VERIPB_SOUNDNESS_DIR/expected.tsv"
 # The reviewed workflow and the installed one must be the same bytes; otherwise
 # "CI runs this" is an assumption rather than a fact.
 #
-# This repository has a standing owner decision (commit 58391bbdd) of NO
-# workflows: neither file exists, and nothing here installs one. That is a
+# This repository has had NO workflows since commit 58391bbdd removed them:
+# neither file exists, and nothing here installs one. That is a
 # consistent state, not drift, so it passes — but ONLY when both are absent. As
 # soon as either file appears, both must exist and match, which is the case the
 # check was written for.

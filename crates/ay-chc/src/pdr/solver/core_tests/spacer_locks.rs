@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Workstream B locks owned by WP-B1-S (`DESIGN_spacer_pob_lemma_pipeline.md`
+//! Workstream B locks owned by WP-B1-S (the development design notes at `9598c4206`
 //! §6 S11): L3 `frame_hyp(k) ⇒ frame_hyp(k+1)`, L4
 //! `cumulative_frame_constraint == frame_hyp` modulo the `false` filter under
 //! the lane, the delta `frames_equivalent` quick-accept, the lifted-cap

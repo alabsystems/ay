@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CHC-COMP 2026 Workstream D (DESIGN_lra_interp_tpa.md §4.1, §9): the PDR
+//! CHC-COMP 2026 Workstream D (the development design notes at 9598c4206, §4.1, §9): the PDR
 //! interpolation ladder. With two or more UNSAT clauses behind a POB, stage 1
 //! now interpolates per clause and serves `∨_c I_c`; stage 5 no longer runs
 //! when the skip probe found `∧A` UNSAT (its `A ⊨ I` check would be vacuous);

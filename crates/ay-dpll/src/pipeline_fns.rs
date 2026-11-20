@@ -39,14 +39,14 @@ pub(crate) fn debug_split_exit(site: &str) {
 /// whole struct. An explicit `:rlimit` (`resource_limit`) always wins;
 /// otherwise the default ground budget supplies
 /// [`crate::executor::Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE`] unless
-/// disabled (`set_ground_budget_enabled(false)` / `:rlimit 0` / the
-/// `AY_NO_GROUND_BUDGET` env knob). `None` = no conflict budget.
+/// disabled (`set_ground_budget_enabled(false)` / `:rlimit 0`). `None` = no
+/// conflict budget.
 pub(crate) fn effective_conflict_allowance(
     resource_limit: Option<u64>,
     ground_budget_enabled: bool,
 ) -> Option<u64> {
     resource_limit.or_else(|| {
-        (ground_budget_enabled && !ground_budget_env_disabled())
+        ground_budget_enabled
             .then_some(crate::executor::Executor::DEFAULT_GROUND_CONFLICT_ALLOWANCE)
     })
 }
@@ -61,16 +61,9 @@ pub(crate) fn effective_decision_allowance(
     ground_budget_enabled: bool,
 ) -> Option<u64> {
     decision_limit.or_else(|| {
-        (ground_budget_enabled && !ground_budget_env_disabled())
+        ground_budget_enabled
             .then_some(crate::executor::Executor::DEFAULT_GROUND_DECISION_ALLOWANCE)
     })
-}
-
-/// Process-wide debug opt-out for the default ground budget
-/// (`AY_NO_GROUND_BUDGET=1`), cached once. For A/B verdict experiments only —
-/// the default path never reads the environment per solve.
-pub(crate) fn ground_budget_env_disabled() -> bool {
-    false // B23: A/B opt-out retired; typed :rlimit is the carrier.
 }
 
 /// SAT-solver statistics snapshot, taken from the SAT solver by value so the

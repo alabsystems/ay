@@ -4,19 +4,6 @@
 
 use super::*;
 
-/// #lra-inc-engine P1 (`--lra-cond-trail`, EXPERIMENTAL, default OFF): when ON,
-/// `assert_var_bound[_with_reasons]` trails ONLY genuine bound writes (tightenings),
-/// not the non-tightening re-assert flood that `process_check_atoms` re-presents
-/// every check. This makes `pop_inner`'s trail replay O(delta) instead of O(base),
-/// eliminating the scoped-push/pop pop-cost tax. SOUNDNESS: a non-tightening assert
-/// changes no bound state, so its trail entry only ever restored a value to itself
-/// (a no-op) — skipping it restores identically. Core trail path (all LRA/LIA):
-/// gate behind full-suite + adversarial review before any default-on.
-fn cond_trail_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| ay_core::misc_cli_flags().lra_cond_trail)
-}
-
 impl LraSolver {
     /// Would `(bound, strict)` tighten `info`'s `bound_type` bound?
     ///
@@ -317,9 +304,7 @@ impl LraSolver {
         //     replay restores it by move, so the trail entry is the same
         //     value it always was), and the new bound is built only here;
         //   * non-tightening: nothing is written; the trail entry (a clone of
-        //     the unchanged bound) is pushed exactly when it was before —
-        //     unconditionally by default, skipped under --lra-cond-trail
-        //     (#lra-inc-engine P1), whose semantics are untouched.
+        //     the unchanged bound) is pushed unconditionally, as before.
         // Restore semantics are byte-identical: every trail entry holds the
         // value that was in the slot before this call.
         let tightened = if should_update {
@@ -332,13 +317,11 @@ impl LraSolver {
             self.trail.push((var, bound_type, old_bound));
             true
         } else {
-            if !cond_trail_enabled() {
-                let old_bound = match bound_type {
-                    BoundType::Lower => info.lower.clone(),
-                    BoundType::Upper => info.upper.clone(),
-                };
-                self.trail.push((var, bound_type, old_bound));
-            }
+            let old_bound = match bound_type {
+                BoundType::Lower => info.lower.clone(),
+                BoundType::Upper => info.upper.clone(),
+            };
+            self.trail.push((var, bound_type, old_bound));
             false
         };
 
@@ -420,12 +403,6 @@ impl LraSolver {
             if is_fixed {
                 self.register_fixed_term_var(var);
             }
-            // Pre-simplex inline refinement removed (#6617): the post-simplex
-            // compute_implied_bounds() + queue_post_simplex_refinements() path
-            // already handles all materializable vars (including slack) in a
-            // single O(touched_rows) batch pass. The inline per-variable scan
-            // was O(N × rows_per_var) where N = bound tightenings per check,
-            // causing 20-350x slowdowns on sc-* benchmarks vs Z3.
 
             // Incrementally update the infeasible heap for this variable and
             // all basic variables in rows containing it (#8782). This avoids
@@ -480,7 +457,7 @@ impl LraSolver {
 
         // Same structure as `assert_var_bound` (#bound-churn): one tightening
         // test, move-not-clone on the tightening path, historical trail
-        // behaviour (clone-and-push unless --lra-cond-trail) otherwise.
+        // behaviour (clone-and-push) otherwise.
         let should_update = Self::bound_tightens(info, bound_type, &bound, strict);
         // LIA algebraic-detection memo invalidation (`bound_revision`) is
         // decided AFTER the write below, and only when the write touches a
@@ -514,13 +491,11 @@ impl LraSolver {
             self.trail.push((var, bound_type, old_bound));
             true
         } else {
-            if !cond_trail_enabled() {
-                let old_bound = match bound_type {
-                    BoundType::Lower => info.lower.clone(),
-                    BoundType::Upper => info.upper.clone(),
-                };
-                self.trail.push((var, bound_type, old_bound));
-            }
+            let old_bound = match bound_type {
+                BoundType::Lower => info.lower.clone(),
+                BoundType::Upper => info.upper.clone(),
+            };
+            self.trail.push((var, bound_type, old_bound));
             false
         };
 

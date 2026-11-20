@@ -12,7 +12,7 @@ fn validate_theory_ground_and_words(
     let progress = &mut *context.progress;
     match kind {
         TheoryLemmaKind::SeqGroundEval => {
-            seq_ground::validate_seq_ground_eval(terms, step_id, clause)?;
+            seq_ground::validate_seq_ground_eval_with_progress(terms, step_id, clause, progress)?;
         }
         // Standalone linear-arithmetic clause tautology: the negated
         // clause (or-packed literals flattened conjunctively) is an

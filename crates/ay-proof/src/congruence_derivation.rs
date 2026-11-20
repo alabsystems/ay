@@ -419,7 +419,10 @@ fn plan_core(
 mod assembly;
 
 use assembly::finish;
-pub use assembly::{close_congruence_derivation, congruence_derivation_renders};
+pub use assembly::{
+    close_congruence_derivation, congruence_derivation_renders_within, DerivationRender,
+    DERIVATION_RENDER_WORK_BUDGET,
+};
 
 #[cfg(test)]
 #[path = "congruence_derivation_tests.rs"]

@@ -4,7 +4,66 @@
 
 use super::*;
 
+/// One package authentication retained only while its model and context are
+/// immutably borrowed. This is read DATA, never SAT or theorem authority.
+pub(super) struct AuthenticatedConstInterpRead<'a> {
+    model: &'a Model,
+    context: &'a ay_frontend::Context,
+}
+
+impl AuthenticatedConstInterpRead<'_> {
+    pub(super) fn is_for(&self, context: &ay_frontend::Context, model: &Model) -> bool {
+        std::ptr::eq(self.context, context) && std::ptr::eq(self.model, model)
+    }
+
+    pub(super) fn context_is(&self, context: &ay_frontend::Context) -> bool {
+        std::ptr::eq(self.context, context)
+    }
+
+    pub(super) fn owns_symbol(&self, symbol: &Symbol) -> bool {
+        self.model.has_certified_const_interp_symbol(symbol)
+    }
+
+    pub(super) fn entry(
+        &self,
+        symbol: &Symbol,
+        arguments: &[TermId],
+        result_sort: &Sort,
+    ) -> std::result::Result<Option<&CertifiedConstInterpEntry>, CertifiedConstInterpReadError>
+    {
+        self.model.certified_const_interp_entry_for_signature(
+            self.context,
+            symbol,
+            arguments,
+            result_sort,
+        )
+    }
+}
+
 impl Model {
+    /// Authenticate every entry, including entries unrelated to the requested
+    /// read. The callback prepays each bounded currentness check. The returned
+    /// view cannot outlive either immutable borrow, so a scope pop, declaration
+    /// replacement, model mutation or term rollback requires a new check.
+    pub(super) fn authenticate_const_interp_read<'a>(
+        &'a self,
+        context: &'a ay_frontend::Context,
+        mut admit: impl FnMut(&CertifiedConstInterpEntry) -> bool,
+    ) -> std::result::Result<AuthenticatedConstInterpRead<'a>, CertifiedConstInterpReadError> {
+        for entry in self.certified_const_interp_entries() {
+            if !admit(entry) {
+                return Err(CertifiedConstInterpReadError::ResourceRefused);
+            }
+            if !entry.is_current(context) {
+                return Err(CertifiedConstInterpReadError::StaleIdentity);
+            }
+        }
+        Ok(AuthenticatedConstInterpRead {
+            model: self,
+            context,
+        })
+    }
+
     /// An empty model: no SAT assignment and no theory sub-models.
     ///
     /// Used as the base for the trivially-SAT completion model (every declared
@@ -143,6 +202,12 @@ impl Model {
                     }
                     CertifiedConstInterpBody::LinearInt(linear)
                 }
+                CertifiedConstInterpWitness::Expression(body) => {
+                    if !body.is_current(ctx, binding.parameter_sorts(), binding.result_sort()) {
+                        return None;
+                    }
+                    CertifiedConstInterpBody::Expression(body)
+                }
             };
             let declaration_term = if binding.parameter_sorts().is_empty() {
                 let mut matching = ctx.symbol_iter().filter_map(|(surface_name, info)| {
@@ -250,6 +315,39 @@ impl Model {
         {
             return Err(CertifiedConstInterpReadError::StaleIdentity);
         }
+        let Some(entry) =
+            self.certified_const_interp_entry_for_signature(ctx, symbol, arguments, result_sort)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match entry.body() {
+            CertifiedConstInterpBody::Constant { value, .. } => {
+                CertifiedConstInterpRead::Constant(*value)
+            }
+            CertifiedConstInterpBody::LinearInt(linear) => CertifiedConstInterpRead::LinearInt {
+                body: linear.clone(),
+                arguments: arguments.to_vec(),
+            },
+            CertifiedConstInterpBody::Expression(body) => {
+                if !evaluation_copies::cells(arguments.len()) {
+                    return Err(CertifiedConstInterpReadError::ResourceRefused);
+                }
+                CertifiedConstInterpRead::Expression {
+                    body: Arc::clone(body),
+                    arguments: arguments.to_vec(),
+                }
+            }
+        }))
+    }
+
+    fn certified_const_interp_entry_for_signature(
+        &self,
+        ctx: &ay_frontend::Context,
+        symbol: &Symbol,
+        arguments: &[TermId],
+        result_sort: &Sort,
+    ) -> std::result::Result<Option<&CertifiedConstInterpEntry>, CertifiedConstInterpReadError>
+    {
         let Some(entry) = self
             .certified_const_interps
             .entries
@@ -270,15 +368,7 @@ impl Model {
         {
             return Err(CertifiedConstInterpReadError::SignatureConflict);
         }
-        Ok(Some(match entry.body() {
-            CertifiedConstInterpBody::Constant { value, .. } => {
-                CertifiedConstInterpRead::Constant(*value)
-            }
-            CertifiedConstInterpBody::LinearInt(linear) => CertifiedConstInterpRead::LinearInt {
-                body: linear.clone(),
-                arguments: arguments.to_vec(),
-            },
-        }))
+        Ok(Some(entry))
     }
 
     /// Whether every model-owned constant interpretation still names the exact

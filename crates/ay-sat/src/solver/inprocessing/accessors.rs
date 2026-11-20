@@ -77,8 +77,10 @@ impl Solver {
     /// Called at a safe point (root decision level, between clause
     /// operations, from level-0 unit materialization). The verdict machinery
     /// is unaffected — `--no-proof` runs the whole search this way. The
-    /// clause trace keeps its `proof_work_exhausted` marker (entries are
-    /// dropped to reclaim memory), so downstream certificate reconstruction
+    /// clause trace keeps its `proof_work_exhausted` marker and its clause
+    /// literals (hints stripped, later additions hint-free), so downstream
+    /// reconstruction may still repair a certificate from the complete
+    /// literal sequence; anything it cannot independently replay still
     /// fails closed into the honest "no proof certificate emitted" warning.
     pub(in crate::solver) fn degrade_proof_bookkeeping_after_exhaustion(&mut self) {
         if !self.cold.lrat_enabled {
@@ -88,12 +90,15 @@ impl Solver {
         self.cold.lrat_enabled = false;
         if let Some(trace) = self.cold.clause_trace.as_mut() {
             trace.mark_proof_work_exhausted();
-            // #destroyed-trace. Take the census BEFORE the clear, because the
-            // clear is what makes the question unanswerable downstream: every
-            // consumer then sees `entries=0` and cannot tell a destroyed
-            // refutation from a destroyed partial search record. Write-only.
+            // #destroyed-trace. Take the census BEFORE the strip: it
+            // records what the trace held while hints were still recorded.
+            // Write-only.
             trace.snapshot_before_exhaustion_clear();
-            trace.clear_entries();
+            // Keep the clause sequence, drop the hints: literal copies are
+            // the cheap part of trace bookkeeping, and reconstruction
+            // repair lanes can re-derive antecedents from a complete
+            // literal trace under independent replay.
+            trace.strip_hints_for_literals_only_recording();
         }
         // With no certificate left, restore controls that proof mode disabled
         // so search continues at full (--no-proof) power, unless this solver

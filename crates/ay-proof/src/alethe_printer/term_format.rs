@@ -29,7 +29,7 @@ impl AlethePrinter<'_> {
         // gigabytes of string building for output nobody will see. The
         // placeholder never reaches disk.
         if self.work_budget_exhausted() {
-            out.push_str("@a2b_emission_budget_exhausted");
+            out.push_str(EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER);
             return;
         }
         if let Some(term_str) = self.skolem_overrides.borrow().get(&term_id).cloned() {
@@ -68,6 +68,11 @@ impl AlethePrinter<'_> {
             return;
         }
         let term = self.terms.get(term_id);
+        if self.assembled_rendering == AssembledRendering::Streamed
+            && self.write_assembled_into(out, term_id, term)
+        {
+            return;
+        }
         let formatted = if let Some(formatted) = self.format_const_array(term_id, term) {
             formatted
         } else if let TermData::App(symbol, args) = term {
@@ -176,6 +181,17 @@ impl AlethePrinter<'_> {
     /// so a user-declared function that happens to be spelled `const-array`
     /// keeps its ordinary rendering.
     fn format_const_array(&self, term_id: TermId, term: &TermData) -> Option<String> {
+        let (head, value) = self.const_array_parts(term_id, term)?;
+        let value = self.format_term(value);
+        if self.assembly_declined() {
+            return Some(EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER.to_string());
+        }
+        Some(format!("{head}{value})"))
+    }
+
+    /// `((as const SORT) ` and the value of a constant array, or `None` when
+    /// `term` is not one (see [`Self::format_const_array`]).
+    fn const_array_parts(&self, term_id: TermId, term: &TermData) -> Option<(String, TermId)> {
         let TermData::App(Symbol::Named(name), args) = term else {
             return None;
         };
@@ -192,10 +208,101 @@ impl AlethePrinter<'_> {
         if self.terms.sort(*value) != &array_sort.element_sort {
             return None;
         }
-        Some(format!(
-            "((as const {}) {})",
-            format_sort_alethe(sort),
-            self.format_term(*value)
-        ))
+        Some((format!("((as const {}) ", format_sort_alethe(sort)), *value))
+    }
+
+    /// Whether an assembled rendering must not be built now: the printer is
+    /// in [`AssembledRendering::CachedWithinBudget`] and its work budget is
+    /// exhausted (or its caller stopped it). The caller returns the
+    /// exhaustion placeholder instead of copying its children into a new
+    /// `String`; the document is discarded either way.
+    pub(super) fn assembly_declined(&self) -> bool {
+        self.assembled_rendering == AssembledRendering::CachedWithinBudget
+            && self.work_budget_exhausted()
+    }
+
+    /// [`AssembledRendering::Streamed`]: write a `not`, `ite`, `let`,
+    /// quantifier or constant array straight into `out`, uncached, charging
+    /// exactly the bytes of its own syntax (each child charges its own).
+    /// Returns `false`, writing nothing, for every other term.
+    ///
+    /// The text is byte-identical to the assembled spelling
+    /// ([`Self::format_term_data`], [`Self::format_const_array`]); the
+    /// streamed-vs-assembled tests pin it shape by shape.
+    fn write_assembled_into(&self, out: &mut String, term_id: TermId, term: &TermData) -> bool {
+        if let Some((head, value)) = self.const_array_parts(term_id, term) {
+            if self.admit_emission_work(head.len() as u64 + 1) {
+                out.push_str(&head);
+                self.write_term_into(out, value);
+                out.push(')');
+            }
+            return true;
+        }
+        match term {
+            TermData::Not(inner) => {
+                if self.admit_emission_work("(not )".len() as u64) {
+                    out.push_str("(not ");
+                    self.write_term_into(out, *inner);
+                    out.push(')');
+                }
+            }
+            TermData::Ite(cond, then_br, else_br) => {
+                if self.admit_emission_work("(ite   )".len() as u64) {
+                    out.push_str("(ite ");
+                    self.write_term_into(out, *cond);
+                    out.push(' ');
+                    self.write_term_into(out, *then_br);
+                    out.push(' ');
+                    self.write_term_into(out, *else_br);
+                    out.push(')');
+                }
+            }
+            TermData::Let(bindings, body) => {
+                let names: Vec<String> = bindings
+                    .iter()
+                    .map(|(name, _)| quote_symbol(name))
+                    .collect();
+                // `(let (` + each `(NAME ` … `)` + separators + `) ` + `)`.
+                let own = names
+                    .iter()
+                    .fold("(let () )".len(), |sum, name| sum + name.len() + 3)
+                    + names.len().saturating_sub(1);
+                if !self.admit_emission_work(own as u64) {
+                    return true;
+                }
+                out.push_str("(let (");
+                for (index, (name, (_, value))) in names.iter().zip(bindings).enumerate() {
+                    if index > 0 {
+                        out.push(' ');
+                    }
+                    out.push('(');
+                    out.push_str(name);
+                    out.push(' ');
+                    self.write_term_into(out, *value);
+                    out.push(')');
+                    if self.work_budget_exhausted() {
+                        return true;
+                    }
+                }
+                out.push_str(") ");
+                self.write_term_into(out, *body);
+                out.push(')');
+            }
+            TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
+                let keyword = if matches!(term, TermData::Forall(..)) {
+                    "forall"
+                } else {
+                    "exists"
+                };
+                let head = format!("({keyword} ({}) ", Self::format_quantifier_vars(vars));
+                if self.admit_emission_work(head.len() as u64 + 1) {
+                    out.push_str(&head);
+                    self.write_term_into(out, *body);
+                    out.push(')');
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 }

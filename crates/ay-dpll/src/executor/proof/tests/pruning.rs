@@ -387,7 +387,6 @@ fn test_proof_quality_strict_check_via_api() {
     }
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn test_internal_proof_checker_records_partial_hole_metrics() {
     let mut exec = Executor::new();

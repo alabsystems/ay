@@ -77,12 +77,43 @@ built and run as external checker binaries.
   kept only for comparison. Upstream LoAT licensing governs it; see the local
   README and the upstream distribution. It is not relicensed by AY and is not
   part of any published Cargo package.
-- **Verus** (MIT, "Copyright (c) 2021 The Verus Contributors") — the SMT-LIB
-  reproducers in the development design notes are
-  queries that Verus generated for its own test suite, or hand reductions of
-  them, and embed Verus's AIR prelude text. They are diagnosis inputs kept for
-  comparison against z3, not part of any published Cargo package. Verus's MIT
-  notice is reproduced beside them in `LICENSE-VERUS.txt`.
+- **Verus** (MIT, "Copyright (c) 2021 The Verus Contributors") — SMT-LIB
+  queries that Verus generated, and reductions of them, embed Verus's AIR
+  prelude text. Verus's MIT notice below covers every such query in the tree.
+  Those present are test and regression inputs:
+  - the regression `benchmarks/smt/wrong-verdict/sat_verus_zero_divisor_after_int_const_subst.smt2`
+    and its twin `unsat_verus_zero_divisor_after_int_const_subst_twin.smt2`,
+    with Verus's push/pop, get-info and rlimit commands removed (not part of
+    any Cargo package);
+  - the ay-dpll test fixtures `crates/ay-dpll/tests/fixtures/verus_demand_flush_closure.smt2`
+    and `verus_demand_flush_closure_sat.smt2`;
+  - the delta-debugged reductions inlined in
+    `crates/ay-dpll/tests/group_quantifiers/fuel_guard_verus_reductions.rs` and
+    `fuel_guarded_definitions.rs`.
+
+  Verus's MIT notice:
+
+  > MIT License
+  >
+  > Copyright (c) 2021 The Verus Contributors
+  >
+  > Permission is hereby granted, free of charge, to any person obtaining a copy
+  > of this software and associated documentation files (the "Software"), to deal
+  > in the Software without restriction, including without limitation the rights
+  > to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  > copies of the Software, and to permit persons to whom the Software is
+  > furnished to do so, subject to the following conditions:
+  >
+  > The above copyright notice and this permission notice shall be included in all
+  > copies or substantial portions of the Software.
+  >
+  > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  > IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  > FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  > AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  > SOFTWARE.
 - **TLA+ / TLC** (`tla2tools.jar`) — an optional external tool. Supply it
   through `TLC_BIN` or `TLA2TOOLS_JAR`; it is not vendored here.
 - **DRAT/LRAT proof checkers** — used externally to cross-check emitted proofs

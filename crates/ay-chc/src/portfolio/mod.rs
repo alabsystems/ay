@@ -48,7 +48,7 @@ pub use types::{
     PortfolioConfig, PortfolioResult,
 };
 pub(crate) use validation::backtranslate_counterexample_with_ground_evidence;
-use validation::{SafePrecheckResult, ValidationBudget, ValidationResult};
+use validation::{MonolithicVerdict, SafePrecheckResult, ValidationBudget, ValidationResult};
 
 use crate::cancellation::CancellationToken;
 use crate::transform::{

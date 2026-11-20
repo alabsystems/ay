@@ -1,6 +1,6 @@
 # LRA scope-trail: BCP-batching window, end-to-end attempts (2026-09-19)
 
-Companion to the development design notes §2. The deterministic repro of the window is
+Companion to the development design notes at `9598c4206`, §2. The deterministic repro of the window is
 the extension-level test `crates/ay-dpll/src/extension/tests_lra_scope_trail.rs` on branch
 `lra-scope-trail-fix`; these files document the end-to-end attempt against the release binary.
 

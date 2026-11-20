@@ -468,7 +468,8 @@ impl KindSolver {
                 // Forward induction UNSAT + all base cases UNSAT = system is SAFE.
                 // Use raw query to avoid free aux vars in the negation.
                 let inv = ChcExpr::not(ts.query_raw().clone());
-                let final_inv = self.strengthen_to_1_inductive(&inv, k, &ts, start_time);
+                // The check above used k + 1 transitions: ¬Q is (k + 1)-inductive.
+                let final_inv = self.strengthen_to_1_inductive(&inv, k + 1, &ts, start_time);
                 if self.verify_invariant_init_query(&ts, &final_inv, start_time) {
                     if self.config.base.verbose {
                         safe_eprintln!("KIND: Forward induction succeeded at k = {}", k);
@@ -620,9 +621,11 @@ impl KindSolver {
                 // auxiliary variables. See TransitionSystem::init_raw doc.
                 let reversed_ts = ts.reverse();
                 let neg_reversed_query = ChcExpr::not(reversed_ts.query_raw().clone());
+                // Init ∧ Tr^(k+1) ∧ ¬Init(x1..x{k+1}) used k + 1 transitions:
+                // ¬Init is (k + 1)-inductive on the reversed system.
                 let converted = self.strengthen_to_1_inductive(
                     &neg_reversed_query,
-                    k,
+                    k + 1,
                     &reversed_ts,
                     start_time,
                 );

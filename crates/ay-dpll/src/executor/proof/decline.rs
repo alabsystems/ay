@@ -525,9 +525,10 @@ pub struct SatReconstructionRecord {
     /// Trace entries were dropped against a memory budget.
     pub trace_truncated: bool,
     /// #destroyed-trace. What the clause trace held at the INSTANT the #A2b
-    /// budget cleared it, measured at the clear site in
-    /// `degrade_proof_bookkeeping_after_exhaustion`. Zero when no clear
-    /// happened on this query.
+    /// budget degraded it (hints stripped, entries retained literals-only),
+    /// measured at the strip site in
+    /// `degrade_proof_bookkeeping_after_exhaustion`. Zero when no
+    /// degradation happened on this query.
     ///
     /// The 2026-09-08 closure diagnosis described this population as "a
     /// propositional refutation AY recorded and then deliberately discarded"

@@ -1,0 +1,7 @@
+(set-logic QF_UFBVLIA)
+(declare-fun __trust_u__22 () Int)
+(declare-fun __trust_u__23 () Int)
+(declare-fun __trust_u__24 () Int)
+(declare-fun __trust_u__25 () Bool)
+(assert (and __trust_u__25 (= __trust_u__23 3) (= __trust_u__24 (bv2nat (bvand ((_ int2bv 64) __trust_u__22) ((_ int2bv 64) __trust_u__23)))) (= __trust_u__25 (= __trust_u__24 0))))
+(check-sat)

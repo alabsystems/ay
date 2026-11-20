@@ -481,13 +481,6 @@ impl LraSolver {
                 let is_equality = (is_eq && value) || (is_distinct && !value);
 
                 if is_equality {
-                    // A5 core: BCP-time checks defer equality rows; the full
-                    // check materializes violated ones on demand.
-                    if self.a5_core && bcp_mode && !expr.is_constant() {
-                        self.deferred_eq_atoms.push((term, expr.clone(), value));
-                        self.bound_atoms.insert((term, value));
-                        continue;
-                    }
                     // Equality: expr = 0 means expr <= 0 AND expr >= 0
                     // Use the actual assertion value for reason_value (important for `distinct` negations)
                     //
@@ -796,15 +789,13 @@ impl LraSolver {
         // `propagate_impl()` discards every pending propagation at drain
         // time, so the propagation results of BCP-time implied-bounds
         // computation are wasted work (profiled as the #1 hot leaf even with
-        // the flag on). However, the computed bounds have one other surviving
-        // consumer during BCP: `queue_post_simplex_refinements` (BP_REFINE
-        // dynamic atom creation). Measured on DRAGON_3 depth-1: skipping the
-        // BCP computation while refinement is still enabled flips the
-        // eager-arm verdict from sat (1.4s) to unknown — the refinement
-        // atoms are load-bearing for completeness. So the skip only applies
-        // when bound refinement is ALSO disabled, i.e. when the computed
-        // bounds are provably discarded. Final-check cascades are always
-        // kept (they additionally feed compound wakeups and offset-equality
+        // the flag on). The computed bounds still mark
+        // `propagation_dirty_vars` during BCP. Measured on DRAGON_3 depth-1
+        // (while BP_REFINE dynamic atom creation was still live): skipping
+        // the BCP computation without `no_bound_refinement` flipped the
+        // eager-arm verdict from sat (1.4s) to unknown, so the skip keeps
+        // requiring that flag too. Final-check cascades are always kept
+        // (they additionally feed compound wakeups and offset-equality
         // discovery).
         let skip_implied = self.no_implied_bounds
             || (bcp_mode && self.no_bcp_implied_bounds)
@@ -1113,29 +1104,6 @@ impl LraSolver {
                 if let Some(ref snapshot) = touched_snapshot {
                     self.discover_offset_equalities(snapshot);
                 }
-            }
-
-            // BP_REFINE (#4919 Phase 6): After simplex finds feasible and
-            // compute_implied_bounds() derives fresh bounds, scan atoms for
-            // variables that gained a tighter implied bound with no matching
-            // existing atom. Queue BoundRefinementRequests for the DPLL
-            // executor to create new atoms.
-            //
-            // Runs in BOTH full-check and BCP modes. Z3's refine_bound()
-            // fires during every propagate_core() call (theory_lra.cpp:2498),
-            // not just at final check. Enabling it during BCP gives the SAT
-            // solver finer-grained theory information earlier, reducing
-            // unnecessary decisions on under-constrained variables.
-            //
-            // Budget: queue_post_simplex_refinements caps at
-            // MAX_REFINEMENTS_PER_CHECK (8) to prevent atom explosion during
-            // BCP where the callback fires hundreds of times per solve.
-            //
-            // Reference: Z3 propagate_lp_solver_bound() / refine_bound()
-            // at theory_lra.cpp:2463-2504.
-            // #8319: AY_NO_BOUND_REFINEMENT disables BP_REFINE dynamic atom creation.
-            if !self.no_bound_refinement {
-                self.queue_post_simplex_refinements(&all_newly_bounded, debug);
             }
         } else if skip_implied {
             // #7973: Skipped compute_implied_bounds. Reset the direct-touched flag.

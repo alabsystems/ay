@@ -45,7 +45,6 @@ pub mod debug_channel;
 pub mod forgone;
 pub mod kani_compat;
 pub(crate) mod math;
-pub mod memory_pressure;
 pub mod nonlinear;
 pub mod original_query;
 pub mod panic_utils;
@@ -82,10 +81,6 @@ pub use debug_channel::{
     SatDisableFlags, TheoryDisableFlags, TraceConfig, TracePathCache,
 };
 pub use math::extended_gcd_bigint;
-pub use memory_pressure::{
-    Band, BandThresholds, MemoryPressure, MemorySource, MockSource, PressureObserver, SystemSource,
-    UnknownReason,
-};
 pub use proof::{
     alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, is_clean_dialect_alethe_rule,
     wire_rule_name, AletheRule, BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp,

@@ -46,11 +46,15 @@ mod forall_exists_witness;
 #[cfg(test)]
 mod guarded_range_boundary_tests;
 mod leaf_memo;
+mod linear_interpretation;
 mod pending_array_data;
 mod point_table;
 pub(super) use pending_array_data::PreparedPendingArrayAlias;
 mod printed_uf_interpretation;
 pub(in crate::executor) mod probe_budget;
+mod published_answer;
+mod published_carriers;
+pub(super) use published_answer::{PublishedAnswer, PublishedAnswerSession};
 mod refutation_retries;
 mod restoration_bridge;
 mod total_model;
@@ -309,7 +313,14 @@ pub(in crate::executor) struct GateViewCacheSession {
 
 impl GateViewCacheSession {
     pub(in crate::executor) fn new() -> Self {
-        let prev = ACTIVE_VIEW_CACHES.with(|c| c.borrow_mut().replace(SharedViewCaches::fresh()));
+        Self::resume(SharedViewCaches::fresh())
+    }
+
+    /// A scope over `caches`, which an earlier scope over the same fixed
+    /// `(assertions, model)` pair filled; the answer route re-enters its
+    /// batch's caches once per term (#get-value-published-model).
+    fn resume(caches: SharedViewCaches) -> Self {
+        let prev = ACTIVE_VIEW_CACHES.with(|c| c.borrow_mut().replace(caches));
         GateViewCacheSession { prev }
     }
 }
@@ -388,6 +399,303 @@ pub(super) struct IndependentModelView<'a> {
     /// quantified certificates checked, so a quantified leaf discharged by one
     /// of them cannot be claimed for the printed model.
     printed_over_pin: RefCell<Option<TermId>>,
+    /// How this view reads applications of declared functions; see
+    /// [`UfReadPolicy`].
+    uf_reads: UfReadPolicy,
+}
+
+/// How an [`IndependentModelView`] reads an application of a declared
+/// function.
+#[derive(Clone)]
+enum UfReadPolicy {
+    /// The gate's verdict reads: the printed value where the printed
+    /// interpretation decodes in full
+    /// ([`IndependentModelView::printed_uf_interpretation`]), the
+    /// per-application pin otherwise.
+    Gate,
+    /// Answer reads for `(get-value)`, `(eval)` and the Rust `values()`
+    /// (#get-value-published-model). An application of a function that
+    /// `(get-model)` prints as a table reads that table and nothing else, a
+    /// datatype selector applied to a value of another constructor reads the
+    /// printed selector table, an application of a function printed through
+    /// another definition channel reads that definition at its evaluated
+    /// argument point
+    /// ([`IndependentModelView::published_definition_value`]), and no pin is
+    /// read for any term that mentions an application of a function printed
+    /// as a table; see [`IndependentModelView::uf_app_value_at`].
+    Published(Rc<PublishedTables>),
+}
+
+/// The published tables an answer session derived, shared by the per-term
+/// views of one batch (#get-value-published-model). Every entry is a function
+/// of the fixed `(assertions, model)` pair the session reads.
+#[derive(Default)]
+struct PublishedTables {
+    /// [`PublishedUfTable`] per function identity.
+    tables: RefCell<HashMap<String, Rc<PublishedUfTable>>>,
+    /// The certified total table per function identity
+    /// ([`IndependentModelView::published_certified_total`]).
+    certified: RefCell<HashMap<String, Option<Rc<PublishedUfCells>>>>,
+    /// Whether a term mentions an application of a function whose table is
+    /// printed ([`IndependentModelView::mentions_printed_table_application`]).
+    mentions: RefCell<HashMap<TermId, bool>>,
+    /// What the printed selector definitions are built from
+    /// ([`Executor::selector_tables`]), read once per session.
+    selectors: OnceCell<Option<Rc<super::dt_model::SelectorTables>>>,
+    /// The constructor terms of each EUF class, by the class's extractor
+    /// token ([`IndependentModelView::resolve_datatype_carriers`]), read once
+    /// per session.
+    constructor_members: OnceCell<HashMap<String, Vec<TermId>>>,
+    /// The backing value of each abstract value of a datatype sort, by its
+    /// token and sort spelling
+    /// ([`IndependentModelView::resolve_datatype_carriers`]).
+    carrier_values: RefCell<HashMap<(String, String), Option<(String, ModelValue)>>>,
+}
+
+/// What `(get-model)` prints for one function identity, as the answer route
+/// reads it (#get-value-published-model).
+enum PublishedUfTable {
+    /// No table: the printer publishes the symbol through another channel
+    /// (projection, certified total function, constant-interpretation
+    /// certificate, formula-neutral default, adopted macro), omits it, or it
+    /// is not a declared function ([`IndependentModelView::printed_uf_rows`]
+    /// returns `None`).
+    NotPrinted,
+    /// The printer's row pipeline failed ([`Executor::printed_uf_table_rows`]
+    /// returned an error), so `(get-model)` prints no table for it.
+    RowsFailed,
+    /// A printed table some of whose row keys do not decode
+    /// ([`IndependentModelView::read_published_uf_cells`]).
+    KeysUndecoded,
+    /// A printed table whose keys all decode.
+    Readable(PublishedUfCells),
+}
+
+/// One printed table cell: the text `(get-model)` prints there, what the
+/// answer route answers for it, and, when that answer decodes, its value
+/// (`IndependentModelView::read_published_uf_cells`).
+struct PrintedCell {
+    text: String,
+    answer: CellAnswer,
+    value: Option<ModelValue>,
+}
+
+/// What the answer route answers for a printed cell
+/// (`IndependentModelView::read_published_uf_cells`).
+enum CellAnswer {
+    /// The printed text, named as the printer names table cells.
+    Printed,
+    /// The printed text with each abstract value of a datatype sort replaced
+    /// by its backing value
+    /// (`IndependentModelView::resolve_datatype_carriers`).
+    Backed(String),
+    /// No answer: the printed text holds this abstract value of a datatype
+    /// sort, and the model backs it with no constructor value.
+    Unbacked(String),
+}
+
+/// A printed function table read with decoded keys and text-bearing cells
+/// ([`IndependentModelView::read_published_uf_cells`]). Unlike
+/// [`PrintedUfInterpretation`], a cell need not decode: the answer route
+/// answers its [`CellAnswer`].
+struct PublishedUfCells {
+    /// The declared argument sorts.
+    arg_sorts: Vec<Sort>,
+    /// The `ite` arms in printed (first-match) order.
+    rows: Vec<(Vec<ModelValue>, PrintedCell)>,
+    /// The final branch.
+    else_cell: PrintedCell,
+    /// True when the table is empty and the printer emitted the canonical
+    /// default body, which its table-cell naming does not touch
+    /// (`Executor::format_function_table`).
+    default_body: bool,
+}
+
+impl PublishedUfCells {
+    /// The cell the printed body selects at `arg_values`: the first row whose
+    /// key [`decided_equal`] decides equal to the point, and the else cell only
+    /// when every key is decided unequal. `None` on an arity mismatch or when
+    /// equality with a key is not decided before a row matches.
+    fn cell_at(&self, arg_values: &[ModelValue]) -> Option<&PrintedCell> {
+        if arg_values.len() != self.arg_sorts.len() {
+            return None;
+        }
+        for (row_args, cell) in &self.rows {
+            let mut matches_point = true;
+            for ((expected, actual), sort) in row_args.iter().zip(arg_values).zip(&self.arg_sorts) {
+                if !decided_equal(expected, actual, Some(sort))? {
+                    matches_point = false;
+                    break;
+                }
+            }
+            if matches_point {
+                return Some(cell);
+            }
+        }
+        Some(&self.else_cell)
+    }
+}
+
+/// SMT-LIB equality of two gate values when the values decide it: `Some(true)`
+/// or `Some(false)`, and `None` when they do not.
+///
+/// - Booleans, integers, reals, bitvectors and strings compare by value.
+/// - Two rounding-mode names compare by the mode they name; two other opaque
+///   tokens (declare-sort abstract values) by identity; a rounding-mode name
+///   and another token are undecided.
+/// - Two `FloatingPoint` values of one format with an exponent width of 1 to
+///   63 bits compare structurally, except that any two NaNs are equal (SMT-LIB
+///   has one NaN per format); other floating-point pairs are undecided.
+/// - Datatype values with different constructors are unequal; with one
+///   constructor and equal argument counts they compare argument-wise.
+/// - Sequences of different lengths are unequal; of one length they compare
+///   element-wise.
+/// - Arrays compare by [`decided_array_equal`].
+/// - Every other pair is undecided.
+///
+/// `sort` is the values' sort when the caller knows it; only the array arm
+/// reads it, and it is passed down to sequence elements and array cells but
+/// not to datatype fields. Argument-wise and element-wise comparison is
+/// unequal when some position is unequal, equal when every position is equal,
+/// and undecided otherwise. Used by the answer route
+/// (#get-value-published-model); the gate's reads keep [`values_equal`].
+fn decided_equal(a: &ModelValue, b: &ModelValue, sort: Option<&Sort>) -> Option<bool> {
+    use ModelValue as V;
+    fn all_decided<'v>(
+        pairs: impl Iterator<Item = (&'v ModelValue, &'v ModelValue)>,
+        sort: Option<&Sort>,
+    ) -> Option<bool> {
+        let mut undecided = false;
+        for (x, y) in pairs {
+            match decided_equal(x, y, sort) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => undecided = true,
+            }
+        }
+        (!undecided).then_some(true)
+    }
+    match (a, b) {
+        (V::Uninterpreted(x), V::Uninterpreted(y)) => {
+            match (
+                ay_fp::RoundingMode::from_name(x),
+                ay_fp::RoundingMode::from_name(y),
+            ) {
+                (Some(x), Some(y)) => Some(x == y),
+                (None, None) => Some(x == y),
+                _ => None,
+            }
+        }
+        (V::Bool(_), V::Bool(_))
+        | (V::Int(_), V::Int(_))
+        | (V::Real(_), V::Real(_))
+        | (V::BitVec { .. }, V::BitVec { .. })
+        | (V::Str(_), V::Str(_)) => Some(values_equal(a, b)),
+        (
+            V::FloatingPoint {
+                sign: s1,
+                exponent: e1,
+                significand: m1,
+                exponent_bits: eb1,
+                significand_bits: sb1,
+            },
+            V::FloatingPoint {
+                sign: s2,
+                exponent: e2,
+                significand: m2,
+                exponent_bits: eb2,
+                significand_bits: sb2,
+            },
+        ) => {
+            if (eb1, sb1) != (eb2, sb2) || *eb1 == 0 || *eb1 >= 64 {
+                return None;
+            }
+            let all_ones = (1u64 << *eb1) - 1;
+            let nan1 = *e1 == all_ones && *m1 != 0;
+            let nan2 = *e2 == all_ones && *m2 != 0;
+            Some(if nan1 || nan2 {
+                nan1 && nan2
+            } else {
+                (s1, e1, m1) == (s2, e2, m2)
+            })
+        }
+        (V::Seq(x), V::Seq(y)) => {
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            all_decided(x.iter().zip(y), sort.and_then(Sort::seq_element))
+        }
+        (V::Datatype { ctor: c1, args: a1 }, V::Datatype { ctor: c2, args: a2 }) => {
+            if c1 != c2 {
+                return Some(false);
+            }
+            if a1.len() != a2.len() {
+                return None;
+            }
+            all_decided(a1.iter().zip(a2), None)
+        }
+        (V::Array(x), V::Array(y)) => decided_array_equal(x, y, sort),
+        _ => None,
+    }
+}
+
+/// [`decided_equal`] for two array values over the `(default, stores)`
+/// representation, with `sort` their array sort when known:
+///
+/// - unequal when the two arrays read values decided unequal at an index some
+///   store of either names;
+/// - unequal when the defaults are decided unequal and the index sort is
+///   `Int`, `Real`, `String` or a sequence sort: such a sort has infinitely
+///   many indices, so some index no store names reads both defaults;
+/// - equal when every stored index reads values decided equal and the
+///   defaults are decided equal;
+/// - undecided otherwise, including differing defaults over any other index
+///   sort or an unknown sort, where the stores may name every index.
+///
+/// A read at a stored index is undecided when its comparison with a newer
+/// store's index is undecided ([`decided_select`]).
+fn decided_array_equal(a: &ArrayValue, b: &ArrayValue, sort: Option<&Sort>) -> Option<bool> {
+    let (index_sort, element_sort) = match sort {
+        Some(Sort::Array(array)) => (Some(&array.index_sort), Some(&array.element_sort)),
+        _ => (None, None),
+    };
+    let mut undecided = false;
+    for (index, _) in a.store.iter().chain(&b.store) {
+        let reads = decided_select(a, index, index_sort).zip(decided_select(b, index, index_sort));
+        match reads.and_then(|(x, y)| decided_equal(x, y, element_sort)) {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => undecided = true,
+        }
+    }
+    match decided_equal(&a.default, &b.default, element_sort) {
+        Some(true) => (!undecided).then_some(true),
+        Some(false)
+            if index_sort.is_some_and(|sort| {
+                matches!(sort, Sort::Int | Sort::Real | Sort::String | Sort::Seq(_))
+            }) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// The value `array` holds at `index`: the newest store whose index is
+/// decided equal to `index`, or the default when every store's index is
+/// decided unequal. `None` when a comparison is undecided before a store
+/// matches.
+fn decided_select<'v>(
+    array: &'v ArrayValue,
+    index: &ModelValue,
+    index_sort: Option<&Sort>,
+) -> Option<&'v ModelValue> {
+    for (stored, value) in array.store.iter().rev() {
+        if decided_equal(stored, index, index_sort)? {
+            return Some(value);
+        }
+    }
+    Some(&array.default)
 }
 
 /// The PUBLISHED total interpretation of one uninterpreted function, i.e. the
@@ -648,6 +956,9 @@ impl ModelView for IndependentModelView<'_> {
         if !self.construction_source_is_valid() || !self.recovery_leaf_admitted(t) {
             return None;
         }
+        if self.pin_refused(t) {
+            return None;
+        }
         match self.model.clone_constant_array_value(self.exec, t) {
             Ok(Some(value)) => return Some(value),
             Ok(None) => {}
@@ -785,6 +1096,9 @@ impl ModelView for IndependentModelView<'_> {
         if !self.construction_source_is_valid() || !self.recovery_leaf_admitted(t) {
             return None;
         }
+        if self.pin_refused(t) {
+            return None;
+        }
         match self.model.clone_constant_array_value(self.exec, t) {
             Ok(Some(value)) => return Some(value),
             Ok(None) => {}
@@ -888,6 +1202,10 @@ impl ModelView for IndependentModelView<'_> {
     /// that SMT-LIB leaves this exact input unconstrained. We then defensively
     /// recheck the exact canonical head and signature before consulting the same
     /// unconditional definition index used for genuine UFs.
+    ///
+    /// An answer view (#get-value-published-model) reads this too: the value
+    /// is the asserted definition's, evaluated through the same view, not a
+    /// per-term pin, so [`Self::pin_refused`] does not apply.
     fn proven_unconstrained_app_value(
         &self,
         t: TermId,
@@ -1000,6 +1318,38 @@ impl ModelView for IndependentModelView<'_> {
         if self.certified_const_interp_value(t).is_err() {
             return None;
         }
+        // Answer reads (#get-value-published-model): a function printed as a
+        // table is read from that table at the point the evaluator computed,
+        // and only from it. A key that does not decide the point, or a
+        // selected cell that does not decode, leaves the application without
+        // a value; no pin stands in for the published one. A selector the
+        // evaluator sends here (its argument is built by another constructor)
+        // reads the printed selector table the same way. A function printed
+        // through another definition channel reads that definition at the
+        // same point; where the definition gives no value there, the pin
+        // below stands in unless `pin_refused` withholds it.
+        if let UfReadPolicy::Published(_) = self.uf_reads {
+            if let Some(read) = self.published_selector_value(t, arg_values) {
+                return read;
+            }
+            match self.published_uf_table_for_app(t).as_deref() {
+                Some(PublishedUfTable::Readable(cells)) => {
+                    let value = cells.cell_at(arg_values)?.value.as_ref()?;
+                    if !super::recovery_admission::pay_model_value_copy(value) {
+                        return None;
+                    }
+                    return Some(value.clone());
+                }
+                Some(PublishedUfTable::RowsFailed | PublishedUfTable::KeysUndecoded) => {
+                    return None
+                }
+                Some(PublishedUfTable::NotPrinted) | None => {
+                    if let Some(value) = self.published_definition_value(t, arg_values) {
+                        return Some(value);
+                    }
+                }
+            }
+        }
         let pin = self.uf_app_value(t);
         // #dt-ground-uf-canonical-pin: a datatype-sorted application must use
         // the gate's canonical constructor-bearing encoding.  An opaque
@@ -1021,6 +1371,11 @@ impl ModelView for IndependentModelView<'_> {
             }
             other => other,
         };
+        // An answer read reaches here only for a function with no printed
+        // table, so there is no published body to reconcile the pin with.
+        if let UfReadPolicy::Published(_) = self.uf_reads {
+            return pin;
+        }
         let Some(interp) = self.printed_uf_interpretation_for_app(t) else {
             return pin;
         };
@@ -1091,6 +1446,9 @@ impl ModelView for IndependentModelView<'_> {
     /// (#array-select-collapse). Guarded to a genuine binary `select`.
     fn array_select_value(&self, t: TermId) -> Option<ModelValue> {
         if !self.construction_source_is_valid() || !self.recovery_leaf_admitted(t) {
+            return None;
+        }
+        if self.pin_refused(t) {
             return None;
         }
         let TermData::App(sym, args) = self.exec.ctx.terms.get(t) else {
@@ -1168,7 +1526,21 @@ impl<'a> IndependentModelView<'a> {
             building_index: Cell::new(false),
             printed_uf_tables: RefCell::new(HashMap::new()),
             printed_over_pin: RefCell::new(None),
+            uf_reads: UfReadPolicy::Gate,
         }
+    }
+
+    /// A view for the answer route (#get-value-published-model): built like
+    /// [`Self::new`], reading declared-function applications under
+    /// [`UfReadPolicy::Published`] with the session's shared `tables`.
+    fn for_published_answers(
+        exec: &'a Executor,
+        model: &'a Model,
+        tables: Rc<PublishedTables>,
+    ) -> Self {
+        let mut view = Self::new(exec, model);
+        view.uf_reads = UfReadPolicy::Published(tables);
+        view
     }
 }
 
@@ -1495,6 +1867,13 @@ impl IndependentModelView<'_> {
         let Some(read) = read else {
             return Ok(None);
         };
+        if let CertifiedConstInterpRead::Expression { body, arguments } = &read {
+            return if arguments.is_empty() {
+                self.certified_expression_at(body, &[]).map(Some)
+            } else {
+                Err(())
+            };
+        }
         let CertifiedConstInterpRead::Constant(value) = read else {
             // A SYMBOLIC body has no value at the bare application TERM: it
             // has one at an ARGUMENT POINT, which this accessor does not know.
@@ -1535,6 +1914,13 @@ impl IndependentModelView<'_> {
             .exec
             .const_interp_witness_value(self.model, term)
             .map_err(|_| ())?;
+        if let Some(CertifiedConstInterpRead::Expression { body, arguments }) = &read {
+            return if arguments.len() == arg_values.len() {
+                self.certified_expression_at(body, arg_values).map(Some)
+            } else {
+                Err(())
+            };
+        }
         let Some(CertifiedConstInterpRead::LinearInt { body, arguments }) = read else {
             return Ok(None);
         };
@@ -1544,17 +1930,90 @@ impl IndependentModelView<'_> {
         {
             return Err(());
         }
-        let mut point = Vec::with_capacity(arg_values.len());
-        for value in arg_values {
-            let ModelValue::Int(value) = value else {
-                return Err(());
-            };
-            point.push(value.clone());
+        // Re-derive the value independently from immutable coefficients and
+        // this evaluator's argument values. The native evaluator's arithmetic
+        // and any per-application model pin supply no result here.
+        linear_interpretation::evaluate(&body, arg_values, &mut |work, bytes| match self
+            .admit_evaluation_work(work, bytes)
+        {
+            Ok(()) => true,
+            Err(reason) => {
+                self.refuse_evaluation_work(&reason);
+                false
+            }
+        })
+        .map(ModelValue::Int)
+        .map(Some)
+    }
+
+    fn certified_expression_at(
+        &self,
+        body: &super::CertifiedExpressionBody,
+        values: &[ModelValue],
+    ) -> Result<ModelValue, ()> {
+        struct BodyView<'a> {
+            parent: &'a dyn ModelView,
+            parameters: &'a [TermId],
+            values: &'a [ModelValue],
         }
-        body.evaluate(&point)
-            .map(ModelValue::Int)
-            .map(Some)
-            .ok_or(())
+        impl ModelView for BodyView<'_> {
+            fn has_evaluation_admission(&self) -> bool {
+                self.parent.has_evaluation_admission()
+            }
+            fn refuse_evaluation_work(&self, reason: &str) {
+                self.parent.refuse_evaluation_work(reason);
+            }
+            fn admit_evaluation_work(&self, work: usize, bytes: usize) -> Result<(), String> {
+                self.parent.admit_evaluation_work(work, bytes)
+            }
+            fn leaf_value(&self, term: TermId) -> Option<ModelValue> {
+                let index = self
+                    .parameters
+                    .iter()
+                    .position(|&parameter| parameter == term)?;
+                let value = self.values.get(index)?;
+                if self.has_evaluation_admission() {
+                    if let Err(reason) =
+                        ay_model_check::admit_model_value_work(value, &mut |work, bytes| {
+                            self.admit_evaluation_work(work, bytes)
+                        })
+                    {
+                        self.refuse_evaluation_work(&reason);
+                        return None;
+                    }
+                }
+                Some(value.clone())
+            }
+        }
+        if body.parameters().len() != values.len() {
+            return Err(());
+        }
+        for (&parameter, value) in body.parameters().iter().zip(values) {
+            let scalar = |value: &ModelValue, sort: &Sort| {
+                matches!(
+                    (value, sort),
+                    (ModelValue::Int(_), Sort::Int) | (ModelValue::Bool(_), Sort::Bool)
+                )
+            };
+            let valid = match (value, self.exec.ctx.terms.sort(parameter)) {
+                (ModelValue::Seq(elements), Sort::Seq(sort)) => elements.iter().all(|element| {
+                    self.admit_evaluation_work(1, 0).is_ok() && scalar(element, sort)
+                }),
+                (value, sort) => scalar(value, sort),
+            };
+            if !valid {
+                return Err(());
+            }
+        }
+        let view = BodyView {
+            parent: self,
+            parameters: body.parameters(),
+            values,
+        };
+        match Evaluator::new(&self.exec.ctx.terms, &view).evaluate(body.root()) {
+            EvalOutcome::Value(value) => Ok(value),
+            EvalOutcome::Unevaluable(_) => Err(()),
+        }
     }
 
     /// Resolve an array-variable leaf.
@@ -4296,8 +4755,9 @@ impl Executor {
 
     /// LOUD, always-visible soundness alarm: a gate caught a model that
     /// FALSIFIES an assertion (a [`GateVerdict::ModelViolates`]). That means an
-    /// (untrusted) theory-search path produced an INVALID model — a genuine
-    /// internal bug — even though AY then fail-closes `Sat -> Unknown` (SOUND).
+    /// (untrusted) theory-search path produced an INVALID candidate. That
+    /// candidate is discarded; a retry can still produce a different checked
+    /// model. This event does not describe the final query verdict.
     ///
     /// Printed to STDERR (never stdout, so the `sat`/`unsat`/`unknown` verdict
     /// line stays machine-parseable) with the falsifying assignment, so the
@@ -4329,8 +4789,9 @@ impl Executor {
             logic = %logic,
             assertion = %assertion_str,
             assignment = %assignment,
+            candidate_status = "discarded",
             "SOUNDNESS GATE caught an invalid model: a theory-search path produced \
-             a model that falsifies an assertion; fail-closing Sat -> Unknown"
+             a candidate that falsifies an assertion; this candidate was discarded"
         );
         let flags = ay_core::misc_cli_flags();
         if flags.quiet_soundness_gate || flags.z3_transcript {
@@ -4339,8 +4800,8 @@ impl Executor {
         eprintln!(
             "\n[AY SOUNDNESS GATE] caught an INVALID model — a theory-search path \
              returned a model that falsifies an assertion.\n    \
-             AY fail-closed to `unknown` (this is SOUND); it indicates an internal \
-             solver bug worth reporting.\n    \
+             This candidate was discarded. Search may produce another independently \
+             checked model; this event does not state the final verdict.\n    \
              logic:     {logic}\n    \
              assertion: {assertion_str}\n    \
              falsified under model: {assignment}\n    \

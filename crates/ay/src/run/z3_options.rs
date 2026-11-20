@@ -57,7 +57,6 @@ const DISPATCHED_OPTIONS: &[&str] = &[
 // them makes AY ignore options AY itself documents. An unknown key that is
 // neither z3's nor AY's still reports exactly as before.
 const NATIVE_OPTIONS: &[&str] = &[
-    "ay-diff-logic",
     "ay-eq-diffvar",
     "ay-maxsmt-engine",
     "ay-proof-no-varsubst",

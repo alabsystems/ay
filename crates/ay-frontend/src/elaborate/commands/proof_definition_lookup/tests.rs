@@ -102,3 +102,37 @@ fn define_fun_reusing_a_popped_label_name_has_authority() {
     process(&mut context, "(pop 1)(define-fun a () Bool (< x 3))");
     assert!(context.source_nullary_definition_for_proof("a").is_some());
 }
+
+/// AY-SMT-4: walking the whole symbol table through this lookup — what
+/// `nullary_definition_premises` does once per UNSAT proof assembly — must
+/// stay linear in the number of `:named` labels. With the live-symbol scan of
+/// `effective_declaration_kind` ahead of the constant-time label refusal the
+/// walk was quadratic: 17,653 labels cost over 10 s per assembly, and the
+/// reduced-core recheck of the SMT-COMP unsat-core track ran out of its 2 s
+/// budget. Measured with a release build on the loaded host: 40,000 labels
+/// took 2.07 s with the old order; with the new one the whole test, parsing
+/// included, took 0.42 s. The 1 s bound separates the two.
+#[test]
+fn walking_many_named_labels_is_linear() {
+    use std::fmt::Write as _;
+    const LABELS: usize = 40_000;
+    let mut script = String::from("(declare-const x Int)(define-fun alias () Int (+ x 1))");
+    for i in 0..LABELS {
+        let _ = write!(script, "(assert (! (>= x (- {i})) :named label{i}))");
+    }
+    let mut context = Context::new();
+    process(&mut context, &script);
+    let names: Vec<String> = context.symbols_iter().map(|(n, _)| n.clone()).collect();
+    assert!(names.len() > LABELS);
+    let started = std::time::Instant::now();
+    let found: Vec<&String> = names
+        .iter()
+        .filter(|name| context.source_nullary_definition_for_proof(name).is_some())
+        .collect();
+    let elapsed = started.elapsed();
+    assert_eq!(found, vec!["alias"]);
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_000),
+        "walking {LABELS} labels took {elapsed:?}"
+    );
+}

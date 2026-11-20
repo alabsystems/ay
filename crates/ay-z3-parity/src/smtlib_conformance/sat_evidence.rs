@@ -84,6 +84,12 @@ impl Transcript {
 pub(super) struct Evidence {
     pub(super) error: Option<String>,
     original: Option<Artifact>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    scoped: Option<Artifact>,
     producer_input: Option<Artifact>,
     model: Option<Artifact>,
     verification_input: Option<Artifact>,
@@ -91,12 +97,39 @@ pub(super) struct Evidence {
     verifier: Option<Transcript>,
     z3_sha256: String,
     original_assertions: usize,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkpoint_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    original_assumptions: Option<usize>,
     covered_declarations: usize,
 }
 
 impl Evidence {
     pub(super) fn accepted(&self) -> bool {
         self.error.is_none()
+    }
+
+    pub(super) fn records_accepted_model(&self, query_sha256: &str, z3_sha256: &str) -> bool {
+        self.accepted()
+            && self.z3_sha256 == z3_sha256
+            && self
+                .original
+                .as_ref()
+                .is_some_and(|artifact| artifact.sha256 == query_sha256)
+            && self.producer_input.is_some()
+            && self.model.is_some()
+            && self.verification_input.is_some()
+            && self.producer.as_ref().is_some_and(Transcript::complete)
+            && self
+                .verifier
+                .as_ref()
+                .is_some_and(Transcript::accepts_model)
+    }
+
+    pub(super) fn has_checkpoint_fields(&self) -> bool {
+        self.scoped.is_some() || self.original_assumptions.is_some()
     }
 
     pub(super) fn artifacts(&self) -> [Option<&Artifact>; 4] {
@@ -682,6 +715,7 @@ pub(super) fn run(
     let mut evidence = Evidence {
         error: None,
         original: None,
+        scoped: None,
         producer_input: None,
         model: None,
         verification_input: None,
@@ -689,6 +723,7 @@ pub(super) fn run(
         verifier: None,
         z3_sha256: String::new(),
         original_assertions: 0,
+        original_assumptions: None,
         covered_declarations: 0,
     };
     let outcome = (|| {
@@ -873,8 +908,12 @@ pub(super) fn replay(
         .verification_input
         .as_ref()
         .ok_or("missing SAT replay input")?;
-    read_artifact(base, artifact, MAX_SCRIPT_BYTES as u64)?;
-    let input = resolve_relative_evidence_path(base, &artifact.path)?;
+    let bytes = read_artifact(base, artifact, MAX_SCRIPT_BYTES as u64)?;
+    let directory = tempfile::tempdir()
+        .map_err(|error| format!("create private SAT replay directory: {error}"))?;
+    let input = directory.path().join("verify.smt2");
+    fs::write(&input, &bytes)
+        .map_err(|error| format!("stage authenticated SAT replay: {error}"))?;
     let output = Transcript::capture(
         resources
             .run_external_transcript_scrubbed(
@@ -1098,6 +1137,7 @@ mod tests {
         let generated = verification_script(std::str::from_utf8(original).unwrap(), model).unwrap();
         let evidence = Evidence {
             error: None,
+            scoped: None,
             original: Some(store_artifact(base, base, "original.smt2", original).unwrap()),
             producer_input: Some(
                 store_artifact(
@@ -1122,9 +1162,12 @@ mod tests {
                 .reference_executable
                 .sha256,
             original_assertions: generated.assertions,
+            original_assumptions: None,
             covered_declarations: generated.declarations,
         };
         validate(&evidence, original, base).unwrap();
+        assert!(evidence.records_accepted_model(&sha256_bytes(original), &evidence.z3_sha256));
+        assert!(!evidence.records_accepted_model(&sha256_bytes(changed), &evidence.z3_sha256));
         assert!(validate(&evidence, changed, base)
             .unwrap_err()
             .contains("exact query prefix"));

@@ -45,9 +45,9 @@ impl ChainSpend {
 /// The allowances one bit-blast SAT solve chain runs under. `None` is no
 /// bound on that axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::executor) struct BitblastAllowances {
-    pub(in crate::executor) conflicts: Option<u64>,
-    pub(in crate::executor) decisions: Option<u64>,
+pub(crate) struct BitblastAllowances {
+    pub(crate) conflicts: Option<u64>,
+    pub(crate) decisions: Option<u64>,
 }
 
 impl BitblastAllowances {
@@ -129,7 +129,7 @@ impl BitblastAllowances {
 impl Executor {
     /// The bit-blast lanes' allowances for this executor's configuration
     /// (see [`BitblastAllowances::for_limits`]).
-    pub(in crate::executor) fn bitblast_sat_allowances(&self) -> BitblastAllowances {
+    pub(crate) fn bitblast_sat_allowances(&self) -> BitblastAllowances {
         BitblastAllowances::for_limits(
             self.resource_limit,
             self.decision_limit,

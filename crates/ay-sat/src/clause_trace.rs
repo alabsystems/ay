@@ -231,16 +231,15 @@ pub fn clause_trace_armings() -> u32 {
 /// Solver-minted `(variable count, active scope premises)` authority.
 type SolverProvenance = (usize, Vec<Literal>);
 
-/// What the trace held at the instant #A2b budget exhaustion destroyed it.
+/// What the trace held at the instant #A2b budget exhaustion degraded it.
 ///
-/// #destroyed-trace. `degrade_proof_bookkeeping_after_exhaustion` calls
-/// [`ClauseTrace::clear_entries`], so every consumer downstream sees
-/// `entries=0` and cannot say whether the discarded trace was a complete
-/// propositional refutation or a partial search record. The
-/// `2026-09-08-assume-family-trust-closure` report called that population
-/// "a propositional refutation … deliberately discarded" WITHOUT measuring it.
-/// This snapshot is taken immediately before the clear so the claim can be
-/// settled from the artifact instead of asserted.
+/// #destroyed-trace. `degrade_proof_bookkeeping_after_exhaustion` used to
+/// call [`ClauseTrace::clear_entries`], so every consumer downstream saw
+/// `entries=0` and could not say whether the discarded trace was a complete
+/// propositional refutation or a partial search record. Degradation now
+/// strips hints and keeps recording literals, but the census question —
+/// what had hinted recording accumulated when it stopped — is unchanged,
+/// so the snapshot is still taken immediately before the strip.
 ///
 /// Write-only: no gate, verdict, certificate, or export reads any field.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -298,6 +297,11 @@ pub struct ClauseTrace {
     is_truncated: bool,
     /// True if search-time proof bookkeeping exhausted its work budget (#A2b)
     proof_work_exhausted: bool,
+    /// True after #A2b degradation stripped every recorded hint: entries
+    /// keep their literals and further additions are recorded hint-free,
+    /// so the trace remains a complete clause sequence for reconstruction
+    /// repair lanes. Only ever set together with `proof_work_exhausted`.
+    literals_only: bool,
     /// #destroyed-trace. What the trace held when #A2b exhaustion cleared it.
     /// Survives [`Self::clear_entries`] on purpose; that is its whole point.
     exhaustion_snapshot: Option<ExhaustionSnapshot>,
@@ -536,6 +540,14 @@ impl ClauseTrace {
     /// True if the search-time proof bookkeeping work budget was exhausted.
     pub fn proof_work_exhausted(&self) -> bool {
         self.proof_work_exhausted
+    }
+
+    /// True when #A2b degradation switched this trace to literals-only
+    /// recording: every entry's hints were stripped and later additions
+    /// are recorded hint-free. The clause sequence itself stays complete,
+    /// unlike a plainly exhausted trace whose entries were discarded.
+    pub fn literals_only_recording(&self) -> bool {
+        self.literals_only
     }
 
     /// Record what the trace holds, for the census, immediately before #A2b

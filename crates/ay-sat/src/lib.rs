@@ -395,7 +395,7 @@ pub use technique::SatTechnique;
 pub use tla_trace::TlaTraceWriter;
 pub use tla_traceable::TlaTraceable;
 #[cfg(feature = "unsat-cert")]
-pub use unsat_cert::{prove_cnf_unsat_dimacs, CnfCertError};
+pub use unsat_cert::{prove_cnf_unsat_dimacs, prove_cnf_unsat_dimacs_until, CnfCertError};
 pub use variant::{
     SolverVariant, VariantBranchPolicy, VariantConfig, VariantHotPathConfig, VariantInput,
     VariantProfilePlan, VariantProofMode, VariantRestartPolicy, VariantRouteProfile,

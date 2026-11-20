@@ -7,21 +7,60 @@
 //!
 //! The clause is exactly `(cl (not (= x S1)) (= x S2))` — either equality
 //! orientation, either literal order — where `S1` and `S2` are GROUND
-//! sequence terms (built only from `seq.empty`, `seq.unit` over constant
-//! elements, and `seq.++`) whose concat-flattened, empty-dropped normal
-//! forms are elementwise identical. `x = S1 ⊢ x = S2` is then the
-//! substitution instance of the ground identity `S1 = S2`, so the clause is
-//! a sequence tautology. The normalizer here is independent of the solver's
-//! seq engine and fails closed on any non-ground leaf or unsupported
-//! operator.
+//! sequence terms whose concat-flattened, empty-dropped normal forms are
+//! identical. A unit contributes its exact element term; any other well-typed
+//! sequence contributes one opaque chunk. No commutation, element equality or
+//! element inference is performed. This is the free-monoid identity `S1 = S2`,
+//! so `x = S1 ⊢ x = S2` is also valid. The normalizer is independent of the
+//! solver's sequence engine and rejects malformed native operators/sorts.
+//! Unit sentences additionally admit the bounded exact length and singleton
+//! membership laws in `sentences`; every conjunct must pass independently.
+//!
+//! Operator semantics: https://microsoft.github.io/z3guide/docs/theories/Sequences/
 
-use ay_core::{ProofId, Symbol, TermData, TermId, TermStore};
+use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
 
 /// Bound on the flattened element count, so a pathological concat tree
 /// cannot make validation quadratic in adversarial input.
 const MAX_GROUND_ELEMENTS: usize = 4096;
+const MAX_NORMALIZATION_NODES: usize = MAX_GROUND_ELEMENTS * 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordPart {
+    Unit(TermId),
+    Opaque(TermId),
+}
+
+struct Work<'a> {
+    remaining: usize,
+    progress: &'a mut dyn FnMut(usize, usize) -> bool,
+}
+
+impl<'a> Work<'a> {
+    fn new(progress: &'a mut dyn FnMut(usize, usize) -> bool) -> Option<Self> {
+        progress(1, 4 * std::mem::size_of::<Vec<TermId>>()).then_some(Self {
+            remaining: MAX_NORMALIZATION_NODES,
+            progress,
+        })
+    }
+
+    fn visit(&mut self) -> Option<()> {
+        self.remaining = self.remaining.checked_sub(1)?;
+        (self.progress)(1, 0).then_some(())
+    }
+
+    /// Before each push/extension, conservatively pay capacity growth, moved
+    /// cells and eventual disposal. Vector doubling needs fewer than four
+    /// cells of cumulative allocation/movement per inserted cell.
+    fn scratch<T>(&mut self, count: usize) -> Option<()> {
+        let bytes = count.checked_mul(4 * std::mem::size_of::<T>())?;
+        (self.progress)(count.checked_mul(4)?, bytes).then_some(())
+    }
+}
+
+mod sentences;
 
 fn invalid(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
     ProofCheckError::InvalidTheoryLemma {
@@ -33,15 +72,24 @@ fn invalid(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
 /// Flatten a single-literal `(cl (or L1 .. Ln))` clause into `[L1, .., Ln]`;
 /// every other clause is returned unchanged (mirrors the array/euf lanes —
 /// the packed `or` form denotes the same disjunction).
-fn flatten_clause_literals(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
+fn flatten_clause_literals(terms: &TermStore, clause: &[TermId]) -> Option<Vec<TermId>> {
+    if clause.len() > 2 || clause.iter().any(|&term| terms.entry_stamp(term).is_none()) {
+        return None;
+    }
     if clause.len() == 1 {
         if let TermData::App(Symbol::Named(sym), args) = terms.get(clause[0]) {
-            if sym == "or" && args.len() >= 2 {
-                return args.clone();
+            if sym == "or" {
+                return (args.len() == 2
+                    && !terms.is_declared_function(sym)
+                    && terms.sort(clause[0]) == &Sort::Bool
+                    && args.iter().all(|&term| {
+                        terms.entry_stamp(term).is_some() && terms.sort(term) == &Sort::Bool
+                    }))
+                .then(|| args.clone());
             }
         }
     }
-    clause.to_vec()
+    Some(clause.to_vec())
 }
 
 fn strip_not(terms: &TermStore, term: TermId) -> (TermId, bool) {
@@ -52,42 +100,100 @@ fn strip_not(terms: &TermStore, term: TermId) -> (TermId, bool) {
 }
 
 fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    if terms.entry_stamp(term).is_none() || terms.sort(term) != &Sort::Bool {
+        return None;
+    }
     match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
+        TermData::App(Symbol::Named(name), args)
+            if name == "="
+                && !terms.is_declared_function(name)
+                && args.len() == 2
+                && args
+                    .iter()
+                    .all(|&argument| terms.entry_stamp(argument).is_some())
+                && terms.sort(args[0]) == terms.sort(args[1]) =>
+        {
             Some((args[0], args[1]))
         }
         _ => None,
     }
 }
 
-/// Flatten a ground sequence term into its unit-element argument list.
-///
-/// Returns `None` (fail closed) for anything that is not `seq.empty`,
-/// `seq.unit` of a CONSTANT element, or `seq.++` of such terms.
-fn ground_seq_elements(terms: &TermStore, term: TermId, out: &mut Vec<TermId>) -> Option<()> {
-    match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) => match name.as_str() {
-            "seq.empty" if args.is_empty() => Some(()),
-            "seq.unit" if args.len() == 1 => {
-                if !matches!(terms.get(args[0]), TermData::Const(_)) {
+/// Normalize only the associative operation and its identity. Opaque chunks
+/// and arbitrary unit elements keep exact, ordered term identities.
+fn ground_seq_elements(
+    terms: &TermStore,
+    root: TermId,
+    out: &mut Vec<WordPart>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Option<()> {
+    let mut work = Work::new(progress)?;
+    ground_seq_elements_with_budget(terms, root, out, &mut work)
+}
+
+fn ground_seq_elements_with_budget(
+    terms: &TermStore,
+    root: TermId,
+    out: &mut Vec<WordPart>,
+    work: &mut Work<'_>,
+) -> Option<()> {
+    if terms.entry_stamp(root).is_none() {
+        return None;
+    }
+    let sort = terms.sort(root);
+    let Sort::Seq(element) = sort else {
+        return None;
+    };
+    work.scratch::<TermId>(1)?;
+    let mut pending = vec![root];
+    while let Some(term) = pending.pop() {
+        work.visit()?;
+        if terms.entry_stamp(term).is_none() || terms.sort(term) != sort {
+            return None;
+        }
+        if let TermData::App(Symbol::Named(name), _) = terms.get(term) {
+            if matches!(name.as_str(), "seq.empty" | "seq.unit" | "seq.++")
+                && terms.is_declared_function(name)
+            {
+                return None;
+            }
+        }
+        match terms.get(term) {
+            TermData::App(Symbol::Named(name), args) if name == "seq.empty" => {
+                if !args.is_empty() {
+                    return None;
+                }
+            }
+            TermData::App(Symbol::Named(name), args) if name == "seq.unit" => {
+                let [value] = args.as_slice() else {
+                    return None;
+                };
+                if terms.entry_stamp(*value).is_none() || terms.sort(*value) != element.as_ref() {
                     return None;
                 }
                 if out.len() >= MAX_GROUND_ELEMENTS {
                     return None;
                 }
-                out.push(args[0]);
-                Some(())
+                work.scratch::<WordPart>(1)?;
+                out.push(WordPart::Unit(*value));
             }
-            "seq.++" if !args.is_empty() => {
-                for &arg in args {
-                    ground_seq_elements(terms, arg, out)?;
+            TermData::App(Symbol::Named(name), args) if name == "seq.++" => {
+                if args.is_empty() || pending.len().checked_add(args.len())? > work.remaining {
+                    return None;
                 }
-                Some(())
+                work.scratch::<TermId>(args.len())?;
+                pending.extend(args.iter().rev().copied());
             }
-            _ => None,
-        },
-        _ => None,
+            _ => {
+                if out.len() >= MAX_GROUND_ELEMENTS {
+                    return None;
+                }
+                work.scratch::<WordPart>(1)?;
+                out.push(WordPart::Opaque(term));
+            }
+        }
     }
+    Some(())
 }
 
 /// Validate a [`ay_core::TheoryLemmaKind::SeqGroundEval`] clause.
@@ -96,13 +202,52 @@ pub(crate) fn validate_seq_ground_eval(
     step_id: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    let literals = flatten_clause_literals(terms, clause);
+    validate_seq_ground_eval_with_progress(terms, step_id, clause, &mut |_, _| true)
+}
+
+pub(super) fn validate_seq_ground_eval_with_progress(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    let mut refused = false;
+    let mut original = |work, bytes| {
+        if !refused && !progress(work, bytes) {
+            refused = true;
+        }
+        !refused
+    };
+    let result = validate_seq_ground_eval_impl(terms, step_id, clause, &mut original);
+    if result.is_ok() {
+        let _ = original(0, 0);
+    }
+    if refused {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+    result
+}
+
+fn validate_seq_ground_eval_impl(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    if !progress(4, 4 * std::mem::size_of::<TermId>()) {
+        return Err(invalid(step_id, "original caller refused normalization"));
+    }
+    let literals = flatten_clause_literals(terms, clause)
+        .ok_or_else(|| invalid(step_id, "malformed or oversized literal vector"))?;
     // Shape (B): a UNIT positive equality between two ground sequence terms
     // with elementwise-identical normal forms — the pure ground identity
     // (`(= (seq.++ seq.empty (seq.unit 1)) (seq.unit 1))`), used by the
     // authored-source rebuild's trans chains exactly like the BV `evaluate`
     // leg.
     if let [only] = literals.as_slice() {
+        if sentences::valid(terms, *only, progress) {
+            return Ok(());
+        }
         let (eq, negated) = strip_not(terms, *only);
         if negated {
             return Err(invalid(step_id, "unit clause must be a positive equality"));
@@ -111,8 +256,9 @@ pub(crate) fn validate_seq_ground_eval(
             .ok_or_else(|| invalid(step_id, "unit literal is not an equality"))?;
         let mut left_elements = Vec::new();
         let mut right_elements = Vec::new();
-        if ground_seq_elements(terms, left, &mut left_elements).is_some()
-            && ground_seq_elements(terms, right, &mut right_elements).is_some()
+        if ground_seq_elements(terms, left, &mut left_elements, progress).is_some()
+            && ground_seq_elements(terms, right, &mut right_elements, progress).is_some()
+            && progress(left_elements.len().saturating_add(right_elements.len()), 0)
             && left_elements == right_elements
         {
             return Ok(());
@@ -159,8 +305,15 @@ pub(crate) fn validate_seq_ground_eval(
         }
         let mut premise_elements = Vec::new();
         let mut conclusion_elements = Vec::new();
-        if ground_seq_elements(terms, premise_ground, &mut premise_elements).is_some()
-            && ground_seq_elements(terms, conclusion_ground, &mut conclusion_elements).is_some()
+        if ground_seq_elements(terms, premise_ground, &mut premise_elements, progress).is_some()
+            && ground_seq_elements(terms, conclusion_ground, &mut conclusion_elements, progress)
+                .is_some()
+            && progress(
+                premise_elements
+                    .len()
+                    .saturating_add(conclusion_elements.len()),
+                0,
+            )
             && premise_elements == conclusion_elements
         {
             return Ok(());
@@ -178,3 +331,17 @@ pub(crate) fn validate_seq_ground_eval(
 pub fn recognize_seq_ground_eval(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_seq_ground_eval(terms, ProofId(0), clause).is_ok()
 }
+
+/// The same independent kernel, with refusal-only original work/storage
+/// admission before traversal and scratch growth. Refusal supplies no lemma.
+#[must_use]
+pub fn recognize_seq_ground_eval_with_progress(
+    terms: &TermStore,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> bool {
+    validate_seq_ground_eval_with_progress(terms, ProofId(0), clause, progress).is_ok()
+}
+
+#[cfg(test)]
+mod tests;

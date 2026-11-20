@@ -12,7 +12,7 @@ use num_traits::{Signed, Zero};
 
 use super::{coeffs_valid, hypothesis};
 use crate::alethe_printer::AlethePrintError;
-use crate::alethe_printer::AlethePrinter;
+use crate::alethe_printer::{AlethePrinter, AssembledRendering};
 
 const MAX_PRINTED_ATOM_BYTES: usize = 64 * 1024;
 const MAX_PRINTED_ATOM_DEPTH: usize = 256;
@@ -90,7 +90,8 @@ pub fn format_terms_alethe_with_overrides_bounded(
         terms,
         Some(term_overrides),
         Some(work_budget),
-    );
+    )
+    .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     format_term_batch(&printer, term_ids)
 }
 
@@ -126,7 +127,8 @@ pub fn format_terms_alethe_with_overrides_and_canonical_bounded_with_work(
             terms,
             Some(term_overrides),
             Some(work_budget),
-        );
+        )
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
         let rendered = format_term_batch(&printer, effective_term_ids)?;
         (rendered, printer.work_used())
     };
@@ -136,7 +138,8 @@ pub fn format_terms_alethe_with_overrides_and_canonical_bounded_with_work(
             steps_rendered: 0,
         });
     };
-    let printer = AlethePrinter::new_with_overrides_and_budget(terms, None, Some(remaining_work));
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, None, Some(remaining_work))
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     let canonical = format_term_batch(&printer, canonical_term_ids)?;
     let total_work = effective_work.checked_add(printer.work_used()).ok_or(
         AlethePrintError::EmissionBudgetExhausted {

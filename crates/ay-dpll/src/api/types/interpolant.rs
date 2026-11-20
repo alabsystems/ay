@@ -161,7 +161,7 @@ impl PathInterpolantResult {
 /// How strictly proof-based interpolant extraction treats the proof.
 ///
 /// Workstream D, Rung 1 (CHC-COMP 2026; the development design notes
-/// DESIGN_lra_interp_tpa.md` §4.1). Owner: WP-D1-P (proof substrate).
+/// DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1). Owner: WP-D1-P (proof substrate).
 ///
 /// - `Legacy` is the historical traversal, byte-identical to
 ///   [`crate::api::Solver::get_interpolant_with_strength`]: a missing premise

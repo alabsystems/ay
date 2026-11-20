@@ -7,6 +7,7 @@
 // Shared helpers are compiled into each integration-test binary separately, so
 // any given test target legitimately uses only a subset of this module.
 
+pub(crate) mod coherence;
 pub(crate) mod incremental_script;
 
 use anyhow::{anyhow, Context, Result};

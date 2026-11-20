@@ -1,0 +1,6 @@
+(set-logic QF_LRA)
+(declare-const x Real)
+(declare-const y Real)
+(assert (= (+ x y) 0))
+(assert (= (+ x (* (/ 18014398509481985 18014398509481984) y)) 1))
+(check-sat)

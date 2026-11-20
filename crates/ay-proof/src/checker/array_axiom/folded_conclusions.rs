@@ -22,9 +22,9 @@
 //!   `store_value_cong`, `store_base_cong`, `store_other_side_cong`,
 //!   `array_cong_select`.
 //! * folded chain evaluation — sub-schema (A). Sites `row2_clause` over a
-//!   constant base, `ext_row_seed`, `witness_row2`.
+//!   constant base, `witness_row2`.
 //! * folded conditional ROW1 — `ArraySelectStore { index_eq: true }`. Sites
-//!   `row1_clause`, `ext_row_seed`, `witness_row1`.
+//!   `row1_clause`, `witness_row1`.
 //! * folded same-index store value — sub-schema (I). Site `store_value_cong`
 //!   over a store/store equality.
 //!

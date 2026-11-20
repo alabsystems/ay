@@ -55,6 +55,28 @@ enum Outcome {
     DryRunUnchanged,
     DryRunPermission,
 }
+
+#[derive(Clone, Copy)]
+enum RepositoryField {
+    Bound,
+    Null,
+    Foreign,
+    Malformed,
+    Missing,
+}
+
+impl RepositoryField {
+    fn value(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Bound => Some(serde_json::json!(REPOSITORY)),
+            Self::Null => Some(serde_json::Value::Null),
+            Self::Foreign => Some(serde_json::json!("example/foreign")),
+            Self::Malformed => Some(serde_json::json!(17)),
+            Self::Missing => None,
+        }
+    }
+}
+
 struct Peer {
     fetched: String,
     desired: String,
@@ -65,6 +87,8 @@ struct Peer {
     dry_runs: usize,
     fetches: usize,
     receipts: Vec<PathBuf>,
+    output_repo: RepositoryField,
+    error_repo: RepositoryField,
 }
 impl Peer {
     fn new(base: &str, head: &str, later: &str, outcome: Outcome) -> Self {
@@ -78,6 +102,8 @@ impl Peer {
             dry_runs: 0,
             fetches: 0,
             receipts: vec![],
+            output_repo: RepositoryField::Bound,
+            error_repo: RepositoryField::Bound,
         }
     }
 }
@@ -120,20 +146,22 @@ impl Agh for Peer {
                 } else {
                     "conflict"
                 };
-                fs::write(
-                    receipts.join("dry-run.json"),
-                    serde_json::to_vec(&serde_json::json!({
-                        "repo": REPOSITORY, "op":"ref.update-atomic", "dry_run":true, "outcome":"refused"
-                    }))?,
-                )?;
+                let mut output = serde_json::json!({
+                    "op":"ref.update-atomic", "dry_run":true, "outcome":"refused"
+                });
+                if let Some(repo) = self.output_repo.value() {
+                    output["repo"] = repo;
+                }
+                fs::write(receipts.join("dry-run.json"), serde_json::to_vec(&output)?)?;
+                let mut error = serde_json::json!({"error": {
+                    "kind":kind, "exit":9, "side_effect":"none"
+                }});
+                if let Some(repo) = self.error_repo.value() {
+                    error["error"]["repo"] = repo;
+                }
                 fs::write(
                     receipts.join("dry-run-error.json"),
-                    format!(
-                        "agh: refused\n{}\n",
-                        serde_json::json!({"error": {
-                            "repo":REPOSITORY, "kind":kind, "exit":9, "side_effect":"none"
-                        }})
-                    ),
+                    format!("agh: refused\n{}\n", error),
                 )?;
                 if !matches!(self.outcome, Outcome::DryRunUnchanged) {
                     self.fetched = self.later.clone();
@@ -160,32 +188,72 @@ impl Agh for Peer {
 
 #[test]
 fn a_nonwriting_ref_conflict_requires_fresh_composition_without_a_push() {
-    let (_temp, mut runner, base, head, later) = fixture();
-    let mut peer = Peer::new(&base, &head, &later, Outcome::DryRunConflict);
-    assert!(!push_with(&mut runner, &head, &base, &mut peer).unwrap());
-    assert_eq!(peer.writes, 0);
-    assert_eq!(peer.dry_runs, 1);
-    assert_eq!(peer.fetches, 2);
-    assert_eq!(runner.head().unwrap(), head);
-    assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(later));
+    for error_repo in [RepositoryField::Bound, RepositoryField::Null] {
+        let (_temp, mut runner, base, head, later) = fixture();
+        let mut peer = Peer::new(&base, &head, &later, Outcome::DryRunConflict);
+        peer.error_repo = error_repo;
+        assert!(!push_with(&mut runner, &head, &base, &mut peer).unwrap());
+        assert_eq!(peer.writes, 0);
+        assert_eq!(peer.dry_runs, 1);
+        assert_eq!(peer.fetches, 2);
+        assert_eq!(runner.head().unwrap(), head);
+        assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(later));
+    }
 }
 
 #[test]
 fn permission_refusal_and_unchanged_conflict_do_not_retry() {
-    for outcome in [Outcome::DryRunPermission, Outcome::DryRunUnchanged] {
+    for error_repo in [RepositoryField::Bound, RepositoryField::Null] {
+        for outcome in [Outcome::DryRunPermission, Outcome::DryRunUnchanged] {
+            let (_temp, mut runner, base, head, later) = fixture();
+            let mut peer = Peer::new(&base, &head, &later, outcome);
+            peer.error_repo = error_repo;
+            assert!(push_with(&mut runner, &head, &base, &mut peer).is_err());
+            assert_eq!(peer.writes, 0);
+            assert_eq!(peer.dry_runs, 1);
+            assert_eq!(runner.head().unwrap(), head);
+            assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(base));
+            assert_eq!(
+                peer.fetches,
+                if matches!(outcome, Outcome::DryRunPermission) {
+                    1
+                } else {
+                    2
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn nonwriting_conflict_requires_unambiguous_repository_binding() {
+    for error_repo in [
+        RepositoryField::Foreign,
+        RepositoryField::Malformed,
+        RepositoryField::Missing,
+    ] {
         let (_temp, mut runner, base, head, later) = fixture();
-        let mut peer = Peer::new(&base, &head, &later, outcome);
+        let mut peer = Peer::new(&base, &head, &later, Outcome::DryRunConflict);
+        peer.error_repo = error_repo;
         assert!(push_with(&mut runner, &head, &base, &mut peer).is_err());
         assert_eq!(peer.writes, 0);
-        assert_eq!(peer.dry_runs, 1);
-        assert_eq!(
-            peer.fetches,
-            if matches!(outcome, Outcome::DryRunPermission) {
-                1
-            } else {
-                2
-            }
-        );
+        assert_eq!(peer.fetches, 1);
+        assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(base));
+    }
+    for output_repo in [
+        RepositoryField::Null,
+        RepositoryField::Foreign,
+        RepositoryField::Malformed,
+        RepositoryField::Missing,
+    ] {
+        let (_temp, mut runner, base, head, later) = fixture();
+        let mut peer = Peer::new(&base, &head, &later, Outcome::DryRunConflict);
+        peer.error_repo = RepositoryField::Null;
+        peer.output_repo = output_repo;
+        assert!(push_with(&mut runner, &head, &base, &mut peer).is_err());
+        assert_eq!(peer.writes, 0);
+        assert_eq!(peer.fetches, 1);
+        assert_eq!(read_ref(&mut runner, TRACKING).unwrap(), Some(base));
     }
 }
 

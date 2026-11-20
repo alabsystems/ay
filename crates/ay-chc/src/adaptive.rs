@@ -1718,7 +1718,7 @@ impl AdaptivePortfolio {
     /// The staged-probe profile this problem's portfolios use.
     ///
     /// Real-sorted problems keep BMC at the portfolio's full wave share
-    /// (`LRA_BMC_unsafe_2026-09-22.md`). On the Real route the portfolio BMC is
+    /// (the development design notes at `9598c4206`). On the Real route the portfolio BMC is
     /// the only counterexample engine — no adaptive front BMC probe runs before
     /// it (that probe is the Int SimpleLoop arm's), Kind is not applicable on
     /// Real (#5856), and all engines of the Real roster run in one parallel
@@ -5934,6 +5934,10 @@ impl AdaptivePortfolio {
         }
 
         if let Some(result) = self.try_adt_array_nullary_unsafe_prepass(deadline) {
+            return result;
+        }
+
+        if let Some(result) = self.try_linear_chain_invariant(&features, deadline) {
             return result;
         }
 

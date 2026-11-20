@@ -20,7 +20,8 @@ mod veripb;
 
 pub use self::cert::{
     certified_bb_diagnosis, certify_decision_unsat, certify_decision_unsat_interruptible,
-    certify_opt_lin_any_interruptible, certify_opt_lin_bounds, certify_opt_lin_bounds_compact,
+    certify_opt_infeasible_pb_interruptible, certify_opt_lin_any_interruptible,
+    certify_opt_lin_bounds, certify_opt_lin_bounds_compact,
     certify_opt_lin_bounds_compact_interruptible, certify_opt_lin_bounds_interruptible,
     certify_opt_lin_bounds_pb, certify_opt_lin_bounds_pb_interruptible,
     certify_opt_lin_certified_bb, certify_opt_lin_certified_bb_interruptible,

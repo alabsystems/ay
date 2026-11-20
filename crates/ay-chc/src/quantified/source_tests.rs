@@ -320,6 +320,25 @@ fn theory_shadowing_bad_symbols_and_predicate_capture_are_refused() {
         .contains("(|bound index| (_ BitVec 8))"));
 }
 
+/// AY-SMT-10: the SMT-LIB 2.7 names of the BV/Int conversions are theory
+/// symbols the CHC parser reads, so a source binder or free name spelled like
+/// one must be refused exactly as `bv2nat` / `int2bv` are.
+#[test]
+fn smtlib_2_7_bv_conversion_names_cannot_be_shadowed() {
+    for name in [
+        "bv2nat",
+        "int2bv",
+        "bv2int",
+        "ubv_to_int",
+        "sbv_to_int",
+        "int_to_bv",
+    ] {
+        assert!(standalone(vec![premise(name, 8, ChcExpr::Bool(true))]).is_err());
+        assert!(standalone(vec![premise("i", 8, var(name, ChcSort::Bool))]).is_err());
+    }
+    assert!(standalone(vec![premise("i", 8, var("ubv_to_int_x", ChcSort::Bool))]).is_ok());
+}
+
 #[test]
 fn raw_argument_structure_is_retained_without_relational_normalization() {
     let mut declarations = ChcProblem::new();

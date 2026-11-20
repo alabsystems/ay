@@ -9,6 +9,7 @@ use super::*;
 use crate::z3_abi_500::{LibraryObservation, StockCProbe};
 use std::ffi::OsString;
 
+pub(super) mod gaps;
 mod registered;
 mod semantic_contracts;
 
@@ -953,9 +954,20 @@ fn finite_probe_differences(
 }
 
 fn validate_report(report: &Report) -> Result<(), String> {
+    if report.profile_sha256 != canonical_profile_sha256()? {
+        return Err("current ABI report uses a different native profile".to_string());
+    }
+    validate_observation(report)?;
+    verify_artifact(
+        &report.semantic_compiler,
+        Path::new("."),
+        "ABI semantic compiler",
+    )
+}
+
+fn validate_observation(report: &Report) -> Result<(), String> {
     if report.schema != SCHEMA
         || report.capture_path_normalization != STAGING_PATH_POLICY
-        || report.profile_sha256 != canonical_profile_sha256()?
         || report.abi_complete
         || report.full_replacement_ready
         || report.functions.len() != 817
@@ -970,11 +982,6 @@ fn validate_report(report: &Report) -> Result<(), String> {
         );
     }
     validate_header_provenance(&report.ay_header_provenance, report.fragment_passed)?;
-    verify_artifact(
-        &report.semantic_compiler,
-        Path::new("."),
-        "ABI semantic compiler",
-    )?;
     if report
         .functions
         .windows(2)

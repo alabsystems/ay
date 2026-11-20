@@ -898,7 +898,10 @@ fn overlay_dimension(contract: &Contract) -> Result<&Dimension, String> {
         .ok_or("closed Z3 overlay dimension is missing".to_string())
 }
 
-fn create_snapshot(checkout: &Path, profile: &Profile) -> Result<Z3SourceSnapshot, String> {
+pub(super) fn create_snapshot(
+    checkout: &Path,
+    profile: &Profile,
+) -> Result<Z3SourceSnapshot, String> {
     let checkout = fs::canonicalize(checkout).map_err(|error| {
         format!(
             "canonicalizing Z3 source checkout {}: {error}",

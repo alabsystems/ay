@@ -30,16 +30,6 @@ impl LraSolver {
             };
             self.const_bool_cache.insert(term, val);
         }
-        // Cache refinement eligibility and integer-sort for bound refinement
-        // warm path (#6590 Packet 1).
-        if !self.refinement_eligible_cache.contains_key(&term) {
-            let eligible = self.term_supports_bound_refinement(term);
-            self.refinement_eligible_cache.insert(term, eligible);
-        }
-        if !self.is_integer_sort_cache.contains_key(&term) {
-            let is_int = *self.terms().sort(term) == Sort::Int;
-            self.is_integer_sort_cache.insert(term, is_int);
-        }
         // Fast path: if this atom was already fully registered (parsing + indexing),
         // skip structural work but refresh dirty reseeding. This is essential for the
         // structural snapshot path (#6590) where atom_index, var_to_atoms, etc. are

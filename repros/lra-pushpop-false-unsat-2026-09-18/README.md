@@ -1,7 +1,7 @@
 # Incremental QF_LRA push/pop: false `unsat` under `--competition` / `--no-proof` (found 2026-09-18)
 
 Discovered by the CHC campaign's query-replay microbenchmark
-(the development design notes): replaying AY's own PDR
+(the development design notes at `9598c4206`): replaying AY's own PDR
 query stream for `sally-chc-benchmarks/oral_messages/om1_with_relays_agreement_000` as ONE
 push/pop session, `ay` answered `unsat` on 16/442 (and 6/275) scopes that z3 and a fresh `ay`
 per query both answer `sat`.
@@ -27,7 +27,7 @@ ay 0.27.0+build.10305 @ 25e6683cf (release):
 Dropping ONE of the `S1=0` scopes, dropping scope 1, or dropping the disequality makes every
 variant answer correctly -- by luck, see below.
 
-## Root cause (established 2026-09-18, see the development design notes)
+## Root cause (established 2026-09-18, see the development design notes at `9598c4206`)
 
 The `#lra-inc-engine` lane runs the split loop on a SESSION-persistent SAT solver whose SMT
 push/pop is mirrored as SAT scope selectors. Every `Solver::push()` mints a selector variable

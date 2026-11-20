@@ -199,7 +199,6 @@ impl LraSolver {
         self.pending_fixed_term_equalities.clear();
         self.pending_offset_equalities.clear();
         self.pending_propagations.clear();
-        self.pending_bound_refinements.clear();
         // #inc-prop-trail: remove exactly the propagation markers inserted in
         // the popped scopes (their literals were just unassigned by the DPLL
         // backtrack) instead of wholesale-clearing. Outer-scope markers
@@ -299,7 +298,8 @@ impl LraSolver {
             for &var in changed_vars.iter().chain(rewound_vars.iter()) {
                 let vi = var as usize;
                 if vi < self.var_bound_gen.len() {
-                    self.var_bound_gen[vi] = cur_gen;
+                    // A pop rewind cannot name the side it restored.
+                    self.var_bound_gen[vi] = (cur_gen, cur_gen);
                 }
                 if vi < self.implied_tighten_streak.len() {
                     self.implied_tighten_streak[vi] = 0;

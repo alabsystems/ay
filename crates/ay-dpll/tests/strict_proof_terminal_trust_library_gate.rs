@@ -53,16 +53,22 @@ const SEQ_LEN_UNCHECKABLE_UNSAT: &str = "\
 (check-sat)
 ";
 
-/// A sequence problem AY refutes only by ASSUMING an injected `seq.len`
-/// additivity axiom the problem never asserted. Its trust step is caught by the
-/// mandatory certification funnel, which publishes `SelfCheckRejected`. Used
-/// below to prove the restored reason is a *distinct* third value, not a rename
-/// of an existing one.
-const SEQ_INJECTED_AXIOM_UNSAT: &str = "\
+/// A sequence problem (a prefix longer than its sequence) whose refutation
+/// carries a `trust` step (step t2 at 2018a5f36). The mandatory certification
+/// funnel refuses it and publishes `SelfCheckRejected`. Used below to prove the
+/// restored reason is a *distinct* third value, not a rename of an existing
+/// one.
+///
+/// The fixture used to be an injected `seq.len` additivity identity. Since
+/// 36c91281d certifies that identity as a `SeqGroundEval` lemma, its refutation
+/// mints a certificate and only the terminal-trust gate withholds it
+/// (`ProofTrusted`), so it no longer reaches the funnel's refusal.
+const SEQ_PREFIX_LENGTH_TRUST_UNSAT: &str = "\
 (set-logic ALL)
 (declare-const s (Seq Int))
 (declare-const t (Seq Int))
-(assert (= (seq.len (seq.++ s t)) (+ (seq.len s) (seq.len t) 1)))
+(assert (seq.prefixof s t))
+(assert (> (seq.len s) (seq.len t)))
 (check-sat)
 ";
 
@@ -171,11 +177,13 @@ fn library_terminal_trust_reason_is_not_generic_incomplete() {
 #[timeout(120_000)]
 fn terminal_trust_is_distinct_from_self_check_rejection() {
     let (_, gated) = solve(STRICT, SEQ_LEN_UNCHECKABLE_UNSAT);
-    let (_, refuted) = solve(STRICT, SEQ_INJECTED_AXIOM_UNSAT);
+    let (_, refuted) = solve(STRICT, SEQ_PREFIX_LENGTH_TRUST_UNSAT);
     assert_eq!(gated.unknown_reason(), Some(UnknownReason::ProofTrusted));
     assert_eq!(
         refuted.unknown_reason(),
-        Some(UnknownReason::SelfCheckRejected)
+        Some(UnknownReason::SelfCheckRejected),
+        "fixture drifted if certification now accepts this refutation: pick one \
+         whose refutation still carries a trust step"
     );
     assert_ne!(
         gated.unknown_reason(),

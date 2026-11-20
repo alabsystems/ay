@@ -4,7 +4,7 @@
 
 //! Clause caps for the orbitope and aux-free SR routes, and the
 //! `--sat-symmetry-large-caps` switch that raises them: lever 2 of
-//! competition/proof-posture-parity/PLAN-next-sat-levers.md (2026-09-14). The
+//! competition/proof-posture-parity/PLAN-next-sat-levers.md at 9598c4206 (2026-09-14). The
 //! switch is ON by default since 2026-09-17; `false` restores the old caps.
 
 use super::ladder_collapse::LADDER_COLLAPSE_MAX_TOTAL_BINARIES;
@@ -22,7 +22,7 @@ use crate::symmetry::orbitope::OrbitopeLimits;
 const SYMMETRY_LARGE_MAX_CLAUSES: usize = 8_000_000;
 
 /// `--sat-symmetry-large-caps`, ON by default since 2026-09-17: on the A/B of
-/// competition/proof-posture-parity it solved latin_square_10.15 (3 of 3, and at
+/// competition/proof-posture-parity at 9598c4206 it solved latin_square_10.15 (3 of 3, and at
 /// 1500 s) and lost nothing, and the three instances it slowed still solve at
 /// 1500 s. Read per call, not cached: the symmetry pass runs once per solve,
 /// and tests scope the switch.

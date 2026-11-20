@@ -2,11 +2,6 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-// test_eager_relative_slack_queues_refinement_without_simplex_issue_6586:
-// Removed in #6617 — the inline per-variable eager refinement path was deleted.
-// Relative slack refinements are now handled by the post-simplex batch path
-// (compute_implied_bounds + queue_post_simplex_refinements).
-
 use super::*;
 use ay_core::term::TermStore;
 use ay_core::Sort;

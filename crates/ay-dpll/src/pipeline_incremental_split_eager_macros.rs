@@ -203,21 +203,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         let _islp_skip_arith_triangle: bool = false;
         $(let _islp_skip_arith_triangle: bool = $skip_arith_tri;)?
 
-        // Inc5 #fused-detour: capture the executor's eager relevancy-HARD flag
-        // ONCE at attempt entry. Non-fused attempts (the default: eager1, the
-        // hybrid's isolated resume, the AUFLIA/UF+LRA lanes) carry `false` and
-        // keep their byte-identical relevancy configuration below. The FUSED
-        // detour arm (`--uflia-fused-detour=1`, combined/mod.rs #fused-detour
-        // slot) sets the flag around this expansion so relevancy-hard rides
-        // the live TheoryExtension on the SHARED persistent solver
-        // (the development design notes §2 Inc5).
-        // Captured as a local so a re-entrant inner solve
-        // (`verify_post_split_unsat_via_fresh_solve` re-enters check-sat,
-        // whose UFLIA entry defensively resets the executor flags) can never
-        // flip this attempt's per-round relevancy configuration or its
-        // cross-arm UNSAT guard mid-attempt.
-        let _islp_eager_relevancy_hard: bool = $self.split_eager_relevancy_hard;
-
         // Per-theory statistics saved from the most recent theory instance (#6579).
         let mut _islp_last_theory_stats: Vec<(&'static str, u64)> = Vec::new();
         let mut _islp_string_lemma_clauses: Vec<Vec<TermId>> = Vec::new();
@@ -477,21 +462,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 // can never cause a wrong verdict. See
                 // the development design notes
                 //
-                // Inc5 #fused-detour seam (flag-respecting; mirrors the lazy
-                // arm's seam verbatim): `--sat-relevancy` still kills the
-                // brancher (env override wins); `--sat-relevancy|2` forces it
-                // on. With the fused flag unset this computes exactly the
-                // historical values (branching = env default-off, hard =
-                // false — eager solves never ran relevancy HARD, and the
-                // persistent solver may carry the hard flag from a prior
-                // lazy-arm fallback, so it is re-stamped every round either
-                // way). Relevancy-hard is inert without the branching enable
-                // (`relevancy_should_engage` checks `relevancy_branching`
-                // first), so the hard flag forces branching on.
-                let _islp_relevancy_on = SatSolver::relevancy_env_override()
-                    .unwrap_or(_islp_eager_relevancy_hard);
+                // Branching follows the env override (default off). Eager
+                // solves never run relevancy HARD; the persistent solver may
+                // carry the hard flag from a prior lazy-arm fallback, so it is
+                // re-stamped every round.
+                let _islp_relevancy_on = SatSolver::relevancy_env_override().unwrap_or(false);
                 solver.set_relevancy_branching(_islp_relevancy_on);
-                solver.set_relevancy_hard(_islp_relevancy_on && _islp_eager_relevancy_hard);
+                solver.set_relevancy_hard(false);
                 // #relevancy-lazy-routing: arm the wander-abort trip-wire for
                 // hybrid arm routing (UFLIA). Re-armed each round so the
                 // conflict/decision baselines snapshot the round start. A no-op
@@ -866,34 +843,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         // captured a pending split — the extension's check() already
                         // invoked theory.check() and the result is in pending_split.
                         // Running check() again would operate on modified state.
-                        //
-                        // Inc5 #fused-detour Q2 (brief open question 2:
-                        // frontier-empty exit × extension final check): under
-                        // relevancy-HARD the extension lane suppresses
-                        // `suggest_decision` (theory_backend.rs USE_CALLBACK
-                        // decide branch) and decisions route through
-                        // `pick_relevancy_frontier_decision`; an EMPTY CNF
-                        // frontier returns no decision, which lands in the
-                        // CDCL loop's complete-assignment branch and routes
-                        // through the extension's `check_model` →
-                        // `TheoryExtension::check` — the SAME full theory
-                        // final check as any complete-assignment SAT, over the
-                        // TRAIL-asserted atoms only. Don't-care atoms were
-                        // never asserted to the theory (a strictly weaker
-                        // obligation set), so there is no spurious-escalation
-                        // path: split-type results are parked in
-                        // `pending_split` with Sat returned (the normal
-                        // protocol, handled below), and this gate's
-                        // pending_split-aware skip behaves identically at a
-                        // frontier-empty accept. Completion-model source
-                        // (brief's confirm item): the SAT-level accept
-                        // completes don't-cares via `get_model` (vals;
-                        // unassigned ⇒ false) — `relevancy_completed_model`'s
-                        // phase completion is wired only into the lazy arm's
-                        // assumption path (finalize_sat.rs) — and a
-                        // false-completed don't-care theory atom is re-checked
-                        // by the unchanged model-validation gates: worst case
-                        // `unknown`, never wrong-sat.
                         if ay_core::TheorySolver::needs_final_check_after_sat(&theory)
                             && pending_split.is_none()
                         {
@@ -1427,24 +1376,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         // accepting UNSAT after splits via accept_unsat_after_splits.
                         // In those logics, the split clauses are tautological and
                         // cannot cause false-UNSAT.
-                        //
-                        // Inc5 #fused-detour Q4 (brief open question 4:
-                        // cross-arm stale-clause false-UNSAT vector): the fused
-                        // arm runs this macro on a SHARED persistent solver
-                        // PRE-LOADED by eager1 and the lazy detour. Their split
-                        // clauses are invisible to THIS expansion's fresh
-                        // `_islp_added_split_clauses` dedup set, so a
-                        // propositional UNSAT with an empty LOCAL set could
-                        // still lean on prior-arm split clauses. The fused arm
-                        // therefore ALWAYS routes UNSAT through the
-                        // verify-before-accept backstop below
-                        // (`verify_unsat_after_splits`: fresh isolated
-                        // re-derivation from the ORIGINAL assertions, accept
-                        // only on an explicit fresh Unsat — the stale-clause
-                        // backstop; do NOT weaken it). Non-fused attempts
-                        // (`_islp_eager_relevancy_hard == false`) keep the
-                        // exact historical guard — byte-identical flags-off.
-                        if !_islp_added_split_clauses.is_empty() || _islp_eager_relevancy_hard {
+                        if !_islp_added_split_clauses.is_empty() {
                             // #6846: tautological-split opt-in (unverified). Accepts
                             // the post-split UNSAT directly because the split clauses
                             // are integer tautologies (plain-LIA, #8727).

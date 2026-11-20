@@ -24,6 +24,8 @@ mod ordered;
 mod payload;
 pub(super) mod prepared;
 mod text;
+pub(crate) mod wire_sort;
+use wire_sort::Key;
 
 /// Caller refusal, never a semantic indeterminate or an identity value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -33,6 +35,11 @@ pub(crate) struct IdentityHashInterrupted;
 trait Progress {
     type Error;
     fn poll(&mut self) -> Result<(), Self::Error>;
+
+    fn sort<T>(&mut self, rows: &mut [T], key: impl Fn(&T) -> Key<'_>) -> Result<(), Self::Error> {
+        rows.sort_by(|a, b| key(a).cmp(&key(b)));
+        Ok(())
+    }
 
     fn datatype_spelling(&self) -> DatatypeSpelling {
         DatatypeSpelling::ReferenceV2

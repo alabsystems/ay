@@ -13,7 +13,7 @@ use super::*;
 use crate::proof_metadata::normalized_chc_input_sha256_with_progress;
 use crate::proof_metadata::{
     normalized_chc_input_identity_with_progress, ordered_chc_clause_sequence_sha256_with_progress,
-    IdentityHashInterrupted,
+    wire_sort::WireSort, IdentityHashInterrupted,
 };
 
 pub(super) struct AuthenticatedSource<'a> {
@@ -27,6 +27,59 @@ fn interrupted(_: IdentityHashInterrupted) -> ChcGroundDerivationArtifactError {
     interruption_error(GroundValidationInterrupted)
 }
 
+fn sort_error(err: ay_core::original_query::QueryError) -> ChcGroundDerivationArtifactError {
+    match err {
+        ay_core::original_query::QueryError::Interrupted(_) => {
+            interruption_error(GroundValidationInterrupted)
+        }
+        ay_core::original_query::QueryError::Invalid(detail) => error(
+            ChcGroundDerivationArtifactErrorReason::InvalidSourceProblem,
+            detail,
+        ),
+        ay_core::original_query::QueryError::Exhausted => error(
+            ChcGroundDerivationArtifactErrorReason::SourceWorkLimitExceeded,
+            "whole-problem canonical sort exceeds work bound",
+        ),
+    }
+}
+
+pub(super) fn normalized_source(
+    problem: &ChcProblem,
+    budget: &mut Option<usize>,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(&'static str, String), ChcGroundDerivationArtifactError> {
+    let mut poll = || control.poll().is_ok();
+    match budget {
+        Some(remaining) => WireSort {
+            remaining,
+            progress: &mut poll,
+        }
+        .normalized(problem)
+        .map_err(sort_error),
+        None => {
+            normalized_chc_input_identity_with_progress(problem, &mut poll).map_err(interrupted)
+        }
+    }
+}
+
+pub(super) fn ordered_source(
+    problem: &ChcProblem,
+    budget: &mut Option<usize>,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<String, ChcGroundDerivationArtifactError> {
+    let mut poll = || control.poll().is_ok();
+    match budget {
+        Some(remaining) => WireSort {
+            remaining,
+            progress: &mut poll,
+        }
+        .ordered(problem)
+        .map_err(sort_error),
+        None => ordered_chc_clause_sequence_sha256_with_progress(problem, &mut poll)
+            .map_err(interrupted),
+    }
+}
+
 impl<'a> AuthenticatedSource<'a> {
     pub(super) fn check(
         problem: &'a ChcProblem,
@@ -34,11 +87,11 @@ impl<'a> AuthenticatedSource<'a> {
         normalized_input_sha256: &str,
         source_clause_sequence_sha256: &str,
         artifact_label: &str,
+        mut budget: Option<usize>,
         control: &mut GroundValidationControl<'_>,
     ) -> Result<Self, ChcGroundDerivationArtifactError> {
         let (expected_schema, expected_problem_hash) =
-            normalized_chc_input_identity_with_progress(problem, &mut || control.poll().is_ok())
-                .map_err(interrupted)?;
+            normalized_source(problem, &mut budget, control)?;
         // Keep normalized-input mismatch ahead of both computation and checking
         // of the positional hash, including when the caller budget is expiring.
         if normalized_input_sha256 != expected_problem_hash {
@@ -60,11 +113,7 @@ impl<'a> AuthenticatedSource<'a> {
                 ),
             ));
         }
-        let expected_clause_hash =
-            ordered_chc_clause_sequence_sha256_with_progress(problem, &mut || {
-                control.poll().is_ok()
-            })
-            .map_err(interrupted)?;
+        let expected_clause_hash = ordered_source(problem, &mut budget, control)?;
         if source_clause_sequence_sha256 != expected_clause_hash {
             return Err(error(
                 ChcGroundDerivationArtifactErrorReason::ClauseSequenceHashMismatch,

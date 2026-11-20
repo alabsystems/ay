@@ -55,6 +55,25 @@ fn runtime_packages(plan: &plan::Plan) -> BTreeSet<&str> {
         .collect()
 }
 
+#[cfg(unix)]
+#[test]
+fn removed_inputs_keep_their_physical_owner_through_a_symlink() {
+    let (root, metadata) = fixture();
+    let alias = tempfile::tempdir().unwrap();
+    let checkout = alias.path().join("checkout");
+    std::os::unix::fs::symlink(root.path(), &checkout).unwrap();
+    let graph = Graph::read(&checkout, &metadata).unwrap();
+    for source in ["consumer/src/lib.rs", "imports/leaf/src/lib.rs"] {
+        let input = checkout.join(source);
+        let expected = graph.physical_owner(&input).unwrap().id.clone();
+        std::fs::remove_file(root.path().join(source)).unwrap();
+        assert_eq!(graph.physical_owner(&input).unwrap().id, expected);
+        // Removed subdirectories must not change ownership either.
+        std::fs::remove_dir(root.path().join(source).parent().unwrap()).unwrap();
+        assert_eq!(graph.physical_owner(&input).unwrap().id, expected);
+    }
+}
+
 #[test]
 fn independent_source_keeps_its_owner_edition_and_checks_the_real_importer() {
     let (root, metadata) = fixture();

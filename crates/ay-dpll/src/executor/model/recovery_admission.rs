@@ -222,7 +222,10 @@ pub(super) fn refuse_current() {
 
 pub(super) fn pay_model_value_copy(value: &ay_model_check::ModelValue) -> bool {
     if RecoveryAdmission::current().is_none() {
-        return true;
+        // Native copies retain their original evaluation owner and use the
+        // checker's typed copy accounting, including native and exact FP.
+        // The private datatype-rendering envelope remains private below.
+        return super::evaluation_copies::model_value(value);
     }
     let admitted = super::rendered_dt_limits::model_value_work(value)
         .is_some_and(|amount| pay_current(amount, amount));
@@ -540,6 +543,41 @@ fn fp_view(value: &ay_fp::FpModelValue) -> Option<FpView<'_>> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn model_value_copy_uses_original_evaluation_owner_without_recovery_scope() {
+        let mut exec = Executor::new();
+        exec.set_term_memory_limit(Some(exec.ctx.terms.true_memory_bytes() + 64 * 1024));
+        let _scope = super::super::evaluation_copies::EvaluationCopyScope::enter(&exec).unwrap();
+        assert!(RecoveryAdmission::current().is_none());
+        assert!(pay_model_value_copy(&ay_model_check::ModelValue::Bool(
+            false
+        )));
+        let fp = ay_model_check::ModelValue::FloatingPoint {
+            sign: false,
+            exponent: 0,
+            significand: 0,
+            exponent_bits: 5,
+            significand_bits: 11,
+        };
+        let exact = ay_model_check::ModelValue::floating_point_exact(
+            false,
+            num_bigint::BigUint::from(127u32),
+            num_bigint::BigUint::from(1u8) << 198usize,
+            8,
+            200,
+        )
+        .unwrap();
+        assert!(pay_model_value_copy(&ay_model_check::ModelValue::Seq(
+            vec![fp, exact,]
+        )));
+        let value = ay_model_check::ModelValue::Str("x".repeat(128 * 1024));
+        assert!(!pay_model_value_copy(&value));
+        assert!(
+            !pay_model_value_copy(&ay_model_check::ModelValue::Bool(true)),
+            "the same original owner's refusal remains sticky"
+        );
+    }
 
     #[test]
     fn borrowed_copy_pays_nested_fp_payload_and_shares_cumulative_refusal() {

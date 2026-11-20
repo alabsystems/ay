@@ -25,6 +25,99 @@ fn first_value(model: &Model) -> TermId {
         .expect("every package these tests install is constant")
 }
 
+fn many_interpretation_array(prefix: &str) -> (Executor, Model, TermId, TermId) {
+    let declarations = (0..14)
+        .map(|index| format!("(declare-const {prefix}{index:02} Int)"))
+        .collect::<String>();
+    let mut exec = executor(&format!(
+        "(declare-sort Unrelated 0) (declare-const unused Unrelated) {declarations}"
+    ));
+    let array = term(&mut exec, "a");
+    let read = term(&mut exec, "(select a #x0000000000000003)");
+    let seven = exec.ctx.terms.mk_bitvec(7.into(), 8);
+    let value = exec.ctx.terms.mk_const_array(Sort::bitvec(64), seven);
+    let mut witness = vec![(binding(&exec, "a"), constant(value))];
+    for index in 0..14 {
+        let value = exec.ctx.terms.mk_int(index.into());
+        witness.push((
+            binding(&exec, &format!("{prefix}{index:02}")),
+            constant(value),
+        ));
+    }
+    let mut model = Model::empty();
+    model
+        .install_certified_const_interps(&exec.ctx, witness)
+        .unwrap();
+    conflict(&mut model, array, read, 99);
+    (exec, model, array, read)
+}
+
+fn note_read_budget(exec: &Executor, model: &Model, label: &str) {
+    let mut checked = CertifiedArrayRead::new();
+    assert!(checked.prepare(exec, model));
+    let inventory: usize = exec
+        .ctx
+        .symbol_iter()
+        .map(|(surface, info)| {
+            surface.len() + exec.ctx.symbol_identity_name(surface, info).len() + 3
+        })
+        .sum();
+    eprintln!("certified array {label}: entries={} inventory_work={} once_auth_work={} remaining={} lookup_work={}",
+        model.certified_const_interp_entries().len(), inventory + 1,
+        MAX_READ_WORK - checked.remaining, checked.remaining, checked.lookup_work);
+}
+
+#[test]
+fn many_current_interpretations_share_one_checked_array_read() {
+    let (mut exec, mut model, array, read) = many_interpretation_array("c");
+    note_read_budget(&exec, &model, "short names");
+    assert_eq!(exec.evaluate_term(&model, read), bv(7));
+    assert_eq!(exec.term_value_string(&model, read).unwrap(), "#x07");
+    assert!(exec.evaluation_stop_origin().is_none());
+    {
+        let foreign = model.clone();
+        let mut checked = CertifiedArrayRead::new();
+        assert!(checked.prepare(&exec, &model));
+        assert!(checked.resolve(&exec, &foreign, array).is_err());
+    }
+
+    // Even an entry unrelated to this read belongs to the authenticated
+    // package. Replacing its retained slot must invalidate the next read.
+    let checkpoint = exec.ctx.terms.rollback_checkpoint();
+    let temporary = exec.ctx.terms.mk_int(12345.into());
+    let entry = &mut Arc::get_mut(&mut model.certified_const_interps.entries).unwrap()[1];
+    let CertifiedConstInterpBody::Constant { value, value_graph } = &mut entry.body else {
+        panic!("constant component");
+    };
+    *value = temporary;
+    value_graph.slots =
+        vec![(temporary, exec.ctx.terms.entry_stamp(temporary).unwrap())].into_boxed_slice();
+    assert!(model.certified_const_interps_are_current(&exec.ctx));
+    exec.ctx.terms.rollback_to(checkpoint);
+    assert_eq!(exec.ctx.terms.mk_int(54321.into()), temporary);
+    assert!(!model.certified_const_interps_are_current(&exec.ctx));
+    assert!(matches!(
+        exec.evaluate_term(&model, read),
+        EvalValue::Unknown
+    ));
+    assert!(exec.term_value_string(&model, read).is_err());
+}
+
+#[test]
+fn long_interpretation_names_retain_the_original_read_budget_refusal() {
+    let (exec, model, _, read) = many_interpretation_array("model_component_");
+    note_read_budget(&exec, &model, "long names");
+    assert!(matches!(
+        exec.evaluate_term(&model, read),
+        EvalValue::Unknown
+    ));
+    assert_eq!(
+        exec.evaluation_stop_origin(),
+        Some(UnknownOrigin::DeterministicResourceBudget)
+    );
+    assert!(exec.term_value_string(&model, read).is_err());
+}
+
 #[test]
 fn nonzero_owned_array_original_fresh_direct_and_public_reads_agree() {
     let mut exec = executor("");

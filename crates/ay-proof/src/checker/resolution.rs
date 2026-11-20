@@ -55,6 +55,16 @@ pub(crate) fn is_valid_binary_resolution(
     conclusion: &[TermId],
     pivot: Option<TermId>,
 ) -> bool {
+    // Short premises are cheaper to normalize directly in the sorted checker.
+    if clause1.len() >= 12 || clause2.len() >= 12 {
+        if let Some(pivot) = pivot {
+            if let Some(valid) =
+                parity::dense_pivot_resolution(terms, clause1, clause2, conclusion, pivot)
+            {
+                return valid;
+            }
+        }
+    }
     let clause1_set = clause_as_set(terms, clause1);
     let clause2_set = clause_as_set(terms, clause2);
     let conclusion_set = clause_as_set(terms, conclusion);

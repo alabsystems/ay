@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Concurrent pre-stage ladder (item #2 of
-//! the development design notes).
+//! the development design notes at `9598c4206`).
 //!
 //! [`AdaptivePortfolio::race_ladder`] runs the stages as concurrent members
 //! from t=0 next to the arm's foreground (the portfolio / BV dual lane / the

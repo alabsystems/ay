@@ -194,7 +194,7 @@ impl IndependentModelView<'_> {
         Some(protected)
     }
 
-    fn build_exact_datatype_cell_values(&self) -> ExactDatatypeCellValues {
+    pub(super) fn build_exact_datatype_cell_values(&self) -> ExactDatatypeCellValues {
         const MAX_GROUND: usize = 1_024;
         const MAX_WORK: usize = 4 * 1_024 * 1_024;
 

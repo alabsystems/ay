@@ -158,8 +158,14 @@ mod tests {
             "Cargo.toml",
             "[workspace]\nmembers=['crates/ay','crates/ay-ffi','dependency']\nresolver='2'\n",
         );
-        write("dependency/Cargo.toml", "[package]\nname='dependency'\nversion='0.1.0'\nedition='2021'\n[features]\ncli=[]\ntesting=[]\n");
+        write("dependency/Cargo.toml", "[package]\nname='dependency'\nversion='0.1.0'\nedition='2021'\n[features]\ncli=[]\ntesting=[]\ntool=[]\nother=[]\n[[bin]]\nname='selected-tool'\npath='src/bin/tool.rs'\nrequired-features=['tool']\n[[bin]]\nname='unrelated-tool'\npath='src/bin/unrelated.rs'\nrequired-features=['other']\n");
         write("dependency/src/lib.rs", "pub fn value()->u32 { 6 + u32::from(cfg!(feature=\"testing\")) + 16*u32::from(cfg!(feature=\"cli\")) }\n");
+        write("dependency/src/main.rs", "#[cfg(not(test))] fn main(){assert_eq!(dependency::value(),6); println!(\"default-production\");}\n#[cfg(test)] fn main(){}\n");
+        write("dependency/src/bin/tool.rs", "#[cfg(not(test))] fn main(){assert!(cfg!(feature=\"tool\")); println!(\"selected-production\");}\n#[cfg(test)] fn main(){}\n");
+        write(
+            "dependency/src/bin/unrelated.rs",
+            "compile_error!(\"unrelated optional tool must not be compiled\"); fn main(){}\n",
+        );
         write("crates/ay/Cargo.toml", "[package]\nname='ay'\nversion='0.1.0'\nedition='2021'\n[features]\ncli=['dependency/cli']\nbench=[]\n[dependencies]\ndependency={path='../../dependency'}\n");
         write(
             "crates/ay/src/main.rs",
@@ -197,6 +203,8 @@ mod tests {
             vec![
                 "crates/ay/src/main.rs".into(),
                 "crates/ay-ffi/tests/group_ffi.rs".into(),
+                "dependency/src/lib.rs".into(),
+                "dependency/src/bin/tool.rs".into(),
             ],
             None,
             &RustScope::default(),
@@ -206,15 +214,19 @@ mod tests {
         let mut prepare = None;
         let mut consume = None;
         for mut step in plan.steps {
-            let compiler = step.program == "build-slot";
-            let build = compiler && step.args.get(3).is_some_and(|a| a == "build");
+            let build = step
+                .compiler_payload()
+                .is_some_and(|args| args.first().is_some_and(|a| a == "build"));
             if !build && step.kind != StepKind::FfiArtifactTests {
                 continue;
             }
             // Native test is already admitted. Preserve the generated Targo
             // payload verbatim, without taking another machine-wide claim.
-            step.program = step.args[1].clone();
-            step.args.drain(..2);
+            let payload = step.compiler_payload().unwrap().to_vec();
+            step.program = "targo".into();
+            step.args = std::iter::once("--unverified".into())
+                .chain(payload)
+                .collect();
             // The inherited target belongs to the containing owner. In
             // particular, this fixture also builds a binary named `ay` and
             // must never replace that owner's real CLI.
@@ -241,6 +253,27 @@ mod tests {
         let library = runner.ffi_artifact.as_ref().unwrap();
         assert!(library.path.starts_with(root.join("isolated-target")));
         assert!(root.join("isolated-target/debug/ay").is_file());
+        for (name, expected) in [
+            ("dependency", "default-production"),
+            ("selected-tool", "selected-production"),
+        ] {
+            let output = ay_sys::metadata_capture::capture(
+                Command::new(root.join("isolated-target/debug").join(name)),
+                ay_sys::metadata_capture::CaptureLimits {
+                    timeout: std::time::Duration::from_secs(5),
+                    output_bytes: 4096,
+                    resident_bytes: Some(256 << 20),
+                },
+                "native land production companion",
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
         let before = std::fs::metadata(&library.path)
             .unwrap()
             .modified()

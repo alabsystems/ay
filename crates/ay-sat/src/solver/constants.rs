@@ -1330,7 +1330,7 @@ pub(super) const SBVA_MAX_INTERVAL: u64 = 100_000;
 /// sample: QuasiGroup-4-12_c18 answers in 64.2-64.6 s against the tip's one
 /// answer in three at 297.05 s, and at 1500 s in 124.63 s against 654.00 s —
 /// a 5.2x speed-up, with nothing lost on either sample
-/// (competition/proof-posture-parity/l8-sbva-cap-verdict.tsv). A value above
+/// (competition/proof-posture-parity/l8-sbva-cap-verdict.tsv at 9598c4206). A value above
 /// any real density opts out.
 pub(in crate::solver) const SBVA_DEFAULT_MAX_DENSITY: f64 = 12.0;
 

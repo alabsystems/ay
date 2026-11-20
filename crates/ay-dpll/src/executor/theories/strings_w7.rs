@@ -259,6 +259,26 @@ const MAX_W7_WORD_CANDIDATES: usize = 12;
 /// Derivative-BFS depth for the distinct-witness enumerator.
 const MAX_W7_WITNESS_DEPTH: usize = 16;
 
+/// Longest word the distinct-witness enumerator builds for a variable whose
+/// asserted length window starts past [`MAX_W7_WORD_LEN`].
+const MAX_W7_WINDOW_WORD_LEN: usize = 512;
+
+/// The lengths the distinct-witness enumerator probes for a variable with
+/// length window `window` (inclusive; `usize::MAX` = no upper bound):
+/// `MAX_W7_WORD_LEN + 1` lengths from the bottom of the window, or
+/// `0..=MAX_W7_WORD_LEN` without one. A window past
+/// [`MAX_W7_WINDOW_WORD_LEN`] or an empty window probes nothing.
+fn w7_word_lengths(window: Option<(usize, usize)>) -> Vec<usize> {
+    let (lo, hi) = window.unwrap_or((0, usize::MAX));
+    if lo > hi || lo > MAX_W7_WINDOW_WORD_LEN {
+        return Vec::new();
+    }
+    let hi = hi
+        .min(lo.saturating_add(MAX_W7_WORD_LEN))
+        .min(MAX_W7_WINDOW_WORD_LEN);
+    (lo..=hi).collect()
+}
+
 impl Executor {
     // ─────────────────────────── the W7 pre-pass ──────────────────────────
 
@@ -1614,6 +1634,10 @@ impl Executor {
         if memberships.is_empty() {
             return Ok(None);
         }
+        // #w7-length-window (AY-SMT-6): probe the lengths the formula allows.
+        // A fixed 0..=12 missed every word of an asserted length past 12
+        // (`len x2 = 14`, `len x1 = len x2`: `unknown` while 4 was `sat`).
+        let windows = self.regex_var_length_bounds();
         let mut pools: Vec<(TermId, Vec<String>)> = Vec::new();
         for &var in vars {
             let regexes: Vec<WeRegex> = memberships
@@ -1625,11 +1649,11 @@ impl Executor {
                 continue;
             }
             let mut pool: Vec<String> = Vec::new();
-            for len in 0..=MAX_W7_WORD_LEN {
+            for len in w7_word_lengths(windows.get(&var).copied()) {
                 for w in find_witnesses_bounded(
                     &regexes,
                     Some(len),
-                    MAX_W7_WITNESS_DEPTH,
+                    MAX_W7_WITNESS_DEPTH.max(len),
                     MAX_W7_WORDS_PER_LEN,
                 ) {
                     if !pool.contains(&w) {

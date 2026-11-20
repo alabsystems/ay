@@ -105,7 +105,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         propagation: TheoryPropagation,
         round: &PropagationRound<'_>,
     ) -> PropagationDisposition {
-        if self.propagation_is_unmapped(&propagation, round.ctx) {
+        if self.propagation_is_unmapped(&propagation) {
             return PropagationDisposition::Skip;
         }
         log_propagation_debug(&propagation, "eager");
@@ -123,12 +123,9 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         if !self.propagation_is_semantically_valid(&propagation) {
             return PropagationDisposition::Skip;
         }
-        let Some(literal) = self.term_to_literal_minting(
-            propagation.literal.term,
-            propagation.literal.value,
-            round.ctx,
-            super::super::check::mint_theory_vars_enabled(),
-        ) else {
+        let Some(literal) =
+            self.term_to_literal(propagation.literal.term, propagation.literal.value)
+        else {
             return PropagationDisposition::Skip;
         };
         if let Some(value) = round.ctx.value(literal.variable()) {
@@ -152,21 +149,8 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         }
     }
 
-    fn propagation_is_unmapped(
-        &mut self,
-        propagation: &TheoryPropagation,
-        ctx: &dyn SolverContext,
-    ) -> bool {
+    fn propagation_is_unmapped(&mut self, propagation: &TheoryPropagation) -> bool {
         if self.var_for_term(propagation.literal.term).is_some() {
-            return false;
-        }
-        // #6846 BCP parity: with minting enabled, name the propagated
-        // term instead of skipping the propagation outright.
-        if super::super::check::mint_theory_vars_enabled()
-            && self
-                .mint_var_for_term(propagation.literal.term, ctx)
-                .is_some()
-        {
             return false;
         }
         self.eager_stats.props_unmapped += 1;
@@ -188,17 +172,10 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         literal: Literal,
         round: &PropagationRound<'_>,
     ) -> PropagationDisposition {
-        let mint_enabled = super::super::check::mint_theory_vars_enabled();
-        let mut minted_any = false;
         let mut conflict: Vec<Literal> = Vec::with_capacity(propagation.reason.len());
         for reason in &propagation.reason {
-            let was_mapped = self.var_for_term(reason.term).is_some();
-            match self.term_to_literal_minting(reason.term, !reason.value, round.ctx, mint_enabled)
-            {
-                Some(lit) => {
-                    minted_any |= !was_mapped;
-                    conflict.push(lit);
-                }
+            match self.term_to_literal(reason.term, !reason.value) {
+                Some(lit) => conflict.push(lit),
                 None => break,
             }
         }
@@ -208,12 +185,6 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             return PropagationDisposition::Skip;
         }
         if !reasons_are_falsified(&conflict, round) {
-            if minted_any {
-                // Completed only by minting: the clause is a valid
-                // propagation lemma, not a falsified conflict.
-                conflict.push(literal);
-                return PropagationDisposition::Lemma(conflict);
-            }
             tracing::warn!(
                 propagated = ?literal,
                 reason_count = conflict.len(),
@@ -250,10 +221,12 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     ) -> ClauseDisposition {
         let mut clause = Vec::with_capacity(propagation.reason.len() + 1);
         clause.push(literal);
-        let mint_enabled = super::super::check::mint_theory_vars_enabled();
-        clause.extend(propagation.reason.iter().filter_map(|reason| {
-            self.term_to_literal_minting(reason.term, !reason.value, round.ctx, mint_enabled)
-        }));
+        clause.extend(
+            propagation
+                .reason
+                .iter()
+                .filter_map(|reason| self.term_to_literal(reason.term, !reason.value)),
+        );
         if clause.len() - 1 < propagation.reason.len() {
             self.bump_partial_clause_count();
             return ClauseDisposition::Skip;

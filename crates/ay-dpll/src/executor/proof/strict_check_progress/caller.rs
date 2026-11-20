@@ -95,6 +95,6 @@ fn run_with_meter(
     (outcome, meter.work())
 }
 
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 #[path = "caller/tests.rs"]
 mod tests;

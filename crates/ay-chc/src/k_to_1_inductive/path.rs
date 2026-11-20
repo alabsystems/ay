@@ -5,7 +5,7 @@
 //! One-proof k-inductive → 1-inductive conversion by path interpolation.
 //!
 //! CHC-COMP 2026 Workstream D, Rung 1 (the development design notes
-//! DESIGN_lra_interp_tpa.md` §4.1, contract **C-P1**). **Owner: WP-D1-P.**
+//! DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1, contract **C-P1**). **Owner: WP-D1-P.**
 //! Rung 1 calls it only from IMC; `convert_with_timeout` is unchanged.
 
 use crate::interpolant_validation::is_unsat_result;

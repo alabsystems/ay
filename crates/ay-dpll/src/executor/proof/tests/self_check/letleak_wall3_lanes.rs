@@ -18,7 +18,6 @@
 /// The refutation the funnel publishes is the checked SAT-refutation sidecar,
 /// whose exact-fragment bridge closes the substituted instance with a
 /// strictly-validated `ground_equality_substitution` lemma.
-#[cfg(feature = "proof-checker")]
 const LETLEAK_WALL3_DRIVER_QUERY: &str = r#"
 (set-option :produce-unsat-cores true)
 (set-logic ALL)
@@ -53,7 +52,6 @@ const LETLEAK_WALL3_DRIVER_QUERY: &str = r#"
 /// AY elaborates to the same term. `--self-check` claims an external-style
 /// check, and pinned Carcara defines only `ubv_to_int`, so the verbatim
 /// spelling is withheld (`self_check_withholds_letleak_unsat_carcara_cannot_parse`).
-#[cfg(feature = "proof-checker")]
 fn letleak_wall3_query_in_carcara_spelling() -> String {
     LETLEAK_WALL3_DRIVER_QUERY.replace("(bv2nat ", "(ubv_to_int ")
 }
@@ -61,7 +59,6 @@ fn letleak_wall3_query_in_carcara_spelling() -> String {
 /// Self-check accepts the checked refutation for the exact original query.
 /// This is the CLI's collection-only wiring: `set_self_check` followed by
 /// `set_mandatory_proof_collection`.
-#[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn self_check_publishes_letleak_unsat_on_checked_sat_refutation_authority() {
@@ -86,7 +83,6 @@ fn self_check_publishes_letleak_unsat_on_checked_sat_refutation_authority() {
 /// is no substitute here: the printer spells the elaborated conversion
 /// `bv2nat`, so the `and_pos` conjunct no longer matches its authored source
 /// and the export is refused (measured; the proof-side vocabulary follow-up).
-#[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn explicit_proof_demand_exports_complete_letleak_unsat() {
@@ -117,7 +113,6 @@ fn explicit_proof_demand_exports_complete_letleak_unsat() {
 /// explicit artifact demand (the combination the explicit-demand test used
 /// before). Before the certificate surface read the authored problem it was
 /// disclosed `supported` and published.
-#[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn self_check_withholds_letleak_unsat_carcara_cannot_parse() {
@@ -148,7 +143,6 @@ fn self_check_withholds_letleak_unsat_carcara_cannot_parse() {
 /// leg: the rescue solve binds `roots = base ++ A` with an empty assumption
 /// vector while the outer command's `last_assumptions` still names `A`, and
 /// the exact tail match admits precisely that shape.
-#[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn default_lane_publishes_letleak_unsat_via_folded_assumption_certificate() {

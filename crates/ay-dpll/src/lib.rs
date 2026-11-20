@@ -107,15 +107,14 @@ pub mod bv_proof_check;
 
 /// Compile-time feature flag constants for downstream crate introspection.
 pub mod feature_flags {
-    /// Internal Alethe proof checker enabled. Always true: the former
-    /// `proof-checker` feature flag was removed 2026-07-14 — the checker
-    /// is the production soundness bar and is compiled unconditionally.
-    /// The constant is retained so `ay --features` keeps reporting it.
+    /// Internal Alethe proof checker enabled. Always true: the checker is the
+    /// production soundness bar and is compiled unconditionally (the former
+    /// `proof-checker` Cargo feature is gone). The constant is retained so
+    /// `ay --features` keeps reporting it.
     pub const PROOF_CHECKER: bool = true;
 }
 
 mod assume_step_result;
-pub(crate) mod bound_refinement;
 pub(crate) mod cegqi;
 mod clause_application;
 mod combined_solvers;

@@ -213,7 +213,7 @@ impl PdrSolver {
                         });
                     }
                 }
-                // Workstream D ladder fix (DESIGN_lra_interp_tpa.md §4.1): a
+                // Workstream D ladder fix (the development design notes at 9598c4206, §4.1): a
                 // lemma for a predicate defined by clauses c1..cn needs
                 // `A_ci ⊨ L` for EVERY clause, so with two or more UNSAT
                 // clauses stage 1 interpolates each clause separately and

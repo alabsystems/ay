@@ -63,20 +63,26 @@ impl LraSolver {
                         continue;
                     }
                     self.big_bound_seen |= Self::var_has_big_direct_bound(&self.vars[i]);
-                    let changed = Self::overlay_direct_bound_for_var(
+                    let (lower_changed, upper_changed) = Self::overlay_direct_bound_for_var(
                         &self.vars[i],
                         &mut self.implied_bounds[i],
                     );
                     self.register_fixed_term_var(var);
-                    // Stamp variable so rows containing it are re-analyzed —
-                    // only when the overlay actually changed the slot, as
-                    // the full-scan path below already does. Row arithmetic
-                    // reads only slot values/strictness, so stamping an
-                    // unchanged slot (a direct bound weaker than the stored
-                    // derived bound) only re-analyzes its rows to identical
-                    // results, defeating the generation skip.
-                    if changed && i < self.var_bound_gen.len() {
-                        self.var_bound_gen[i] = cur_gen;
+                    // Stamp each changed side so row directions reading it
+                    // are re-analyzed — only when the overlay actually
+                    // changed that slot, as the full-scan path below
+                    // already does. Row arithmetic reads only slot
+                    // values/strictness, so stamping an unchanged slot (a
+                    // direct bound weaker than the stored derived bound)
+                    // only re-analyzes its rows to identical results,
+                    // defeating the generation skip.
+                    if i < self.var_bound_gen.len() {
+                        if lower_changed {
+                            self.var_bound_gen[i].0 = cur_gen;
+                        }
+                        if upper_changed {
+                            self.var_bound_gen[i].1 = cur_gen;
+                        }
                     }
                     // #8857: A direct-bound change legitimately enables a new
                     // round of derived tightenings for this variable.
@@ -114,11 +120,16 @@ impl LraSolver {
                     // The skip compares only stamps, and row arithmetic
                     // reads only slot values/strictness, so an unchanged
                     // slot needs no new generation.
-                    let changed =
+                    let (lower_changed, upper_changed) =
                         Self::overlay_direct_bound_for_var(info, &mut self.implied_bounds[i]);
                     fixed_vars.push(i as u32);
-                    if changed && i < self.var_bound_gen.len() {
-                        self.var_bound_gen[i] = cur_gen;
+                    if i < self.var_bound_gen.len() {
+                        if lower_changed {
+                            self.var_bound_gen[i].0 = cur_gen;
+                        }
+                        if upper_changed {
+                            self.var_bound_gen[i].1 = cur_gen;
+                        }
                     }
                 }
                 self.big_bound_seen |= any_big;
@@ -208,7 +219,7 @@ impl LraSolver {
     #[inline]
     pub(crate) fn mark_row_content_changed(&mut self, row_idx: usize) {
         if let Some(stamp) = self.row_computed_gen.get_mut(row_idx) {
-            *stamp = 0;
+            *stamp = (0, 0);
         }
     }
 
@@ -222,7 +233,8 @@ impl LraSolver {
         // A u64 bumped once per call cannot reach `u64::MAX`.
         self.bound_generation = self.bound_generation.saturating_add(1);
         if vi < self.var_bound_gen.len() {
-            self.var_bound_gen[vi] = self.bound_generation;
+            // This site cannot name the side that changed: stamp both.
+            self.var_bound_gen[vi] = (self.bound_generation, self.bound_generation);
         }
         if vi < self.implied_tighten_streak.len() {
             self.implied_tighten_streak[vi] = 0;

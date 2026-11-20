@@ -924,15 +924,8 @@ impl Executor {
         // never reached the raw-diseq QF_AX contradiction (unknown → unsat).
         // On truncation (`false`) the legacy path stays on unchanged.
         let witness_guided_rows = self.add_witness_guided_chain_row_axioms();
-        let has_storeinv_witness = !witness_guided_rows
-            && (self.has_storeinv_extensionality_witness()
-            // #qf-ax-negated-swap: the swap/storeinv `_np_nf_` shape — one
-            // top-level negated equality between two deep store chains, no
-            // explicit select witness — needs the same eager-ROW2b rescue so
-            // the fabricated `__ay_ext_diff` select unrolls down both chains.
-            // Without it the lazy ArraySolver misses upward select propagation
-            // and certifies a witness-less disequality: false SAT.
-            || self.has_negated_deep_store_chain_array_equality());
+        let has_storeinv_witness =
+            !witness_guided_rows && self.has_storeinv_extensionality_witness();
         let eager_row2b = plan.eager_row2b || has_storeinv_witness;
         // Budget is per-inner-fixpoint; the outer loop can refresh it up to
         // 20 times. 256 is enough to unroll 9-level storeinv chains while

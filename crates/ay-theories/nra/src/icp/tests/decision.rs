@@ -152,6 +152,7 @@ fn icp_algebraic_certificate_refuses_unparsed_atoms() {
         constraints,
         vars,
         coverage: ParseCoverage::Complete,
+        relaxed: false,
     };
     let result = solver.branch_and_prune(
         &problem,

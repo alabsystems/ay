@@ -176,14 +176,14 @@ impl Executor {
             .prune_to_active_assertions(&self.ctx.terms, &self.ctx.assertions);
         self.finite_array_expansion.begin_external_query();
         // `ay_lia`'s probe trajectory state (the #probe-subset-cache hint and
-        // the #probe-prefix-bisect fail streak and total) is per THREAD, and a
+        // the exhausted-scan fail streak and total) is per THREAD, and a
         // thread serves query after query in an API session: re-arm it here so
         // a query starts from the same state however many solves ran before it.
         // A nested internal executor that runs a `CheckSat` command crosses
         // this boundary too and starts clean as well; its enclosing solve then
         // resumes from whatever state the nested solve left, as it did before
-        // this reset. Only the UFLIA detour (which resets at its own entry) and
-        // the opt-in `--probe-prescreen` read the state.
+        // this reset. Only the UFLIA detour (which resets at its own entry)
+        // reads the hint.
         ay_lia::reset_probe_subset_hint();
         self.begin_public_solve(preserve_pareto_enumeration);
     }

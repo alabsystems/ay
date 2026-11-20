@@ -13,8 +13,12 @@ workspace = true
 [dependencies]
 ay-arrays.workspace = true
 ay-core.workspace = true
+ay-drat-check.workspace = true
+ay-jit.workspace = true
+ay-proof-common.workspace = true
 ay-sys.workspace = true
 num-bigint.workspace = true
+num-traits.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 stacker.workspace = true

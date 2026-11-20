@@ -31,7 +31,7 @@ const SUPPORTED_DIMENSIONS: [&str; 10] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SnapshotKind {
+pub(super) enum SnapshotKind {
     Language,
     Registry,
 }
@@ -69,7 +69,7 @@ impl SnapshotKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceSnapshot {
+pub(super) struct SourceSnapshot {
     schema: String,
     profile_id: String,
     source: SnapshotSource,
@@ -1447,7 +1447,7 @@ fn required_snapshot_kind(dimension_id: &str) -> Option<SnapshotKind> {
     }
 }
 
-fn create_snapshot(
+pub(super) fn create_snapshot(
     kind: SnapshotKind,
     checkout: &Path,
     profile: &Profile,

@@ -1126,7 +1126,7 @@ fn test_nested_array_alia_false_unsat_is_quarantined() {
 
 /// #nested-array-quarantine-quantified — the boundary the 2026-09-06 z3-parity
 /// ledger proposed to move (the development design notes
-/// 2026-09-06-diagnoses-r2-quantified.md`, rank 3 / next-action 3), pinned
+/// 2026-09-06-diagnoses-r2-quantified.md` at `9598c4206`, rank 3 / next-action 3), pinned
 /// where the evidence actually leaves it.
 ///
 /// The input is the unit-split form of the Ultimate Automizer row

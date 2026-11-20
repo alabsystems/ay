@@ -19,8 +19,6 @@ impl LraSolver {
     #[must_use]
     pub fn new(terms: &TermStore) -> Self {
         Self {
-            deferred_eq_atoms: Vec::new(),
-            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
             terms_ptr: std::ptr::from_ref(terms),
             rows: Vec::new(),
             vars: Vec::new(),
@@ -66,7 +64,6 @@ impl LraSolver {
             decision_index: DecisionCandidateIndex::default(),
             atom_index: HashMap::default(),
             pending_propagations: Vec::new(),
-            pending_bound_refinements: Vec::new(),
             propagated_atoms: HashSet::default(),
             combined_theory_mode: false,
             opaque_applications: false,
@@ -174,8 +171,6 @@ impl LraSolver {
             reason_seen_buf: HashSet::default(),
             not_inner_cache: HashMap::default(),
             const_bool_cache: HashMap::default(),
-            refinement_eligible_cache: HashMap::default(),
-            is_integer_sort_cache: HashMap::default(),
             bcp_implied_dry_streak: 0,
             bcp_cascade_dry_streak: 0,
             max_row_width: 0,
@@ -251,8 +246,6 @@ impl LraSolver {
         propagation_dirty_vars.extend(snap.atom_index.keys().copied());
         propagation_dirty_vars.extend(snap.compound_use_index.keys().copied());
         let mut solver = Self {
-            deferred_eq_atoms: Vec::new(),
-            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
             terms_ptr: std::ptr::from_ref(terms),
             // Structural fields from snapshot (moved, not cloned):
             rows: snap.rows,
@@ -285,8 +278,6 @@ impl LraSolver {
             unassigned_atom_count: snap.unassigned_atom_count,
             not_inner_cache: snap.not_inner_cache,
             const_bool_cache: snap.const_bool_cache,
-            refinement_eligible_cache: snap.refinement_eligible_cache,
-            is_integer_sort_cache: snap.is_integer_sort_cache,
             // Assertion-derived fields start clean:
             trail: Vec::new(),
             bound_revision: 0,
@@ -316,7 +307,6 @@ impl LraSolver {
             debug_intern: lra_debug_flags().debug_intern,
             stats: stats::LraStats::default(),
             pending_propagations: Vec::new(),
-            pending_bound_refinements: Vec::new(),
             propagated_atoms: HashSet::default(),
             combined_theory_mode: false,
             opaque_applications: false,
@@ -358,7 +348,7 @@ impl LraSolver {
             bcp_implied_single_pass: false,
             direct_bounds_changed_vars: Vec::new(),
             bound_generation: 0,
-            var_bound_gen: vec![0; var_count],
+            var_bound_gen: vec![(0, 0); var_count],
             row_computed_gen: Vec::new(),
             implied_tighten_streak: Vec::new(),
             implied_tighten_scratch: Vec::new(),
@@ -585,7 +575,6 @@ impl LraSolver {
         self.cross_theory_asserted_scopes.clear();
         self.pending_equalities.clear();
         self.pending_propagations.clear();
-        self.pending_bound_refinements.clear();
         self.propagated_atoms.clear();
         // #inc-prop-trail: set nuked wholesale — drop the undo trail with it.
         self.propagated_trail.clear();

@@ -421,14 +421,18 @@ pub enum TheoryLemmaKind {
 
     /// Ground sequence identity through one shared symbolic anchor: the clause
     /// is exactly `(cl (not (= x S1)) (= x S2))` (either equality orientation,
-    /// either literal order) where `S1` and `S2` are GROUND sequence terms —
-    /// built only from `seq.empty`, `seq.unit` over constant elements, and
-    /// `seq.++` — whose concat-flattened, empty-dropped normal forms are
-    /// ELEMENTWISE IDENTICAL. `x = S1 ⊢ x = S2` is then the substitution
-    /// instance of the ground identity `S1 = S2`, so the clause is a sequence
-    /// tautology. Validated by `ay-proof` with an independent normalizer
-    /// (fail-closed on any non-ground leaf or unsupported operator), never by
-    /// the solver's own seq engine. Motivated by the seq-direct refutation
+    /// either literal order), or a unit equality `S1 = S2`. Sequence words
+    /// normalize by concatenation associativity and empty identity. Exact unit
+    /// elements and opaque sequence chunks retain their identity, order and
+    /// multiplicity; no commutation or new element equality is inferred.
+    /// `x = S1 ⊢ x = S2` is a substitution instance of the word identity.
+    /// Unit clauses also admit exact additive sequence-length identities,
+    /// nonnegativity, singleton-membership recursion/empty exclusion, and
+    /// conjunctions whose every member is independently validated. Arbitrary
+    /// subsequence needles and unsupported arithmetic are refused.
+    /// Validated by `ay-proof` with an independently bounded, typed normalizer,
+    /// never by the solver's own seq engine. Malformed operators/sorts and
+    /// exhausted normalization work are refused. Motivated by the seq-direct refutation
     /// lane closing `a = seq.unit(1) ∧ a ≠ seq.++(seq.empty, seq.unit(1))`
     /// on a bare trust step, which mandatory certification then demoted to
     /// `unknown` (deductive-checks's calc_basic Seq equality red, 2026-08-19).

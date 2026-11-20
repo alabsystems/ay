@@ -108,6 +108,19 @@ USAGE:
       validator and repeated full-corpus performance measurements. --plan shows
       all work without running it. Missing coverage fails closed.
 
+  ay-z3-parity abi-gaps FILE [--function Z3_NAME] [--against FILE] [--json]
+      Inspect missing declarations, exports and finite linked behavior in a
+      recorded current ABI report. Compare reports measured under the same
+      reference, registry, compiler and resource limits with --against.
+
+  ay-z3-parity qualify-status DIR [--stage ID | --gaps] [--json]
+      Inspect recorded stage outcomes and refusals without running validators.
+      --gaps omits recorded passes. Missing required evidence fails inspection.
+
+  ay-z3-parity official-corpus-gaps --checkpoint RECORDS.jsonl
+      --corpus-manifest CORPUS.json [--worklist NEW_JSONL]
+      Inspect a stable prefix of a producer-bound v2 official corpus checkpoint.
+
   ay-z3-parity smtlib-conformance <command> ...
       Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.3.3 conformance
       contract. The contract has closed dimensions for grammar, commands,

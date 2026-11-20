@@ -3050,81 +3050,11 @@ fn dispatch_table_skips_non_theory_atoms() {
     );
 }
 
-/// #6846: mid-search minting must name an unencoded term with a variable that
-/// cannot collide with the solver's existing variable space, must be stable
-/// across repeated lookups, and must refuse when it cannot know where that
-/// space ends.
+/// A BCP theory conflict naming a term with no SAT variable fails closed: no
+/// clause, partial count bumped, for both plain and Farkas origins. A fully
+/// mapped conflict whose causes are all assigned true is a falsified conflict.
 #[test]
-fn mint_var_for_term_allocates_above_solver_var_space_and_is_stable() {
-    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, y, _z]) =
-        create_test_setup();
-    let mut theory = MockTheory::new();
-    let mut ext = TheoryExtension::new(
-        &mut theory,
-        &var_to_term,
-        &term_to_var,
-        &theory_atoms,
-        &theory_atom_set,
-        Some(&terms),
-        None,
-    );
-
-    // An unencoded term: pick a TermId that the pre-solve encoding never mapped.
-    let unencoded = TermId(9_999);
-    assert!(
-        ext.var_for_term(unencoded).is_none(),
-        "precondition: the term must start unnamed"
-    );
-
-    // num_vars == 0 means "unknown"; minting must REFUSE rather than guess an id,
-    // because guessing would alias a fresh term onto a live variable.
-    let blind = MockContext::new();
-    assert!(
-        ext.mint_var_for_term(unencoded, &blind).is_none(),
-        "must refuse to mint when the solver's variable-space size is unknown"
-    );
-    assert!(ext.var_for_term(unencoded).is_none());
-
-    // With a known variable space, the minted id must sit ABOVE it.
-    let mut ctx = MockContext::new();
-    ctx.num_vars = 40;
-    let first = ext
-        .mint_var_for_term(unencoded, &ctx)
-        .expect("minting should succeed once num_vars is known");
-    assert!(
-        first.id() >= 40,
-        "minted id {} must not alias an existing solver variable (num_vars=40)",
-        first.id()
-    );
-
-    // Stability: a term must map to exactly ONE variable for the whole solve,
-    // or two clauses could name the same atom differently.
-    assert_eq!(ext.var_for_term(unencoded), Some(first));
-    assert_eq!(ext.mint_var_for_term(unencoded, &ctx), Some(first));
-
-    // A second distinct term gets a distinct id, still above the space.
-    let second_term = TermId(9_998);
-    let second = ext
-        .mint_var_for_term(second_term, &ctx)
-        .expect("second mint should succeed");
-    assert_ne!(first, second, "distinct terms must not share a variable");
-    assert!(second.id() >= 40);
-
-    // Pre-existing encodings still win: an already-encoded term is never renamed.
-    let x_var = ext.var_for_term(x).expect("x is encoded by the test setup");
-    assert_eq!(ext.mint_var_for_term(x, &ctx), Some(x_var));
-    assert!(ext.var_for_term(y).is_some());
-}
-
-/// #6846 BCP parity: a BCP theory conflict naming an unencoded term
-/// must, with minting enabled, be completed by minting that term and
-/// delivered as a LEMMA clause (the minted variable is unassigned, so
-/// the clause is not falsified and cannot drive conflict analysis) —
-/// not truncated (partial-clause count must not move). With minting
-/// disabled the historical fail-closed behavior stands: no clause,
-/// partial count bumped. Farkas-origin conflicts never mint.
-#[test]
-fn bcp_conflict_with_unmapped_term_mints_to_lemma() {
+fn bcp_conflict_with_unmapped_term_fails_closed() {
     use super::propagate::conflict::{ConflictOrigin, MappedConflict};
     use ay_core::TheoryLit;
 
@@ -3141,65 +3071,36 @@ fn bcp_conflict_with_unmapped_term_mints_to_lemma() {
         None,
     );
     let unencoded = TermId(9_999);
-    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(unencoded, true)];
-    let mut ctx =
+    let ctx =
         MockContext::new().with_trail(vec![Literal::positive(Variable::new(term_to_var[&x]))]);
-    ctx.num_vars = 40;
 
-    // Minting disabled: fail closed exactly as before.
-    let partials_before = ext.partial_clause_count;
-    assert!(
-        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, false)
-            .is_none(),
-        "minting disabled must keep the partial-clause refusal"
-    );
-    assert_eq!(ext.partial_clause_count, partials_before + 1);
+    for origin in [ConflictOrigin::Plain, ConflictOrigin::Farkas] {
+        let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(unencoded, true)];
+        let partials_before = ext.partial_clause_count;
+        assert!(
+            ext.map_conflict_clause(&conflict, origin, &ctx).is_none(),
+            "an unencoded term must keep the partial-clause refusal"
+        );
+        assert_eq!(ext.partial_clause_count, partials_before + 1);
+    }
 
-    // Minting enabled: complete clause delivered as a lemma, no
-    // partial counted, minted literal negated above the var space.
-    let partials_before = ext.partial_clause_count;
-    let Some(MappedConflict::Lemma(clause)) =
-        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
-    else {
-        panic!("minting must complete the clause as a lemma");
-    };
-    assert_eq!(clause.len(), 2);
-    assert_eq!(ext.partial_clause_count, partials_before);
-    let minted_lit = clause[1];
-    assert!(minted_lit.variable().id() >= 40);
-    assert!(!minted_lit.is_positive(), "conflict literals negate");
-
-    // Mapped causes actually assigned true stay on the falsified/conflict path.
     let mapped_conflict = vec![TheoryLit::new(x, true)];
     assert!(matches!(
-        ext.map_conflict_clause_minting(&mapped_conflict, ConflictOrigin::Plain, &ctx, true),
+        ext.map_conflict_clause(&mapped_conflict, ConflictOrigin::Plain, &ctx),
         Some(MappedConflict::Falsified(_))
     ));
-
-    // Farkas origin never mints (coefficient alignment/proof path
-    // unchanged): still refuses partials. A FRESH unencoded term is
-    // required here — the Plain call above permanently mapped the
-    // first one, after which any origin maps it directly.
-    let farkas_conflict = vec![TheoryLit::new(x, true), TheoryLit::new(TermId(9_997), true)];
-    let partials_before = ext.partial_clause_count;
-    assert!(
-        ext.map_conflict_clause_minting(&farkas_conflict, ConflictOrigin::Farkas, &ctx, true)
-            .is_none(),
-        "Farkas conflicts must not mint"
-    );
-    assert_eq!(ext.partial_clause_count, partials_before + 1);
 }
 
-/// Mapped variables can remain unassigned after minting or backtracking.
-/// Only the current SAT assignment can classify a complete clause as a conflict.
+/// Mapped variables can remain unassigned after backtracking. Only the current
+/// SAT assignment can classify a complete clause as a conflict.
 #[test]
-fn repeated_minted_conflict_is_a_lemma_until_falsified() {
+fn complete_conflict_mapping_is_a_lemma_until_falsified() {
     use super::propagate::conflict::{ConflictOrigin, MappedConflict};
 
-    let (mut terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, _y, _z]) =
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, y, _z]) =
         create_test_setup();
-    let unencoded = terms.mk_var("bcp_repeated_unencoded", Sort::Bool);
     let x_var = Variable::new(term_to_var[&x]);
+    let y_var = Variable::new(term_to_var[&y]);
     let mut theory = MockTheory::new();
     let mut ext = TheoryExtension::new(
         &mut theory,
@@ -3211,47 +3112,34 @@ fn repeated_minted_conflict_is_a_lemma_until_falsified() {
         None,
     );
     let mut ctx = MockContext::new().with_trail(vec![Literal::positive(x_var)]);
-    ctx.num_vars = 40;
-    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(unencoded, false)];
+    let conflict = vec![TheoryLit::new(x, true), TheoryLit::new(y, false)];
 
     let Some(MappedConflict::Lemma(first)) =
-        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+        ext.map_conflict_clause(&conflict, ConflictOrigin::Plain, &ctx)
     else {
-        panic!("the first newly minted literal is unassigned");
+        panic!("an unassigned cause cannot drive conflict analysis");
     };
-    let minted = first[1].variable();
-    assert!(minted.id() >= 40);
-    assert!(first[1].is_positive(), "both literal polarities matter");
-    assert_eq!(ctx.value(minted), None);
-    let minted_count = ext.minted_var_count;
-    for mint_enabled in [true, false] {
-        let Some(MappedConflict::Lemma(repeated)) =
-            ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, mint_enabled)
-        else {
-            panic!("reusing a minted mapping must not invent an assignment");
-        };
-        assert_eq!(repeated, first);
-        assert_eq!(ext.minted_var_count, minted_count);
-    }
+    assert_eq!(
+        first,
+        vec![Literal::negative(x_var), Literal::positive(y_var)]
+    );
 
-    // The native solver has now grown to include the variable and assigned
-    // both causes. Exactly this assignment makes the whole clause false.
-    ctx.num_vars = minted.index() + 1;
-    ctx.replace_trail(vec![Literal::positive(x_var), Literal::negative(minted)]);
+    // Exactly this assignment makes the whole clause false.
+    ctx.replace_trail(vec![Literal::positive(x_var), Literal::negative(y_var)]);
     let Some(MappedConflict::Falsified(falsified)) =
-        ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+        ext.map_conflict_clause(&conflict, ConflictOrigin::Plain, &ctx)
     else {
         panic!("every literal is now false under the actual assignment");
     };
     assert_eq!(falsified, first);
 
     for trail in [
-        vec![Literal::positive(x_var), Literal::positive(minted)],
+        vec![Literal::positive(x_var), Literal::positive(y_var)],
         vec![Literal::positive(x_var)],
     ] {
         ctx.replace_trail(trail);
         let Some(MappedConflict::Lemma(clause)) =
-            ext.map_conflict_clause_minting(&conflict, ConflictOrigin::Plain, &ctx, true)
+            ext.map_conflict_clause(&conflict, ConflictOrigin::Plain, &ctx)
         else {
             panic!("a satisfied or backtracked literal cannot drive conflict analysis");
         };

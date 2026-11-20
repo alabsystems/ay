@@ -164,7 +164,7 @@ fn shrink_removable_kissat_clause(on: bool) -> (Vec<Literal>, Vec<Literal>, Solv
     (learned, removed, solver)
 }
 
-/// Rank 22 of PLAN-kissat-404-parity.md. The level-1 block {-a4, -b5}
+/// Rank 22 of competition/proof-posture-parity/PLAN-kissat-404-parity.md at 9598c4206. The level-1 block {-a4, -b5}
 /// shrinks to -s1, walking t2 but not y3. The level-2 block {-p7, -q8} then
 /// reaches t2 and y3, both before a4, level 1's first clause literal. By
 /// default the trail abort refuses y3, the block fails, and fallback

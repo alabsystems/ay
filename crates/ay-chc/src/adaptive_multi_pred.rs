@@ -1460,7 +1460,7 @@ impl AdaptivePortfolio {
         // BV+array DAGs with threaded-memory relations (full arity ~235) hit
         // the exact DAG encoding at full width and burned the whole stage
         // budget. Run the bounded-cost forwarding-only combination
-        // (ArrayStoreForwarder + cost-bounded DeadParamEliminator) first and,
+        // (ArrayStoreForwarder + trailing DeadParamEliminator) first and,
         // when it actually rewrites something, probe the slimmed problem via
         // the preprocessed lane — which back-translates witnesses and
         // validates Safe models on the ORIGINAL clauses fail-closed. The raw
@@ -1508,7 +1508,7 @@ impl AdaptivePortfolio {
                 // (wide) predicate signatures. Finish the job with the
                 // bounded forwarding-only combination on the CONDENSED
                 // problem — forwarder + ground-table concretizer + one
-                // cost-bounded arity slicer — and compose the translators.
+                // trailing arity slicer — and compose the translators.
                 let post = PreprocessSummary::build_array_forwarding_only_with_limits(
                     condensed.problem,
                     self.config.verbose,

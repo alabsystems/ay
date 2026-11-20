@@ -146,7 +146,7 @@ pub(crate) struct SolverStats {
     /// Whether the solver terminated due to convergence stagnation detection.
     pub terminated_by_stagnation: bool,
 
-    // Workstream B board counters (DESIGN_spacer_pob_lemma_pipeline.md §4.6).
+    // Workstream B board counters (the development design notes at 9598c4206, §4.6).
     /// Proof obligations popped by `strengthen`.
     pub spacer_pobs_processed: usize,
     /// POBs that returned `BlockResult::Blocked`.

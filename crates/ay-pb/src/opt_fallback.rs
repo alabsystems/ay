@@ -49,7 +49,8 @@ use ay_pb_core::{PbExactSolution, PbInstance, PbObjective, PbSolution, PbStatus}
 
 use crate::portfolio::{self, PbPortfolioPhaseTimings};
 use crate::proof::{
-    cert_debug_line, certify_opt_lin_any_interruptible, certify_reserve, OptLinCertRoute,
+    cert_debug_line, certify_opt_infeasible_pb_interruptible, certify_opt_lin_any_interruptible,
+    certify_reserve, OptLinCertRoute,
 };
 
 /// What [`run_opt_lin_cert_fallback`] concluded.
@@ -62,6 +63,14 @@ pub enum OptLinCertFallback {
     /// not apply), no candidate optimum survived the checked upgrade gate, or
     /// every rung of the certificate chain declined.
     Declined {
+        timings: Option<PbPortfolioPhaseTimings>,
+    },
+    /// The instance has no feasible solution, and a VeriPB proof concluding
+    /// `BOUNDS INF INF` was built (`certify_opt_infeasible_pb_interruptible`).
+    /// The caller writes and commits it and answers `s UNSATISFIABLE`.
+    CertifiedInfeasible {
+        /// The proof text, ready to write.
+        pbp: String,
         timings: Option<PbPortfolioPhaseTimings>,
     },
     /// A VeriPB proof was built. The caller writes and commits it.
@@ -223,6 +232,24 @@ pub fn run_opt_lin_cert_fallback(
             || timeout_dur.is_some_and(|d| start.elapsed() >= d)
             || ay_sys::process_memory_exceeded()
     };
+
+    // AY-SAT-7: the portfolio says the constraints have no solution. The
+    // optimization proof solver logs through the legacy writer, which cannot
+    // refute some such instances in any budget (factor-size=9-P=379-Q=521:
+    // none in 58 s); the decision proof tap refutes them at once
+    // (`certify_opt_infeasible_pb_interruptible`). Tried only when no
+    // incumbent was ever verified (one would contradict the portfolio, and
+    // then nothing is tried). The checker re-validates every step.
+    if portfolio_solution.status == PbStatus::Unsatisfiable
+        && best_solution.lock().is_ok_and(|cached| cached.is_none())
+    {
+        if let Some(pbp) = certify_opt_infeasible_pb_interruptible(instance_ref, &should_stop) {
+            cert_debug_line(format_args!(
+                "c opt-lin-cert route: infeasible (decision proof tap)"
+            ));
+            return OptLinCertFallback::CertifiedInfeasible { pbp, timings };
+        }
+    }
 
     // Only a proven optimum is certifiable (BOUNDS V V). CANDIDATE WIDENING:
     // take the portfolio's own `OptimumFound` when it has one, otherwise ask

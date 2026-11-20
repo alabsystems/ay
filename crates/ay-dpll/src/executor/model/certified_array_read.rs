@@ -5,8 +5,9 @@
 //! interpretation: values come only from the existing checked package, and
 //! store/nested reads use the ordinary array walker.
 
+use super::model_base::AuthenticatedConstInterpRead;
 use super::{
-    eval_guard, CertifiedConstInterpRead, EvalValue, Executor, HashSet, Model, Sort, TermData,
+    eval_guard, CertifiedConstInterpBody, EvalValue, Executor, HashSet, Model, Sort, TermData,
     TermId,
 };
 use crate::executor_types::UnknownOrigin;
@@ -25,20 +26,22 @@ impl ModelView for ClosedValue {
     }
 }
 
-pub(super) struct CertifiedArrayRead {
+pub(super) struct CertifiedArrayRead<'a> {
     remaining: usize,
     work_poison: u64,
     refused: bool,
-    package_cost: usize,
+    package: Option<AuthenticatedConstInterpRead<'a>>,
+    lookup_work: usize,
 }
 
-impl CertifiedArrayRead {
+impl<'a> CertifiedArrayRead<'a> {
     fn new() -> Self {
         Self {
             remaining: MAX_READ_WORK,
             work_poison: eval_guard::work_budget_poison(),
             refused: false,
-            package_cost: 0,
+            package: None,
+            lookup_work: 0,
         }
     }
 
@@ -57,6 +60,14 @@ impl CertifiedArrayRead {
 
     pub(super) fn live(&mut self, exec: &Executor) -> bool {
         if self.refused {
+            return false;
+        }
+        if self
+            .package
+            .as_ref()
+            .is_some_and(|package| !package.context_is(&exec.ctx))
+        {
+            self.refused = true;
             return false;
         }
         if eval_guard::work_budget_poison() != self.work_poison {
@@ -91,62 +102,74 @@ impl CertifiedArrayRead {
         model: &Model,
         term: TermId,
     ) -> Result<Option<TermId>, ()> {
-        if !self.charge(exec, self.package_cost) {
+        if !self.charge(exec, self.lookup_work)
+            || !self
+                .package
+                .as_ref()
+                .is_some_and(|package| package.is_for(&exec.ctx, model))
+        {
+            self.refused = true;
             return Err(());
         }
-        match exec.ctx.terms.get(term) {
+        let (symbol, arguments) = match exec.ctx.terms.get(term) {
             TermData::App(symbol, args) => {
                 if !self.charge(exec, symbol.name().len()) {
                     return Err(());
                 }
-                if model.has_certified_const_interp_symbol(symbol) {
-                    if !self.charge(exec, args.len())
-                        || !self.same_sort(
-                            exec,
-                            exec.ctx.terms.sort(term),
-                            exec.ctx.terms.sort(term),
-                        )
-                    {
-                        return Err(());
-                    }
-                    for &arg in args {
-                        if !self.visit(exec, arg, 0)
-                            || !self.same_sort(
-                                exec,
-                                exec.ctx.terms.sort(arg),
-                                exec.ctx.terms.sort(arg),
-                            )
-                        {
-                            return Err(());
-                        }
-                    }
-                }
+                (std::borrow::Cow::Borrowed(symbol), args.as_slice())
             }
             TermData::Var(name, _) => {
                 if !self.charge(exec, name.len()) {
                     return Err(());
                 }
-                if model
-                    .certified_const_interp_entries()
-                    .iter()
-                    .any(|entry| entry.name() == Some(name.as_str()))
-                    && !self.same_sort(exec, exec.ctx.terms.sort(term), exec.ctx.terms.sort(term))
-                {
-                    return Err(());
-                }
+                (
+                    std::borrow::Cow::Owned(ay_core::Symbol::named(name)),
+                    [].as_slice(),
+                )
             }
-            _ => {}
+            _ => return Ok(None),
+        };
+        if !self
+            .package
+            .as_ref()
+            .is_some_and(|package| package.owns_symbol(&symbol))
+        {
+            return Ok(None);
         }
-        match exec.const_interp_witness_value(model, term) {
-            Ok(Some(CertifiedConstInterpRead::Constant(value))) if value != term => Ok(Some(value)),
+        if !self.charge(exec, self.lookup_work)
+            || !self.charge(exec, arguments.len())
+            || !self.same_sort(exec, exec.ctx.terms.sort(term), exec.ctx.terms.sort(term))
+        {
+            return Err(());
+        }
+        for &argument in arguments {
+            if !self.visit(exec, argument, 0)
+                || !self.same_sort(
+                    exec,
+                    exec.ctx.terms.sort(argument),
+                    exec.ctx.terms.sort(argument),
+                )
+            {
+                return Err(());
+            }
+        }
+        let Some(package) = self.package.as_ref() else {
+            return Err(());
+        };
+        match package.entry(&symbol, arguments, exec.ctx.terms.sort(term)) {
+            Ok(Some(entry)) => match entry.body() {
+                CertifiedConstInterpBody::Constant { value, .. } if *value != term => {
+                    Ok(Some(*value))
+                }
+                // Symbolic bodies remain owned refusals; this closed-value
+                // reader never borrows their arguments from raw model pins.
+                _ => {
+                    self.refused = true;
+                    Err(())
+                }
+            },
             Ok(None) => Ok(None),
-            // A SYMBOLIC body has no closed value at a bare term: it has one
-            // only at an evaluated argument point, and this reader evaluates
-            // closed values alone. The head is still owned, so the read is an
-            // owned refusal, never an unowned fall-through to raw pins.
-            Ok(Some(CertifiedConstInterpRead::Constant(_)))
-            | Ok(Some(CertifiedConstInterpRead::LinearInt { .. }))
-            | Err(_) => {
+            Err(_) => {
                 self.refused = true;
                 Err(())
             }

@@ -10,7 +10,7 @@
 //! it and report a skeleton, and the portfolio then re-solved the unrolling
 //! from scratch to certify the answer — on equality-heavy LRA systems the
 //! re-solve never finishes, so correct Unsafe answers were discarded
-//! (the development design notes, item 4).
+//! (the development design notes at `9598c4206`, item 4).
 //!
 //! This module turns such a trace into a [`GroundDerivation`] over the
 //! engine's problem (fact → transition × n → query, each step one clause

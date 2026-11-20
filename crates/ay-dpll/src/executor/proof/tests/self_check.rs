@@ -2,7 +2,6 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_rejects_generic_theory_lemma_accepted_by_partial_checker() {
     let mut exec = Executor::new();
@@ -28,7 +27,6 @@ fn self_check_rejects_generic_theory_lemma_accepted_by_partial_checker() {
     );
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_rejects_forged_named_theory_lemma_accepted_by_partial_checker() {
     let mut exec = Executor::new();
@@ -54,7 +52,6 @@ fn self_check_rejects_forged_named_theory_lemma_accepted_by_partial_checker() {
     );
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_rejects_strict_refutation_from_non_problem_assumptions() {
     let mut exec = Executor::new();
@@ -84,7 +81,6 @@ fn self_check_rejects_strict_refutation_from_non_problem_assumptions() {
     );
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn self_check_accepts_strict_boolean_refutation() {
     let commands = parse(
@@ -113,7 +109,6 @@ include!("self_check/ground_substitution_wire.rs");
 /// Now all builds log the error and record the failure in statistics, with
 /// the walk's own counts: the two assumptions validated, the resolution at
 /// step 2 did not, so `checked_steps` is 2 of 3 (#4592), not the proof's shape.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn test_internal_proof_checker_records_failure_without_panic() {
     let mut exec = Executor::new();
@@ -220,7 +215,6 @@ include!("self_check/letleak_wall3_lanes.rs");
 /// used to offer multi-literal originals only to the bool/DT/EUF
 /// recognizers, so the arithmetic tautology `(or (not (<= 5 c)) (not (< c
 /// 5)))` declined and the computed UNSAT demoted under every proof demand.
-#[cfg(feature = "proof-checker")]
 #[test]
 #[timeout(120000)]
 fn self_check_certifies_cegqi_arith_tautology_refutation() {

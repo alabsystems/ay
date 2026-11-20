@@ -89,13 +89,17 @@ const WALK_PLAIN_POPS: usize = 512;
 /// occurrences come in the same order as in the tree walk (duplicates are
 /// rejected when popped, not when pushed, so a node reached earlier through a
 /// deeper path is still visited at that earlier point).
-pub(crate) fn walk_distinct_preorder(
-    root: &ChcExpr,
-    mut visit: impl FnMut(&ChcExpr) -> Step,
+///
+/// Every node is handed to `visit` borrowed for the root's lifetime, so a
+/// visitor may keep references to the nodes (for example the variables) it
+/// meets.
+pub(crate) fn walk_distinct_preorder<'a>(
+    root: &'a ChcExpr,
+    mut visit: impl FnMut(&'a ChcExpr) -> Step,
 ) -> bool {
     let mut seen: ay_core::kani_compat::DetHashSet<*const ChcExpr> = Default::default();
     let mut plain_pops = WALK_PLAIN_POPS;
-    let mut stack: Vec<&ChcExpr> = vec![root];
+    let mut stack: Vec<&'a ChcExpr> = vec![root];
     while let Some(node) = stack.pop() {
         if has_children(node) {
             if plain_pops > 0 {

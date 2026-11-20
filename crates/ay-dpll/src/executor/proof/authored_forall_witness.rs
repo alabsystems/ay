@@ -269,16 +269,9 @@ impl Executor {
         self.proof_check_result = None;
         self.proof_check_ok = false;
         self.last_proof_quality = None;
-        #[cfg(feature = "proof-checker")]
-        {
-            self.run_internal_proof_check(&candidate);
-            if !self.proof_check_ok {
-                self.proof_check_result = None;
-                return false;
-            }
-        }
-        #[cfg(not(feature = "proof-checker"))]
-        if self.self_check() {
+        self.run_internal_proof_check(&candidate);
+        if !self.proof_check_ok {
+            self.proof_check_result = None;
             return false;
         }
         self.populate_proof_quality_stats(&quality);

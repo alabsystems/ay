@@ -441,7 +441,7 @@ fn recognize_neuron(
     }
 
     // Orient: positive selector coeff -> positive half (inputs + thr derivation).
-    let (pos_inputs, neg_coeff, neg_rhs, _pos_rhs) = if s1 > 0 {
+    let (pos_inputs, neg_coeff, neg_rhs, pos_rhs) = if s1 > 0 {
         (others1, s2, rhs2, rhs1)
     } else if s2 > 0 {
         (others2, s1, rhs1, rhs2)
@@ -451,9 +451,16 @@ fn recognize_neuron(
     // thr = cN - rhsN ; rule x = 1 iff S <= thr.
     let thr = neg_coeff.checked_sub(neg_rhs)?;
 
-    // Cheap adjacency self-check (not load-bearing for soundness): the positive
-    // and negative bands should be adjacent. (cN - rhsN) + 1 == rhsP.
-    debug_assert_eq!(thr.saturating_add(1), _pos_rhs, "neuron bands not adjacent");
+    // Two rows of this shape are one neuron only when the positive and the
+    // negative band are adjacent: (cN - rhsN) + 1 == rhsP. With any other pair
+    // of right-hand sides the rows do not say `out = 1 iff S <= thr`, and the
+    // pair is not a neuron. Until 2026-11-19 this was a debug assertion: it
+    // held on the BNN instances the recognizer was written for, and a model
+    // that only has the shape (found by random MPS input) aborted a debug
+    // build and was read as a neuron by a release build.
+    if thr.checked_add(1) != Some(pos_rhs) {
+        return None;
+    }
 
     Some(Neuron {
         out: selector,
@@ -947,6 +954,31 @@ mod tests {
         let assignment = seed(&instance, &objective).expect("seed should be produced");
         assert!(verify_all_constraints(&instance.constraints, &assignment));
         assert_eq!(assignment.len(), 3);
+    }
+
+    /// The two rows of `single_neuron_instance` with a positive right-hand
+    /// side that leaves a gap between the bands (5 where adjacency needs 2):
+    /// the shape of a neuron, not a neuron. It must be declined, not asserted
+    /// on (debug builds) or read as `out = 1 iff x1 + x2 <= 1` (release).
+    #[test]
+    fn declines_rows_with_the_shape_of_a_neuron_and_bands_that_are_not_adjacent() {
+        let m = 100i128;
+        let pos = ge(vec![term(m, lit(3)), term(1, lit(1)), term(1, lit(2))], 5);
+        let neg = ge(
+            vec![term(-m, lit(3)), term(-1, lit(1)), term(-1, lit(2))],
+            -101,
+        );
+        let objective = PbObjective {
+            terms: vec![term(1, lit(1)), term(1, lit(2))],
+        };
+        let instance = PbInstance {
+            num_vars: 3,
+            num_constraints: 2,
+            constraints: vec![pos, neg],
+            objective: Some(objective.clone()),
+        };
+        assert!(recognize(&instance, &objective).is_none());
+        assert!(seed(&instance, &objective).is_none());
     }
 
     #[test]

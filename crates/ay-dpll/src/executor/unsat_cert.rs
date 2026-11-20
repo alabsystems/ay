@@ -4818,7 +4818,9 @@ impl Executor {
         }
         // This whole-problem re-solve accounted for 94.1% of mint cost on
         // dillig12_m despite only 94/1019 mints reaching it (#cert-accounting 6).
-        let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
+        let _nested_timer = cert_accounting::NestedCorroborationTimer::start(
+            cert_accounting::NestedCorroborationRole::Reconfirm,
+        );
         let mut exec = self.new_derived_query_executor();
         // Held until the re-solve is screened: its SAT solvers latch the
         // inprocessing choice when their budget is set (`screened_reconfirmation`).
@@ -4919,7 +4921,7 @@ impl Executor {
         exec.bind_unsat_query_assumptions(&[]);
         // This is an ACCEPTING step, so its operating boundary must be a
         // deterministic count rather than elapsed wall time. These fixed caps
-        // win over executor defaults and AY_NO_GROUND_BUDGET, but never widen a
+        // win over executor defaults, but never widen a
         // tighter caller-supplied deterministic limit. Preserve the outer
         // cancellation/deadline/memory envelope as well; any stop, count
         // exhaustion, or incomplete result declines.
@@ -5301,7 +5303,9 @@ impl Executor {
         // dillig12_m as 94.1% of all mint cost from only 94 of 1019 mints,
         // so the mint is cheap EXCEPT when it reaches here. Without a
         // standing counter that has to be rediscovered by hand.
-        let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
+        let _nested_timer = cert_accounting::NestedCorroborationTimer::start(
+            cert_accounting::NestedCorroborationRole::Guard,
+        );
         let mut exec = self.new_derived_query_executor();
         // The grant's limits are explicit, the default ground budget is off so
         // it cannot replace them, and quantified solving may not relax the

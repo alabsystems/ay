@@ -108,6 +108,42 @@ pub fn prove_cnf_unsat_dimacs(
     num_vars: usize,
     clauses: &[Vec<i32>],
 ) -> Result<ResolutionDag, CnfCertError> {
+    let sat_clauses = dimacs_clauses(num_vars, clauses)?;
+    let dag = prove_unsat_resolution_dag(num_vars, &sat_clauses)?;
+    dag.validate()?;
+    Ok(dag)
+}
+
+/// [`prove_cnf_unsat_dimacs`], stopped by the caller.
+///
+/// `should_stop` is polled by the solver's sticky control throughout the
+/// search, inprocessing and proof extraction (see
+/// [`crate::prove_unsat_resolution_dag_until`]). Once it returns `true` the
+/// call ends with [`CnfCertError::Solve`]`(`[`ResolutionDagError::Unknown`]`)`
+/// — never a refutation and never a satisfiable verdict. A caller with a
+/// deadline can therefore produce its certificate in one interruptible solve,
+/// instead of deciding the CNF first and then re-solving with proof logging
+/// that it cannot stop. The final [`ResolutionDag::validate`] replay is not
+/// polled; it is linear in the emitted proof.
+///
+/// # Errors
+/// As [`prove_cnf_unsat_dimacs`], plus `Solve(Unknown)` on a stop.
+pub fn prove_cnf_unsat_dimacs_until(
+    num_vars: usize,
+    clauses: &[Vec<i32>],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<ResolutionDag, CnfCertError> {
+    let sat_clauses = dimacs_clauses(num_vars, clauses)?;
+    let dag = crate::prove_unsat_resolution_dag_until(num_vars, &sat_clauses, should_stop)?;
+    dag.validate()?;
+    Ok(dag)
+}
+
+/// Check DIMACS literals against `num_vars` and convert them.
+fn dimacs_clauses(
+    num_vars: usize,
+    clauses: &[Vec<i32>],
+) -> Result<Vec<Vec<Literal>>, CnfCertError> {
     let mut sat_clauses: Vec<Vec<Literal>> = Vec::with_capacity(clauses.len());
     for (clause_index, clause) in clauses.iter().enumerate() {
         let mut lits = Vec::with_capacity(clause.len());
@@ -123,10 +159,7 @@ pub fn prove_cnf_unsat_dimacs(
         }
         sat_clauses.push(lits);
     }
-
-    let dag = prove_unsat_resolution_dag(num_vars, &sat_clauses)?;
-    dag.validate()?;
-    Ok(dag)
+    Ok(sat_clauses)
 }
 
 #[cfg(test)]
@@ -302,6 +335,30 @@ mod tests {
         assert!(matches!(
             err,
             CnfCertError::MalformedLiteral { literal: -3, .. }
+        ));
+    }
+
+    #[test]
+    fn stoppable_dimacs_prover_proves_when_not_stopped_and_refuses_when_stopped() {
+        let (num_vars, clauses) = php_cnf(5, 4);
+        let dag = prove_cnf_unsat_dimacs_until(num_vars, &clauses, &|| false)
+            .expect("PHP(5,4) is UNSAT and the stop never fires");
+        dag.validate().expect("independent replay");
+        assert_eq!(dag.original_clauses.len(), clauses.len());
+        // A stop that has already fired is Unknown: no refutation, no SAT.
+        assert!(matches!(
+            prove_cnf_unsat_dimacs_until(num_vars, &clauses, &|| true),
+            Err(CnfCertError::Solve(ResolutionDagError::Unknown))
+        ));
+        // Literal validation is shared with the unstoppable entry.
+        assert!(matches!(
+            prove_cnf_unsat_dimacs_until(2, &[vec![1, 3]], &|| false),
+            Err(CnfCertError::MalformedLiteral { literal: 3, .. })
+        ));
+        // A satisfiable CNF is never refuted.
+        assert!(matches!(
+            prove_cnf_unsat_dimacs_until(2, &[vec![1, 2]], &|| false),
+            Err(CnfCertError::Solve(ResolutionDagError::Satisfiable))
         ));
     }
 

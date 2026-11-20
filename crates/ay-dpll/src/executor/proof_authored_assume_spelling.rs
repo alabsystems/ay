@@ -74,6 +74,8 @@ use super::proof_surface_syntax::{format_frontend_term, strip_frontend_annotatio
 use super::Executor;
 
 mod export_surfaces;
+#[cfg(test)]
+mod tests;
 
 pub(in crate::executor) use export_surfaces::AuthoredExportSurfaces;
 
@@ -81,9 +83,19 @@ pub(in crate::executor) use export_surfaces::AuthoredExportSurfaces;
 /// pathological stack must not turn certificate disclosure into the run's cost
 /// centre; declining to judge preserves today's behaviour exactly.
 const MAX_JUDGED_ASSERTIONS: usize = 16_384;
-/// Per-assertion and aggregate caps on rendered authored text.
+/// Per-assertion and aggregate caps on rendered authored text. The printed
+/// side is judged by the same per-assertion cap, rendered under it (see
+/// `printed_assume_text`); the aggregate binds only the authored surfaces of
+/// the negation-shell branch, as on origin/main.
 const MAX_SHELL_SURFACE_BYTES: usize = 64 * 1024;
 const MAX_SHELL_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// `printed_assume_text` renders this thread has run (pins that every
+    /// `let`-rooted assertion is judged, with no aggregate cutoff).
+    static PRINTED_ASSUME_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Authored `assume` spellings the emitted document would otherwise misstate.
 #[derive(Default, Debug)]
@@ -121,11 +133,25 @@ fn canonical_negation_shell_depth(terms: &ay_core::TermStore, term: TermId) -> u
 }
 
 impl Executor {
-    /// Exactly the text the exported document will print for `term`.
+    /// Exactly the text the exported document will print for `term`, when it
+    /// is at most `MAX_SHELL_SURFACE_BYTES` long; `None` past that.
     ///
     /// The override table is the one the export hands the printer, and it is
-    /// materialized at most once per scan (only when a candidate exists);
-    /// `None` means the rendering is past the module's byte bound.
+    /// materialized at most once per scan (only when a candidate exists).
+    ///
+    /// Rendered BOUNDED (DR-PROOF-RENDER-BUDGET-20261118). Rendering in full
+    /// and measuring afterwards was a memout, not a size check: a `let`-shared
+    /// assertion of a few thousand DAG nodes spells ~1e14 bytes (measured 4 GB
+    /// after an `unsat` was already published). The bounded renderer streams
+    /// and charges exactly the bytes it writes, so it answers `Some` for
+    /// exactly the texts the unbounded `len() <= MAX_SHELL_SURFACE_BYTES` test
+    /// admitted (classification is unchanged), and one render costs at most
+    /// about that many bytes, however large the term (streamed, nothing is
+    /// assembled or cached: the output is the only `String` that grows).
+    ///
+    /// It does NOT poll the solve's stop: the byte cap already bounds each
+    /// call, and a stop here would turn faithful spellings into foreign
+    /// premises after the verdict (the export runs past the solve deadline).
     fn printed_assume_text(
         &self,
         term: TermId,
@@ -136,13 +162,15 @@ impl Executor {
             *overrides = self.proof_export_term_overrides();
             *loaded = true;
         }
-        let printed = match overrides.as_ref() {
-            Some(table) => {
-                ay_proof::format_term_alethe_with_overrides(&self.ctx.terms, term, table)
-            }
-            None => ay_proof::format_term_alethe(&self.ctx.terms, term),
-        };
-        (printed.len() <= MAX_SHELL_SURFACE_BYTES).then_some(printed)
+        #[cfg(test)]
+        PRINTED_ASSUME_RENDERS.with(|renders| renders.set(renders.get() + 1));
+        ay_proof::format_term_alethe_bounded(
+            &self.ctx.terms,
+            term,
+            overrides.as_ref(),
+            MAX_SHELL_SURFACE_BYTES as u64,
+            &mut || true,
+        )
     }
 
     /// Classify every authored assertion whose `assume` leaf this document
@@ -181,6 +209,13 @@ impl Executor {
             // leaf that is still a `let`. Judged on the root token alone, which
             // is exactly the part that decides matchability and is immune to
             // every rendering difference inside the body.
+            //
+            // Every such assertion is judged by the per-assertion cap alone,
+            // exactly as origin/main judged it: an aggregate cutoff here would
+            // turn later faithful premises foreign and withhold `unsat` under
+            // `--strict-proofs`/`--self-check`. Each render is bounded by that
+            // cap, so the scan costs at most `MAX_JUDGED_ASSERTIONS` x 64 KiB
+            // of transient writes and 64 KiB live.
             if matches!(strip_frontend_annotations(authored), FrontendTerm::Let(..)) {
                 let printed = self.printed_assume_text(
                     canonical,

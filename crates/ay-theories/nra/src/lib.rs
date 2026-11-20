@@ -102,6 +102,8 @@ mod av_probe;
 #[cfg(test)]
 mod check_stop_tests;
 #[cfg(test)]
+mod icp_relaxed_tests;
+#[cfg(test)]
 mod interval_fixture_tests;
 #[cfg(test)]
 mod mpbq_tests;
@@ -111,6 +113,8 @@ mod reset_tests;
 mod scaled_product_tests;
 #[cfg(test)]
 mod shared_reason_tests;
+#[cfg(test)]
+mod sos_decision_tests;
 #[cfg(test)]
 mod theory_tests;
 #[cfg(test)]
@@ -290,6 +294,17 @@ pub struct NraSolver<'a> {
         std::cell::RefCell<std::collections::HashMap<TermId, Option<univariate::MultiPoly>>>,
     multipoly_cache_hits: std::cell::Cell<u64>,
 
+    /// Per-instance memo of relaxed ICP atom clearings, keyed by
+    /// `(atom, polarity)`. The clearing is a pure function of the
+    /// immutable term structure (only the denominator sign proofs
+    /// repeat per preparation, against the current bounds), so
+    /// entries never need invalidation — same contract as
+    /// `multipoly_cache`, whose absence on this path re-translated
+    /// every declined atom on every one of ~16k ICP preparations.
+    relaxed_atom_cache: std::cell::RefCell<
+        std::collections::HashMap<(TermId, bool), Option<univariate::ClearedRelaxedAtom>>,
+    >,
+
     /// Assertion-derived fixed values and identities emitted in the current scope.
     pub(crate) fixed_factor_values: HashMap<TermId, BigRational>,
     pub(crate) fixed_lin_emitted: HashSet<TermId>,
@@ -444,6 +459,7 @@ impl<'a> NraSolver<'a> {
             feasible_set_count: 0,
             multipoly_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
             multipoly_cache_hits: std::cell::Cell::new(0),
+            relaxed_atom_cache: std::cell::RefCell::new(std::collections::HashMap::default()),
             fixed_factor_values: HashMap::default(),
             fixed_lin_emitted: HashSet::default(),
             registered_atoms: Vec::new(),

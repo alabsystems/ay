@@ -226,12 +226,6 @@ impl LraSolver {
                 implied_count,
             );
         }
-        if debug && !self.pending_bound_refinements.is_empty() {
-            safe_eprintln!(
-                "[LRA] Queued {} bound refinements",
-                self.pending_bound_refinements.len(),
-            );
-        }
     }
 
     /// #8422: Collect the reason for a variable's implied bound, trying multiple

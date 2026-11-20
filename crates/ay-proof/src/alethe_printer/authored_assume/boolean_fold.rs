@@ -374,7 +374,7 @@ impl AlethePrinter<'_> {
             (negation_operand(text), self.terms.get(canonical_term))
         {
             let inner = *inner;
-            let inner_canonical = crate::render_term_canonical(self.terms, inner);
+            let inner_canonical = self.render_canonical(inner);
             let child_id = format!("{id}.c0");
             let mark = output.len();
             if operand != inner_canonical

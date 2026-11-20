@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Workstream D ladder tests (DESIGN_lra_interp_tpa.md §4.1, WP-D1-M): the
+//! Workstream D ladder tests (the development design notes at 9598c4206, §4.1, WP-D1-M): the
 //! per-clause stage 1 serves `∨_c I_c`, which every clause implies, even when
 //! the conjunction of the clauses' A-sides is unsatisfiable (where the old
 //! conjunctive call was skipped and stage 5 validated vacuously).

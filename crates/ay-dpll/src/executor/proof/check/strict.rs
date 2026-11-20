@@ -378,7 +378,6 @@ impl Executor {
     /// repair, entered *because* the caller had asked the solve to stop. That
     /// is the very behaviour the envelope exists to remove, re-entered through
     /// the response to the envelope firing.
-    #[cfg(feature = "proof-checker")]
     pub(in crate::executor::proof) fn empty_clause_derivation_status(
         &self,
         proof: &Proof,
@@ -391,17 +390,5 @@ impl Executor {
         // Run the partial checker. If it finds no errors, the chain is valid.
         let outcome = check_partial_with_executor_progress(self, proof, WantQuality::No);
         classify_empty_clause_walk(outcome.error.as_ref(), outcome.envelope_refused())
-    }
-
-    #[cfg(not(feature = "proof-checker"))]
-    pub(in crate::executor::proof) fn empty_clause_derivation_status(
-        &self,
-        proof: &Proof,
-    ) -> EmptyClauseDerivation {
-        if Self::proof_derives_empty_clause(proof) {
-            EmptyClauseDerivation::Valid
-        } else {
-            EmptyClauseDerivation::Invalid
-        }
     }
 }

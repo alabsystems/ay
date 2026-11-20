@@ -2,14 +2,14 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! MPS / CPLEX LP format parser plus a Phase 1 MIP/LP solver driver.
+//! MPS and CPLEX LP parsers and a dense LP/MIP solver.
 //!
 //! The crate provides:
 //!
-//! - [`parse_mps`] and [`parse_lp`] parsers that normalize either format into
-//!   a shared [`Problem`] representation.
-//! - [`mod@solve`] which applies a small revised simplex for the LP relaxation
-//!   and depth-first branch-and-bound for integer variables.
+//! - [`parse_mps_exact`] reads MPS numbers as exact rationals for the sparse MILP engine.
+//! - [`parse_mps`] and [`parse_lp`] produce a binary64 [`Problem`].
+//! - [`mod@solve`] uses tableau simplex for LP relaxations and depth-first
+//!   branch-and-bound for integer variables.
 //!
 //! # Example
 //!
@@ -34,16 +34,18 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod exact;
 pub mod model;
 mod parser;
 pub mod simplex;
 pub mod solve;
 
 pub use error::LpError;
+pub use exact::{ExactColumn, ExactProblem, ExactRow};
 pub use model::{Constraint, Problem, RowKind, Sense, Solution, VarKind, Variable};
-pub use parser::{parse_lp, parse_mps};
+pub use parser::{parse_lp, parse_mps, parse_mps_exact};
 pub use simplex::{solve_lp_relaxation, solve_lp_relaxation_budgeted, LpRelaxation};
-pub use solve::solve;
+pub use solve::{check_point, solve, solve_with_incumbents};
 
 /// Detects whether `input` looks like MPS or CPLEX LP format.
 ///

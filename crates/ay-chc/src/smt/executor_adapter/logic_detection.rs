@@ -22,7 +22,7 @@ pub(super) const MAX_DT_SELECTORS: usize = 16_384;
 const MAX_DT_SORT_NODES: usize = 32_768;
 /// Distinct expression nodes (pointer identity) one executor query may carry.
 ///
-/// Workstream D bridge item D-1 (CHC-COMP 2026, `DESIGN_lra_interp_tpa.md`
+/// Workstream D bridge item D-1 (CHC-COMP 2026, the development design notes at `9598c4206`
 /// §4.1): the admission walks below are pointer-memoised, so this caps UNIQUE
 /// nodes. It used to cap the TREE expansion, which refused every IMC k-query
 /// of the wide `oral_messages` systems at k = 1 (a 168 k–280 k-node let tree

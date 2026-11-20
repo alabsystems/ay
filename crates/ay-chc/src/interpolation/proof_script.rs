@@ -6,7 +6,7 @@
 //! sort-preserving ay-dpll `Term` → `ChcExpr` converter.
 //!
 //! CHC-COMP 2026 Workstream D, Rung 1 (the development design notes
-//! DESIGN_lra_interp_tpa.md` §4.1). **Owner: WP-D1-P.** Generalises
+//! DESIGN_lra_interp_tpa.md` at `9598c4206`, §4.1). **Owner: WP-D1-P.** Generalises
 //! `proof_backed.rs`'s QF_LIA-only helpers (`collect_supported_vars`,
 //! `build_qf_lia_script`, `dpll_term_to_chc_expr`, `app_to_chc_expr`,
 //! `parse_const_text`) to QF_LRA; the legacy QF_LIA copies stay in

@@ -70,7 +70,7 @@ mod check_sat;
 mod check_sat_assuming;
 mod commands;
 mod core_minimize;
-mod diff_logic;
+mod dl_atom;
 pub(crate) mod dl_theory;
 mod dt_axioms;
 mod engine_route;
@@ -85,7 +85,6 @@ mod expansion;
 mod finite_model_mbqi;
 pub(crate) mod ground_solve_carry;
 mod guard_nodes;
-pub(crate) mod ite_lift;
 pub(crate) mod lean_firewall;
 pub(crate) mod lemma_cache;
 mod lnh_symmetry;
@@ -136,7 +135,6 @@ mod simplifier_stage;
 mod solve_deadline;
 mod strengthening;
 pub(crate) mod theories;
-mod uflia_model_repair;
 mod unsat_cert;
 use model::Model;
 // Re-export the SAT-emission witness token so the API boundary
@@ -324,19 +322,6 @@ pub struct Executor {
     /// the whole deadline. Set only around the UFLIA hybrid's eager first
     /// attempt; always reset immediately after.
     pub(crate) split_eager_wander_abort: bool,
-    /// Inc5 #fused-detour: when `true`, the EAGER split-loop arm runs its
-    /// per-round SAT solves with the relevancy brancher in HARD mode (engage
-    /// on every decision) on top of the live TheoryExtension — the fused
-    /// "relevancy-hard + eager theory propagation" regime
-    /// (the development design notes §2 Inc5). Set
-    /// ONLY around the UFLIA hybrid's fused detour arm
-    /// (`--uflia-fused-detour=1`, combined/mod.rs #fused-detour slot);
-    /// always reset immediately after (plus the unconditional post-attempt
-    /// and entry-defensive resets in `solve_uf_lia`). Default `false` keeps
-    /// every eager expansion (eager1, the hybrid resume, AUFLIA/UF+LRA
-    /// lanes) byte-identical. `--sat-relevancy` still kills it (env override
-    /// wins, mirroring the lazy seam).
-    pub(crate) split_eager_relevancy_hard: bool,
     /// #relevancy-lazy-routing: when `true`, the lazy split-loop arm runs its
     /// per-round SAT solves with the relevancy brancher in HARD mode (engage
     /// on every decision — the design prototype's regime). Set only around the
@@ -370,52 +355,6 @@ pub struct Executor {
     /// gate<->resolve arming fires AT MOST ONCE per public check-sat; a
     /// still-rejected armed re-solve falls through to a fail-closed Unknown.
     pub(crate) uflia_congruence_retry_done: bool,
-    /// #uflia-model-repair (§3.2 targeted model-repair lever,
-    /// `AY_UFLIA_MODEL_REPAIR=1`, default off = byte-identical): the UFLIA
-    /// candidate model snapshotted in `check_sat_guarded` IMMEDIATELY BEFORE
-    /// `emit_sat_verdict`, i.e. before the gate battery can reject it and
-    /// erase it (`downgrade_sat_after_gate` / the strict-oracle degrade / the
-    /// `uf_table_conflict` discard all clear `last_model`). This is the
-    /// rejection EVIDENCE the targeted repair re-solve reads: which
-    /// assertions the candidate falsifies and the concrete colliding value
-    /// assignment. A solve can reject SEVERAL distinct candidates (07_09:
-    /// an in-attempt strict rejection at ~1s AND an independent-gate
-    /// rejection of the resume's model at ~10s), and each names a different
-    /// trap; all of them are blocked. Capped small (see push sites).
-    /// Env-gated at the capture sites; always empty flags-off.
-    pub(in crate::executor) uflia_repair_candidates: Vec<Model>,
-    /// #uflia-model-repair: UF function tables the `uf_table_conflict`
-    /// discard (model/completion.rs) found semantically inconsistent after
-    /// cross-theory merging. That discard runs BEFORE the independent gate
-    /// and previously erased the evidence a repair needs (relevancy design
-    /// §7); under the env gate the table names are preserved here
-    /// (diagnostic + repair scoping). Verdict flow is unchanged.
-    pub(crate) uflia_repair_conflict_tables: Vec<String>,
-    /// #uflia-model-repair: once-per-check-sat latch for the targeted repair
-    /// re-solve (mirrors `uflia_congruence_retry_done`, which stays the
-    /// blind re-solve's own latch).
-    pub(crate) uflia_model_repair_done: bool,
-    /// #uflia-model-repair: routing flag for the ONE targeted repair
-    /// re-solve (`AY_UFLIA_MODEL_REPAIR_ROUTE=detour`): `solve_uf_lia`
-    /// skips the eager first attempt and enters the hybrid's bounded
-    /// relevancy-hard lazy detour directly. Measured NON-default: on the
-    /// model-rejection tail the detour theory-spins without reaching an
-    /// accept point, while the armed eager arm converts. Set only inside
-    /// `uflia_targeted_model_repair_resolve`; reset immediately after and
-    /// defensively at `check_sat_guarded` entry. Can only ever be `true`
-    /// under `AY_UFLIA_MODEL_REPAIR=1`.
-    pub(crate) uflia_repair_detour_direct: bool,
-    /// #uflia-model-repair: default routing for the ONE targeted repair
-    /// re-solve: force the EAGER arm as a single full-window run (no
-    /// wander-abort reroute, no detour, no resume) — the arm that reaches
-    /// N-O accept points on the model-rejection tail (every rejected
-    /// candidate came from an eager-family arm), now steered by the
-    /// installed trap blocks and the armed accept-point repair scan +
-    /// finite-domain rescue. Set only inside
-    /// `uflia_targeted_model_repair_resolve`; reset immediately after and
-    /// defensively at `check_sat_guarded` entry. Can only ever be `true`
-    /// under `AY_UFLIA_MODEL_REPAIR=1`.
-    pub(crate) uflia_repair_eager_direct: bool,
     /// L2 (combined-theory-engine campaign): `true` while the lazy-DT-AUFLIA
     /// lane (`try_solve_dt_auflia_lazy`) runs its inner combiner solve under the
     /// `AY_DT_LAZY_AUFLIA_EAGER` sub-flag. Forces the UFLIA split arm to EAGER
@@ -1384,6 +1323,10 @@ pub struct Executor {
     /// SAT-under-partial-axiomatization degrade path deterministically.
     #[cfg(test)]
     pub(crate) test_force_non_bv_congruence_bail: Option<theories::TestCongruenceBail>,
+    /// Test hook: the clause budget of the BV-return congruence pass, in
+    /// place of its 2,000,000, so a small file reaches the count cap.
+    #[cfg(test)]
+    pub(crate) test_euf_bv_congruence_clause_cap: Option<usize>,
     /// Test hook: panic inside the #quantified-trace-arming retry pass.
     #[cfg(test)]
     pub(crate) test_panic_in_quantified_trace_retry: bool,
@@ -1733,7 +1676,7 @@ pub struct Executor {
     /// that can move where a count stops a search, though it never ends one.)
     /// `(set-option :rlimit 0)` or
     /// [`set_ground_budget_enabled(false)`](Self::set_ground_budget_enabled)
-    /// (or the `AY_NO_GROUND_BUDGET` env knob) restores the pre-budget
+    /// restores the pre-budget
     /// wall-clock-only behavior. See
     /// `crate::pipeline_fns::effective_conflict_allowance`.
     pub(crate) ground_budget_enabled: bool,
@@ -1832,6 +1775,15 @@ pub struct Executor {
     /// caller can observe `Unsat`. Fail-closed: reset to false when emission or
     /// verification fails.
     last_bv_drat_self_cert: bool,
+    /// BV solves this executor ended `unknown` before their SAT search began
+    /// because a stop (interrupt, deadline, memory ceiling) cut the encoding
+    /// short. Monotone over the executor's life; read through
+    /// [`Executor::bv_encodings_stopped_before_search`].
+    bv_encodings_stopped_before_search: u64,
+    /// BV solves this executor carried into a SAT search (the eager path once
+    /// its clause load finished; the incremental path on entry). Monotone;
+    /// read through [`Executor::bv_sat_searches_entered`].
+    bv_sat_searches_entered: u64,
     /// When true, the datatype-carrying-array SAT soundness gate
     /// (`problem_has_datatype_carrying_array` in `finalize_sat_model_validation`
     /// and in `solve_with_dt_axioms`) is BYPASSED because the store-value
@@ -2528,13 +2480,6 @@ pub struct Executor {
     /// revoke the model/certificate/outcomes rather than publish stale optima.
     #[cfg(test)]
     forced_optimization_post_emit_objective_flip: Cell<bool>,
-    /// Test-only instrumentation: whether the Phase 5 difference-logic engine
-    /// (`try_diff_logic`) decided the most recent `check_sat_internal` call. Lets
-    /// the differential gate confirm the diff-logic path actually fired when the
-    /// `:ay-diff-logic` option is ON (rather than silently falling through to the
-    /// normal solver and coincidentally agreeing).
-    #[cfg(test)]
-    last_diff_logic_decided: Cell<bool>,
     /// When true, theory lemmas are cached across push/pop scope transitions
     /// and replayed into the SAT solver on subsequent check-sat calls (#8304).
     /// Off by default. Enabled via `Solver::set_lemma_persistence(true)`.

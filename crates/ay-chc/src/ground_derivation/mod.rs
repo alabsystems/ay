@@ -60,6 +60,7 @@ pub(crate) mod clause_map;
 pub(crate) mod complete;
 mod exact_bindings;
 pub(crate) mod forward;
+mod identity_sort;
 mod lambda_replay;
 mod lambda_scope;
 pub(crate) mod linear_trace;
@@ -75,11 +76,10 @@ pub(crate) mod witness;
 /// constructors/selectors, and each bounded cache entry also consume units.
 /// Every step then reserves its cached clause's expression/predicate replay,
 /// recursive value/sort typechecking, declared bitvector-width work, variables,
-/// and UF applications. Producer environments are additionally multiplied by
-/// exact incoming head-argument fanout. The accounting is completed before
-/// evaluating any derivation step, so repeated references to a hostile clause
-/// cannot multiply source walks, datatype lookup, aggregate comparison, or
-/// evaluator allocation outside this envelope.
+/// and UF applications before evaluation. Each materialized producer head cell
+/// then reserves its value comparison and sort checks for all incoming premise
+/// edges before entering the cache. Each consumer charges its own value before
+/// comparing the two cells.
 pub const CHC_GROUND_DERIVATION_MAX_SOURCE_WORK: usize = 4_194_304;
 /// The per-derivation source-surface envelope for NATIVE validation
 /// (`validate_ground_derivation`, i.e. derivations AY built in-process and
@@ -454,6 +454,7 @@ pub(crate) struct GroundClauseSurface {
 pub(crate) struct GroundSourceSurfaceCache<'a> {
     problem: &'a ChcProblem,
     entries: FxHashMap<usize, GroundClauseSurface>,
+    identity_datatypes: FxHashMap<crate::ChcDtId, crate::ChcDtConstructors>,
     work_used: usize,
     work_limit: usize,
     #[cfg(test)]
@@ -475,6 +476,7 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             // over a huge in-memory problem must allocate only for clauses it
             // actually selects.
             entries: FxHashMap::default(),
+            identity_datatypes: FxHashMap::default(),
             work_used: 0,
             work_limit,
             #[cfg(test)]
@@ -654,11 +656,11 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                         .checked_add(variable.name.len())
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
                     let sort_work = self.reserve_source_sort(&variable.sort, control)?;
-                    let nested_sort_work = sort_work
-                        .checked_mul(function_memberships)
-                        .and_then(|work| work.checked_mul(32))
-                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    self.charge(nested_sort_work)?;
+                    let nested_sort_work = self.reserve_nested_sort_identity(
+                        &variable.sort,
+                        function_memberships,
+                        control,
+                    )?;
                     nested_identity_work = nested_identity_work
                         .checked_add(nested_sort_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
@@ -690,12 +692,12 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                     replay_work = replay_work
                         .checked_add(signature_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    let sort_work = self.reserve_source_sort(return_sort, control)?;
-                    let nested_sort_work = sort_work
-                        .checked_mul(function_memberships)
-                        .and_then(|work| work.checked_mul(32))
-                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    self.charge(nested_sort_work)?;
+                    self.reserve_source_sort(return_sort, control)?;
+                    let nested_sort_work = self.reserve_nested_sort_identity(
+                        return_sort,
+                        function_memberships,
+                        control,
+                    )?;
                     nested_identity_work = nested_identity_work
                         .checked_add(nested_sort_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
@@ -707,12 +709,9 @@ impl<'a> GroundSourceSurfaceCache<'a> {
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
                 }
                 ChcExpr::ConstArray(key_sort, _) | ChcExpr::ConstArrayMarker(key_sort) => {
-                    let sort_work = self.reserve_source_sort(key_sort, control)?;
-                    let nested_sort_work = sort_work
-                        .checked_mul(function_memberships)
-                        .and_then(|work| work.checked_mul(32))
-                        .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
-                    self.charge(nested_sort_work)?;
+                    self.reserve_source_sort(key_sort, control)?;
+                    let nested_sort_work =
+                        self.reserve_nested_sort_identity(key_sort, function_memberships, control)?;
                     nested_identity_work = nested_identity_work
                         .checked_add(nested_sort_work)
                         .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?;
@@ -895,12 +894,9 @@ impl<'a> GroundSourceSurfaceCache<'a> {
             if depth > CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
                 return Err(GroundSourceSurfaceError::SourceWorkLimitExceeded);
             }
-            // Derived sort formatting, hashing, ordering, and equality expand
-            // nested structure bottom-up. Weight each occurrence by its sort
-            // ancestor depth so a deep shared datatype DAG cannot hide
-            // quadratic work behind Arc identity. Occurrences are deliberately
-            // not deduplicated: the downstream derived operations do not
-            // deduplicate them either. The depth/work caps terminate cycles.
+            // Typing and constructor/selector lookup still visit definitions.
+            // Reserve that traversal even when the nested syntactic UF key
+            // uses only the constructor list's content address.
             self.charge(
                 32usize
                     .checked_mul(depth)
@@ -1227,26 +1223,28 @@ impl<'a> GroundSourceSurfaceCache<'a> {
         self.charge(work)
     }
 
-    /// Reserve producer-head evaluation and aggregate comparison work for all
-    /// incoming body-argument uses before any head value is materialized.
-    pub(crate) fn charge_step_head_fanout_replay(
+    /// A premise edge reads each cached tuple position exactly once. Reserve
+    /// the cost of comparing this particular value and checking its declared
+    /// sort across all uses before any of those comparisons take place.
+    fn charge_premise_value(
         &mut self,
-        clause_index: usize,
-        argument_fanout: usize,
-        env: &FxHashMap<String, SmtValue>,
+        value: &SmtValue,
+        sort_work: usize,
+        uses: usize,
     ) -> Result<(), GroundSourceSurfaceError> {
-        if argument_fanout == 0 {
-            return Ok(());
-        }
-        let replay_work = self.surface(clause_index)?.replay_work;
-        self.charge(
-            replay_work
-                .checked_mul(argument_fanout)
-                .ok_or(GroundSourceSurfaceError::SourceWorkLimitExceeded)?,
-        )?;
-        // Each incoming use compares the whole head tuple: every binding it
-        // reads, once per use.
-        self.charge_each_binding(env, argument_fanout).map(|_| ())
+        let exhausted = GroundSourceSurfaceError::SourceWorkLimitExceeded;
+        let per_use = (self.work_limit - self.work_used)
+            .checked_div(uses)
+            .ok_or(exhausted)?;
+        let storage_limit = (per_use / sort_work).min(CHC_GROUND_DERIVATION_MAX_SOURCE_WORK);
+        let (storage, nonlinear) = ground_value_storage_profile_with_limit(value, storage_limit)?;
+        let comparison = ground_profile_replay_work(storage, nonlinear)?;
+        let work = storage
+            .checked_mul(sort_work)
+            .and_then(|typecheck| typecheck.checked_add(comparison))
+            .and_then(|per_use| per_use.checked_mul(uses))
+            .ok_or(exhausted)?;
+        self.charge(work)
     }
 
     /// Charge every binding (name and value) `multiplier` times; returns the
@@ -1421,6 +1419,13 @@ fn ground_value_storage_profile_with_limit(
 
 fn ground_value_replay_work(value: &SmtValue) -> Result<usize, GroundSourceSurfaceError> {
     let (storage_work, has_nonlinear_aggregate) = ground_value_storage_profile(value)?;
+    ground_profile_replay_work(storage_work, has_nonlinear_aggregate)
+}
+
+fn ground_profile_replay_work(
+    storage_work: usize,
+    has_nonlinear_aggregate: bool,
+) -> Result<usize, GroundSourceSurfaceError> {
     if has_nonlinear_aggregate {
         storage_work
             .checked_mul(storage_work)
@@ -2064,23 +2069,21 @@ fn validate_ground_derivation_with_control(
         }
     }
 
-    // One cached producer head can feed many consumer arguments. Equality of
-    // aggregate values is not constant-time, so derive exact incoming argument
-    // multiplicity without evaluating either side and reserve producer replay
-    // work before Pass 3 materializes any head value.
-    let mut premise_head_argument_fanout = vec![0usize; derivation.steps.len()];
-    let mut total_head_argument_fanout = 0usize;
+    // Keep the global argument bound, and count how many times each cached
+    // tuple will be read. One edge compares each position once.
+    let mut premise_uses = vec![0usize; derivation.steps.len()];
+    let mut total_arguments = 0usize;
     for step in &derivation.steps {
         control.poll()?;
         let clause = &clauses[step.clause_index];
         for ((_, arguments), premise) in clause.body.predicates.iter().zip(&step.premises) {
             control.poll()?;
-            total_head_argument_fanout = total_head_argument_fanout
+            total_arguments = total_arguments
                 .checked_add(arguments.len())
-                .filter(|fanout| *fanout <= CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
+                .filter(|total| *total <= CHC_GROUND_DERIVATION_MAX_SOURCE_WORK)
                 .ok_or(GroundDerivationError::SourceWorkLimitExceeded)?;
-            premise_head_argument_fanout[*premise] = premise_head_argument_fanout[*premise]
-                .checked_add(arguments.len())
+            premise_uses[*premise] = premise_uses[*premise]
+                .checked_add(1)
                 .ok_or(GroundDerivationError::SourceWorkLimitExceeded)?;
         }
     }
@@ -2138,18 +2141,6 @@ fn validate_ground_derivation_with_control(
             return Err(refuse(&source_surfaces, "scalar replay", surface_error));
         }
         control.poll()?;
-        if let Err(surface_error) = source_surfaces.charge_step_head_fanout_replay(
-            step.clause_index,
-            premise_head_argument_fanout[step_index],
-            &step.env,
-        ) {
-            return Err(refuse(
-                &source_surfaces,
-                "head fan-out replay",
-                surface_error,
-            ));
-        }
-        control.poll()?;
         let variables = &source_surfaces
             .surface(step.clause_index)
             .map_err(map_surface_error)?
@@ -2180,7 +2171,7 @@ fn validate_ground_derivation_with_control(
     // A premise head may fan out to arbitrarily many incoming body edges.
     // Evaluate its tuple exactly once after the producing step validates, then
     // reuse the concrete/indeterminate cells at every consumer.
-    let mut evaluated_heads: Vec<Option<Vec<Option<SmtValue>>>> =
+    let mut evaluated_heads: Vec<Option<Vec<Option<(SmtValue, usize)>>>> =
         vec![None; derivation.steps.len()];
     for (idx, step) in derivation.steps.iter().enumerate() {
         control.poll()?;
@@ -2257,7 +2248,7 @@ fn validate_ground_derivation_with_control(
                 .enumerate()
             {
                 control.poll()?;
-                let (Some(use_value), Some(def_value)) = (
+                let (Some(use_value), Some((def_value, sort_work))) = (
                     eval_ground_with_control(use_arg, &step.env, control)?,
                     def_value.as_ref(),
                 ) else {
@@ -2273,6 +2264,9 @@ fn validate_ground_derivation_with_control(
                         position,
                     });
                 };
+                source_surfaces
+                    .charge_premise_value(&use_value, *sort_work, 1)
+                    .map_err(|_| GroundDerivationError::SourceWorkLimitExceeded)?;
                 let sorts_match = canonical_ground_value_matches_sort(&use_value, expected_sort)
                     && canonical_ground_value_matches_sort(def_value, expected_sort);
                 control.poll()?;
@@ -2302,10 +2296,33 @@ fn validate_ground_derivation_with_control(
                 }
             }
         }
-        evaluated_heads[idx] = if let Some(arguments) = head_args(clause) {
+        evaluated_heads[idx] = if let ClauseHead::Predicate(id, arguments) = &clause.head {
+            let predicate = problem
+                .get_predicate(*id)
+                .ok_or(GroundDerivationError::InvalidSourceProblem)?;
+            if arguments.len() != predicate.arg_sorts.len() {
+                return Err(GroundDerivationError::InvalidSourceProblem);
+            }
             let mut values = Vec::with_capacity(arguments.len());
-            for argument in arguments {
-                values.push(eval_ground_with_control(argument, &step.env, control)?);
+            for (argument, sort) in arguments.iter().zip(&predicate.arg_sorts) {
+                let cached = if let Some(value) =
+                    eval_ground_with_control(argument, &step.env, control)?
+                {
+                    let sort_work =
+                        source_sort_typecheck_work(sort, control).map_err(|error| match error {
+                            GroundSourceSurfaceError::Interrupted => {
+                                GroundDerivationError::Interrupted
+                            }
+                            _ => GroundDerivationError::SourceWorkLimitExceeded,
+                        })?;
+                    source_surfaces
+                        .charge_premise_value(&value, sort_work, premise_uses[idx])
+                        .map_err(|_| GroundDerivationError::SourceWorkLimitExceeded)?;
+                    Some((value, sort_work))
+                } else {
+                    None
+                };
+                values.push(cached);
             }
             Some(values)
         } else {

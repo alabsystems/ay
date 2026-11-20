@@ -92,6 +92,6 @@
       "external_proof": "Unsupported FP surface, one rendered hole; neither external Alethe acceptance nor formal compiler verification is claimed"
     }
   },
-  "retained_logs": "Public outputs and unsupported artifact: the development design notes Source qualification/build logs: /tmp/.ubd/ay-session-config/.",
+  "retained_logs": "Public outputs and unsupported artifact: the development design notes at ay 9598c4206 (removed from the tree since; git history keeps it). Source qualification/build logs: /tmp/.ubd/ay-session-config/.",
   "limits": "Original evaluator cumulative work/storage/callbacks, existing exact dyadic/rounding envelope; no new allowance, cache, flag, solver arithmetic dependency or proof-transport claim"
 }

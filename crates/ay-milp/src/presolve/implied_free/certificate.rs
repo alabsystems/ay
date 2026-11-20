@@ -24,6 +24,12 @@ impl AffineAggregationCertificate {
         &self,
         source: &Model,
     ) -> Result<AffineAggregationVerification, AffineAggregationCertificateError> {
+        // Replay uses exact(f64), like the producer, so it supports only
+        // models without authoritative exact side-store overrides. A matching
+        // digest does not establish that those rounded values are exact.
+        if source.has_inexact_coeffs() {
+            return Err(AffineAggregationCertificateError::Replay);
+        }
         if crate::cert_io::canonical_digest(source) != self.analysis.source_digest {
             return Err(AffineAggregationCertificateError::SourceDigest);
         }

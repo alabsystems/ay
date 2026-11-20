@@ -105,6 +105,24 @@ impl Solver {
             .filter(|trace| !trace.proof_work_exhausted())
     }
 
+    /// Whether the retained trace still records clause additions: live
+    /// traces, plus exhausted traces degraded to literals-only recording
+    /// (complete clause sequence, no hints). LRAT bookkeeping ownership
+    /// (`has_live_clause_trace`) is unaffected.
+    pub(in crate::solver) fn has_recording_clause_trace(&self) -> bool {
+        self.cold
+            .clause_trace
+            .as_ref()
+            .is_some_and(|trace| !trace.proof_work_exhausted() || trace.literals_only_recording())
+    }
+
+    pub(in crate::solver) fn recording_clause_trace_mut(&mut self) -> Option<&mut ClauseTrace> {
+        self.cold
+            .clause_trace
+            .as_mut()
+            .filter(|trace| !trace.proof_work_exhausted() || trace.literals_only_recording())
+    }
+
     /// Recompute composite proof state after an ownership transition.
     ///
     /// Output LRAT, explicit internal LRAT, and a live clause trace own LRAT

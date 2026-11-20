@@ -162,6 +162,7 @@ pub(crate) fn validate_with_owner(
             &envelope.normalized_input_sha256,
             &envelope.source_clause_sequence_sha256,
             "compact artifact",
+            None, // source::admit_identity already reserved both canonical sorts.
             control,
         )
         .map(|_| ())

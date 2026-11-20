@@ -1236,6 +1236,73 @@ pub(crate) fn grid_ladder(bits: Option<u32>) -> impl Iterator<Item = Option<u32>
 /// bound on the leaf COUNT, and an integral column with an infinite side can
 /// descend forever — `leaf_cap` and `MAX_DEPTH` are caps, not a terminator, and
 /// are the honest reason this returns `Option`.
+/// An exact certificate that every integer-feasible point of a model has
+/// objective at least `value` (Minimize) or at most `value` (Maximize): the
+/// BOUND half of a [`MilpOptimalityCertificate`], with no incumbent.
+///
+/// This is the artifact an INTERRUPTED search can stand behind: its dual
+/// bound is a claim about points nobody has found, and only a tree whose
+/// every leaf is an exact bound or Farkas proof over the box its position
+/// implies can license it. NY withholds the dual bound of an interrupted AY
+/// tree for exactly that want of an artifact (`ny-mip/src/ay_lib.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MilpBoundCertificate {
+    /// The certified bound, in the model's own objective frame and with its
+    /// offset applied, like [`MilpOptimalityCertificate::value`].
+    pub value: BigRational,
+    /// The case-split tree. Its leaves are checked at the boxes the verifier
+    /// reconstructs from the caller's model.
+    pub root: OptTreeNode,
+}
+
+impl MilpBoundCertificate {
+    /// Independently verify the bound against `model` (exact arithmetic, no
+    /// solver state): [`verify_optimality_tree_bound`] at `value`.
+    ///
+    /// # Errors
+    /// As [`verify_optimality_tree_bound`].
+    pub fn verify(&self, model: &Model) -> Result<(), CertificateError> {
+        verify_optimality_tree_bound(model, &self.value, &self.root)
+    }
+}
+
+/// Derive a [`MilpBoundCertificate`] for `value` from scratch, by the same
+/// independent descent [`derive_optimality_tree`] runs: against the CALLER's
+/// model, with no cuts, presolve, reduced-cost fixing or propagation, every
+/// leaf proved on the exact rim or by an exactified float dual that is then
+/// re-verified, and the whole tree verified again before it is returned.
+///
+/// No witness is needed or consulted; that is the difference. A caller holding
+/// an interrupted search's dual bound can ask for exactly that number, or for
+/// a weaker one that is cheaper to close. The same caps apply and the same
+/// honesty about cost: the descent's tree is usually larger than the one the
+/// engine walked, so `None` (with the report naming why) is an ordinary answer.
+#[must_use]
+pub fn derive_bound_tree_reported(
+    model: &Model,
+    value: &BigRational,
+    budget: &OptimalityTreeBudget,
+) -> (Option<MilpBoundCertificate>, OptTreeReport) {
+    let mut sink = TreeSink::default();
+    let (ok, mut report) = run_bound_descent(&mut sink, model, value, None, budget);
+    if !ok {
+        return (None, report);
+    }
+    let Some(root) = sink.finish() else {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    };
+    let cert = MilpBoundCertificate {
+        value: value.clone(),
+        root,
+    };
+    if cert.verify(model).is_err() {
+        report.decline = Some(OptTreeDecline::VerifyFailed);
+        return (None, report);
+    }
+    (Some(cert), report)
+}
+
 #[must_use]
 pub fn derive_optimality_tree(
     model: &Model,
@@ -1411,6 +1478,20 @@ fn run_descent<S: OptTreeSink>(
         report.decline = Some(OptTreeDecline::WitnessRejected);
         return (false, report);
     }
+    run_bound_descent(sink, model, value, Some(witness), budget)
+}
+
+/// The dual half of [`run_descent`]: derive a tree proving `objective >= value`
+/// (minimise frame) over every integer-feasible point. `witness`, when given,
+/// only prices the root gap in the report; nothing in the descent reads it.
+fn run_bound_descent<S: OptTreeSink>(
+    sink: &mut S,
+    model: &Model,
+    value: &BigRational,
+    witness: Option<&[BigRational]>,
+    budget: &OptimalityTreeBudget,
+) -> (bool, OptTreeReport) {
+    let mut report = OptTreeReport::default();
     if budget.leaf_cap == 0 {
         report.decline = Some(OptTreeDecline::Disabled);
         return (false, report);
@@ -1456,7 +1537,7 @@ fn run_descent<S: OptTreeSink>(
         // very objective vector the root LP minimised, so the model's offset and
         // its sense cancel and the difference is the gap the descent has to
         // branch away.
-        if let Some(rb) = &d.root_bound {
+        if let (Some(rb), Some(witness)) = (&d.root_bound, witness) {
             let z_min: BigRational = descent
                 .obj_min
                 .iter()

@@ -41,6 +41,7 @@ mod authored_negated_exists_ground_inst;
 mod authored_negated_exists_witness_hints;
 mod authored_nested_forall;
 mod authored_nested_forall_search;
+mod authored_seq_word;
 mod authored_shared_tautology;
 mod authored_store_permutation;
 mod authored_string_length;
@@ -6943,10 +6944,10 @@ fn build_bool_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
 }
 
 pub(in crate::executor) use check::StrictWalkMemo;
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 use check::*;
 pub(in crate::executor) use terminal_trust::WireGapScreenDeclines;
-#[cfg(all(test, feature = "proof-checker"))]
+#[cfg(test)]
 mod ground_conflict_bridge_tests;
 #[cfg(test)]
 mod scoped_premise_tests;

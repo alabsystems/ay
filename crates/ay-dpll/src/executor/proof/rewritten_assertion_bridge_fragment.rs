@@ -192,22 +192,42 @@ impl Executor {
         atom: TermId,
         overrides: Option<&DetHashMap<TermId, String>>,
     ) -> bool {
+        !self
+            .bridge_fragment_render(fragment, atom, overrides)
+            .renders()
+    }
+
+    /// Guard 5, with the reason a fragment does not render: a lane that can
+    /// skip the rest of a root's work on [`ay_proof::DerivationRender::OutOfBudget`]
+    /// reads this one.
+    pub(super) fn bridge_fragment_render(
+        &self,
+        fragment: &[ProofStep],
+        atom: TermId,
+        overrides: Option<&DetHashMap<TermId, String>>,
+    ) -> ay_proof::DerivationRender {
         let rendered = ay_proof::CongruenceDerivation {
             steps: fragment.to_vec(),
             clause: vec![atom],
         };
-        if !ay_proof::congruence_derivation_renders(&self.ctx.terms, overrides, &rendered) {
-            return true;
+        let verdict = self.congruence_derivation_renders_until_stopped(overrides, &rendered);
+        if !verdict.renders() {
+            return verdict;
         }
         let Some(overrides) = overrides else {
-            return false;
+            return verdict;
         };
-        fragment.iter().any(|step| match step {
+        let eq_transitive_refused = fragment.iter().any(|step| match step {
             ProofStep::Step { clause, .. } => {
                 Self::eq_transitive_clause_is_unrenderable(&self.ctx.terms, overrides, clause)
             }
             _ => false,
-        })
+        });
+        if eq_transitive_refused {
+            ay_proof::DerivationRender::Unrenderable
+        } else {
+            verdict
+        }
     }
 
     /// Splice every planned fragment in, remapping premise references, and

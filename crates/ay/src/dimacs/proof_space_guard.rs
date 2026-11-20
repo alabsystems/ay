@@ -15,7 +15,7 @@ const PROOF_FREE_SPACE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The byte cadence of the probe. `statvfs` is cheap but not free, and the
 /// proof grows at 6 to 19 MB/s on the instances that write the most
-/// (competition/proof-posture-parity/capoff-1500-traces.tsv), so 256 MiB is a look
+/// (competition/proof-posture-parity/capoff-1500-traces.tsv at 9598c4206), so 256 MiB is a look
 /// every 14 to 45 seconds there. The interval is clamped to an eighth of the
 /// reserve so a small reserve keeps its meaning: between two probes at most
 /// `interval` bytes are written, so the floor actually held is

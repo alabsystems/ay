@@ -10,7 +10,6 @@ impl LraSolver {
     pub(super) fn check_impl(&mut self) -> TheoryResult {
         self.stats.check_count += 1;
         let debug = self.debug_lra;
-        self.pending_bound_refinements.clear();
         // #8468: Clear BCP freshness flag — full check runs its own implied
         // bounds pass so any stale BCP freshness is irrelevant.
         self.implied_bounds_fresh = false;
@@ -310,24 +309,6 @@ impl LraSolver {
                 .persistent_unsupported_atoms
                 .iter()
                 .any(|a| self.asserted.contains_key(a));
-
-        // A5 core (#qfuflia-a5): after a Sat simplex, materialize any deferred
-        // equality whose expression the current assignment VIOLATES, then
-        // re-run the simplex — demand-driven row generation, looped to a
-        // small fixpoint. Satisfied deferrals stay row-free.
-        if self.a5_core && matches!(simplex_result, TheoryResult::Sat) {
-            for _round in 0..8 {
-                let n = self.materialize_violated_deferred_eqs();
-                if n == 0 {
-                    break;
-                }
-                let re = self.dual_simplex();
-                self.set_last_simplex_feasible(matches!(re, TheoryResult::Sat));
-                if !matches!(re, TheoryResult::Sat) {
-                    return re;
-                }
-            }
-        }
 
         // If simplex returned Sat, check disequalities
         // IMPORTANT: Only check disequalities when we have complete information.
@@ -742,9 +723,6 @@ impl LraSolver {
     pub(super) fn check_during_propagate_impl(&mut self) -> TheoryResult {
         self.stats.check_count += 1;
         let debug = self.debug_lra;
-        if !self.pending_bound_refinements.is_empty() {
-            self.pending_bound_refinements.clear();
-        }
         // #8003: Reset per-check pivot counter (same as check_impl).
         self.stats.check_pivot_count = 0;
         // #8187: Reset the soundness-gate flag (see check_impl doc above).

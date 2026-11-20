@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Consolidated api integration tests for ay-dpll.
-//! Groups 8 test modules into a single binary to reduce link time.
+//! Groups the api test modules into a single binary to reduce link time.
 
 #![allow(clippy::panic)]
 
@@ -23,6 +23,8 @@ mod interface_bridge_5227;
 mod interface_bridge_5230;
 #[path = "group_api/parallel_instance_isolation_6563.rs"]
 mod parallel_instance_isolation_6563;
+#[path = "group_api/resource_limit_classification.rs"]
+mod resource_limit_classification;
 #[path = "group_api/solver_construct_stack_safety.rs"]
 mod solver_construct_stack_safety;
 #[path = "group_api/step_mode_api_canary_6315.rs"]

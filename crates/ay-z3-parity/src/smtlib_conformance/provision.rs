@@ -6,6 +6,7 @@
 //! independently checked before a path is returned to the qualification run.
 
 use super::*;
+use reference_inventory::SnapshotKind;
 use std::ffi::OsString;
 use std::io;
 
@@ -156,10 +157,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
     }
     let directory = directory.ok_or("provision requires --directory DIR")?;
     let inputs = prepare(&directory, access)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&inputs).map_err(|error| error.to_string())?
-    );
+    print_utf8(&pretty_json(&inputs)?)?;
     Ok(0)
 }
 
@@ -631,9 +629,18 @@ pub(super) fn prepare(directory: &Path, access: NetworkAccess) -> Result<Provisi
     let language_snapshot = directory.join("language-source.json");
     let registry_snapshot = directory.join("registry-source.json");
     let z3_snapshot = directory.join("z3-source.json");
-    authenticate_snapshot("language", &language_source, &language_snapshot)?;
-    authenticate_snapshot("registry", &registry_source, &registry_snapshot)?;
-    authenticate_snapshot("z3", &z3_source, &z3_snapshot)?;
+    retain_authenticated_snapshot(
+        &reference_inventory::create_snapshot(SnapshotKind::Language, &language_source, &profile)?,
+        &language_snapshot,
+    )?;
+    retain_authenticated_snapshot(
+        &reference_inventory::create_snapshot(SnapshotKind::Registry, &registry_source, &profile)?,
+        &registry_snapshot,
+    )?;
+    retain_authenticated_snapshot(
+        &z3_source_inventory::create_snapshot(&z3_source, &profile)?,
+        &z3_snapshot,
+    )?;
     let inputs = Provisioned {
         schema: "ay-conformance-provision/v2".to_string(),
         profile_id: profile.id,
@@ -1026,25 +1033,13 @@ fn authenticate_z3_source(
     Ok(())
 }
 
-fn authenticate_snapshot(kind: &str, source: &Path, destination: &Path) -> Result<(), String> {
-    // The maintained extractor authenticates selected path/blob/size manifests
-    // and every content byte. Generate beside the destination, then compare
-    // byte-for-byte when resuming instead of trusting an old receipt.
-    let temporary = tempfile::tempdir_in(destination.parent().ok_or("snapshot has no parent")?)
-        .map_err(|error| error.to_string())?;
-    let fresh = temporary.path().join("snapshot.json");
-    let mut arguments = vec![
-        source.display().to_string(),
-        "--out".to_owned(),
-        fresh.display().to_string(),
-    ];
-    if kind == "z3" {
-        z3_source_inventory::snapshot(&arguments)?;
-    } else {
-        arguments.insert(0, kind.to_owned());
-        reference_inventory::snapshot(&arguments)?;
-    }
-    let bytes = fs::read(fresh).map_err(|error| error.to_string())?;
+fn retain_authenticated_snapshot<T: Serialize>(
+    snapshot: &T,
+    destination: &Path,
+) -> Result<(), String> {
+    // The extractors have authenticated the selected path/blob/size manifests
+    // and contents. Compare the fresh serialization byte-for-byte.
+    let bytes = pretty_json(snapshot)?;
     if destination.exists() {
         if fs::read(destination).map_err(|error| error.to_string())? != bytes {
             return Err(format!(

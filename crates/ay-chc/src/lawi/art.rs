@@ -4,6 +4,7 @@
 
 use crate::{ChcProblem, ClauseHead, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
+use ay_core::kani_compat::DetHashSet as FxHashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ArtVertexId(pub(crate) u32);
@@ -47,6 +48,10 @@ pub(crate) struct AbstractReachabilityTree {
     edges: FxHashMap<ArtEdgeId, ArtEdge>,
     vertices_by_location: FxHashMap<ArtLocation, Vec<ArtVertexId>>,
     outgoing: FxHashMap<PredicateId, Vec<OutgoingClause>>,
+    /// Predicate-location vertices whose outgoing clauses have all been
+    /// expanded. A leaf with no outgoing clause is expanded once `expand`
+    /// ran on it, although it stays a leaf.
+    expanded: FxHashSet<ArtVertexId>,
 }
 
 impl AbstractReachabilityTree {
@@ -72,6 +77,7 @@ impl AbstractReachabilityTree {
             edges: FxHashMap::default(),
             vertices_by_location,
             outgoing,
+            expanded: FxHashSet::default(),
         })
     }
 
@@ -106,6 +112,22 @@ impl AbstractReachabilityTree {
         self.children.get(&vertex).is_none_or(Vec::is_empty)
     }
 
+    /// Whether `expand` has created every child of this predicate vertex.
+    pub(crate) fn is_expanded(&self, vertex: ArtVertexId) -> bool {
+        self.expanded.contains(&vertex)
+    }
+
+    /// The edge into `vertex` (`None` for the root).
+    pub(crate) fn parent_edge(&self, vertex: ArtVertexId) -> Option<ArtEdge> {
+        self.edge(*self.parent.get(&vertex)?)
+    }
+
+    /// The parent of `vertex` (`None` for the root). `expand` numbers a
+    /// child after its parent, so a parent's id is always smaller.
+    pub(crate) fn parent_vertex(&self, vertex: ArtVertexId) -> Option<ArtVertexId> {
+        self.parent_edge(vertex).map(|edge| edge.source)
+    }
+
     pub(crate) fn edge(&self, edge: ArtEdgeId) -> Option<ArtEdge> {
         self.edges.get(&edge).copied()
     }
@@ -119,6 +141,9 @@ impl AbstractReachabilityTree {
             return Vec::new();
         };
 
+        if !self.expanded.insert(vertex) {
+            return Vec::new();
+        }
         let outgoing = self.outgoing.get(&location).cloned().unwrap_or_default();
         let mut children = Vec::with_capacity(outgoing.len());
 

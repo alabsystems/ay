@@ -454,7 +454,7 @@ pub struct SatAbSwitches {
     /// instances an 8 GB size cap stopped answer nothing when uncapped at 1500 s,
     /// and a proof large enough to be unverifiable scores what no proof scores,
     /// so the policy guards the disk rather than the size
-    /// (competition/proof-posture-parity/HANDOFF-2026-09-10.md, drive#92).
+    /// (competition/proof-posture-parity/HANDOFF-2026-09-10.md at 9598c4206, drive#92).
     pub proof_min_free_bytes: Option<u64>,
     /// `--sat-proof-cap-bytes <BYTES>`. Unset by default: no size ceiling. When
     /// set, the DIMACS proof writer stops the proof at that many bytes, through
@@ -470,13 +470,13 @@ pub struct SatAbSwitches {
     /// clause factoring run on formulas the expensive-pass size gate refuses (over 200K
     /// variables or 3M clauses, up to 2M variables, 10M clauses and density 20), opening
     /// its size and delay gates there. Lever 3 of competition/proof-posture-parity/PLAN-next-
-    /// sat-levers.md; see `solver/factor_large.rs`.
+    /// sat-levers.md at 9598c4206; see `solver/factor_large.rs`.
     pub factor_large: Option<bool>,
     /// `--sat-subst-auto-giant-proof <bool>`. Default OFF; `true` arms the giant
     /// congruence band (4M variables, 10M clauses, the 12 s preprocessing budget)
     /// under the DRAT posture, which the shipped VeriPB surface resolves to. Today
     /// that band is non-proof only. Lever 4 of
-    /// competition/proof-posture-parity/PLAN-next-sat-levers-2.md; see
+    /// competition/proof-posture-parity/PLAN-next-sat-levers-2.md at 9598c4206; see
     /// `subst_auto_giant_band_active` in `variant.rs`.
     pub subst_auto_giant_proof: Option<bool>,
     /// `--sat-bve-ext-cooccur <bool>`. Default OFF; `true` lets bounded variable
@@ -497,7 +497,7 @@ pub struct SatAbSwitches {
     /// `--sat-giant-band-max-vars <N>`. Default 2,000,000; raises the variable
     /// ceiling of the giant raw-BVE band (`BVE_GIANT_RAW_MAX_VARS`) and of the
     /// `--sat-factor-large` band (`FACTOR_LARGE_MAX_VARS`) together. Plan-2
-    /// lever 7 (competition/proof-posture-parity/PLAN-next-sat-levers-2.md): the
+    /// lever 7 (competition/proof-posture-parity/PLAN-next-sat-levers-2.md at 9598c4206): the
     /// six official instances between 2M and 4.1M variables (baseballcover x2,
     /// newpol32-4, T90, T92, g2-T97) have no BVE route today; 4.1M admits them
     /// and keeps the giant SAT controls (7.3M and 23.4M variables) out.
@@ -530,7 +530,7 @@ pub struct SatAbSwitches {
     /// most of them: stable-400, 1,130 factored, 1,023 eliminated) and
     /// factoring off counted at 0.24 to 0.5 of the propagations on the
     /// stable-400, ER, SGI, schooltt, 5x-1xxxxx, qwh and vdw rows
-    /// (2026-09-19, `miss-screen-nofactor.tsv`).
+    /// (2026-09-19, `competition/proof-posture-parity/miss-screen-nofactor.tsv` at `9598c4206`).
     pub factor_max_density: Option<f64>,
     /// `--sat-sbva-max-density <f>`. **Default 12 since 2026-09-22**; a value
     /// above any real density opts out. SBVA is skipped above this density,
@@ -541,7 +541,7 @@ pub struct SatAbSwitches {
     /// answers once in three at 297.05 s, and at 1500 s in 124.63 s against
     /// 654.00 s — a 5.2x speed-up, not new reach; on the uniform 24 nothing
     /// changes but 2.8 s of PAR-2
-    /// (competition/proof-posture-parity/l8-sbva-cap-verdict.tsv).
+    /// (competition/proof-posture-parity/l8-sbva-cap-verdict.tsv at 9598c4206).
     pub sbva_max_density: Option<f64>,
     /// `--sat-elim-density-irredundant <bool>`. Default unset: the in-search
     /// elimination gates (the dense skip at 50, the factor-dense band at 90)

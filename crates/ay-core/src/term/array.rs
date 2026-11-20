@@ -537,6 +537,152 @@ impl TermStore {
         )
     }
 
+    /// Reduce equality between a pair of array functions without crossing a
+    /// binder. An eta projection of a free array is its owner. Two singleton
+    /// updates with the same fallback and key agree iff their live values do.
+    /// Other pairs of literal singleton updates have an exact const/store form.
+    pub(super) fn array_lambda_equality_values(
+        &mut self,
+        left: TermId,
+        right: TermId,
+    ) -> Option<(TermId, TermId)> {
+        // A source equality between a free array and its defining lambda also
+        // supplies a constructor recipe to the functional-array model checker.
+        // Preserve that source binder and normalize only pairs of functions.
+        let (left_binder, left_body) = self.get_lambda_array(left)?;
+        let (right_binder, right_body) = self.get_lambda_array(right)?;
+        let left_owner = self.lambda_read_owner(left_body, left_binder);
+        let right_owner = self.lambda_read_owner(right_body, right_binder);
+        if left_owner.is_some() || right_owner.is_some() {
+            return Some((left_owner.unwrap_or(left), right_owner.unwrap_or(right)));
+        }
+        // An update that writes the fallback is simplified to a constant body
+        // before reaching this equality. Keep the surviving live-cell equality.
+        if matches!(self.get(right_body), TermData::Const(_)) {
+            return self.lambda_equality_with_constant(left_binder, left_body, right_body);
+        }
+        if matches!(self.get(left_body), TermData::Const(_)) {
+            return self
+                .lambda_equality_with_constant(right_binder, right_body, left_body)
+                .map(|(right, left)| (left, right));
+        }
+        let (key, fallback, left_cell) = self.lambda_singleton_parts(left_binder, left_body)?;
+        let (other_key, other_fallback, right_cell) =
+            self.lambda_singleton_parts(right_binder, right_body)?;
+        let left_value = self.lambda_cell_at_literal(left_binder, left_cell, key)?;
+        let right_value = self.lambda_cell_at_literal(right_binder, right_cell, other_key)?;
+        if key == other_key && fallback == other_fallback {
+            return Some((left_value, right_value));
+        }
+        // Each update needs its own key and fallback. The array solver accounts
+        // for an index sort whose finite carrier is exhausted by those writes.
+        let left_base = self.mk_const_array(self.sort(key).clone(), fallback);
+        let right_base = self.mk_const_array(self.sort(other_key).clone(), other_fallback);
+        let left = self.mk_store(left_base, key, left_value);
+        let right = self.mk_store(right_base, other_key, right_value);
+        Some((left, right))
+    }
+
+    fn lambda_equality_with_constant(
+        &mut self,
+        binder: TermId,
+        body: TermId,
+        constant: TermId,
+    ) -> Option<(TermId, TermId)> {
+        if matches!(self.get(body), TermData::Const(_)) {
+            return Some((body, constant));
+        }
+        let (key, fallback, cell) = self.lambda_singleton_parts(binder, body)?;
+        let value = self.lambda_cell_at_literal(binder, cell, key)?;
+        if fallback == constant {
+            return Some((value, constant));
+        }
+        let index_sort = self.sort(binder).clone();
+        let base = self.mk_const_array(index_sort.clone(), fallback);
+        let singleton = self.mk_store(base, key, value);
+        let uniform = self.mk_const_array(index_sort, constant);
+        Some((singleton, uniform))
+    }
+
+    fn lambda_singleton_parts(
+        &self,
+        binder: TermId,
+        body: TermId,
+    ) -> Option<(TermId, TermId, TermId)> {
+        let TermData::Ite(guard, selected, fallback) = *self.get(body) else {
+            return None;
+        };
+        if !matches!(self.get(fallback), TermData::Const(_)) {
+            return None;
+        }
+        Some((
+            self.lambda_singleton_guard(guard, binder)?,
+            fallback,
+            selected,
+        ))
+    }
+
+    fn lambda_cell_at_literal(
+        &mut self,
+        binder: TermId,
+        cell: TermId,
+        key: TermId,
+    ) -> Option<TermId> {
+        if cell == binder {
+            return Some(key);
+        }
+        if matches!(self.get(cell), TermData::Const(_) | TermData::Var(_, _)) {
+            return Some(cell);
+        }
+        let owner = self.lambda_read_owner(cell, binder)?;
+        Some(self.mk_select(owner, key))
+    }
+
+    fn lambda_read_owner(&self, read: TermId, binder: TermId) -> Option<TermId> {
+        let TermData::App(Symbol::Named(op), args) = self.get(read) else {
+            return None;
+        };
+        let &[owner, index] = args.as_slice() else {
+            return None;
+        };
+        (op == "select"
+            && index == binder
+            && owner != binder
+            && matches!(self.get(owner), TermData::Var(_, _)))
+        .then_some(owner)
+    }
+
+    fn lambda_singleton_guard(&self, guard: TermId, binder: TermId) -> Option<TermId> {
+        let TermData::App(Symbol::Named(op), args) = self.get(guard) else {
+            return None;
+        };
+        let &[left, right] = args.as_slice() else {
+            return None;
+        };
+        let key = match op.as_str() {
+            "=" if left == binder => right,
+            "=" if right == binder => left,
+            "select" if right == binder => {
+                let TermData::App(Symbol::Named(store), args) = self.get(left) else {
+                    return None;
+                };
+                let &[base, key, present] = args.as_slice() else {
+                    return None;
+                };
+                if store != "store"
+                    || !self.is_true(present)
+                    || !self.get_const_array(base).is_some_and(|v| self.is_false(v))
+                {
+                    return None;
+                }
+                key
+            }
+            _ => return None,
+        };
+        (matches!(self.get(key), TermData::Const(_)) && self.sort(key) == self.sort(binder))
+            .then_some(key)
+    }
+
     /// Check if a term is a lambda array, returning `(var_term, body)` if so.
     pub fn get_lambda_array(&self, term: TermId) -> Option<(TermId, TermId)> {
         match self.get(term) {

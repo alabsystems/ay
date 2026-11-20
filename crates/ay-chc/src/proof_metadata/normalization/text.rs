@@ -28,7 +28,7 @@ pub(super) fn normalized_input<P: Progress>(
         actions.push(json_string(name));
     }
     progress.poll()?;
-    actions.sort();
+    progress.sort(&mut actions, |s| Key::text(s))?;
     for action in actions {
         progress.poll()?;
         out.push_str(&format!("action {action}\n"));
@@ -54,7 +54,7 @@ pub(super) fn normalized_input<P: Progress>(
         ));
     }
     progress.poll()?;
-    predicates.sort();
+    progress.sort(&mut predicates, |s| Key::text(s))?;
     for predicate in predicates {
         progress.poll()?;
         out.push_str(&predicate);
@@ -73,7 +73,7 @@ pub(super) fn normalized_input<P: Progress>(
         )?);
     }
     progress.poll()?;
-    clauses.sort();
+    progress.sort(&mut clauses, |s| Key::text(s))?;
     for clause in clauses {
         progress.poll()?;
         out.push_str(&clause);
@@ -143,7 +143,9 @@ pub(super) fn predicate_names<P: Progress>(
         ));
     }
     progress.poll()?;
-    signatures.sort();
+    progress.sort(&mut signatures, |(name, sorts, index)| {
+        Key(name, sorts, *index)
+    })?;
     let mut names = BTreeMap::new();
     for (index, (_, _, original_index)) in signatures.into_iter().enumerate() {
         progress.poll()?;
@@ -168,7 +170,7 @@ fn append_datatypes<P: Progress>(
         datatypes.push(entry);
     }
     progress.poll()?;
-    datatypes.sort_by_key(|(name, _)| *name);
+    progress.sort(&mut datatypes, |(name, _)| Key::text(name))?;
     for (name, constructors) in datatypes {
         progress.poll()?;
         let mut ctor_parts = Vec::new();
@@ -215,7 +217,7 @@ fn normalized_clause<P: Progress>(
         )?);
     }
     progress.poll()?;
-    body_predicates.sort();
+    progress.sort(&mut body_predicates, |s| Key::text(s))?;
     progress.poll()?;
     let constraint = match &clause.body.constraint {
         Some(expr) => payload::expression(expr, pred_names, progress, refs)?,

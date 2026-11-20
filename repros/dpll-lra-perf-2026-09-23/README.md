@@ -9,7 +9,7 @@ exactly what the engines hand to `ay_dpll::Executor` (competition posture, fresh
 `<instance>_k<k*>.smt2` is `BmcSolver::ts_incremental_script_segments_for_test` for the instance's
 transition system at its shortest counterexample depth k\* (init + trans@0..k\*-1 + query@k\*, a
 single `check-sat`, expected `sat`). k\* comes from a z3 scan of AY's unrollings
-(the development design notes §1). These are the queries where LRA_BMC §2 B8
+(the development design notes at `9598c4206`, §1). These are the queries where LRA_BMC §2 B8
 found that "one fresh depth-k\* check does not finish in 60 s on AY while z3 needs 0.2–2 s" (approx_hybrid.6.c,
 scenario2 ×3, scenario3 at k\*=1; the two tte_synchro clock-distance systems at k\*=6) plus the three om1/tte
 queries AY does decide (5–19 s) and s3_clnt_2 at k\*=8.
@@ -17,7 +17,7 @@ queries AY does decide (5–19 s) and s3_clnt_2 at k\*=8.
 ## 2. `imc_om1/` — IMC interpolation queries on oral_messages (16 scripts + metadata)
 
 `<instance>__imc_k<k>.smt2` (k = 3, 4) is the k-step IMC check on eight oral_messages instances, the
-A-D0 wall of `DESIGN_lra_interp_tpa.md` ("om1 k=3–4 unrollings take ay-dpll 6–>20 s vs z3 0.03–0.5 s").
+A-D0 wall of the development design notes at `9598c4206` ("om1 k=3–4 unrollings take ay-dpll 6–>20 s vs z3 0.03–0.5 s").
 The sibling `.json` records the source instance, `k`, the assertion group sizes, the interpolation
 partition masks and the shared-variable frontier between partitions, so the same query can be re-emitted
 as a proof/interpolant request.
@@ -43,4 +43,4 @@ wall-clock iteration budgets, which is why the symptom was load-dependent (8 qui
 ay --competition --timeout 60000 <query>.smt2      # AY, as the CHC lanes run it
 z3 -T:60 <query>.smt2
 ```
-The leased baseline/candidate tables live in the development design notes.
+The leased baseline/candidate tables were recorded in the development design notes at `9598c4206`.

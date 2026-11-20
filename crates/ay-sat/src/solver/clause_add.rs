@@ -221,7 +221,7 @@ impl Solver {
             };
             self.cold.empty_clause_lrat_id = Some(id);
             append(self, id, trace_hints)?;
-        } else if self.has_live_clause_trace() {
+        } else if self.has_recording_clause_trace() {
             let id = self.cold.empty_clause_lrat_id.unwrap_or_else(|| {
                 let id = self.cold.next_clause_id;
                 self.cold.next_clause_id += 1;

@@ -3377,32 +3377,6 @@ impl TheorySolver for TheoryCombiner<'_> {
         fresh
     }
 
-    fn suggest_decision_atom(&self) -> Option<(TermId, bool)> {
-        // Inc2 (eager-theory-propagation design 2026-07-20 §2): forward the
-        // arithmetic solver's LP-model-guided decision-atom suggestion
-        // (`LraSolver::suggest_decision_atom`, #8445; LIA is a pure delegate
-        // to its inner LRA). The combiner never forwarded this (git-verified
-        // never-wired), so UF+arith extension lanes always fell through to
-        // activity-based atom selection. Mirrors `suggest_phase` above minus
-        // the arrays arm: ArraySolver has no decision-atom suggestion (trait
-        // default `None`), so there is nothing to override.
-        //
-        // DEFAULT OFF (`--uflia-arith-decisions`, B72): the default keeps
-        // the historical `None` and the byte-identical
-        // trajectory. The consumer's wander suppression (extension wander
-        // latch + relevancy_should_engage) sits upstream and is unaffected.
-        if !ay_core::debug_channel::uflia_arith_decisions_enabled() {
-            return None;
-        }
-        if let Some(lia) = &self.lia {
-            return lia.suggest_decision_atom();
-        }
-        if let Some(lra) = &self.lra {
-            return lra.suggest_decision_atom();
-        }
-        None
-    }
-
     fn phase_hint_epoch(&self) -> Option<u64> {
         // SCOPE: this epoch covers `suggest_phase` ONLY. Every *phase*
         // suggestion this combiner emits is a pure function of the arithmetic

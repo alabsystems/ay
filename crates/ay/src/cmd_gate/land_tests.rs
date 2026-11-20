@@ -214,7 +214,10 @@ fn cli_module_changes_do_not_select_unrelated_external_checker_suites() {
     let tests: Vec<_> = plan
         .steps
         .iter()
-        .filter(|s| s.args.windows(2).any(|a| a == ["--unverified", "test"]))
+        .filter(|step| {
+            step.compiler_payload()
+                .is_some_and(|args| args.first().is_some_and(|arg| arg == "test"))
+        })
         .collect();
     assert_eq!(tests.len(), 1);
     assert!(!tests
@@ -314,6 +317,68 @@ fn metadata() -> plan::Metadata {
                  {"name": "group_core", "kind": ["test"], "src_path": "/repo/crates/ay-core/tests/group_core.rs"}]}
         ]
     })).unwrap()
+}
+
+#[test]
+fn removing_a_standalone_test_compiles_survivors_without_running_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut metadata = metadata();
+    for package in &mut metadata.packages {
+        package.manifest_path = temp
+            .path()
+            .join(package.manifest_path.strip_prefix("/repo").unwrap());
+        for target in &mut package.targets {
+            target.src_path = temp
+                .path()
+                .join(target.src_path.strip_prefix("/repo").unwrap());
+        }
+    }
+    let retired = PathBuf::from("crates/ay-core/tests/retired.rs");
+    let select = || {
+        plan::select(
+            temp.path(),
+            &metadata,
+            vec![retired.clone()],
+            None,
+            &Default::default(),
+        )
+        .unwrap()
+    };
+    let removed = select();
+    assert!(removed.steps.iter().any(|step| {
+        step.args.iter().any(|arg| arg == "check") && step.args.iter().any(|arg| arg == "--tests")
+    }));
+    assert!(!removed
+        .steps
+        .iter()
+        .any(|step| step.kind == super::process::StepKind::RustTests));
+
+    // A live shared helper retains conservative runtime ownership.
+    let live = temp.path().join(&retired);
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, "pub fn helper() {}\n").unwrap();
+    assert!(select()
+        .steps
+        .iter()
+        .any(|step| step.kind == super::process::StepKind::RustTests));
+
+    // Default test compilation does not cover a gated survivor.
+    std::fs::remove_file(live).unwrap();
+    metadata.packages[1].targets[1]
+        .required_features
+        .push("gated".into());
+    let gated = plan::select(
+        temp.path(),
+        &metadata,
+        vec![retired],
+        None,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(gated
+        .steps
+        .iter()
+        .any(|step| step.kind == super::process::StepKind::RustTests));
 }
 
 #[test]
@@ -539,7 +604,7 @@ fn a_version_only_bump_plans_the_metadata_check_and_the_cli_build_only() {
     assert!(!plan.broad_compile);
     assert_eq!(plan.steps.len(), 2, "{:?}", plan.steps);
     // Resolution with the checked-in lockfile and no network, outside the
-    // build-slot admission that compiler work takes.
+    // native fixed admission that compiler work takes.
     assert_eq!(plan.steps[0].program, "targo");
     assert_eq!(
         plan.steps[0].args,
@@ -549,9 +614,8 @@ fn a_version_only_bump_plans_the_metadata_check_and_the_cli_build_only() {
     let build = &plan.steps[1];
     assert_eq!(build.kind, super::process::StepKind::Command);
     assert!(build
-        .args
-        .windows(2)
-        .any(|a| a == ["--unverified", "build"]));
+        .compiler_payload()
+        .is_some_and(|args| args.first().is_some_and(|arg| arg == "build")));
     assert!(build.args.windows(2).any(|a| a == ["-p", "ay"]));
     assert!(build
         .args

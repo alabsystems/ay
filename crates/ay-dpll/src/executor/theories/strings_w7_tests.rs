@@ -142,3 +142,51 @@ fn place_depth_is_bounded() {
         "depth must be a bounded multi-placement search"
     );
 }
+
+#[test]
+fn distinct_word_lengths_follow_the_asserted_window() {
+    // No window: the historical 0..=12.
+    assert_eq!(
+        w7_word_lengths(None),
+        (0..=MAX_W7_WORD_LEN).collect::<Vec<_>>()
+    );
+    // `len x = 14`: exactly 14 (the fixed 0..=12 never reached it).
+    assert_eq!(w7_word_lengths(Some((14, 14))), vec![14]);
+    // A window from 20 up: 13 lengths from its bottom.
+    assert_eq!(
+        w7_word_lengths(Some((20, usize::MAX))),
+        (20..=20 + MAX_W7_WORD_LEN).collect::<Vec<_>>()
+    );
+    // Empty or out-of-reach windows probe nothing.
+    assert_eq!(w7_word_lengths(Some((5, 4))), Vec::<usize>::new());
+    assert_eq!(
+        w7_word_lengths(Some((MAX_W7_WINDOW_WORD_LEN + 1, usize::MAX))),
+        Vec::<usize>::new()
+    );
+}
+
+/// QF_SLIA 9df5efea, minimised: two distinct words of one regular language
+/// at an asserted length past 12. Length 4 was `sat`, length 14 `unknown`
+/// after the candidates (all of the wrong length) ran out.
+#[test]
+fn distinct_words_at_an_asserted_length_past_twelve_are_found() {
+    for n in [4, 14] {
+        let input = format!(
+            r#"
+            (set-logic QF_SLIA)
+            (declare-fun x1 () String)
+            (declare-fun x2 () String)
+            (assert (str.in_re x1 (re.* (re.++ (str.to_re "b") (re.* (str.to_re "aa"))))))
+            (assert (str.in_re x2 (re.* (re.++ (str.to_re "b") (re.* (str.to_re "aa"))))))
+            (assert (= (str.len x2) {n}))
+            (assert (= (str.len x1) (str.len x2)))
+            (assert (not (= x1 x2)))
+            (check-sat)
+            "#
+        );
+        let commands = ay_frontend::parse(&input).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).unwrap();
+        assert_eq!(outputs, vec!["sat"], "length {n}");
+    }
+}

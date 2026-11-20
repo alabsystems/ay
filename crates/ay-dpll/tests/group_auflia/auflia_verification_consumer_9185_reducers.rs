@@ -80,34 +80,9 @@ fn symbolic_address_frame_independence_native_reducer_is_sat() {
     );
 }
 
-#[test]
-#[timeout(30_000)]
-fn slice_index_has_value_usize_fails_closed_without_total_model() {
-    expect_unknown(
-        include_str!("../fixtures/verification_consumer_9185/slice_index_has_value_usize_sat.smt2"),
-        "ay#9185 slice_index has_value_usize reducer",
-    );
-}
-
-#[test]
-#[timeout(30_000)]
-fn slice_index_in_bounds_usize_fails_closed_without_total_model() {
-    expect_unknown(
-        include_str!("../fixtures/verification_consumer_9185/slice_index_in_bounds_usize_sat.smt2"),
-        "ay#9185 slice_index in_bounds_usize reducer",
-    );
-}
-
-#[test]
-#[timeout(30_000)]
-fn slice_index_in_bounds_range_inclusive_fails_closed_without_total_model() {
-    expect_unknown(
-        include_str!(
-            "../fixtures/verification_consumer_9185/slice_index_in_bounds_range_inclusive_sat.smt2"
-        ),
-        "ay#9185 slice_index in_bounds_range_inclusive reducer",
-    );
-}
+// The three original slice reducers now use the stronger tests in
+// `model_replay::theory_program_original_*`: public SAT, self-check, an exact
+// certificate gate and verbatim model replay through the pinned Z3 oracle.
 
 #[test]
 #[timeout(30_000)]

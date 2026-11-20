@@ -11,11 +11,7 @@ readme.workspace = true
 workspace = true
 
 [features]
-default = ["proof-checker", "jit"]
-# Keep the checker feature enabled by default. The hardened proof path still
-# uses this cfg boundary, so removing the feature would silently compile the
-# permissive fallback instead of the production certification path.
-proof-checker = []
+default = ["jit"]
 jit = ["dep:ay-jit"]
 # Enables the incremental-E-matching differential canary (recomputes a full
 # TermIndex/EqualityClasses rebuild each round and asserts incremental == full).

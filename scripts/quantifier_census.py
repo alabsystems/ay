@@ -6,7 +6,7 @@
 this answers the next question: *for the files AY loses to a quantifier reason,
 which gate declined, and how much instantiation happened first.* It is the
 harness behind sections 2.4/2.5 of
-the development design notes, and it
+the development design notes at `9598c4206`, and it
 is committed so that every later stage of that plan is measured against a
 reproducible baseline rather than against prose.
 
@@ -56,8 +56,9 @@ Example (paths under $HOME; never a target or output directory in /tmp):
         --out WORK/oracle_510.jsonl
     scripts/quantifier_census.py report WORK/census_*.jsonl WORK/oracle_*.jsonl
 
-The frozen stage-0 result of exactly that sequence is committed at
-the development design notes, and
+The frozen stage-0 result of exactly that sequence was committed on
+2026-09-06 as the development design notes
+(at `8dd63d700`, its last commit), and
 `report` accepts it directly.
 """
 
@@ -418,7 +419,7 @@ def run_z3_one(job):
     wall = time.time() - start
     # A reference solver's printed verdict is not evidence that it understood the
     # input: z3 4.16 error-recovers past unknown FP sorts and answers anyway.
-    # Any `(error` output disqualifies the run (2026-09-06-baseline.md).
+    # Any `(error` output disqualifies the run (the development design notes at 9598c4206).
     if "(error" in out or "(error" in err:
         verdict = "error"
     else:

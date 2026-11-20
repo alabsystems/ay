@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! PDR never builds an ill-typed atom (PDR_typed_subst_2026-09-19.md).
+//! PDR never builds an ill-typed atom (the development design notes at 9598c4206).
 //!
 //! kind2 lustre encodings reuse short clause-variable names across clauses
 //! with different sorts (`C` is Bool in 12 clauses of metros_1 and Int in one)

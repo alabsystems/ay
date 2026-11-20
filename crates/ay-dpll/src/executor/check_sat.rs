@@ -713,28 +713,6 @@ impl Executor {
         // theory route ran or which in-place passes it applied.
         let scope_tracked_assertions = self.ctx.assertions.clone();
 
-        // #ite-lift (kill-switch --dpll-ite-lift, default OFF): eager LINEAR
-        // definitional naming of term-level ITEs. Replaces the default Shannon
-        // expansion (which explodes on chained min-selection ITEs compared by
-        // ordering atoms — see executor::ite_lift) with fresh-variable
-        // definitions so each ITE condition is a single shared decision rather
-        // than being re-expanded inside every arithmetic atom. Equisatisfiable;
-        // the added definitional guards are transient solve-time assertions,
-        // reverted with the rest of the scope-tracked set on exit. A no-op when
-        // the switch is off (byte-identical preprocessing) or when there are no
-        // non-Bool ITEs to name.
-        if crate::executor::ite_lift::ite_lift_enabled() {
-            let mut ite_defs: Vec<TermId> = Vec::new();
-            let named = self
-                .ctx
-                .terms
-                .name_non_bool_ites_all(&self.ctx.assertions, &mut ite_defs);
-            if !ite_defs.is_empty() {
-                self.ctx.assertions = named;
-                self.ctx.assertions.extend(ite_defs);
-            }
-        }
-
         // Purify compound Boolean arguments to uninterpreted functions: rewrite
         // `f((and ...))` to `f(p)` and append `(= p (and ...))` for a fresh Bool
         // proxy `p`. Without this, EUF cannot congruence-close over UF
@@ -2749,6 +2727,12 @@ impl Executor {
         if let Some(result) = self.try_presolve_exact_semantic_unsat() {
             return result;
         }
+        // This UNSAT-only proof factory checks exact frozen premises. It does
+        // not mint or consume constructive SAT/projection authority; checked
+        // isolated validity probes therefore use it under their own scope too.
+        if let Some(result) = self.try_presolve_seq_word_refutation() {
+            return Ok(result);
+        }
         // Ground-first scheduling (#qe-ground-first, `check_sat/ground_first.rs`),
         // competition shedding only: the first decision of a quantified
         // check-sat is the query without its top-level universal axioms,
@@ -2848,29 +2832,6 @@ impl Executor {
         // permitted after the certified witness leaves that boundary. (The
         // reactive re-solves below re-enter through emit_sat_verdict, so their
         // verdicts get the same completion + gate sequence.)
-        // #uflia-model-repair (§3.2 targeted lever, `AY_UFLIA_MODEL_REPAIR=1`):
-        // BEFORE the blind congruence-repair re-solve below, try ONE targeted
-        // repair re-solve driven by the preserved rejection evidence — block
-        // the colliding value assignments the gates refuted, arm the
-        // accept-point repair scan, and route the arm pipeline by evidence
-        // class (see uflia_model_repair.rs `RepairRoute`) so the remaining
-        // window is spent in the arm that can actually re-find a candidate.
-        // Structurally sound: a minted Sat passed the full unchanged gate
-        // battery over the original window; an unsat found under a block is
-        // suppressed (see uflia_model_repair.rs docs). Same
-        // trigger/latch/deadline discipline as the blind path; if this does
-        // not mint a Sat, the blind re-solve below is still reachable.
-        if super::uflia_model_repair::uflia_model_repair_enabled()
-            && result == SolveResult::Unknown
-            && self.uflia_congruence_gate_rejected
-            && !self.ite_uf_definition_recovery.ready()
-            && !self.uflia_model_repair_done
-            && !matches!(self.last_unknown_reason, Some(UnknownReason::Timeout))
-            && !self.solve_deadline.expired()
-        {
-            self.uflia_model_repair_done = true;
-            result = self.uflia_targeted_model_repair_resolve(result)?;
-        }
         // #uflia-cong-repair-arm: REACTIVE re-solve. The independent model gate
         // (inside `emit_sat_verdict`) just refuted a UFLIA first-pass model as a
         // UF function-graph violation and downgraded `Sat` -> `Unknown`. Arm the
@@ -3318,36 +3279,6 @@ impl Executor {
         if result.is_unsat() && self.produce_proofs_enabled() && self.last_proof.is_none() {
             self.build_unsat_proof();
         }
-        // #uflia-model-repair EVIDENCE CAPTURE (env-gated, flags-off = no
-        // clone, byte-identical): snapshot the UFLIA candidate model BEFORE
-        // the emission funnel runs, because every rejecting gate inside it
-        // (strict oracle, independent gate, `uf_table_conflict` discard)
-        // clears `last_model` — erasing exactly the evidence (the colliding
-        // value assignment) the §3.2 targeted repair needs. Read-only with
-        // respect to the funnel: the snapshot is consumed only on the
-        // rejection path below.
-        if super::uflia_model_repair::uflia_model_repair_enabled()
-            && self.uflia_congruence_lane
-            && result == SolveResult::Sat
-        {
-            if ay_core::misc_cli_flags().debug_read_pin {
-                eprintln!(
-                    "[model-repair] outer capture: last_model={}",
-                    if self.last_model.is_some() {
-                        "some"
-                    } else {
-                        "NONE"
-                    }
-                );
-            }
-            if let Some(model) = self.last_model.clone() {
-                super::uflia_model_repair::push_repair_candidate(
-                    &mut self.uflia_repair_candidates,
-                    model,
-                );
-            }
-        }
-
         // ORDINARY SAT-EMISSION CHOKEPOINT (#sat-chokepoint): route the proposed
         // search verdict through `emit_sat_verdict`. It defaults unconstrained
         // constants, then runs the strict,
@@ -3416,13 +3347,6 @@ impl Executor {
         self.arm_uflia_congruence_repair = false;
         self.uflia_congruence_gate_rejected = false;
         self.uflia_congruence_retry_done = false;
-        // #uflia-model-repair: fresh per public check-sat (mirrors the trio
-        // above; stale evidence from a prior solve must never seed a repair).
-        self.uflia_repair_candidates.clear();
-        self.uflia_repair_conflict_tables.clear();
-        self.uflia_model_repair_done = false;
-        self.uflia_repair_detour_direct = false;
-        self.uflia_repair_eager_direct = false;
         // L2 lazy-DT-AUFLIA eager-arm routing: strictly lane-scoped
         // (set/reset around the inner solve in `try_solve_dt_auflia_lazy`), but
         // reset defensively here so an early return inside the lane can never
@@ -4569,20 +4493,6 @@ impl Executor {
             }
         }
 
-        // Phase 5 difference-logic pre-check (default OFF; opt-in via
-        // `(set-option :ay-diff-logic true)`). When ON and every hard assertion
-        // is a pure QF_IDL/QF_RDL atom, the standalone self-certifying
-        // Bellman-Ford engine decides the instance. Any non-DL assertion (or the
-        // engine declining) returns `None` and we fall through to the normal
-        // solver, so the default-OFF path is byte-identical to before. See
-        // `executor::diff_logic`.
-        self.record_diff_logic_decided_for_test(false);
-        if let Some(dl_result) = self.try_diff_logic()? {
-            self.record_diff_logic_decided_for_test(true);
-            self.last_result = Some(dl_result.clone());
-            return Ok(dl_result);
-        }
-
         // Unsat core extraction: when produce-unsat-cores is enabled and there
         // are named assertions, redirect through check_sat_assuming with named
         // assertions as assumptions. The SAT solver's failed-assumption tracking
@@ -4735,11 +4645,25 @@ impl Executor {
                     let entry_started = Instant::now();
                     let result =
                         self.check_sat_assuming_deferred_to_plain_check_sat(&named_assumptions);
+                    let harvested_len = self.last_assumption_core.as_ref().map(Vec::len);
                     // Certificate gate while the base is still stripped: a
                     // harvested proper-subset core must re-prove UNSAT on its
                     // own or it is discarded (#unsat-core-miscount).
                     let result = self.certify_assumption_core(&named_assumptions, result);
                     let entry_elapsed = entry_started.elapsed();
+                    if ay_core::misc_cli_flags().phase_trace {
+                        eprintln!(
+                            "c phase-trace uc-entry result={} harvested={harvested_len:?} \
+                             certified={:?} elapsed={entry_elapsed:?}",
+                            match &result {
+                                Ok(SolveResult::Unsat(_)) => "unsat",
+                                Ok(SolveResult::Sat) => "sat",
+                                Ok(SolveResult::Unknown) => "unknown",
+                                Err(_) => "error",
+                            },
+                            self.last_assumption_core.as_ref().map(Vec::len),
+                        );
+                    }
 
                     // Completeness rescue (#named-cores-ground-sat): the
                     // named→assumption redirect is a core-TRACKING strategy,
@@ -4990,45 +4914,35 @@ impl Executor {
             LogicCategory::QfUf => self.solve_euf(),
             LogicCategory::QfS => self.solve_strings(),
             LogicCategory::QfAx => {
-                // #qfax-combiner-probe: route through the AUFLIA combiner
-                // (live ArraysSolver + lazy Row2Down) instead of the
-                // axiom-pregeneration pipeline — measurement flag for the
-                // in-search ROW instantiation build.
-                if ay_core::misc_cli_flags().qfax_combiner_route {
-                    self.solve_auf_lia()
-                } else {
-                    // #qfax-budget-ladder: the fixpoint's ROW-closure budgets
-                    // are sized for 7-9 level chains; deeper swap/storeinv
-                    // chains exhaust them and degrade to validated-unknown
-                    // (measured: storeinv_t1_np_sf converts unknown -> unsat
-                    // in 0.05s at 16x budgets). Retry ONCE at a raised tier
-                    // when the standard solve returns a non-timeout Unknown —
-                    // solved files never pay, and the gates re-validate the
-                    // retry exactly like any solve.
-                    // Snapshot BEFORE tier-1: solve_array_euf rewrites
-                    // ctx.assertions destructively, and tier-2 must start
-                    // from the ORIGINAL problem, not tier-1's residue.
-                    let pre_tier_assertions = self.ctx.assertions.clone();
-                    let tier1 = self.solve_array_euf();
-                    match &tier1 {
-                        Ok(SolveResult::Unknown)
-                            if !matches!(
-                                self.last_unknown_reason,
-                                Some(UnknownReason::Timeout)
-                            ) && self.finite_array_expansion.is_complete()
-                                && !self.solve_deadline.expired() =>
-                        {
-                            self.ctx.assertions = pre_tier_assertions;
-                            self.qfax_budget_multiplier = 16;
-                            self.last_result = None;
-                            self.last_model = None;
-                            self.last_unknown_reason = None;
-                            let tier2 = self.solve_array_euf();
-                            self.qfax_budget_multiplier = 1;
-                            tier2
-                        }
-                        _ => tier1,
+                // #qfax-budget-ladder: the fixpoint's ROW-closure budgets
+                // are sized for 7-9 level chains; deeper swap/storeinv
+                // chains exhaust them and degrade to validated-unknown
+                // (measured: storeinv_t1_np_sf converts unknown -> unsat
+                // in 0.05s at 16x budgets). Retry ONCE at a raised tier
+                // when the standard solve returns a non-timeout Unknown —
+                // solved files never pay, and the gates re-validate the
+                // retry exactly like any solve.
+                // Snapshot BEFORE tier-1: solve_array_euf rewrites
+                // ctx.assertions destructively, and tier-2 must start
+                // from the ORIGINAL problem, not tier-1's residue.
+                let pre_tier_assertions = self.ctx.assertions.clone();
+                let tier1 = self.solve_array_euf();
+                match &tier1 {
+                    Ok(SolveResult::Unknown)
+                        if !matches!(self.last_unknown_reason, Some(UnknownReason::Timeout))
+                            && self.finite_array_expansion.is_complete()
+                            && !self.solve_deadline.expired() =>
+                    {
+                        self.ctx.assertions = pre_tier_assertions;
+                        self.qfax_budget_multiplier = 16;
+                        self.last_result = None;
+                        self.last_model = None;
+                        self.last_unknown_reason = None;
+                        let tier2 = self.solve_array_euf();
+                        self.qfax_budget_multiplier = 1;
+                        tier2
                     }
+                    _ => tier1,
                 }
             }
             // `is_int` over a Real argument needs the NRA exact univariate
@@ -5310,8 +5224,6 @@ impl Executor {
                         // battery like any solve.
                         //   1. standard budgets            (most files)
                         //   2. ladder: 16x ROW budgets     (deep chains)
-                        //   3. CEGAR pattern-blocking      (opt-in: budget-
-                        //      immune refutations; --qfax-cegar)
                         let dbg_esc = ay_core::misc_cli_flags().debug_cegar;
                         let saved_assertions = self.ctx.assertions.clone();
                         let mut stage_result = self.solve_array_euf()?;
@@ -5398,51 +5310,6 @@ impl Executor {
                             } else {
                                 self.ctx.assertions = saved_assertions.clone();
                             }
-                        }
-                        // Stage 3 (opt-in): CEGAR pattern-blocking rounds.
-                        // Each rejection derives a clause proving the
-                        // rejected model's index pattern element-
-                        // independently unsatisfiable; assert and re-solve.
-                        let mut cegar_rounds = 0usize;
-                        while ay_core::misc_cli_flags().qfax_cegar
-                            && cegar_rounds < 24
-                            && can_continue(self)
-                        {
-                            let Some(lits) = self.qfax_refinement_clause.take() else {
-                                break;
-                            };
-                            cegar_rounds += 1;
-                            let mut disj: Vec<TermId> = Vec::new();
-                            for (atom, val) in lits {
-                                let lit = if val {
-                                    self.ctx.terms.mk_not(atom)
-                                } else {
-                                    atom
-                                };
-                                disj.push(lit);
-                            }
-                            let clause = if disj.len() == 1 {
-                                disj[0]
-                            } else {
-                                self.ctx.terms.mk_or(disj)
-                            };
-                            self.ctx.assertions.push(clause);
-                            self.last_unknown_reason = None;
-                            self.last_result = None;
-                            self.last_model = None;
-                            let refined = self.solve_array_euf()?;
-                            if refined != SolveResult::Unknown {
-                                self.ctx.assertions = saved_assertions;
-                                // #qfax-isolated-lane-retry: this verdict is PUBLISHED by the
-                                // LIA-less isolated ladder. Mark the lane so a model-gate
-                                // refutation of it arms the single combiner re-solve in
-                                // `check_sat_guarded` (see `qfax_isolated_lane`).
-                                self.qfax_isolated_lane = true;
-                                return Ok(refined);
-                            }
-                        }
-                        if cegar_rounds > 0 {
-                            self.ctx.assertions = saved_assertions.clone();
                         }
                         self.qfax_refinement_clause = None;
                         self.last_unknown_reason = None;

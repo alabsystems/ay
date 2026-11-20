@@ -40,7 +40,7 @@ impl Solver {
     ) -> Result<(), UnsatProofFinalizationError> {
         // Preserve the existing SMT query marker. This is not an empty-clause
         // addition and must not raise has_empty_clause or allocate a proof ID.
-        if let Some(trace) = self.live_clause_trace_mut() {
+        if let Some(trace) = self.recording_clause_trace_mut() {
             trace.mark_empty();
         }
 

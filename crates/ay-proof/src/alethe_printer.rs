@@ -21,6 +21,7 @@ pub use bv_support_memo::{
     theory_lemma_bv_arithmetic_lowering_supported_within_solve, BvSupportDeclines,
 };
 mod bv_ult_zero;
+mod check_budget;
 mod clean_bitvec_rules;
 mod closed_guard;
 mod complete_blast;
@@ -666,6 +667,10 @@ pub(crate) struct AlethePrinter<'a> {
     work: std::cell::Cell<u64>,
     /// Optional cap on `work` (#A2b, synthesized-default emission only).
     work_budget: Option<u64>,
+    /// How assembled renderings are built; see [`AssembledRendering`].
+    assembled_rendering: AssembledRendering,
+    /// Whom the printer prints for; see [`PrinterPurpose`].
+    purpose: PrinterPurpose,
     /// One borrowed, sticky owner observation across planning and rendering.
     emission_progress: emission_progress::EmissionProgress<'a>,
     /// Shared proof-wide admission for the expensive arithmetic `poly_simp`
@@ -678,6 +683,75 @@ pub(crate) struct AlethePrinter<'a> {
     /// The asking solve's record of its screen's declines, which a render
     /// asked from inside that solve reads (`bv_support_memo/within_solve.rs`).
     support_declines: Option<&'a BvSupportDeclines>,
+}
+
+/// Whom a printer prints for, which decides whether the bounding mechanisms
+/// of DR-PROOF-RENDER-BUDGET-20261118 apply to it.
+///
+/// Every printer other than a renderability check (an export, a preflight, a
+/// wire-gap or authored-surface screen) charges its work counter exactly as
+/// on origin/main (merge-base ddd875aff): their budgets are calibrated on
+/// that counter, and a 64 MiB full-document screen that declined more would
+/// keep `trust`/`hole` leaves main replaced. A renderability check answers
+/// only "does this render within its budget", main ran it with no budget at
+/// all, and so anything that makes it decline sooner moves its verdict only
+/// toward `DerivationRender::OutOfBudget`, the fail-closed side.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum PrinterPurpose {
+    /// An export, preflight or screen: charges exactly as on origin/main.
+    #[default]
+    Emission,
+    /// A producer's renderability check (`congruence_derivation_renders_within`)
+    /// or the printed-`assume` spelling's bounded render. Under it, and only
+    /// under it:
+    /// - the gate re-derivations whose text grows with depth x root size (the
+    ///   nested `and_pos` navigator, the nested `or_pos`/`and_neg`
+    ///   re-derivations, the certified `let`-assume bridge) charge what they
+    ///   write BEFORE writing it ([`AlethePrinter::admit_check_work`]);
+    /// - every printer built while it renders a step is built within its
+    ///   budget and exhausts it when it runs out ([`check_budget`]);
+    /// - an override-free structural render it compares against is charged
+    ///   to its own budget ([`AlethePrinter::render_canonical`]).
+    RenderabilityCheck(std::rc::Rc<check_budget::CheckBudget>),
+    /// A printer built while a renderability check renders: the same rules,
+    /// within that check's budget ([`check_budget`]).
+    WithinRenderabilityCheck(std::rc::Rc<check_budget::CheckBudget>),
+}
+
+/// What a budget-exhausted printer writes in place of a term. The document is
+/// discarded (exhaustion is sticky), so the placeholder never reaches disk.
+const EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER: &str = "@a2b_emission_budget_exhausted";
+
+/// How the printer builds the rendering of a `not`, `ite`, `let`, quantifier
+/// or constant array, the terms it ASSEMBLES from its children's renderings
+/// (an application is always streamed into the caller's buffer).
+///
+/// The work counter charges an assembled rendering its full length when it is
+/// built, on top of what its children charged, so `work` is at least every
+/// byte the printer has written into any `String`: streamed bytes, copies of
+/// cached or override text, and every assembled `String`, including the ones
+/// `format_cache` retains. Under a budget that makes `work` a bound on the
+/// printer's allocation, provided nothing is allocated once it is exhausted
+/// (DR-PROOF-RENDER-BUDGET-20261118).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssembledRendering {
+    /// Assemble and cache. An assembly whose children were rendered before
+    /// exhaustion is still built after it: the export's historical behaviour,
+    /// which every budget reader on the export path is calibrated against.
+    Cached,
+    /// [`Self::Cached`], except that no assembled `String` is built once the
+    /// budget is exhausted or the caller has stopped: the exhaustion
+    /// placeholder takes its place. Without this an `ite` chain whose
+    /// recursion reached its leaves under the budget assembles every level on
+    /// the way back up, each copying the whole chain below it, quadratic in
+    /// memory whatever the budget says (measured: DR-PROOF-RENDER-BUDGET-20261118).
+    /// For a check that only asks whether something renders.
+    CachedWithinBudget,
+    /// Write assembled renderings straight into the caller's buffer, uncached.
+    /// `work` then equals the bytes of the rendering exactly, and the
+    /// rendering is the only `String` that grows with it. For a single-term
+    /// render judged by its byte length.
+    Streamed,
 }
 
 impl<'a> AlethePrinter<'a> {
@@ -743,6 +817,8 @@ impl<'a> AlethePrinter<'a> {
             assume_printed: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
             work_budget,
+            assembled_rendering: AssembledRendering::Cached,
+            purpose: PrinterPurpose::Emission,
             emission_progress: Default::default(),
             poly_simp_promotion_budget: std::cell::RefCell::new(
                 crate::wire_rule::ArithPolySimpPromotionBudget::standalone(),
@@ -750,6 +826,97 @@ impl<'a> AlethePrinter<'a> {
             complete_blast: CompleteBlastAsk::Asked,
             support_declines: None,
         }
+        .built_within_active_check()
+    }
+
+    /// A printer built while a renderability check renders a step is built
+    /// within that check's budget ([`check_budget`]); any other is unchanged.
+    fn built_within_active_check(mut self) -> Self {
+        let Some(budget) = check_budget::active() else {
+            return self;
+        };
+        let remaining = budget.remaining();
+        self.work_budget = Some(self.work_budget.map_or(remaining, |own| own.min(remaining)));
+        self.assembled_rendering = AssembledRendering::CachedWithinBudget;
+        self.purpose = PrinterPurpose::WithinRenderabilityCheck(budget);
+        self
+    }
+
+    /// Build assembled renderings as `mode` says ([`AssembledRendering`]).
+    #[must_use]
+    pub(crate) fn with_assembled_rendering(mut self, mode: AssembledRendering) -> Self {
+        self.assembled_rendering = mode;
+        self
+    }
+
+    /// Mark this printer a renderability check ([`PrinterPurpose`]), with
+    /// its current work budget. A printer already built within a check stays
+    /// within that one.
+    #[must_use]
+    pub(crate) fn as_renderability_check(mut self) -> Self {
+        if !self.is_renderability_check() {
+            self.purpose = PrinterPurpose::RenderabilityCheck(check_budget::CheckBudget::new(
+                self.work_budget,
+            ));
+        }
+        self
+    }
+
+    /// Whether this printer is, or is built within, a renderability check
+    /// ([`PrinterPurpose`]).
+    pub(crate) fn is_renderability_check(&self) -> bool {
+        self.check_budget().is_some()
+    }
+
+    /// The renderability check's budget this printer is, or is built within.
+    fn check_budget(&self) -> Option<&check_budget::CheckBudget> {
+        match &self.purpose {
+            PrinterPurpose::Emission => None,
+            PrinterPurpose::RenderabilityCheck(budget)
+            | PrinterPurpose::WithinRenderabilityCheck(budget) => Some(budget),
+        }
+    }
+
+    /// Install this printer's check budget for the printers built until the
+    /// guard drops ([`check_budget`]); `None` outside a renderability check.
+    fn enter_check_budget(&self) -> Option<check_budget::Entered> {
+        match &self.purpose {
+            PrinterPurpose::Emission => None,
+            PrinterPurpose::RenderabilityCheck(budget)
+            | PrinterPurpose::WithinRenderabilityCheck(budget) => Some(check_budget::enter(budget)),
+        }
+    }
+
+    /// An override-free structural rendering of `term`, as
+    /// [`crate::render_term_canonical`] spells it.
+    ///
+    /// Outside a renderability check it IS that call, on a fresh unbudgeted
+    /// printer, as on origin/main. Under one the fresh printer is built
+    /// within the check's budget ([`check_budget`]) and its work is charged to
+    /// this printer: the comparisons that read it (`and_pos` bridge 5, the
+    /// `EqCongruent` surface pairs, the folded-assume projection) expanded the
+    /// whole TREE of a term whose printed form may be a few bytes of
+    /// overrides, with no budget, inside a check that claimed to be bounded.
+    /// Past exhaustion its text is the placeholder, which matches nothing,
+    /// and the step is refused as out of budget.
+    pub(super) fn render_canonical(&self, term: TermId) -> String {
+        self.structural_render(self.terms, |printer| printer.format_term(term))
+    }
+
+    /// [`Self::render_canonical`] for any rendering `render` asks of a fresh
+    /// override-free printer over `terms`.
+    pub(super) fn structural_render<'t, R>(
+        &self,
+        terms: &'t TermStore,
+        render: impl FnOnce(&AlethePrinter<'t>) -> R,
+    ) -> R {
+        let _within = self.enter_check_budget();
+        let printer = AlethePrinter::new(terms);
+        let rendered = render(&printer);
+        if self.is_renderability_check() {
+            self.charge(printer.work_used());
+        }
+        rendered
     }
 
     /// Attach one caller observation without granting any proof authority.
@@ -1694,7 +1861,7 @@ impl<'a> AlethePrinter<'a> {
             let mut positions = operands
                 .iter()
                 .enumerate()
-                .filter(|(_, operand)| *operand == ak_str);
+                .filter(|(_, operand)| **operand == ak_str);
             let (index, _) = positions.next()?;
             if positions.next().is_some() {
                 return None;
@@ -1713,6 +1880,23 @@ impl<'a> AlethePrinter<'a> {
             return Some(format!(
                 "(step {id} (cl (not {root}) {ak_str}) :rule and_pos :args ({index}))"
             ));
+        }
+        // Every hop writes its parent and child in full: O(depth x root.len())
+        // bytes that the one `root.len()` above does not cover. A
+        // renderability check charges them before a byte is written, so it
+        // declines instead of writing them (DR-PROOF-RENDER-BUDGET-20261118,
+        // review 2 finding 2); every other printer charges as on origin/main.
+        let hops: u64 = path
+            .iter()
+            .map(|&(parent, operand_index)| {
+                (nesting.nodes[parent].len() + nesting.operands[parent][operand_index].len()) as u64
+            })
+            .sum();
+        let written = hops
+            .saturating_add((nesting.nodes[node].len() + 2 * ak_str.len()) as u64)
+            .saturating_add(PRINTED_GATE_LINE_OVERHEAD.saturating_mul(path.len() as u64 + 2));
+        if !self.admit_check_work(written) {
+            return None;
         }
         let mut out = String::new();
         let mut premises = Vec::with_capacity(path.len() + 1);
@@ -1825,6 +2009,13 @@ impl<'a> AlethePrinter<'a> {
         // returns `None` and the caller decides between the honest hole and a
         // declined document, exactly as before.
         let (targets, bridges) = match_printed_leaves_to_tail(&nesting.leaves, &tail)?;
+        // One `or_pos` per printed node writes that node and its operands:
+        // O(depth x source.len()) bytes, which a renderability check charges
+        // before they are written. A flat print writes O(source.len()),
+        // charged as before; every other printer charges as on origin/main.
+        if !nesting.is_flat() && !self.admit_check_work(printed_nesting_gate_bytes(&nesting)) {
+            return None;
+        }
         let mut out = String::new();
         let mut premises = Vec::with_capacity(nesting.nodes.len() + 2 * bridges.len());
         for (node, operands) in nesting.operands.iter().enumerate() {
@@ -2074,6 +2265,33 @@ impl<'a> AlethePrinter<'a> {
             eliminated,
             substitution_matches,
         } = self.plan_let_assume_bridge(term, surface)?;
+        // The plan charged `eliminated` four times: the fallback arm's `hole`,
+        // `equiv_pos2` (twice) and `resolution` lines. The certified arm also
+        // writes it in the `refl` and once per `let` level, beside every
+        // level's surface and the anchors' bindings: (levels + 4) copies in
+        // all, up to 68. A renderability check charges the rest before a byte
+        // is written, so it declines instead of writing it (measured before:
+        // 201 MB of text for 33.0 MB charged on a 60-level surface over a
+        // 3.1 MB eliminated form, DR-PROOF-RENDER-BUDGET-20261118 review 2
+        // finding 1). Every other printer charges as on origin/main: the
+        // 64 MiB screens and the 4 MiB preflight are calibrated on that.
+        if substitution_matches {
+            let level_surfaces: usize = levels.iter().map(|(_, body)| body.len()).sum();
+            let bindings: usize = levels
+                .iter()
+                .flat_map(|(bindings, _)| bindings)
+                .map(|(name, value)| name.len() + value.len() + 6)
+                .sum();
+            let certified_extra = ((levels.len() + 1) as u64)
+                .saturating_mul(eliminated.len() as u64)
+                .saturating_add((level_surfaces + bindings + innermost_body.len()) as u64)
+                .saturating_add(
+                    PRINTED_GATE_LINE_OVERHEAD.saturating_mul(2 * levels.len() as u64 + 1),
+                );
+            if !self.admit_check_work(certified_extra) {
+                return None;
+            }
+        }
 
         let mut out = String::new();
         let _ = std::fmt::Write::write_fmt(&mut out, format_args!("(assume {id}.a {surface})\n"));
@@ -2585,7 +2803,17 @@ impl<'a> AlethePrinter<'a> {
 
     /// Record `amount` units of rendering work (saturating).
     fn charge(&self, amount: u64) {
-        self.work.set(self.work.get().saturating_add(amount));
+        let work = self.work.get().saturating_add(amount);
+        self.work.set(work);
+        match &self.purpose {
+            PrinterPurpose::Emission => {}
+            PrinterPurpose::RenderabilityCheck(budget) => budget.record_own_work(work),
+            PrinterPurpose::WithinRenderabilityCheck(budget) => {
+                if self.work_budget.is_some_and(|limit| work > limit) {
+                    budget.record_nested_exhaustion();
+                }
+            }
+        }
     }
     /// Admit before the bounded operation allocates or scans. Exhaustion and
     /// caller refusal cannot be erased by a speculative bridge rollback.
@@ -2595,6 +2823,14 @@ impl<'a> AlethePrinter<'a> {
         }
         self.charge(amount);
         !self.work_budget_exhausted()
+    }
+
+    /// [`Self::admit_emission_work`] for bytes origin/main wrote UNCHARGED:
+    /// admitted (and charged) only under a renderability check, and always
+    /// `true`, charging nothing, for every other printer, whose budgets are
+    /// calibrated on main's counter ([`PrinterPurpose`]).
+    fn admit_check_work(&self, amount: u64) -> bool {
+        !self.is_renderability_check() || self.admit_emission_work(amount)
     }
 
     pub(crate) fn check_emission_progress(
@@ -2620,8 +2856,15 @@ impl<'a> AlethePrinter<'a> {
         self.work.get()
     }
     /// Whether work is exhausted or the retained caller has stopped emission.
+    ///
+    /// Under a renderability check, also once the check or any printer built
+    /// within it has run out ([`check_budget`]).
     pub(crate) fn work_budget_exhausted(&self) -> bool {
-        !self.emission_progress.poll() || self.work_budget.is_some_and(|b| self.work.get() > b)
+        !self.emission_progress.poll()
+            || self.work_budget.is_some_and(|b| self.work.get() > b)
+            || self
+                .check_budget()
+                .is_some_and(check_budget::CheckBudget::exhausted)
     }
     /// Typed exhaustion error for the caller's per-step check.
     pub(crate) fn work_budget_error(&self, steps_rendered: u32) -> AlethePrintError {
@@ -2770,6 +3013,9 @@ impl<'a> AlethePrinter<'a> {
         step: &ProofStep,
         id: ProofId,
     ) -> Result<String, AlethePrintError> {
+        // Every printer built while a renderability check renders this step
+        // is built within its budget (`check_budget`); a no-op elsewhere.
+        let _within_check = self.enter_check_budget();
         let _scratch_scope = printed_resolution::ScratchScope::enter(
             &self.printed_replay_scratch,
             printed_command::MAX_STEP_BYTES,
@@ -8072,16 +8318,21 @@ impl<'a> AlethePrinter<'a> {
             TermData::Const(c) => Self::format_constant(c),
 
             TermData::Not(inner) => {
-                format!("(not {})", self.format_term(*inner))
+                let inner = self.format_term(*inner);
+                if self.assembly_declined() {
+                    return EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER.to_string();
+                }
+                format!("(not {inner})")
             }
 
             TermData::Ite(cond, then_br, else_br) => {
-                format!(
-                    "(ite {} {} {})",
-                    self.format_term(*cond),
-                    self.format_term(*then_br),
-                    self.format_term(*else_br)
-                )
+                let cond = self.format_term(*cond);
+                let then_br = self.format_term(*then_br);
+                let else_br = self.format_term(*else_br);
+                if self.assembly_declined() {
+                    return EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER.to_string();
+                }
+                format!("(ite {cond} {then_br} {else_br})")
             }
 
             TermData::App(sym, args) => {
@@ -8107,11 +8358,11 @@ impl<'a> AlethePrinter<'a> {
                         format!("({} {})", quote_symbol(name), self.format_term(*term))
                     })
                     .collect();
-                format!(
-                    "(let ({}) {})",
-                    bindings_str.join(" "),
-                    self.format_term(*body)
-                )
+                let body = self.format_term(*body);
+                if self.assembly_declined() {
+                    return EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER.to_string();
+                }
+                format!("(let ({}) {body})", bindings_str.join(" "))
             }
 
             TermData::Forall(vars, body, _) => self.format_quantifier("forall", vars, *body),
@@ -8123,16 +8374,21 @@ impl<'a> AlethePrinter<'a> {
 
     /// Format a quantifier (forall/exists) with sorted variable list.
     fn format_quantifier(&self, keyword: &str, vars: &[(String, Sort)], body: TermId) -> String {
+        let vars_str = Self::format_quantifier_vars(vars);
+        let body = self.format_term(body);
+        if self.assembly_declined() {
+            return EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER.to_string();
+        }
+        format!("({keyword} ({vars_str}) {body})")
+    }
+
+    /// A quantifier's sorted-variable list, without its parentheses.
+    fn format_quantifier_vars(vars: &[(String, Sort)]) -> String {
         let vars_str: Vec<String> = vars
             .iter()
             .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_sort_alethe(sort)))
             .collect();
-        format!(
-            "({} ({}) {})",
-            keyword,
-            vars_str.join(" "),
-            self.format_term(body)
-        )
+        vars_str.join(" ")
     }
 
     /// Format a constant value
@@ -9048,12 +9304,20 @@ impl<'a> AlethePrinter<'a> {
                 .iter()
                 .position(|literal| *literal == Some(flipped.as_str()))?;
             unclaimed[slot] = None;
-            reversed.push((leaf.clone(), swapped));
+            reversed.push(((*leaf).to_string(), swapped));
         }
         if unclaimed.iter().any(Option::is_some) {
             return None;
         }
 
+        // One `and_neg` per printed node writes that node and its negated
+        // operands: O(depth x source.len()) bytes, which a renderability check
+        // charges before they are written. A flat print is the original
+        // three-step bridge, charged as before; every other printer charges
+        // as on origin/main.
+        if !nesting.is_flat() && !self.admit_check_work(printed_nesting_gate_bytes(&nesting)) {
+            return None;
+        }
         let eq = format!("(= {not_source} {and_str})");
         let mut out = String::new();
         let mut premises: Vec<String> = Vec::with_capacity(nesting.nodes.len() + 2);
@@ -9144,6 +9408,10 @@ const ALETHE_CLAUSE_CONSTRUCTOR_TERM: &str = "(cl)";
 /// mathsat `medium*` shape) needs 56 nodes; anything past this is a printing
 /// pathology and must fail loud instead of emitting a huge unverified chain.
 const PRINTED_NESTING_NODE_BUDGET: usize = 4096;
+/// The fixed text of one printed gate or resolution line beside the terms it
+/// prints (`(step ID.gN (cl (not ) ) :rule and_pos :args (N))`, its
+/// premises): charged per line with those terms' bytes.
+const PRINTED_GATE_LINE_OVERHEAD: u64 = 64;
 
 /// Placeholder the Skolem-collapse guard substitutes for a `choice` binder
 /// before comparing two definition bodies.
@@ -9457,7 +9725,8 @@ pub fn certified_let_assume_bridge_is_supported(
         terms,
         term_overrides,
         Some(PREFLIGHT_WORK_BUDGET),
-    );
+    )
+    .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     printer
         .plan_let_assume_bridge(term, surface)
         .is_some_and(|plan| plan.is_certified())
@@ -10313,7 +10582,8 @@ pub fn trans_step_surface_is_supported(
         terms,
         term_overrides,
         Some(MAX_TRANS_SURFACE_WORK),
-    );
+    )
+    .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
     let decode = |clause: &[TermId]| -> Option<(String, String)> {
         let [literal] = clause else {
             return None;
@@ -10426,9 +10696,28 @@ fn printed_application_fields(printed: &str) -> Option<Vec<&str>> {
 /// argument strings by balanced-token scanning. Returns `None` when `s` is
 /// not an application of `op`.
 fn split_application(s: &str, op: &str) -> Option<Vec<String>> {
-    split_alethe_application_bounded(s, op, usize::MAX, usize::MAX)
-        .ok()
+    split_application_slices(s, op)
         .map(|arguments| arguments.into_iter().map(str::to_string).collect())
+}
+
+/// The bytes one gate line per printed node writes (the node, each operand
+/// with a `(not )` around it, the line's fixed text): what the `or_pos` and
+/// `and_neg` re-derivations write beyond the root they already charged.
+fn printed_nesting_gate_bytes(nesting: &PrintedNesting<'_>) -> u64 {
+    nesting
+        .nodes
+        .iter()
+        .zip(&nesting.operands)
+        .map(|(node, operands)| {
+            let operand_bytes: usize = operands.iter().map(|operand| operand.len() + 7).sum();
+            ((node.len() + operand_bytes) as u64).saturating_add(PRINTED_GATE_LINE_OVERHEAD)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// [`split_application`], borrowing the arguments from `s`.
+fn split_application_slices<'a>(s: &'a str, op: &str) -> Option<Vec<&'a str>> {
+    split_alethe_application_bounded(s, op, usize::MAX, usize::MAX).ok()
 }
 
 /// The printed `(= b a)` for the printed binary equality `(= a b)`, or `None`
@@ -10467,7 +10756,7 @@ fn printed_equality_flip(literal: &str) -> Option<String> {
     reason = "the return pair exposes exact per-leaf targets and explicit bridge pairs"
 )]
 fn match_printed_leaves_to_tail(
-    leaves: &[String],
+    leaves: &[&str],
     tail: &[String],
 ) -> Option<(Vec<String>, Vec<(String, String)>)> {
     let mut unclaimed: Vec<Option<&str>> = tail.iter().map(|t| Some(t.as_str())).collect();
@@ -10475,9 +10764,9 @@ fn match_printed_leaves_to_tail(
     // Exact matches first, so a leaf that is literally present can never
     // consume the flip partner another leaf needs.
     for (index, leaf) in leaves.iter().enumerate() {
-        if let Some(slot) = unclaimed.iter().position(|t| *t == Some(leaf.as_str())) {
+        if let Some(slot) = unclaimed.iter().position(|t| *t == Some(*leaf)) {
             unclaimed[slot] = None;
-            targets[index] = Some(leaf.clone());
+            targets[index] = Some((*leaf).to_string());
         }
     }
     let mut bridges = Vec::new();
@@ -10490,7 +10779,7 @@ fn match_printed_leaves_to_tail(
             .iter()
             .position(|t| *t == Some(flipped.as_str()))?;
         unclaimed[slot] = None;
-        bridges.push((leaf.clone(), flipped.clone()));
+        bridges.push(((*leaf).to_string(), flipped.clone()));
         targets[index] = Some(flipped);
     }
     // Every traced literal must be reached, or the re-derived step concludes
@@ -10629,33 +10918,39 @@ fn peel_printed_lets(s: &str) -> Option<(Vec<PrintedLetLevel>, String)> {
 /// one genuine gate step per printed node. Every consecutive `(parent, child)`
 /// pair is a real `and_pos`/`or_pos` instance at the recorded operand index, so
 /// the chain is checkable without changing a single printed TERM.
+///
+/// The nesting BORROWS from the printed root: every node and operand is a
+/// slice of it. Cloning each node's text cost O(depth x root.len()) of memory
+/// that no work counter charged (a 1,001-ary right-nested override of 43 KB
+/// copied 38.9 MB, review 2 of DR-PROOF-RENDER-BUDGET-20261118); the slices
+/// cost O(nodes). What a caller WRITES from them is charged by the caller.
 #[derive(Default)]
-struct PrintedNesting {
+struct PrintedNesting<'a> {
     /// Printed spelling of each node; node 0 is the root.
-    nodes: Vec<String>,
+    nodes: Vec<&'a str>,
     /// Top-level printed operands of each node.
-    operands: Vec<Vec<String>>,
+    operands: Vec<Vec<&'a str>>,
     /// `(parent node, operand index within the parent)`; `None` for the root.
     parent: Vec<Option<(usize, usize)>>,
     /// Operands that are NOT themselves `op` applications, in printed
     /// left-to-right order — i.e. the flattened disjunct/conjunct list.
-    leaves: Vec<String>,
+    leaves: Vec<&'a str>,
 }
 
-impl PrintedNesting {
+impl<'a> PrintedNesting<'a> {
     /// Expand the printed `op`-nesting rooted at `root`.
     ///
     /// `None` when `root` is not an `op` application or the walk exceeds
     /// `node_budget` nodes / a fixed depth cap — the caller must then fail
     /// loud rather than emit an unverifiable gate.
-    fn build(root: &str, op: &str, node_budget: usize) -> Option<Self> {
+    fn build(root: &'a str, op: &str, node_budget: usize) -> Option<Self> {
         let mut nesting = Self::default();
-        nesting.push_node(root.to_string(), None);
+        nesting.push_node(root, None);
         nesting.expand(0, op, node_budget, 0)?;
         Some(nesting)
     }
 
-    fn push_node(&mut self, node: String, parent: Option<(usize, usize)>) -> usize {
+    fn push_node(&mut self, node: &'a str, parent: Option<(usize, usize)>) -> usize {
         self.nodes.push(node);
         self.operands.push(Vec::new());
         self.parent.push(parent);
@@ -10666,17 +10961,17 @@ impl PrintedNesting {
         if depth > 1024 {
             return None;
         }
-        let operands = split_application(&self.nodes[node], op)?;
+        let operands = split_application_slices(self.nodes[node], op)?;
         self.operands[node] = operands.clone();
-        for (index, operand) in operands.iter().enumerate() {
-            if split_application(operand, op).is_some() {
+        for (index, operand) in operands.into_iter().enumerate() {
+            if split_application_slices(operand, op).is_some() {
                 if self.nodes.len() >= node_budget {
                     return None;
                 }
-                let child = self.push_node(operand.clone(), Some((node, index)));
+                let child = self.push_node(operand, Some((node, index)));
                 self.expand(child, op, node_budget, depth + 1)?;
             } else {
-                self.leaves.push(operand.clone());
+                self.leaves.push(operand);
             }
         }
         Some(())
@@ -10704,7 +10999,7 @@ impl PrintedNesting {
     fn find_operand(&self, wanted: &str) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, usize)> = None;
         for (node, operands) in self.operands.iter().enumerate() {
-            let Some(index) = operands.iter().position(|o| o == wanted) else {
+            let Some(index) = operands.iter().position(|o| *o == wanted) else {
                 continue;
             };
             let depth = self.path_to(node).len();

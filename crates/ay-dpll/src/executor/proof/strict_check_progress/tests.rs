@@ -4,9 +4,7 @@
 
 use super::*;
 use crate::api::{Logic, Solver, Sort};
-#[cfg(feature = "proof-checker")]
 use crate::executor::proof::check::EmptyClauseDerivation;
-#[cfg(feature = "proof-checker")]
 use ay_core::AletheRule;
 use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
@@ -143,7 +141,6 @@ fn executor_strict_derivation_check_polls_executor_memory_limit() {
 /// wrong". `build_unsat_assembly` repairs the proof on a defect, and a
 /// repair entered because we ran out of time is unbounded post-stop work of
 /// exactly the kind this envelope exists to remove.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn cancelled_partial_check_names_the_envelope_as_the_refusing_party() {
     let mut exec = Executor::new();
@@ -165,7 +162,6 @@ fn cancelled_partial_check_names_the_envelope_as_the_refusing_party() {
 
 /// The three states must be genuinely three: a proof the checker accepted,
 /// a proof it rejected, and a proof it never got to look at.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn empty_clause_derivation_separates_defect_from_cancellation() {
     let mut accepted = Executor::new();
@@ -206,7 +202,6 @@ fn empty_clause_derivation_separates_defect_from_cancellation() {
 
 /// A structurally empty-clause-free proof is a DEFECT, not a refusal, and
 /// it is decided without walking anything.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn absent_empty_clause_is_invalid_even_under_an_active_interrupt() {
     let mut exec = Executor::new();
@@ -224,7 +219,6 @@ fn absent_empty_clause_is_invalid_even_under_an_active_interrupt() {
 /// The quality-discarding callers must not pay for the fused walk's
 /// unmetered `validate_sko_forall_uniqueness` tail: `WantQuality::No` takes
 /// the quality-free entry point and returns no quality at all.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn want_quality_selects_which_walk_runs() {
     let mut exec = Executor::new();
@@ -258,7 +252,6 @@ fn want_quality_selects_which_walk_runs() {
 /// `explicit_trust_call_site_census` ratchet counts those per source file
 /// WITHOUT stripping inline `#[cfg(test)]` modules. A fixture is no reason
 /// to spend a vetted trust site, and none is needed here.
-#[cfg(feature = "proof-checker")]
 pub(super) fn valid_empty_clause_proof(exec: &mut Executor) -> Proof {
     let p = exec.ctx.terms.mk_var("p", Sort::Bool);
     let not_p = exec.ctx.terms.mk_not(p);
@@ -278,7 +271,6 @@ pub(super) fn valid_empty_clause_proof(exec: &mut Executor) -> Proof {
 /// resolve to the empty clause. The proof still ENDS in an empty clause,
 /// which is what makes this a checker VERDICT about the chain rather than a
 /// structural observation about the proof's shape.
-#[cfg(feature = "proof-checker")]
 fn broken_empty_clause_proof(exec: &mut Executor) -> Proof {
     let p = exec.ctx.terms.mk_var("p", Sort::Bool);
     let mut proof = Proof::new();
@@ -358,7 +350,6 @@ fn strict_publication_admits_one_wide_bv_bitblast_lemma() {
 /// two-limb design rests on are asserted — the limb is named, the error is
 /// NOT laundered into `Cancelled`, and the classification is
 /// `Undetermined` ("never repair"), not `Invalid` ("repair").
-#[cfg(feature = "proof-checker")]
 #[test]
 fn budget_refusal_names_the_budget_and_stays_undetermined() {
     let mut exec = Executor::new();
@@ -397,7 +388,6 @@ fn budget_refusal_names_the_budget_and_stays_undetermined() {
 /// keying on the ERROR KIND instead of the refusing party would move the
 /// checker's own in-checker `ResourceLimit` budgets (`checker::lra_farkas`,
 /// `checker::nia_*`) out of their historical `Invalid` reading.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn classifier_separates_verdicts_from_both_refusal_limbs() {
     use crate::executor::proof::check::classify_empty_clause_walk as classify;

@@ -33,26 +33,33 @@ impl LraSolver {
         self.materialization_delta_computations
             .set(self.materialization_delta_computations.get() + 1);
         let two = BigRational::from(BigInt::from(2));
-        let mut delta = BigRational::one();
+        // Track the smallest slack/|ε| candidate in the Rational domain.
+        // A candidate improves the incumbent iff `slack < best * |ε|`
+        // (all quantities positive), so the scan cross-multiplies instead
+        // of dividing per variable and pays one exact division only when
+        // a candidate actually improves the minimum. The resulting δ is
+        // the same rational the former per-variable BigRational division
+        // produced; only the min-tracking arithmetic changed. `best`
+        // starts at the same cap of 1 the former scan used.
+        let mut best = Rational::one();
         let mut any_epsilon = false;
 
         for info in &self.vars {
-            let y = info.value.epsilon();
+            let (x, y) = info.value.parts();
             if y.is_zero() {
                 continue;
             }
             any_epsilon = true;
-            let x = info.value.rational();
 
             if y.is_negative() {
                 // Variable has negative ε: value decreases with δ.
                 // Lower bound constraint: x + y*δ ≥ lb  ⇒  δ ≤ (x - lb) / |y|
                 if let Some(ref lb) = info.lower {
-                    let slack: BigRational = x.clone() - &lb.value_big();
+                    let slack = x - &lb.value;
                     if slack.is_positive() {
-                        let max_delta = slack / (-y.clone());
-                        if max_delta < delta {
-                            delta = max_delta;
+                        let abs_y = y.abs();
+                        if slack < &best * &abs_y {
+                            best = &slack / &abs_y;
                         }
                     }
                 }
@@ -62,16 +69,14 @@ impl LraSolver {
                 // Variable has positive ε: value increases with δ.
                 // Upper bound constraint: x + y*δ ≤ ub  ⇒  δ ≤ (ub - x) / y
                 if let Some(ref ub) = info.upper {
-                    let slack = &ub.value_big() - &x;
-                    if slack.is_positive() {
-                        let max_delta: BigRational = slack / &y;
-                        if max_delta < delta {
-                            delta = max_delta;
-                        }
+                    let slack = &ub.value - x;
+                    if slack.is_positive() && slack < &best * y {
+                        best = &slack / y;
                     }
                 }
             }
         }
+        let delta = best.to_big();
 
         // Halve for safety margin
         let mut delta = &delta / &two;

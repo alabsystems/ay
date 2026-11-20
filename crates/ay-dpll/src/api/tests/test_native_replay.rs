@@ -56,7 +56,6 @@ fn native_replay_evidence_identity(artifact: &NativeReplayArtifact) -> NativeRep
     .with_solver_binary_sha256("ab".repeat(32))
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
     let artifact = boolean_unsat_native_replay_artifact();
@@ -90,7 +89,6 @@ fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
     );
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_with_checked_proof_returns_the_same_strict_artifact() {
     let artifact = boolean_unsat_native_replay_artifact();
@@ -128,7 +126,6 @@ fn native_replay_with_checked_proof_returns_the_same_strict_artifact() {
 /// equality roots after native replay.  Keep that exact cardinality on the
 /// public replay surface: the equality-closure reconstruction must return a
 /// strict, trust-free artifact rather than stopping at its former 32-root cap.
-#[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_checked_proof_accepts_thirty_three_root_equality_closure() {
     let mut solver = Solver::try_new(Logic::All).expect("solver");
@@ -173,7 +170,6 @@ fn native_replay_checked_proof_accepts_thirty_three_root_equality_closure() {
     assert!(!proof.alethe.contains(":rule hole"));
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_with_proofs_checks_lia_equality_against_negated_bound() {
     let mut solver = Solver::try_new(Logic::QfLia).expect("solver");

@@ -914,7 +914,7 @@ impl VariantConfig {
     ///     than `1` disables, matching the AUTO knob's conservative parse;
     ///     unset = ON per the measured +2 flips / 0 floor losses).
     pub(crate) fn subst_auto_giant_band_active(&self) -> bool {
-        // Lever 4 of competition/proof-posture-parity/PLAN-next-sat-levers-2.md
+        // Lever 4 of competition/proof-posture-parity/PLAN-next-sat-levers-2.md at 9598c4206
         // (2026-09-16): `--sat-subst-auto-giant-proof true` arms the same band
         // under the DRAT posture, which is what the shipped VeriPB surface
         // resolves to. Congruence and decompose emit checker-consumable proofs
@@ -3516,7 +3516,7 @@ mod tests {
             .subst_auto_giant_band_active()
     }
 
-    /// Lever 4 of PLAN-next-sat-levers-2.md: the giant congruence band is
+    /// Lever 4 of competition/proof-posture-parity/PLAN-next-sat-levers-2.md at 9598c4206: the giant congruence band is
     /// non-proof only unless `--sat-subst-auto-giant-proof true`, which arms it
     /// under DRAT (the VeriPB posture) and never under LRAT.
     #[test]

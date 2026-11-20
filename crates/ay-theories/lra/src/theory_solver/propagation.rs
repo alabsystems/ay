@@ -534,10 +534,6 @@ impl LraSolver {
             if !self.all_newly_bounded_buf.is_empty() {
                 self.propagation_dirty_vars
                     .extend(self.all_newly_bounded_buf.iter());
-                // #8599: Take the buffer temporarily to avoid borrow conflict with &mut self.
-                let all_nb = std::mem::take(&mut self.all_newly_bounded_buf);
-                self.queue_post_simplex_refinements(&all_nb, self.debug_lra);
-                self.all_newly_bounded_buf = all_nb;
             }
             // #6617 Packet 1: Discover offset equalities (nf==2 rows) from
             // the same touched rows. Z3's cheap_eq_on_nbase detects x1 = x2

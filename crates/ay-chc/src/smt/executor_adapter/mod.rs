@@ -1560,31 +1560,81 @@ fn admit_for_executor<'a>(
     }
 }
 
+/// The `set-logic` label of one executor script: [`detect_logic`]'s, except
+/// that a Verification-lane query over Real arithmetic that declares no
+/// uninterpreted symbol (no uninterpreted function and no constant of an
+/// uninterpreted sort, [`declares_no_uninterpreted_symbol`]) is labelled
+/// `QF_LRA` rather than `QF_UFLRA`.
+///
+/// `detect_logic` names every Real-only query `QF_UFLRA` (a superset label,
+/// so a query with UF applications is always admitted), and the executor then
+/// runs its UF-combination route for pure linear real arithmetic too.
+/// Measured reason (2026-11-18, `ay --competition`-posture replays of the
+/// in-process scripts of oral_messages om1_with_relays_general_5_4_validity's
+/// Safe validation): the same script is 0.47 s / 0.69 s / 0.50 s under
+/// `QF_UFLRA` and 0.03 s / 0.04 s / 0.03 s under `QF_LRA` (two UNSAT
+/// obligations, one SAT check), and the transition obligation that the
+/// portfolio left undecided at 3 s is UNSAT in 0.16 s as `QF_LRA` and 8.9 s
+/// as `QF_UFLRA`. The label only selects the executor's route: a formula with
+/// no uninterpreted function or sort is in QF_LRA exactly when it is in
+/// QF_UFLRA (one with an uninterpreted-sort constant is not, so it keeps the
+/// UF label), so the
+/// verdict's meaning is unchanged; SAT models are still validated against
+/// the original expression. The Search lane keeps `detect_logic`'s label
+/// until its own paired measurement (its timings steer every engine).
+fn executor_logic(
+    lane: SmtLane,
+    detected: &'static str,
+    no_uninterpreted_symbol: bool,
+) -> &'static str {
+    if lane == SmtLane::Verification && no_uninterpreted_symbol && detected == "QF_UFLRA" {
+        "QF_LRA"
+    } else {
+        detected
+    }
+}
+
+/// True when a script declares neither an uninterpreted function
+/// (`uf_free`: no UF declaration) nor a constant of an uninterpreted sort
+/// among `vars`.
+fn declares_no_uninterpreted_symbol(uf_free: bool, vars: &[ChcVar]) -> bool {
+    uf_free
+        && !vars
+            .iter()
+            .any(|var| matches!(var.sort, ChcSort::Uninterpreted(_)))
+}
+
 /// Append one `(assert …)` per conjunct.
 ///
-/// Search lane, and only for a query whose tree expansion exceeds the old
-/// admission cap (`MAX_DT_EXPR_NODES` tree nodes — exactly the queries the
-/// tree-counting admission used to refuse): DAG-linear (`smt::dag_smtlib`,
-/// `let`-shared; bridge item D-1). Everything else keeps the tree printer, so
-/// every query the executor accepted before is printed byte for byte as
-/// before. Measured reason for the size gate (2026-09-22): the executor is
-/// slower on `let` scripts of small queries — the tte_synchro IMC k=3 query
-/// (SAT) takes `ay --competition` 5.0–5.4 s with its `let`s and 0.7–0.8 s
-/// let-expanded, and in-portfolio the DAG-printed Search-lane checks turned
-/// that `sat` into `unknown` at IMC's 5 s cap — while a wide query printed as
-/// a tree costs megabytes (om1_general_4_6 k=1: 1.09 MB, 0.73 s vs 0.04 s
-/// as a DAG). Verification lane: the tree printer, unchanged until the INV-12
-/// differential gate covers it. A DAG-printer refusal falls back to the tree
-/// printer.
-fn write_executor_asserts(
-    smt: &mut String,
-    conjuncts: &[&ChcExpr],
-    lane: SmtLane,
-    tree_nodes: usize,
-) {
+/// A query whose tree expansion exceeds the old admission cap
+/// (`MAX_DT_EXPR_NODES` tree nodes — exactly the queries the tree-counting
+/// admission used to refuse) is printed DAG-linearly (`smt::dag_smtlib`,
+/// `let`-shared; bridge item D-1) on BOTH lanes; everything else keeps the
+/// tree printer, byte for byte as before. Measured reason for the size gate
+/// (2026-09-22): the executor is slower on `let` scripts of small queries —
+/// the tte_synchro IMC k=3 query (SAT) takes `ay --competition` 5.0–5.4 s
+/// with its `let`s and 0.7–0.8 s let-expanded, and in-portfolio the
+/// DAG-printed Search-lane checks turned that `sat` into `unknown` at IMC's
+/// 5 s cap — while a wide query printed as a tree costs megabytes
+/// (om1_general_4_6 k=1: 1.09 MB, 0.73 s vs 0.04 s as a DAG).
+///
+/// The Verification lane was held to the tree printer until the INV-12
+/// differential gate passed (the development design notes at 9598c4206, INV-12 / F0g); it did
+/// on `bac3c1a58` (10,000 random shared Bool/Int/Real DAGs and 17,056 corpus
+/// conjuncts, z3-equivalent, 0 mismatches). Measured reason to lift it
+/// (2026-11-18): portfolio Safe validation of IMC's
+/// om1_with_relays_general_3_7_agreement invariant (525,110 tree nodes, ~750
+/// distinct) printed 6.5 MB per Verification check and spent 60–90 % of its
+/// time re-elaborating that text; the three clause obligations take
+/// 4.4–6.6 s each tree-printed and 0.01–0.20 s `let`-shared. A
+/// Verification-lane UNSAT is trusted on the final verdict, so this relies on
+/// the printer's same-formula contract (`smt::dag_smtlib` module docs); SAT
+/// models are checked against the ORIGINAL expression on both printers. A
+/// DAG-printer refusal falls back to the tree printer.
+fn write_executor_asserts(smt: &mut String, conjuncts: &[&ChcExpr], tree_nodes: usize) {
     use crate::interpolation::stats::{record_script_print, ScriptPrint};
     let before = smt.len();
-    if lane == SmtLane::Search && tree_nodes > logic_detection::MAX_DT_EXPR_NODES {
+    if tree_nodes > logic_detection::MAX_DT_EXPR_NODES {
         let caps = crate::smt::dag_smtlib::DagCaps {
             max_unique_nodes: logic_detection::MAX_DT_EXPR_NODES,
             max_depth: logic_detection::MAX_DT_NESTING_DEPTH,
@@ -1804,8 +1854,27 @@ impl SmtContext {
             None => (solve_expr, vars),
         };
 
+        let uf_decls = match collect_uninterpreted_function_declarations(solve_expr) {
+            Ok(declarations) => declarations,
+            Err(reason) => {
+                tracing::debug!(
+                    "executor_adapter: {reason}; returning Unknown instead of emitting ambiguous declarations"
+                );
+                if exec_trace_enabled() {
+                    safe_eprintln!(
+                        "[EXEC-TRACE {:?}] adapter early-return: uf declarations: {reason}",
+                        std::thread::current().id()
+                    );
+                }
+                return SmtResult::Unknown;
+            }
+        };
         // Step 3: Detect the appropriate logic based on sorts present.
-        let logic = detect_logic(&vars, solve_expr);
+        let logic = executor_logic(
+            lane,
+            detect_logic(&vars, solve_expr),
+            declares_no_uninterpreted_symbol(uf_decls.is_empty(), &vars),
+        );
 
         // Step 4: Build SMT-LIB text.
         let mut smt = String::with_capacity(512);
@@ -1842,21 +1911,6 @@ impl SmtContext {
             }
         }
 
-        let uf_decls = match collect_uninterpreted_function_declarations(solve_expr) {
-            Ok(declarations) => declarations,
-            Err(reason) => {
-                tracing::debug!(
-                    "executor_adapter: {reason}; returning Unknown instead of emitting ambiguous declarations"
-                );
-                if exec_trace_enabled() {
-                    safe_eprintln!(
-                        "[EXEC-TRACE {:?}] adapter early-return: uf declarations: {reason}",
-                        std::thread::current().id()
-                    );
-                }
-                return SmtResult::Unknown;
-            }
-        };
         for declaration in &uf_decls {
             smt.push_str(&emit_declare_uninterpreted_function(declaration));
         }
@@ -1933,7 +1987,7 @@ impl SmtContext {
             }
             return SmtResult::Unknown;
         }
-        write_executor_asserts(&mut smt, &conjuncts, lane, admitted_tree_nodes);
+        write_executor_asserts(&mut smt, &conjuncts, admitted_tree_nodes);
         smt.push_str("(check-sat)\n");
         smt.push_str("(get-model)\n");
         let build_dt = t_build.elapsed();
@@ -2392,6 +2446,9 @@ mod tests;
 
 #[cfg(test)]
 mod cancellation_tests;
+
+#[cfg(test)]
+mod verification_dag_tests;
 
 #[cfg(test)]
 mod array_lambda_executor_tests {

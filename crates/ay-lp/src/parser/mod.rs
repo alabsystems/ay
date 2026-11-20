@@ -13,7 +13,7 @@ pub(crate) mod lp_tok;
 pub(crate) mod mps;
 
 pub use lp::parse_lp;
-pub use mps::parse_mps;
+pub use mps::{parse_mps, parse_mps_exact};
 
 /// Add two parser-produced finite values without letting an aggregate overflow
 /// smuggle an infinity into the normalized problem.

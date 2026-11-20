@@ -375,7 +375,7 @@ impl Solver {
         // Keep ClauseTrace's UNSAT marker consistent with UNSAT returns even when
         // the solver exits at decision level 0 without explicitly learning/adding
         // an empty clause. This is required for SMT-level proof reconstruction.
-        if let Some(trace) = self.live_clause_trace_mut() {
+        if let Some(trace) = self.recording_clause_trace_mut() {
             trace.mark_empty();
         }
 

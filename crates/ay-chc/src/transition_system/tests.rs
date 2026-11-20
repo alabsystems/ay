@@ -1547,3 +1547,157 @@ fn gap_attr_k1_check_isolation_round_trips() {
     let builtin_dir = tempfile::tempdir().expect("temporary diagnostic directory");
     isolate_checks(&make_test_system(), builtin_dir.path(), true);
 }
+
+// --- Clause canonicalization: one simultaneous renaming ---
+
+/// `formula ∧ v{i} = values[i]` (and `v{i}_next = next[i]`) is satisfiable.
+fn canonical_sat(formula: &ChcExpr, values: &[i64], next: &[i64]) -> bool {
+    let mut conjuncts = vec![formula.clone()];
+    for (i, value) in values.iter().enumerate() {
+        let var = ChcVar::new(format!("v{i}"), ChcSort::Int);
+        conjuncts.push(ChcExpr::eq(ChcExpr::var(var), ChcExpr::int(*value)));
+    }
+    for (i, value) in next.iter().enumerate() {
+        let var = ChcVar::new(format!("v{i}_next"), ChcSort::Int);
+        conjuncts.push(ChcExpr::eq(ChcExpr::var(var), ChcExpr::int(*value)));
+    }
+    let mut ctx = crate::smt::SmtContext::new();
+    let result = ctx.check_sat(&ChcExpr::and_all(conjuncts));
+    assert!(
+        result.is_sat() || result.is_unsat(),
+        "undecided canonicalization check: {result:?}"
+    );
+    result.is_sat()
+}
+
+/// Inv(x, y) facts `x = 0 ∧ y = 0`, a self-loop, and the given query clause.
+fn two_arg_system_with(
+    transition: (Vec<ChcExpr>, Option<ChcExpr>, Vec<ChcExpr>),
+    query: (Vec<ChcExpr>, Option<ChcExpr>),
+) -> TransitionSystem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int, ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let y = ChcVar::new("y", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and(
+            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0)),
+            ChcExpr::eq(ChcExpr::var(y.clone()), ChcExpr::int(0)),
+        )),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x), ChcExpr::var(y)]),
+    ));
+    let (body_args, guard, head_args) = transition;
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(inv, body_args)], guard),
+        ClauseHead::Predicate(inv, head_args),
+    ));
+    let (query_args, query_guard) = query;
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(vec![(inv, query_args)], query_guard),
+        ClauseHead::False,
+    ));
+    TransitionSystem::from_chc_problem(&problem).expect("linear single-predicate system")
+}
+
+fn int_var(name: &str) -> ChcExpr {
+    ChcExpr::var(ChcVar::new(name, ChcSort::Int))
+}
+
+#[test]
+fn canonicalization_does_not_capture_swapped_canonical_names() {
+    // Query Inv(v1, v0) ∧ v1 < 1: the clause's `v1` is the FIRST argument.
+    let identity = (
+        vec![int_var("x"), int_var("y")],
+        None,
+        vec![int_var("x"), int_var("y")],
+    );
+    let ts = two_arg_system_with(
+        identity,
+        (
+            vec![int_var("v1"), int_var("v0")],
+            Some(ChcExpr::lt(int_var("v1"), ChcExpr::int(1))),
+        ),
+    );
+    assert!(
+        canonical_sat(&ts.query, &[0, 1], &[]),
+        "first argument 0 < 1"
+    );
+    assert!(
+        !canonical_sat(&ts.query, &[5, 0], &[]),
+        "first argument 5 is not < 1"
+    );
+}
+
+#[test]
+fn canonicalization_keeps_repeated_body_arguments_equal() {
+    // Query Inv(x, x): only states with equal arguments.
+    let identity = (
+        vec![int_var("x"), int_var("y")],
+        None,
+        vec![int_var("x"), int_var("y")],
+    );
+    let ts = two_arg_system_with(identity, (vec![int_var("x"), int_var("x")], None));
+    assert!(canonical_sat(&ts.query, &[3, 3], &[]));
+    assert!(
+        !canonical_sat(&ts.query, &[0, 1], &[]),
+        "Inv(x, x) needs equal arguments"
+    );
+}
+
+#[test]
+fn canonicalization_renames_a_local_named_like_a_state_variable() {
+    // Query Inv(x, y) ∧ v1 = x + 7 ∧ v1 > y, `v1` a clause local: x + 7 > y.
+    let identity = (
+        vec![int_var("x"), int_var("y")],
+        None,
+        vec![int_var("x"), int_var("y")],
+    );
+    let ts = two_arg_system_with(
+        identity,
+        (
+            vec![int_var("x"), int_var("y")],
+            Some(ChcExpr::and(
+                ChcExpr::eq(int_var("v1"), ChcExpr::add(int_var("x"), ChcExpr::int(7))),
+                ChcExpr::gt(int_var("v1"), int_var("y")),
+            )),
+        ),
+    );
+    assert!(canonical_sat(&ts.query, &[0, 5], &[]), "0 + 7 > 5");
+    assert!(!canonical_sat(&ts.query, &[0, 9], &[]), "0 + 7 is not > 9");
+}
+
+#[test]
+fn canonicalization_keeps_repeated_and_dependent_head_arguments() {
+    // Inv(x, y) ∧ z = x + 1 ⇒ Inv(z, z): both next arguments equal x + 1.
+    let ts = two_arg_system_with(
+        (
+            vec![int_var("x"), int_var("y")],
+            Some(ChcExpr::eq(
+                int_var("z"),
+                ChcExpr::add(int_var("x"), ChcExpr::int(1)),
+            )),
+            vec![int_var("z"), int_var("z")],
+        ),
+        (vec![int_var("x"), int_var("y")], None),
+    );
+    assert!(canonical_sat(&ts.transition, &[0, 0], &[1, 1]));
+    assert!(
+        !canonical_sat(&ts.transition, &[0, 0], &[1, 5]),
+        "Inv(z, z) needs equal arguments"
+    );
+
+    // Inv(x, y) ⇒ Inv(w, w + 1): the second next argument follows the first.
+    let ts = two_arg_system_with(
+        (
+            vec![int_var("x"), int_var("y")],
+            None,
+            vec![int_var("w"), ChcExpr::add(int_var("w"), ChcExpr::int(1))],
+        ),
+        (vec![int_var("x"), int_var("y")], None),
+    );
+    assert!(canonical_sat(&ts.transition, &[0, 0], &[3, 4]));
+    assert!(
+        !canonical_sat(&ts.transition, &[0, 0], &[3, 10]),
+        "w + 1 follows w"
+    );
+}

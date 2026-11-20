@@ -3,7 +3,7 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
-//! Workstream B §7.5 lock (`DESIGN_spacer_pob_lemma_pipeline.md`, WP-S
+//! Workstream B §7.5 lock (the development design notes at `9598c4206`, WP-S
 //! 2026-09-23): a predicate the lane proves unreachable carries the lemma
 //! `false`, and the fixed point it takes part in must reach `Safe` with that
 //! predicate interpreted as `false`.

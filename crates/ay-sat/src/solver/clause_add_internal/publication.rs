@@ -223,6 +223,21 @@ impl Solver {
                     resolution_hints,
                 );
             }
+        } else if registered_original_id.is_none() {
+            // Literals-only recording after #A2b degradation: lrat_enabled is
+            // off (no chain computation, no charge), but the clause sequence
+            // must stay complete for reconstruction repair. The trace add
+            // itself drops any hints in this mode.
+            if let Some(trace) = self.recording_clause_trace_mut() {
+                if trace.literals_only_recording() {
+                    trace.add_clause_with_hint_slices(
+                        clause_id,
+                        literals,
+                        !forward_check_derived,
+                        &[],
+                    );
+                }
+            }
         }
     }
 

@@ -37,7 +37,7 @@ impl Executor {
     /// and the nested-array-free justification marker (this file's third
     /// consume-once arm), whose obligation was MEASURED array-free on all eight
     /// AUFLIRA nasa files it converts (see
-    /// the development design notes).
+    /// the development design notes at `9598c4206`).
     /// The exact finite-expansion theorem joined them with
     /// #nested-array-quarantine-datatype-fields: b79271632 certified MODEL_CHECKER_CONSUMER's
     /// `nested_premise_false_unsat` on it while that row's declared carriers

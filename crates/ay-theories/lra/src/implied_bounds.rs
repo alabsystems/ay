@@ -36,12 +36,98 @@ fn bound_not_tighter_than(
     cur_value: &Rational,
     cur_strict: bool,
 ) -> bool {
-    let tighter = match value.cmp(cur_value) {
+    ordering_not_tighter(is_upper, value.cmp(cur_value), strict, cur_strict)
+}
+
+/// The same strict-aware "not tighter" test from a precomputed
+/// candidate-vs-incumbent ordering, so callers that obtain the
+/// ordering without materializing the candidate value (the
+/// fused divide-add compare below) decide identically.
+#[inline]
+fn ordering_not_tighter(
+    is_upper: bool,
+    ord: std::cmp::Ordering,
+    strict: bool,
+    cur_strict: bool,
+) -> bool {
+    let tighter = match ord {
         std::cmp::Ordering::Less => is_upper,
         std::cmp::Ordering::Greater => !is_upper,
         std::cmp::Ordering::Equal => strict && !cur_strict,
     };
     !tighter
+}
+
+/// Outcome of the exact candidate pre-filter: drop the candidate
+/// for the same reason the materialized-value filters would, or
+/// fall through and compute it — reusing the fused pass's
+/// unreduced `(numerator, denominator)` when the pre-filter
+/// already paid for it, so admitted candidates never run the
+/// fused pass twice.
+#[derive(Debug, PartialEq, Eq)]
+enum CandidatePrefilter {
+    NotTighterThanSlot,
+    SuppressedByRoundBest,
+    Compute(Option<(i128, i128)>),
+}
+
+/// Drop a derived candidate `rhs_base / eq_c + addend` (target
+/// side `is_upper`, strictness `strict`) before materializing it,
+/// when the fused divide-add ordering proves it not tighter than
+/// the slot incumbent or the same-round best. This is exactly the
+/// decision the subsequent `derived_bound_not_tighter` and
+/// `round_best_admit` tests make on the computed value — the
+/// ordering is exact and both tests consult the same
+/// strict-aware order — so falling through to compute the value
+/// on any decline (a `Big` operand or i128 overflow) or when the
+/// candidate is tighter changes nothing but the work done. The
+/// census shape this serves: on Gcd, tens of millions of
+/// candidates per window die at these two tests after paying a
+/// normalized division each.
+#[inline]
+fn candidate_prefilter(
+    rhs_base: &Rational,
+    eq_c: &Rational,
+    addend: &Rational,
+    is_upper: bool,
+    strict: bool,
+    slot_incumbent: Option<(&Rational, bool)>,
+    round_best_incumbent: Option<(&Rational, bool)>,
+) -> CandidatePrefilter {
+    let mut parts: Option<(i128, i128)> = None;
+    for (incumbent, is_slot) in [(slot_incumbent, true), (round_best_incumbent, false)] {
+        let Some((cur_value, cur_strict)) = incumbent else {
+            continue;
+        };
+        // A Big incumbent declines the fused ordering; notice
+        // before paying for the fused pass.
+        if !matches!(cur_value, Rational::Small(..)) {
+            return CandidatePrefilter::Compute(parts);
+        }
+        let (num, den) = match parts {
+            Some(p) => p,
+            None => match rhs_base.div_add_unnormalized_small(eq_c, addend) {
+                Some(p) => {
+                    parts = Some(p);
+                    p
+                }
+                None => return CandidatePrefilter::Compute(None),
+            },
+        };
+        match Rational::unnormalized_cmp(num, den, cur_value) {
+            Some(ord) => {
+                if ordering_not_tighter(is_upper, ord, strict, cur_strict) {
+                    return if is_slot {
+                        CandidatePrefilter::NotTighterThanSlot
+                    } else {
+                        CandidatePrefilter::SuppressedByRoundBest
+                    };
+                }
+            }
+            None => return CandidatePrefilter::Compute(parts),
+        }
+    }
+    CandidatePrefilter::Compute(parts)
 }
 
 /// Maximum replacing tightenings stored per variable (between direct
@@ -208,8 +294,8 @@ impl LraSolver {
             self.direct_bounds_changed_since_implied = true;
         }
         self.implied_bounds.resize(num_vars, (None, None));
-        self.var_bound_gen.resize(num_vars, 0);
-        self.row_computed_gen.resize(self.rows.len(), 0);
+        self.var_bound_gen.resize(num_vars, (0, 0));
+        self.row_computed_gen.resize(self.rows.len(), (0, 0));
         self.implied_tighten_streak.resize(num_vars, 0);
         // #inc-cib-nodelta: repeat call with no new inputs — no touched rows,
         // no direct-bound change, no rows added, and the overlay already
@@ -493,9 +579,17 @@ impl LraSolver {
                 if bv >= num_vars || row.coeffs.len() > Self::MAX_TOUCHED_ROW_BOUND_SCAN_WIDTH {
                     continue;
                 }
-                // #8003: Generation-based skip. If no variable in this row has had
-                // its bound tightened since we last analyzed this row, the result
-                // would be identical — skip the expensive arithmetic.
+                // #8003: Generation-based skip, split by bound side. The
+                // LB direction's accumulation reads, per coefficient
+                // variable, the lower side when `eq_c > 0` (stored
+                // coefficient negative) and the upper side otherwise;
+                // the UB direction reads the opposite side. A direction
+                // whose every read side is no newer than its last
+                // analysis would re-derive identical bounds — skip its
+                // expensive arithmetic. The basic variable is the one
+                // exception: each direction's derivation block also
+                // reads its opposite side, so either basic side moving
+                // makes both directions stale.
                 //
                 // #8857: Also applies to full sweeps (previously gated to the
                 // touched-row path). A full sweep recurs whenever touched_rows
@@ -503,25 +597,51 @@ impl LraSolver {
                 // their last analysis (row_gen > 0) would re-derive identical
                 // bounds. After pop/reset the gen arrays are cleared (gen 0)
                 // and after a full-scan overlay all vars are stamped newer, so
-                // stale skips cannot occur on rebuild paths.
+                // stale skips cannot occur on rebuild paths. Stamp sites
+                // that cannot name the side they changed stamp both
+                // sides, so a side is never silently stale.
+                let mut lb_direction_stale = true;
+                let mut ub_direction_stale = true;
                 if row_idx < self.row_computed_gen.len() {
-                    let row_gen = self.row_computed_gen[row_idx];
-                    if row_gen > 0 {
-                        let mut any_newer = false;
-                        if bv < self.var_bound_gen.len() && self.var_bound_gen[bv] > row_gen {
-                            any_newer = true;
+                    let (lb_row_gen, ub_row_gen) = self.row_computed_gen[row_idx];
+                    if lb_row_gen > 0 || ub_row_gen > 0 {
+                        lb_direction_stale = lb_row_gen == 0;
+                        ub_direction_stale = ub_row_gen == 0;
+                        if bv < self.var_bound_gen.len() {
+                            let (bv_lower_gen, bv_upper_gen) = self.var_bound_gen[bv];
+                            if bv_lower_gen > lb_row_gen || bv_upper_gen > lb_row_gen {
+                                lb_direction_stale = true;
+                            }
+                            if bv_lower_gen > ub_row_gen || bv_upper_gen > ub_row_gen {
+                                ub_direction_stale = true;
+                            }
                         }
-                        if !any_newer {
-                            for &(var, _) in &row.coeffs {
+                        if !lb_direction_stale || !ub_direction_stale {
+                            for &(var, ref coeff) in &row.coeffs {
                                 let vi = var as usize;
-                                if vi < self.var_bound_gen.len() && self.var_bound_gen[vi] > row_gen
-                                {
-                                    any_newer = true;
+                                if vi >= self.var_bound_gen.len() {
+                                    continue;
+                                }
+                                let (lower_gen, upper_gen) = self.var_bound_gen[vi];
+                                // `eq_c = -coeff`: LB reads the lower
+                                // side iff `eq_c > 0`, UB the opposite.
+                                let (lb_read_gen, ub_read_gen) = if coeff.is_negative() {
+                                    (lower_gen, upper_gen)
+                                } else {
+                                    (upper_gen, lower_gen)
+                                };
+                                if lb_read_gen > lb_row_gen {
+                                    lb_direction_stale = true;
+                                }
+                                if ub_read_gen > ub_row_gen {
+                                    ub_direction_stale = true;
+                                }
+                                if lb_direction_stale && ub_direction_stale {
                                     break;
                                 }
                             }
                         }
-                        if !any_newer {
+                        if !lb_direction_stale && !ub_direction_stale {
                             continue;
                         }
                     }
@@ -566,9 +686,11 @@ impl LraSolver {
                 // Pass 2: Full arithmetic only for rows with <=1 unbounded.
                 // This avoids expensive Rational operations on rows where 2+ variables
                 // lack bounds, which is the common case on LP-heavy benchmarks.
-                let mut lb_unbounded_count = 0u32;
+                // A fresh LB direction is parked at the 2+-unbounded
+                // outcome: no accumulation, no derivation.
+                let mut lb_unbounded_count = if lb_direction_stale { 0 } else { 2 };
                 let mut lb_prescan_valid = true;
-                if self.implied_bounds[bv].0.is_none() {
+                if lb_direction_stale && self.implied_bounds[bv].0.is_none() {
                     lb_unbounded_count += 1;
                 }
                 if lb_unbounded_count < 2 {
@@ -868,26 +990,6 @@ impl LraSolver {
                                     }
                                 }
                             }
-                            // #8003: Z3-style derivation without storing per-variable contrib.
-                            // bound_val = rhs_base / eq_c + bound_j, where bound_j is the
-                            // bound we used for variable vi during accumulation. This avoids
-                            // storing a BigRational contrib per variable.
-                            // LB direction: eq_c > 0 used lb(vi), eq_c < 0 used ub(vi).
-                            // #8406: Use div_add_small to fuse division+addition in one
-                            // i128 pass, avoiding two separate GCD reductions.
-                            let bound_val = {
-                                let bound_ref = if eq_c.is_positive() {
-                                    &self.implied_bounds[vi].0
-                                } else {
-                                    &self.implied_bounds[vi].1
-                                };
-                                match bound_ref {
-                                    Some(ib_ref) => rhs_base
-                                        .div_add_small(eq_c, &ib_ref.value)
-                                        .unwrap_or_else(|| &(&rhs_base / eq_c) + &ib_ref.value),
-                                    None => &rhs_base / eq_c,
-                                }
-                            };
                             // derived_strict = any OTHER variable's bound was strict
                             let derived_strict = if lb_strict_count >= 2 {
                                 true // multiple strict bounds -> all derivations are strict
@@ -895,6 +997,73 @@ impl LraSolver {
                                 !var_strict // strict only if THIS variable wasn't the strict one
                             } else {
                                 false // no strict bounds at all
+                            };
+                            // #8003: Z3-style derivation without storing per-variable contrib.
+                            // bound_val = rhs_base / eq_c + bound_j, where bound_j is the
+                            // bound we used for variable vi during accumulation. This avoids
+                            // storing a BigRational contrib per variable.
+                            // LB direction: eq_c > 0 used lb(vi), eq_c < 0 used ub(vi).
+                            let bound_ref = if eq_c.is_positive() {
+                                &self.implied_bounds[vi].0
+                            } else {
+                                &self.implied_bounds[vi].1
+                            };
+                            // Exact pre-filter: drop candidates the
+                            // slot/round-best tests below would drop,
+                            // by fused divide-add ordering instead of
+                            // materializing the quotient (see
+                            // candidate_prefilter).
+                            let prefilter_parts = {
+                                let zero = Rational::zero();
+                                let addend =
+                                    bound_ref.as_ref().map(|ib| &ib.value).unwrap_or(&zero);
+                                let slot_incumbent = (if is_upper {
+                                    &self.implied_bounds[vi].1
+                                } else {
+                                    &self.implied_bounds[vi].0
+                                })
+                                .as_ref()
+                                .map(|ib| (&ib.value, ib.strict));
+                                let round_best_incumbent = (if is_upper {
+                                    &round_best[vi].1
+                                } else {
+                                    &round_best[vi].0
+                                })
+                                .as_ref()
+                                .map(|(v, s)| (v, *s));
+                                match candidate_prefilter(
+                                    &rhs_base,
+                                    eq_c,
+                                    addend,
+                                    is_upper,
+                                    derived_strict,
+                                    slot_incumbent,
+                                    round_best_incumbent,
+                                ) {
+                                    CandidatePrefilter::NotTighterThanSlot => {
+                                        self.stats.implied_not_tighter_skips += 1;
+                                        continue;
+                                    }
+                                    CandidatePrefilter::SuppressedByRoundBest => {
+                                        self.stats.implied_round_best_suppressed += 1;
+                                        continue;
+                                    }
+                                    CandidatePrefilter::Compute(parts) => parts,
+                                }
+                            };
+                            // #8406: Use div_add_small to fuse division+addition in one
+                            // i128 pass, avoiding two separate GCD reductions —
+                            // or materialize the pre-filter's fused pass
+                            // directly when it already ran.
+                            let bound_val = if let Some((num, den)) = prefilter_parts {
+                                Rational::from_unnormalized_i128(num, den)
+                            } else {
+                                match bound_ref {
+                                    Some(ib_ref) => rhs_base
+                                        .div_add_small(eq_c, &ib_ref.value)
+                                        .unwrap_or_else(|| &(&rhs_base / eq_c) + &ib_ref.value),
+                                    None => &rhs_base / eq_c,
+                                }
                             };
                             // Not tighter than the slot: the apply loop would drop it.
                             if self.derived_bound_not_tighter(
@@ -1025,9 +1194,10 @@ impl LraSolver {
                 }
 
                 // #7973: Two-pass approach for UB direction (symmetric with LB).
-                let mut ub_unbounded_count = 0u32;
+                // A fresh UB direction is parked likewise (see LB).
+                let mut ub_unbounded_count = if ub_direction_stale { 0 } else { 2 };
                 let mut ub_prescan_valid = true;
-                if self.implied_bounds[bv].1.is_none() {
+                if ub_direction_stale && self.implied_bounds[bv].1.is_none() {
                     ub_unbounded_count += 1;
                 }
                 if ub_unbounded_count < 2 {
@@ -1293,27 +1463,69 @@ impl LraSolver {
                                     }
                                 }
                             }
+                            let derived_strict = if ub_strict_count >= 2 {
+                                true
+                            } else {
+                                ub_strict_count == 1 && !var_strict
+                            };
                             // #8003: Z3-style derivation (see LB direction comment).
                             // UB direction: eq_c > 0 used ub(vi), eq_c < 0 used lb(vi).
-                            // #8406: Use div_add_small to fuse division+addition in one
-                            // i128 pass (see LB direction comment for rationale).
-                            let bound_val = {
-                                let bound_ref = if eq_c.is_positive() {
+                            let bound_ref = if eq_c.is_positive() {
+                                &self.implied_bounds[vi].1
+                            } else {
+                                &self.implied_bounds[vi].0
+                            };
+                            // Exact pre-filter (see LB direction).
+                            let prefilter_parts = {
+                                let zero = Rational::zero();
+                                let addend =
+                                    bound_ref.as_ref().map(|ib| &ib.value).unwrap_or(&zero);
+                                let slot_incumbent = (if is_upper {
                                     &self.implied_bounds[vi].1
                                 } else {
                                     &self.implied_bounds[vi].0
-                                };
+                                })
+                                .as_ref()
+                                .map(|ib| (&ib.value, ib.strict));
+                                let round_best_incumbent = (if is_upper {
+                                    &round_best[vi].1
+                                } else {
+                                    &round_best[vi].0
+                                })
+                                .as_ref()
+                                .map(|(v, s)| (v, *s));
+                                match candidate_prefilter(
+                                    &rhs_base,
+                                    eq_c,
+                                    addend,
+                                    is_upper,
+                                    derived_strict,
+                                    slot_incumbent,
+                                    round_best_incumbent,
+                                ) {
+                                    CandidatePrefilter::NotTighterThanSlot => {
+                                        self.stats.implied_not_tighter_skips += 1;
+                                        continue;
+                                    }
+                                    CandidatePrefilter::SuppressedByRoundBest => {
+                                        self.stats.implied_round_best_suppressed += 1;
+                                        continue;
+                                    }
+                                    CandidatePrefilter::Compute(parts) => parts,
+                                }
+                            };
+                            // #8406: Use div_add_small to fuse division+addition in one
+                            // i128 pass (see LB direction comment for rationale) —
+                            // or materialize the pre-filter's fused pass directly.
+                            let bound_val = if let Some((num, den)) = prefilter_parts {
+                                Rational::from_unnormalized_i128(num, den)
+                            } else {
                                 match bound_ref {
                                     Some(ib_ref) => rhs_base
                                         .div_add_small(eq_c, &ib_ref.value)
                                         .unwrap_or_else(|| &(&rhs_base / eq_c) + &ib_ref.value),
                                     None => &rhs_base / eq_c,
                                 }
-                            };
-                            let derived_strict = if ub_strict_count >= 2 {
-                                true
-                            } else {
-                                ub_strict_count == 1 && !var_strict
                             };
                             // Not tighter than the slot: the apply loop would drop it.
                             if self.derived_bound_not_tighter(
@@ -1424,10 +1636,18 @@ impl LraSolver {
                         }
                     }
                 }
-                // #8003: Stamp row generation after processing so it can be skipped
-                // on the next iteration if no input bound changes.
+                // #8003: Stamp each analyzed direction after processing
+                // so it can be skipped on the next iteration if none of
+                // the bound sides it reads changes. A direction that was
+                // generation-skipped keeps its older stamp, which still
+                // dominates every side it reads.
                 if row_idx < self.row_computed_gen.len() {
-                    self.row_computed_gen[row_idx] = self.bound_generation;
+                    if lb_direction_stale {
+                        self.row_computed_gen[row_idx].0 = self.bound_generation;
+                    }
+                    if ub_direction_stale {
+                        self.row_computed_gen[row_idx].1 = self.bound_generation;
+                    }
                 }
             }
 
@@ -1473,7 +1693,7 @@ impl LraSolver {
                         // stamp keeps from being generation-skipped there.
                         self.bound_generation += 1;
                         if vi < self.var_bound_gen.len() {
-                            self.var_bound_gen[vi] = self.bound_generation;
+                            self.var_bound_gen[vi].0 = self.bound_generation;
                         }
                         if self.implied_tighten_scratch[vi] <= MAX_TIGHTENS_PER_VAR {
                             round_newly_bounded.push(vi as u32);
@@ -1509,7 +1729,7 @@ impl LraSolver {
                         // tighten budget only — see the lower-bound twin above).
                         self.bound_generation += 1;
                         if vi < self.var_bound_gen.len() {
-                            self.var_bound_gen[vi] = self.bound_generation;
+                            self.var_bound_gen[vi].1 = self.bound_generation;
                         }
                         if self.implied_tighten_scratch[vi] <= MAX_TIGHTENS_PER_VAR {
                             round_newly_bounded.push(vi as u32);
@@ -1587,7 +1807,7 @@ impl LraSolver {
                             self.implied_trail.push((vi as u32, false, old));
                             self.bound_generation += 1;
                             if vi < self.var_bound_gen.len() {
-                                self.var_bound_gen[vi] = self.bound_generation;
+                                self.var_bound_gen[vi].0 = self.bound_generation;
                             }
                         }
                     }
@@ -1613,7 +1833,7 @@ impl LraSolver {
                             self.implied_trail.push((vi as u32, true, old));
                             self.bound_generation += 1;
                             if vi < self.var_bound_gen.len() {
-                                self.var_bound_gen[vi] = self.bound_generation;
+                                self.var_bound_gen[vi].1 = self.bound_generation;
                             }
                         }
                     }
@@ -1874,14 +2094,16 @@ impl LraSolver {
                 .is_some_and(|b| matches!(b.value, Rational::Big(_)))
     }
 
-    /// Returns true when either slot's value or strictness changed.
-    /// Replacement happens only for a strictly tighter bound, so this is
-    /// exactly "row analysis could see a different input for this var".
+    /// Returns `(lower_changed, upper_changed)` for the slots whose
+    /// value or strictness changed. Replacement happens only for a
+    /// strictly tighter bound, so this is exactly "row analysis could
+    /// see a different input on this side of this var".
     pub(crate) fn overlay_direct_bound_for_var(
         info: &VarInfo,
         slot: &mut (Option<ImpliedBound>, Option<ImpliedBound>),
-    ) -> bool {
-        let mut changed = false;
+    ) -> (bool, bool) {
+        let mut lower_changed = false;
+        let mut upper_changed = false;
         if let Some(b) = &info.lower {
             let direct_lb = ImpliedBound {
                 value: b.value.clone(),
@@ -1900,7 +2122,7 @@ impl LraSolver {
             };
             if replace {
                 slot.0 = Some(direct_lb);
-                changed = true;
+                lower_changed = true;
             }
         }
         if let Some(b) = &info.upper {
@@ -1921,9 +2143,9 @@ impl LraSolver {
             };
             if replace {
                 slot.1 = Some(direct_ub);
-                changed = true;
+                upper_changed = true;
             }
         }
-        changed
+        (lower_changed, upper_changed)
     }
 }

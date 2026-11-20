@@ -92,6 +92,7 @@
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermData, TermId};
 
+use super::super::proof_repair::proof_trust_surgery_provenance::complement_of;
 use super::super::Executor;
 use super::rewritten_assertion_bridge::{is_binary_equality, HypothesisLeaf};
 
@@ -294,7 +295,7 @@ impl Executor {
                 continue;
             };
             let not_goal = self.ctx.terms.mk_not(goal);
-            let complement = self.ctx.terms.mk_not(root);
+            let complement = complement_of(&mut self.ctx.terms, root);
             fragment.push(ProofStep::Assume(root));
             let assumed = fragment.len() - 1;
             fragment.push(ProofStep::Step {
@@ -350,7 +351,7 @@ impl Executor {
         if !matches!(self.ctx.terms.get(not_goal), TermData::Not(inner) if *inner == goal) {
             return None;
         }
-        let complement = self.ctx.terms.mk_not(root);
+        let complement = complement_of(&mut self.ctx.terms, root);
         let clause = vec![not_goal, complement, atom];
         for rule in [AletheRule::EquivPos1, AletheRule::EquivPos2] {
             let derivation = ay_proof::CongruenceDerivation {

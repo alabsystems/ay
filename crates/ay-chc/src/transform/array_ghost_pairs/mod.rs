@@ -71,7 +71,7 @@
 //!
 //! Source ideas: Eldarica `-arrayQuans:n` (HornReader.scala ghost pairs with
 //! trigger-based body instantiation) — reimplemented from scratch; see
-//! the development design notes (Eldarica #6).
+//! the development design notes at `8dd63d700` (Eldarica #6).
 
 mod candidate;
 mod candidate_flow;

@@ -7,7 +7,7 @@
 //!
 //! The per-lane shares ([`crate::MemoryGroup`]) stop ONE runaway lane. They do
 //! not stop several lanes growing together: on the CHC-COMP LRA-Lin memouts
-//! (the development design notes) PDR x2, BMC and
+//! (the development design notes at `9598c4206`) PDR x2, BMC and
 //! PDKIND each expanded shared expression DAGs at the same time, each stayed
 //! under half the budget, and the process went from 5 to 16 GiB in about two
 //! seconds. The process-wide signals then ended every lane at once — the

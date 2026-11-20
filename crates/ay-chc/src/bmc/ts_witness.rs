@@ -12,8 +12,8 @@
 //! extract a witness from. On the lustre class that confirmation re-solve
 //! costs 10–18 s of CPU for a depth the TS lane decided in 1–3 s and is the
 //! step that loses the front probe's budget
-//! (the development design notes §5,
-//! `DIAG_LIA_LIN_2026-09-18.md` T5).
+//! (the development design notes at `9598c4206`, §5,
+//! the development design notes at `9598c4206`, T5).
 //!
 //! This module turns the TS model into the same `DerivationWitness` shape the
 //! flat path produces — one entry per level `k..=0`, canonical predicate-state

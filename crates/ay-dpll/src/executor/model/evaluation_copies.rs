@@ -717,13 +717,17 @@ pub(super) fn algebraic(value: &ay_nra::RealAlgebraicValue) -> bool {
 pub(super) fn model_value(value: &ay_model_check::ModelValue) -> bool {
     !active()
         || retain_refusal(
-            super::rendered_dt_limits::model_value_work(value)
-                .is_some_and(|amount| pay(amount, amount)),
+            ay_model_check::admit_model_value_work(value, &mut |work, bytes| {
+                pay(work, bytes)
+                    .then_some(())
+                    .ok_or_else(|| "original model value copy admission refused".to_owned())
+            })
+            .is_ok(),
         )
 }
 
 /// Admit vector growth BEFORE reserve/extend, including conservative doubling.
-pub(super) fn cells(count: usize) -> bool {
+pub(in crate::executor) fn cells(count: usize) -> bool {
     count
         .checked_mul(2 * size_of::<EvalValue>())
         .is_some_and(|bytes| pay(count, bytes))

@@ -308,7 +308,7 @@ impl AlethePrinter<'_> {
         selected_surface: &str,
         surface_operands: &[&str],
     ) -> Option<String> {
-        if crate::render_term_canonical(self.terms, selected) != selected_surface {
+        if self.render_canonical(selected) != selected_surface {
             return None;
         }
         // `(operand, the steps concluding (cl GATE operand) as {id}.a)`.

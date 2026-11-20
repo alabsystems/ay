@@ -851,8 +851,27 @@ impl Executor {
         occupied: &mut dyn FnMut(&str) -> bool,
         owner: ay_core::render_admission::Owner<'_>,
     ) -> String {
+        self.format_term_with_formals_owned(term_id, occupied, owner, &[])
+    }
+
+    /// Alpha-rename the formal slots of a validated, binder-free model body.
+    /// The same formatter handles its operators, literals and sort syntax.
+    pub(super) fn format_model_expression(
+        &self,
+        body: &super::model::CertifiedExpressionBody,
+    ) -> String {
+        self.format_term_with_formals_owned(body.root(), &mut |_| false, None, body.parameters())
+    }
+
+    fn format_term_with_formals_owned(
+        &self,
+        term_id: TermId,
+        occupied: &mut dyn FnMut(&str) -> bool,
+        owner: ay_core::render_admission::Owner<'_>,
+        formals: &[TermId],
+    ) -> String {
         ay_core::render_admission::stacked(owner, String::new, || {
-            self.format_term_body(term_id, occupied, owner)
+            self.format_term_body(term_id, occupied, owner, formals)
         })
     }
 
@@ -861,6 +880,7 @@ impl Executor {
         term_id: TermId,
         occupied: &mut dyn FnMut(&str) -> bool,
         owner: ay_core::render_admission::Owner<'_>,
+        formals: &[TermId],
     ) -> String {
         use crate::executor_format::{
             format_bigint_owned, format_bitvec_owned, format_rational_owned,
@@ -878,11 +898,14 @@ impl Executor {
             return String::new();
         }
         match self.ctx.terms.get(term_id) {
-            TermData::Var(name, _) => self.format_declared_symbol_identity_owned(
-                name,
-                self.ctx.terms.sort(term_id),
-                owner,
-            ),
+            TermData::Var(name, _) => match formals.iter().position(|&formal| formal == term_id) {
+                Some(index) => output::format(owner, format_args!("x!{index}")),
+                None => self.format_declared_symbol_identity_owned(
+                    name,
+                    self.ctx.terms.sort(term_id),
+                    owner,
+                ),
+            },
             TermData::Const(Constant::Bool(value)) => {
                 output::text(owner, if *value { "true" } else { "false" })
             }
@@ -912,16 +935,25 @@ impl Executor {
                 format_bitvec_owned(value, *width, owner)
             }
             TermData::Not(inner) => {
-                let inner = self.format_term_owned(*inner, occupied, owner);
+                let inner = self.format_term_with_formals_owned(*inner, occupied, owner, formals);
                 output::format(owner, format_args!("(not {inner})"))
             }
             TermData::Ite(condition, yes, no) => {
-                let condition = self.format_term_owned(*condition, occupied, owner);
-                let yes = self.format_term_owned(*yes, occupied, owner);
-                let no = self.format_term_owned(*no, occupied, owner);
+                let condition =
+                    self.format_term_with_formals_owned(*condition, occupied, owner, formals);
+                let yes = self.format_term_with_formals_owned(*yes, occupied, owner, formals);
+                let no = self.format_term_with_formals_owned(*no, occupied, owner, formals);
                 output::format(owner, format_args!("(ite {condition} {yes} {no})"))
             }
             TermData::App(symbol, args) => {
+                if symbol.name() == "seq.empty"
+                    && args.is_empty()
+                    && matches!(self.ctx.terms.sort(term_id), Sort::Seq(_))
+                {
+                    let sort =
+                        format_sort_surface_owned(&self.ctx, self.ctx.terms.sort(term_id), owner);
+                    return output::format(owner, format_args!("(as seq.empty {sort})"));
+                }
                 if let (Symbol::Named(name), [value]) = (symbol, args.as_slice()) {
                     if name == "const-array"
                         && matches!(self.ctx.terms.sort(term_id), Sort::Array(_))
@@ -931,7 +963,8 @@ impl Executor {
                             self.ctx.terms.sort(term_id),
                             owner,
                         );
-                        let value = self.format_term_owned(*value, occupied, owner);
+                        let value =
+                            self.format_term_with_formals_owned(*value, occupied, owner, formals);
                         return output::format(owner, format_args!("((as const {sort}) {value})"));
                     }
                 }
@@ -944,7 +977,8 @@ impl Executor {
                                 self.ctx.terms.sort(*variable),
                                 owner,
                             );
-                            let body = self.format_term_owned(*body, occupied, owner);
+                            let body = self
+                                .format_term_with_formals_owned(*body, occupied, owner, formals);
                             return output::format(
                                 owner,
                                 format_args!("(lambda (({name} {sort})) {body})"),
@@ -968,7 +1002,7 @@ impl Executor {
                     return String::new();
                 }
                 for &arg in args {
-                    values.push(self.format_term_owned(arg, occupied, owner));
+                    values.push(self.format_term_with_formals_owned(arg, occupied, owner, formals));
                     if !output::pay(owner, 0, 0) {
                         return String::new();
                     }
@@ -983,11 +1017,11 @@ impl Executor {
                 }
                 for (name, term) in bindings {
                     let name = output::quote(owner, name);
-                    let term = self.format_term_owned(*term, occupied, owner);
+                    let term = self.format_term_with_formals_owned(*term, occupied, owner, formals);
                     values.push(output::format(owner, format_args!("({name} {term})")));
                 }
                 let joined = output::join(owner, &values, " ");
-                let body = self.format_term_owned(*body, occupied, owner);
+                let body = self.format_term_with_formals_owned(*body, occupied, owner, formals);
                 output::format(owner, format_args!("(let ({joined}) {body})"))
             }
             TermData::Forall(variables, body, _) | TermData::Exists(variables, body, _) => {
@@ -1006,7 +1040,7 @@ impl Executor {
                     values.push(output::format(owner, format_args!("({name} {sort})")));
                 }
                 let joined = output::join(owner, &values, " ");
-                let body = self.format_term_owned(*body, occupied, owner);
+                let body = self.format_term_with_formals_owned(*body, occupied, owner, formals);
                 output::format(owner, format_args!("({quantifier} ({joined}) {body})"))
             }
             other => {

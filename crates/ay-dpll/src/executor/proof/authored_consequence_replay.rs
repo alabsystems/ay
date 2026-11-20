@@ -420,26 +420,14 @@ impl Executor {
         self.proof_check_result = None;
         self.proof_check_ok = false;
         self.last_proof_quality = None;
-        #[cfg(feature = "proof-checker")]
-        {
-            self.run_internal_proof_check(&candidate);
-            if !self.proof_check_ok {
-                replay_note(|| {
-                    format!(
-                        "decline: internal proof check refused ({:?})",
-                        self.proof_check_result
-                    )
-                });
-                self.proof_check_result = saved_proof_check_result;
-                self.proof_check_ok = saved_proof_check_ok;
-                self.last_proof_quality = saved_proof_quality;
-                self.last_statistics = saved_statistics;
-                return Err(InstallRefusal::InternalCheck);
-            }
-        }
-        #[cfg(not(feature = "proof-checker"))]
-        if self.self_check() {
-            replay_note(|| "decline: self-check without proof-checker feature".into());
+        self.run_internal_proof_check(&candidate);
+        if !self.proof_check_ok {
+            replay_note(|| {
+                format!(
+                    "decline: internal proof check refused ({:?})",
+                    self.proof_check_result
+                )
+            });
             self.proof_check_result = saved_proof_check_result;
             self.proof_check_ok = saved_proof_check_ok;
             self.last_proof_quality = saved_proof_quality;

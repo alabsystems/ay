@@ -4,7 +4,7 @@
 
 //! ITP-BOARD: Workstream D interpolation, bridge and engine-exit telemetry.
 //!
-//! CHC-COMP 2026, the development design notes
+//! CHC-COMP 2026, the development design notes at `9598c4206`
 //! §4.1 and §10. **Owner: WP-D1-M** (measurement, bridge, ladder).
 //!
 //! Interface contract **C-M1** (frozen in the day-1 skeleton): [`EngineTag`],
@@ -179,9 +179,9 @@ pub(crate) enum AdmissionOutcome {
 /// How the executor adapter printed one script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScriptPrint {
-    /// DAG-linear (Search lane).
+    /// DAG-linear (a query wider than `MAX_DT_EXPR_NODES` tree nodes).
     Dag { bytes: usize, shared_nodes: usize },
-    /// Tree printer (Verification lane, or a DAG-printer refusal).
+    /// Tree printer (every other query).
     Tree { bytes: usize },
     /// The DAG printer refused and the tree printer was used instead.
     DagFallback,
@@ -498,6 +498,19 @@ pub(crate) fn record_engine_exit_detail(
     }
     if let Some(line) = snapshot {
         safe_eprintln!("{line}");
+    }
+}
+
+/// One engine event that does not end the engine (for example a LAWI error
+/// path it abandons and searches past), printed as a `[D-EVENT]` line under
+/// `--chc-proof-itp-stats`. Unlike [`record_engine_exit_detail`] it is not
+/// counted as an exit.
+pub(crate) fn record_engine_event(engine: EngineTag, event: &str, k: usize, detail: &str) {
+    if stats_enabled() {
+        safe_eprintln!(
+            "[D-EVENT] engine={} event={event} k={k} {detail}",
+            engine.name()
+        );
     }
 }
 

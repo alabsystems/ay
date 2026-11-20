@@ -54,7 +54,8 @@ impl AlethePrinter<'_> {
         clause: &[TermId],
         clause_str: &str,
     ) -> Option<String> {
-        if clause_str != AlethePrinter::new(self.terms).format_clause(clause) {
+        if clause_str != self.structural_render(self.terms, |printer| printer.format_clause(clause))
+        {
             return None;
         }
         if crate::checker::validate_ground_evaluate_for_printer(self.terms, id, clause, 0, &[])

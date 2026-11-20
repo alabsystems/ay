@@ -36,6 +36,23 @@ impl CoveringRelation {
             .any(|ancestor| self.elements.iter().any(|elem| elem.coveree == *ancestor))
     }
 
+    /// `is_covered` for every vertex at once, indexed by vertex id, in time
+    /// linear in the ART plus the relation (a vertex is covered when it or
+    /// an ancestor is a coveree; parents have smaller ids than children).
+    pub(crate) fn covered_flags(&self, art: &AbstractReachabilityTree) -> Vec<bool> {
+        let coverees: FxHashSet<ArtVertexId> =
+            self.elements.iter().map(|elem| elem.coveree).collect();
+        let mut flags = vec![false; art.vertex_count()];
+        for index in 0..flags.len() {
+            let vertex = ArtVertexId(index as u32);
+            flags[index] = coverees.contains(&vertex)
+                || art
+                    .parent_vertex(vertex)
+                    .is_some_and(|parent| flags[parent.0 as usize]);
+        }
+        flags
+    }
+
     pub(crate) fn update_with(
         &mut self,
         art: &AbstractReachabilityTree,

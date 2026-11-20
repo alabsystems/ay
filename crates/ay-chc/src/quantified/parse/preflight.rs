@@ -164,6 +164,7 @@ fn quoted_syntax(name: &str) -> bool {
                 | "rotate_left"
                 | "rotate_right"
                 | "int2bv"
+                | "int_to_bv"
                 | "set-logic"
                 | "set-info"
                 | "set-option"

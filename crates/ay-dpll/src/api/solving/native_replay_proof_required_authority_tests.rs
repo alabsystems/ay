@@ -18,7 +18,6 @@ fn strict_boolean_unsat_details() -> crate::api::types::SolveDetails {
     solver.check_sat_with_details()
 }
 
-#[cfg(feature = "proof-checker")]
 #[test]
 fn proof_required_authority_rejects_holes_and_checker_failures() {
     let details = strict_boolean_unsat_details();
@@ -95,17 +94,4 @@ fn proof_required_authority_rejects_holes_and_checker_failures() {
     let mut unavailable = details;
     unavailable.verification.unsat_proof_available = false;
     assert_rejected(unavailable);
-}
-
-#[cfg(not(feature = "proof-checker"))]
-#[test]
-fn proof_required_authority_rejects_build_without_checker() {
-    let details = strict_boolean_unsat_details();
-    assert!(matches!(
-        Solver::require_native_replay_proof_authority(details),
-        Err(SolverError::InvalidArgument {
-            operation: "native_replay_with_proofs",
-            ..
-        })
-    ));
 }

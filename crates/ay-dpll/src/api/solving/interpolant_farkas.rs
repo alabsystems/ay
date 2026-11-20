@@ -843,7 +843,7 @@ pub(crate) fn certificate_lemma_interpolant(
 }
 
 /// [`certificate_lemma_interpolant`] with an explicit atom labeller and the
-/// reason for every refusal (Workstream D Rung 1, `DESIGN_lra_interp_tpa.md`
+/// reason for every refusal (Workstream D Rung 1, the development design notes at `9598c4206`
 /// §4.1: undecodable row, certificate rejected, unsupported shape). The
 /// labeller must be the SAME function the rest of the traversal uses for
 /// leaves and pivots (Explicit mode); `shared_vars` is the cut's shared

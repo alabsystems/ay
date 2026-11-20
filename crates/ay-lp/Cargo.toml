@@ -15,6 +15,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+num-bigint.workspace = true
+num-integer.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

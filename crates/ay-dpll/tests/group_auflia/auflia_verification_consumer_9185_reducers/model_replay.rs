@@ -48,13 +48,39 @@ use ntest::timeout;
 /// anything.
 pub(super) fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &str, label: &str) {
     let problem = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n");
-    let result = run_executor_smt_with_timeout(&problem, 30).expect("execution should succeed");
+    expect_original_problem_with_model_replayed_through_z3(&problem, decls, asserts, label);
+}
+
+/// Preserve the complete original reducer, including its authored logic,
+/// through all native solves. Only the independent reference replay uses ALL
+/// so Z3 accepts the original native sequence sorts.
+pub(super) fn expect_original_fixture_with_model_replayed_through_z3(input: &str, label: &str) {
+    let (preamble, assertions) = input.split_once("(assert ").expect("original assertions");
+    let assertions = format!("(assert {assertions}");
+    let assertions = assertions
+        .strip_suffix("(check-sat)\n")
+        .expect("original final query");
+    let declarations = preamble
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("(set-logic "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    expect_original_problem_with_model_replayed_through_z3(input, &declarations, assertions, label);
+}
+
+fn expect_original_problem_with_model_replayed_through_z3(
+    problem: &str,
+    decls: &str,
+    asserts: &str,
+    label: &str,
+) {
+    let result = run_executor_smt_with_timeout(problem, 30).expect("execution should succeed");
     assert_eq!(result, SolverOutcome::Sat, "{label}: expected SAT");
 
     // `--self-check` must not degrade it either. That mode is NOT an
     // independent check of a quantified model-check certificate (it trusts
     // the same grant), so it is asserted, never relied on.
-    let self_checked = crate::common::solve_selfcheck_vec(&problem);
+    let self_checked = crate::common::solve_selfcheck_vec(problem);
     assert_eq!(
         crate::common::sat_result(&self_checked.join("\n")),
         Some("sat"),
@@ -65,7 +91,7 @@ pub(super) fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &s
     // `sat` the quantified publication gate let through uncertified is what
     // the retired `unknown` pins stopped, and neither the self-check nor a
     // replay of a correct model can see one.
-    let (authored, gate) = quantified_gate_record(&problem);
+    let (authored, gate) = quantified_gate_record(problem);
     assert_eq!(
         crate::common::sat_result(&authored.join("\n")),
         Some("sat"),
@@ -78,7 +104,7 @@ pub(super) fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &s
         "{label}: the quantified model gate recorded no certificate behind this SAT: {gate:?}"
     );
 
-    let with_model = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n(get-model)\n");
+    let with_model = format!("{problem}\n(get-model)\n");
     let output = crate::common::solve(&with_model);
     let model = output
         .split_once("(model")
@@ -217,6 +243,37 @@ fn z3_replay_outcome(replay: &str) -> SolverOutcome {
     let outcome = crate::common::z3::run_z3_file(&path, 20).expect("run z3");
     let _ = std::fs::remove_file(&path);
     outcome
+}
+
+#[test]
+#[timeout(120_000)]
+fn theory_program_original_has_value_publishes_a_replayed_model() {
+    expect_original_fixture_with_model_replayed_through_z3(
+        include_str!(
+            "../../fixtures/verification_consumer_9185/slice_index_has_value_usize_sat.smt2"
+        ),
+        "original has_value_usize",
+    );
+}
+
+#[test]
+#[timeout(120_000)]
+fn theory_program_original_in_bounds_usize_publishes_a_replayed_model() {
+    expect_original_fixture_with_model_replayed_through_z3(
+        include_str!(
+            "../../fixtures/verification_consumer_9185/slice_index_in_bounds_usize_sat.smt2"
+        ),
+        "original in_bounds_usize",
+    );
+}
+
+#[test]
+#[timeout(120_000)]
+fn theory_program_original_inclusive_range_publishes_a_replayed_model() {
+    expect_original_fixture_with_model_replayed_through_z3(
+        include_str!("../../fixtures/verification_consumer_9185/slice_index_in_bounds_range_inclusive_sat.smt2"),
+        "original in_bounds_range_inclusive",
+    );
 }
 
 /// The abstract-value splice is new acceptance in the replay oracle, so it is

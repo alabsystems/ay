@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CHC-COMP 2026 Workstream D (DESIGN_lra_interp_tpa.md §9) integration tests:
+//! CHC-COMP 2026 Workstream D (the development design notes at 9598c4206, §9) integration tests:
 //! IMC budget-shaped retry, k->1 witness, source-aware validation; PDKind cancellation.
 //!
 //! Owner: WP-D1-E. The IMC retry and k→1 witness step are unit-tested next to

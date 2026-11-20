@@ -8,7 +8,7 @@ use std::mem::size_of;
 
 pub(super) struct Bytes(pub(super) Vec<u8>);
 
-pub(super) fn reserve<T, C: Control>(
+pub(in super::super) fn reserve<T, C: Control>(
     values: &mut Vec<T>,
     additional: usize,
     control: &mut C,

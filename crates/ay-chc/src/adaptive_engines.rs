@@ -1379,7 +1379,7 @@ impl AdaptivePortfolio {
 
         // Item 4 (model-checker-consumer parity, heavy-memory "235-relation" class): run the
         // bounded-cost forwarding-only combination (ArrayStoreForwarder +
-        // cost-bounded DeadParamEliminator) ahead of the BMC construction so
+        // trailing DeadParamEliminator) ahead of the BMC construction so
         // threaded-memory array relations are sliced before the exact DAG
         // encoding. Identity summaries (no arrays, kill switch
         // AY_CHC_DISABLE_ARRAY_STORE_FORWARDING, no-op forwarding) keep the

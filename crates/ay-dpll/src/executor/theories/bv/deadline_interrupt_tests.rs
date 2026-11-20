@@ -43,11 +43,17 @@ fn a_bitblast_cut_by_the_memory_ceiling_is_memout_after_the_reading_drops() {
         Some(UnknownReason::MemoryLimit)
     );
     assert_eq!(executor.unknown_origin(), Some(UnknownOrigin::MemoryBudget));
+    assert_eq!(
+        executor.bv_encodings_stopped_before_search(),
+        1,
+        "a cut bit-blast is an encoding stopped before its SAT search"
+    );
 
     // The same query with no cut is sat: only the cut stopped it.
     let mut executor = Executor::new();
     let output = executor.execute_all(&commands).expect("fixture runs");
     assert_eq!(output, vec!["sat"]);
+    assert_eq!(executor.bv_encodings_stopped_before_search(), 0);
 }
 
 #[test]
@@ -68,6 +74,43 @@ fn a_bitblast_cut_by_the_interrupt_is_interrupted() {
         executor.get_reason_unknown(),
         Some(UnknownReason::Interrupted)
     );
+    assert_eq!(executor.bv_encodings_stopped_before_search(), 1);
+}
+
+/// A stop that lands during the eager clause load (one unpolled call per
+/// clause; ~10M on a deep BMC unrolling) is an encoding cut, not a search:
+/// the solve answers `unknown` without entering its SAT search, and the
+/// counters say so. Before the post-load poll the solve reported a search,
+/// so a bounded model checker kept sweeping deeper.
+#[test]
+fn a_stop_during_the_clause_load_is_an_encoding_cut() {
+    let script = r#"
+        (set-logic QF_BV)
+        (declare-fun x () (_ BitVec 8))
+        (assert (bvult x #x10))
+        (check-sat)
+    "#;
+    let commands = ay_frontend::parse(script).expect("fixture parses");
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut executor = Executor::new();
+    executor.set_interrupt(flag.clone());
+    stop_during_clause_load::arm(Some(flag));
+    let output = executor.execute_all(&commands).expect("fixture runs");
+    stop_during_clause_load::arm(None);
+    assert_eq!(output, vec!["unknown"]);
+    assert_eq!(
+        executor.get_reason_unknown(),
+        Some(UnknownReason::Interrupted)
+    );
+    assert_eq!(executor.bv_encodings_stopped_before_search(), 1);
+    assert_eq!(executor.bv_sat_searches_entered(), 0);
+
+    // Unstopped, the same query searches and answers.
+    let mut executor = Executor::new();
+    let output = executor.execute_all(&commands).expect("fixture runs");
+    assert_eq!(output, vec!["sat"]);
+    assert_eq!(executor.bv_encodings_stopped_before_search(), 0);
+    assert_eq!(executor.bv_sat_searches_entered(), 1);
 }
 
 #[test]

@@ -172,7 +172,8 @@ pub(crate) struct ArithmeticProfile {
     pub(crate) coeff_max_abs: u128,
     /// Mean absolute value of integer constants.
     pub(crate) coeff_mean_abs: f64,
-    /// L1 norm (sum of absolute values) of integer constants.
+    /// L1 norm (sum of absolute values) of integer constants, saturating at
+    /// `u128::MAX`.
     pub(crate) coeff_l1_norm: u128,
     /// Maximum multiplication degree (depth of nested Mul operations).
     /// 0 = no multiplication, 1 = linear multiplication, 2+ = polynomial.
@@ -962,12 +963,16 @@ impl ChcFeatureExtractor {
             sorted.dedup();
             sorted.len()
         };
-        // Saturating: release builds check overflow, and a large input's
-        // coefficients can sum past u128 (design W0.7).
-        let l1_norm: u128 = constants
+        // Solidity inputs carry constants near 2^127 (|i128| as u128), so the
+        // exact sum overflows u128: saturate it, and take the mean in f64.
+        let l1_norm = constants
             .iter()
-            .fold(0u128, |total, constant| total.saturating_add(*constant));
-        let mean = l1_norm as f64 / constants.len() as f64;
+            .fold(0u128, |sum, &constant| sum.saturating_add(constant));
+        let mean = constants
+            .iter()
+            .map(|&constant| constant as f64)
+            .sum::<f64>()
+            / constants.len() as f64;
         let min_abs = constants.iter().copied().min().unwrap_or(0);
         let max_abs = constants.iter().copied().max().unwrap_or(0);
 
@@ -1315,6 +1320,32 @@ impl std::fmt::Display for ChcFeatureVector {
 mod tests {
     use super::*;
     use crate::{ChcVar, ClauseBody, ClauseHead, HornClause};
+
+    /// AY-SMT-12: constants of magnitude ~2^127 (Solidity CHC inputs,
+    /// mapping_with_cast.sol_1) overflowed the u128 L1-norm sum and panicked
+    /// the adaptive solver thread. The three constants here sum to
+    /// (2^127 - 1) + 2^127 + 2^127 = 3 * 2^127 - 1 > u128::MAX, so the old
+    /// checked `sum()` overflows on them.
+    #[test]
+    fn arithmetic_profile_saturates_l1_norm_of_huge_constants() {
+        let mut problem = ChcProblem::new();
+        let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
+        let x = ChcVar::new("x", ChcSort::Int);
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::and_all([
+                ChcExpr::le(ChcExpr::var(x.clone()), ChcExpr::int(i128::MAX)),
+                ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(i128::MIN)),
+                ChcExpr::ne(ChcExpr::var(x.clone()), ChcExpr::int(i128::MIN)),
+            ])),
+            ClauseHead::Predicate(inv, vec![ChcExpr::var(x)]),
+        ));
+        let profile = ChcFeatureExtractor::analyze_arithmetic_profile(&problem);
+        assert_eq!(profile.coeff_l1_norm, u128::MAX);
+        assert_eq!(profile.coeff_max_abs, i128::MIN.unsigned_abs());
+        let huge = i128::MIN.unsigned_abs() as f64;
+        let expected_mean = (i128::MAX as f64 + 2.0 * huge) / 3.0;
+        assert!((profile.coeff_mean_abs - expected_mean).abs() <= expected_mean * 1e-12);
+    }
 
     fn simple_loop_problem() -> ChcProblem {
         let mut problem = ChcProblem::new();

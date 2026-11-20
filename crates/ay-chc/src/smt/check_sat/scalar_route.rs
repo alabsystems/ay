@@ -72,7 +72,7 @@ pub(super) fn scalar_arith_query(
     // Bool operand, a mixed-sort equality, ...) would be a wasted attempt: the
     // adapter fails closed before parsing (fast_2_000: 6,192 such attempts).
     // Such a query is an ENGINE defect (no clause can contain one): count it so
-    // tests can assert the engines never build one (PDR_typed_subst_2026-09-19.md).
+    // tests can assert the engines never build one (the development design notes at 9598c4206).
     let well_typed = expr
         .conjuncts()
         .iter()

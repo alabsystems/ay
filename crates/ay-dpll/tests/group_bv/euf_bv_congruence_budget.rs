@@ -9,7 +9,11 @@
 //! Congruence is expanded into CNF for every pair of same-symbol
 //! applications, quadratic in their number. Past its clause budget the pass
 //! stops; the clauses it emitted are a subset of the full axiomatization, so
-//! an UNSAT still stands and a SAT becomes `unknown`.
+//! an UNSAT still stands. A SAT under the partial encoding is completed
+//! lazily (AY-SMT-7, `bv_congruence_refine`): the model is checked against
+//! every pair the full pass would have emitted, the disagreeing pairs get
+//! their clauses and the SAT solver runs again, so a SAT that survives is a
+//! model of the full axiomatization.
 //!
 //! 200 applications of a 32-bit `f` are 19,900 pairs, about 190 clauses
 //! each: past the budget.
@@ -32,14 +36,14 @@ fn many_applications(extra: &str) -> String {
     smt
 }
 
-/// Satisfiable (`f(x) = x + 1`), but the congruence pass stops at its
-/// budget, so no model is trusted: `unknown`, never `sat` from a partial
-/// axiomatization.
+/// Satisfiable (`f(x) = x + 1`). The congruence pass stops at its budget,
+/// and the lazy completion checks the model against every remaining pair
+/// before `sat` is reported.
 #[test]
 #[timeout(120_000)]
-fn congruence_past_budget_degrades_sat_to_unknown() {
+fn congruence_past_budget_completes_lazily_to_sat() {
     let outputs = crate::common::solve_vec(&many_applications(""));
-    assert_eq!(outputs, vec!["unknown"]);
+    assert_eq!(outputs, vec!["sat"]);
 }
 
 /// Twin: the first pair's congruence clause is emitted before the budget

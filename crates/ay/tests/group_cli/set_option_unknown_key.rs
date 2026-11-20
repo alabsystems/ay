@@ -168,7 +168,6 @@ fn options_ay_dispatches_on_are_accepted() {
 #[test]
 fn ay_native_options_are_accepted() {
     for (option, value) in [
-        ("ay-diff-logic", "false"),
         ("ay-eq-diffvar", "false"),
         ("ay-maxsmt-engine", "oll"),
         ("ay-proof-no-varsubst", "false"),

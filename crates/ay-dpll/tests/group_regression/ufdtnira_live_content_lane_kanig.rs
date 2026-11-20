@@ -32,7 +32,7 @@
 //! `set_timeout`, a 64 MB stack) did not reproduce it. Pinning `unsat` here
 //! would pin an outcome this entry point does not deliver; the CLI-level
 //! numbers live in
-//! the development design notes,
+//! the development design notes at `9598c4206`,
 //! which also records the unexplained divergence as open.
 //!
 //! Corpus-backed, following the workspace convention (skip when absent, fail

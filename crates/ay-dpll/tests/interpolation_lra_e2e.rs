@@ -6,7 +6,7 @@
 //! the fail-closed `InterpolantMode::Explicit` mode
 //! (`Solver::get_interpolants_for_masks`). Every served interpolant is
 //! Craig-checked by a fresh solver (`A ∧ ¬I` and `I ∧ B` UNSAT, symbols of
-//! `I` shared). Workstream D Rung 1 (`DESIGN_lra_interp_tpa.md` §4.1),
+//! `I` shared). Workstream D Rung 1 (the development design notes at `9598c4206`, §4.1),
 //! owner WP-D1-P.
 
 use std::collections::HashSet;

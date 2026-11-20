@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! `project_real_var`'s Fourier-Motzkin resolvent cap (2026-09-24,
-//! `LRA_memouts_2026-09-24.md`): eliminating a Real variable with L lower
+//! the development design notes at `9598c4206`): eliminating a Real variable with L lower
 //! bounds and U upper bounds must not always produce their full L*U cross
 //! product -- PDKIND's `generalize -> Mbp::project` on wide, ITE-heavy
 //! transition relations (`om1_with_relays_general_*`, `cav12/*`) hit exactly

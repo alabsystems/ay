@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CHC-COMP 2026 Workstream D (DESIGN_lra_interp_tpa.md §9) integration tests:
+//! CHC-COMP 2026 Workstream D (the development design notes at 9598c4206, §9) integration tests:
 //! multi-group proof substrate: masks, path interpolants, fail-closed extraction, convert_path.
 //!
 //! Owner: WP-D1-P. The substrate is crate-internal; its API is unit-tested in

@@ -12,6 +12,86 @@ fn integer(value: i64) -> BigRational {
     BigRational::from_integer(value.into())
 }
 
+#[test]
+fn affine_replay_rejects_exact_side_store_even_when_digest_is_rebound() {
+    let mut proxy = Model::new();
+    let z = proxy.add_binary_col();
+    proxy.fix_col(z, 0.0);
+    let x = proxy.add_col(f64::NEG_INFINITY, f64::INFINITY);
+    let y = proxy.add_col(f64::NEG_INFINITY, f64::INFINITY);
+    proxy.add_row(0.0, 0.0, &[(z, 1.0)]);
+    proxy.add_row(0.0, 0.0, &[(x, 1.0), (y, 1.0)]);
+    let changed_row = proxy.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
+    let (reduced, post) = aggregate_implied_free_equalities(&proxy, None, None)
+        .expect("fixed binary must produce a reduced affine frame");
+    let opts = crate::SolveOpts::new().with_time_limit(Duration::from_secs(20));
+    let mut lp = crate::LpSession::new(&reduced, &opts).unwrap();
+    let outcome = lp.optimize_model_objective().unwrap();
+    assert!(matches!(outcome, Outcome::Infeasible { cert: Some(_), .. }));
+    let mut certificate = post
+        .certificate_for_outcome(&outcome, &reduced, &proxy, None, None)
+        .expect("valid reduced Farkas must produce an affine artifact");
+    assert!(certificate.verify(&proxy).unwrap().infeasibility_verified);
+
+    // A legitimate exact side-store value rounds to the same f64 advice.
+    // The true second equality is x+(1+2^-54)y=1, satisfied at (-2^54,2^54).
+    let magnitude = 1_i64 << 54;
+    let true_coefficient = BigRational::new((magnitude + 1).into(), magnitude.into());
+    assert_eq!(true_coefficient.to_f64(), Some(1.0));
+    // Independent substitution in the two exact equations, before asking the
+    // model's point checker to interpret its side store.
+    let exact_x = integer(-magnitude);
+    let exact_y = integer(magnitude);
+    assert_eq!(&exact_x + &exact_y, integer(0));
+    assert_eq!(&exact_x + &true_coefficient * &exact_y, integer(1));
+    let mut source = proxy.clone();
+    source.record_inexact_row_coeff(changed_row, y.0, true_coefficient);
+    source
+        .check_point(&[integer(0), integer(-magnitude), integer(magnitude)])
+        .expect("the exact source is feasible even though its f64 proxy is not");
+    assert!(source.has_inexact_coeffs());
+    assert!(aggregate_implied_free_equalities(&source, None, None).is_none());
+    // A digest is an untrusted binding claim. Rebinding it cannot license
+    // replaying the rounded source in place of its exact side-store facts.
+    certificate.analysis.source_digest = crate::cert_io::canonical_digest(&source);
+    let replay = certificate.verify(&source);
+    assert!(
+        replay.is_err(),
+        "feasible exact source accepted: {replay:?}"
+    );
+    // Independently distinguish the rounded proxy from its exact source. The
+    // mathematical witness above remains mandatory without a local oracle.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(oracle) = ay_test_support::z3::optional_z3("affine exact side-store replay") {
+        use sha2::{Digest, Sha256};
+        for (case, expected) in [("rounded_unsat", "unsat"), ("exact_sat", "sat")] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/affine_exact_side_store")
+                .join(format!("{case}.smt2"));
+            let input = std::fs::read(&path).expect("exact affine reference fixture");
+            let mut command = oracle.command();
+            command.args(["-smt2", "-T:5", "-memory:256"]).arg(path);
+            let output = ay_sys::metadata_capture::capture(
+                command,
+                ay_sys::metadata_capture::CaptureLimits {
+                    timeout: Duration::from_secs(5),
+                    output_bytes: 4096,
+                    resident_bytes: Some(256 * 1024 * 1024),
+                },
+                "affine exact side-store reference",
+            )
+            .expect("bounded affine reference");
+            eprintln!(
+                "affine reference case={case} input_sha256={:x} status={} verdict={expected}",
+                Sha256::digest(&input),
+                output.status
+            );
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
+    }
+}
+
 fn primal_only_certificate() -> (Model, AffineAggregationCertificate) {
     let mut model = Model::new();
     let x = model.add_int_col(0.0, 2.0);
@@ -31,6 +111,72 @@ fn primal_only_certificate() -> (Model, AffineAggregationCertificate) {
         .certificate_for_outcome(&outcome, &reduced, &model, None, None)
         .expect("a checked source primal must produce an artifact");
     (model, certificate)
+}
+
+#[test]
+fn affine_replay_declines_every_exact_override_and_accepts_its_replacement() {
+    #[derive(Clone, Copy, Debug)]
+    enum Override {
+        RowCoefficient,
+        RowLower,
+        RowUpper,
+        ObjectiveCoefficient,
+        ObjectiveOffset,
+    }
+
+    let (proxy, certificate) = primal_only_certificate();
+    assert!(!proxy.has_inexact_coeffs());
+    assert!(certificate.verify(&proxy).unwrap().primal_verified);
+    let near_one = integer(1) + BigRational::new(1.into(), (1_i64 << 54).into());
+    let near_zero = BigRational::new(1.into(), num_bigint::BigInt::from(1u8) << 1075);
+    assert_eq!(near_one.to_f64(), Some(1.0));
+    assert_eq!(near_zero.to_f64(), Some(0.0));
+
+    for field in [
+        Override::RowCoefficient,
+        Override::RowLower,
+        Override::RowUpper,
+        Override::ObjectiveCoefficient,
+        Override::ObjectiveOffset,
+    ] {
+        let mut source = proxy.clone();
+        match field {
+            Override::RowCoefficient => {
+                source.record_inexact_row_coeff(Row(0), 0, near_one.clone());
+            }
+            Override::RowLower => {
+                source.record_inexact_row_bound(Row(0), true, near_zero.clone());
+            }
+            Override::RowUpper => {
+                source.record_inexact_row_bound(Row(0), false, -&near_zero);
+            }
+            Override::ObjectiveCoefficient => {
+                source.record_inexact_obj_coeff(0, near_one.clone());
+            }
+            Override::ObjectiveOffset => source.record_inexact_obj_offset(near_zero.clone()),
+        }
+        assert!(source.has_inexact_coeffs(), "{field:?}");
+        assert!(aggregate_implied_free_equalities(&source, None, None).is_none());
+        let mut rebound = certificate.clone();
+        rebound.analysis.source_digest = crate::cert_io::canonical_digest(&source);
+        assert_eq!(
+            rebound.verify(&source),
+            Err(AffineAggregationCertificateError::Replay),
+            "{field:?} must obey the producer's supported-input precondition"
+        );
+
+        match field {
+            Override::RowCoefficient | Override::RowLower | Override::RowUpper => {
+                source.set_row(Row(0), 0.0, 0.0, &[(Col(0), 1.0), (Col(1), -1.0)]);
+            }
+            Override::ObjectiveCoefficient => {
+                source.set_objective(&[(Col(0), 1.0), (Col(1), 2.0)], Sense::Minimize);
+            }
+            Override::ObjectiveOffset => source.set_objective_offset(0.0),
+        }
+        assert!(!source.has_inexact_coeffs(), "{field:?}");
+        assert!(certificate.verify(&source).unwrap().primal_verified);
+    }
 }
 
 fn optimality_certificate() -> (Model, AffineAggregationCertificate) {

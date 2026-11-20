@@ -1770,6 +1770,175 @@ pub(crate) struct MultiConstraint {
     pub(crate) rel: Rel,
 }
 
+/// A rational function `num / den` over multivariate polynomials,
+/// for the relaxed ICP parse. `den` is the product of `factors`
+/// (kept separately so each factor's sign can be proven on its
+/// own, where the expanded product's interval hull might
+/// straddle zero), and `inner` lists every further polynomial
+/// that must be nonzero for a subexpression to be defined at
+/// all (divisor numerators and their own denominators). The
+/// represented value equals the source term's value at every
+/// point where all `factors` and `inner` polynomials are
+/// nonzero. Sizes are capped at every construction so a hostile
+/// term cannot blow the translation up.
+struct RationalFunction {
+    num: MultiPoly,
+    den: MultiPoly,
+    factors: Vec<MultiPoly>,
+    inner: Vec<MultiPoly>,
+}
+
+impl RationalFunction {
+    fn leaf(poly: MultiPoly) -> Self {
+        Self {
+            num: poly,
+            den: MultiPoly::constant(BigRational::one()),
+            factors: vec![MultiPoly::constant(BigRational::one())],
+            inner: Vec::new(),
+        }
+    }
+
+    fn checked(self) -> Option<Self> {
+        if self.num.terms.len() > 512
+            || self.den.terms.len() > 512
+            || self.factors.len() + self.inner.len() > 24
+        {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    fn add(&self, other: &Self) -> Option<Self> {
+        let num = self.num.mul(&other.den).add(&other.num.mul(&self.den));
+        let mut factors = self.factors.clone();
+        factors.extend(other.factors.iter().cloned());
+        let mut inner = self.inner.clone();
+        inner.extend(other.inner.iter().cloned());
+        Self {
+            num,
+            den: self.den.mul(&other.den),
+            factors,
+            inner,
+        }
+        .checked()
+    }
+
+    fn sub(&self, other: &Self) -> Option<Self> {
+        let negated = RationalFunction {
+            num: other.num.neg(),
+            den: other.den.clone(),
+            factors: other.factors.clone(),
+            inner: other.inner.clone(),
+        };
+        self.add(&negated)
+    }
+
+    fn mul(&self, other: &Self) -> Option<Self> {
+        let mut factors = self.factors.clone();
+        factors.extend(other.factors.iter().cloned());
+        let mut inner = self.inner.clone();
+        inner.extend(other.inner.iter().cloned());
+        Self {
+            num: self.num.mul(&other.num),
+            den: self.den.mul(&other.den),
+            factors,
+            inner,
+        }
+        .checked()
+    }
+
+    fn div(&self, other: &Self) -> Option<Self> {
+        if other.num.is_zero() {
+            return None;
+        }
+        let mut factors = self.factors.clone();
+        factors.push(other.num.clone());
+        // The divisor's own denominator factors and inner
+        // denominators must be nonzero for the divisor to be
+        // defined; its numerator joins this result's factors.
+        let mut inner = self.inner.clone();
+        inner.extend(other.inner.iter().cloned());
+        inner.extend(other.factors.iter().cloned());
+        Self {
+            num: self.num.mul(&other.den),
+            den: self.den.mul(&other.num),
+            factors,
+            inner,
+        }
+        .checked()
+    }
+}
+
+/// A bounds-independent cleared relaxed atom: the polynomial
+/// `lhs.num * rhs.den - rhs.num * lhs.den` (before the
+/// multiplier-sign flip), its relation, and the denominator
+/// factors whose proven signs decide admissibility. Pure
+/// function of the atom's term structure, so the solver caches
+/// it across ICP preparations; only the sign proofs repeat.
+#[derive(Clone, Debug)]
+pub(crate) struct ClearedRelaxedAtom {
+    pub(crate) poly: MultiPoly,
+    pub(crate) rel: Rel,
+    outer_factors: Vec<MultiPoly>,
+    inner_factors: Vec<MultiPoly>,
+}
+
+impl ClearedRelaxedAtom {
+    /// Admit the cleared atom under `bounds` when every
+    /// denominator factor is proven nonzero there, flipping the
+    /// polynomial when the clearing multiplier is negative.
+    pub(crate) fn admit(&self, bounds: &crate::HashMap<TermId, Interval>) -> Option<MultiAtom> {
+        let mut multiplier_sign = 1i32;
+        for factor in &self.outer_factors {
+            multiplier_sign *= denominator_sign(factor, bounds)?;
+        }
+        for inner in &self.inner_factors {
+            denominator_sign(inner, bounds)?;
+        }
+        let poly = if multiplier_sign < 0 {
+            self.poly.neg()
+        } else {
+            self.poly.clone()
+        };
+        if poly.variables().is_empty() {
+            let sign = if poly.is_zero() {
+                0
+            } else {
+                rational_sign(&poly.terms[0].1)
+            };
+            if self.rel.holds_for_sign(sign) {
+                Some(MultiAtom::ConstTrue)
+            } else {
+                Some(MultiAtom::ConstFalse)
+            }
+        } else {
+            Some(MultiAtom::Constraint(MultiConstraint {
+                poly,
+                rel: self.rel,
+            }))
+        }
+    }
+}
+
+/// The proven sign of a denominator polynomial over `bounds`:
+/// `Some(1)`/`Some(-1)` when its interval hull is strictly
+/// positive/negative (so it vanishes nowhere in the box), else
+/// `None`. The identically-zero polynomial is never provable.
+fn denominator_sign(poly: &MultiPoly, bounds: &crate::HashMap<TermId, Interval>) -> Option<i32> {
+    if poly.is_zero() {
+        return None;
+    }
+    let interval = eval_poly_interval(poly, bounds)?;
+    if interval_is_pos(&interval) {
+        Some(1)
+    } else if interval_is_neg(&interval) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
 impl NraSolver<'_> {
     /// Attempt to decide the current assertion set via LINEAR-EQUALITY
     /// SUBSTITUTION followed by the exact univariate decider. Returns
@@ -2070,6 +2239,109 @@ impl NraSolver<'_> {
             }
         } else {
             Some(MultiAtom::Constraint(MultiConstraint { poly, rel }))
+        }
+    }
+
+    /// Relaxed second-pass parse for ICP, UNSAT ONLY. Atoms the
+    /// exact parser declined are translated as rational functions:
+    /// division is cleared only when every denominator factor is
+    /// proven sign-definite over `bounds` (themselves entailed by
+    /// the exactly-parsed asserted subset, so every original model
+    /// satisfies the nonzero side conditions — SMT-LIB division by
+    /// zero is underspecified and is never cleared), and any other
+    /// unsupported real-sorted application (an uninterpreted
+    /// function leaf above all) becomes an opaque independent
+    /// variable keyed by its term. Every original model maps to a
+    /// model of the relaxed problem (opaque variables take their
+    /// terms' values), so refuting the relaxed problem refutes the
+    /// asserted set; the caller must keep coverage partial so no
+    /// SAT authority ever reads these constraints.
+    pub(crate) fn atom_to_cleared_relaxed(
+        &self,
+        atom: TermId,
+        value: bool,
+    ) -> Option<ClearedRelaxedAtom> {
+        let (rel0, lhs, rhs) = self.comparison_parts(atom)?;
+        let rel = if value { rel0 } else { negate_rel(rel0) };
+        let lhs = self.term_to_rational_relaxed(lhs, 0)?;
+        let rhs = self.term_to_rational_relaxed(rhs, 0)?;
+        let poly = lhs.num.mul(&rhs.den).sub(&rhs.num.mul(&lhs.den));
+        if poly.terms.len() > 512 || poly.terms.iter().any(|(mono, _)| mono.len() > 12) {
+            return None;
+        }
+        let mut outer_factors = lhs.factors;
+        outer_factors.extend(rhs.factors);
+        let mut inner_factors = lhs.inner;
+        inner_factors.extend(rhs.inner);
+        Some(ClearedRelaxedAtom {
+            poly,
+            rel,
+            outer_factors,
+            inner_factors,
+        })
+    }
+
+    fn term_to_rational_relaxed(&self, term: TermId, depth: usize) -> Option<RationalFunction> {
+        if depth > 32 {
+            return None;
+        }
+        let opaque = |this: &Self, term: TermId| -> Option<RationalFunction> {
+            if matches!(this.terms.sort(term), ay_core::Sort::Real) {
+                Some(RationalFunction::leaf(MultiPoly::var(term)))
+            } else {
+                None
+            }
+        };
+        match self.terms.get(term) {
+            TermData::Const(Constant::Int(n)) => Some(RationalFunction::leaf(MultiPoly::constant(
+                BigRational::from_integer(n.clone()),
+            ))),
+            TermData::Const(Constant::Rational(r)) => {
+                Some(RationalFunction::leaf(MultiPoly::constant(r.0.clone())))
+            }
+            TermData::Var(_, _) => Some(RationalFunction::leaf(MultiPoly::var(term))),
+            TermData::App(Symbol::Named(name), args) => match name.as_str() {
+                "+" if !args.is_empty() => {
+                    let mut iter = args.iter();
+                    let mut acc = self.term_to_rational_relaxed(*iter.next()?, depth + 1)?;
+                    for &a in iter {
+                        acc = acc.add(&self.term_to_rational_relaxed(a, depth + 1)?)?;
+                    }
+                    Some(acc)
+                }
+                "-" if args.len() == 1 => {
+                    let inner = self.term_to_rational_relaxed(args[0], depth + 1)?;
+                    Some(RationalFunction {
+                        num: inner.num.neg(),
+                        ..inner
+                    })
+                }
+                "-" if args.len() >= 2 => {
+                    let mut iter = args.iter();
+                    let mut acc = self.term_to_rational_relaxed(*iter.next()?, depth + 1)?;
+                    for &a in iter {
+                        acc = acc.sub(&self.term_to_rational_relaxed(a, depth + 1)?)?;
+                    }
+                    Some(acc)
+                }
+                "*" if !args.is_empty() => {
+                    let mut iter = args.iter();
+                    let mut acc = self.term_to_rational_relaxed(*iter.next()?, depth + 1)?;
+                    for &a in iter {
+                        acc = acc.mul(&self.term_to_rational_relaxed(a, depth + 1)?)?;
+                    }
+                    Some(acc)
+                }
+                "/" if args.len() == 2 => {
+                    let numer = self.term_to_rational_relaxed(args[0], depth + 1)?;
+                    let denom = self.term_to_rational_relaxed(args[1], depth + 1)?;
+                    numer.div(&denom)
+                }
+                "+" | "-" | "*" | "/" => None,
+                _ => opaque(self, term),
+            },
+            TermData::App(_, _) => opaque(self, term),
+            _ => None,
         }
     }
 

@@ -16,11 +16,10 @@ use super::*;
 mod budget;
 mod helpers;
 mod window;
-pub(super) use budget::{ConcreteAnswer, ConcreteBudget};
-// Only tests build a stop by hand; a verifier's comes from
-// `PdrSolver::concrete_budget`.
-#[cfg(test)]
-pub(super) use budget::ConcreteStop;
+// A verifier's stop comes from `PdrSolver::concrete_budget`; a validator
+// outside PDR (portfolio monolithic Safe validation) builds its own with
+// `ConcreteStop::of_caller`.
+pub(crate) use budget::{ConcreteAnswer, ConcreteBudget, ConcreteStop};
 use helpers::*;
 use window::*;
 

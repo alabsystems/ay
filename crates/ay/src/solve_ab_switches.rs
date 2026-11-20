@@ -278,25 +278,15 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     spike_verbose: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    qfax_combiner_route: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    qfax_cegar: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     qfax_lanes_debug: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     probe_strict_check: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     probe_cert_reject: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    uflia_witness_debug: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     pb_sym_debug: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     pb_farkas_cert: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    qfax_neg_eq_witness: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    qfax_neg_chain_gate: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     vsids_decay: Option<f64>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -365,12 +355,6 @@ pub(super) struct SolveAbSwitches {
     vacuous_marker_narrow: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     proj_axiom_budget: Option<usize>,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    uflia_witness_complete: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    uflia_witness_parts: Option<String>,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    uflia_fused_detour: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     verify_memo: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -479,23 +463,11 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     interface_diet: Option<String>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    bv_preprocess: Option<String>,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     fc_cegar_iters: Option<u32>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     int_pigeonhole_enrich_k: Option<usize>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    ext_row_seed: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    debug_row_seed: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    dpll_mint_theory_vars: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    dpll_ite_lift: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     euf_bool_arg_repair: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    lra_warm_theory: bool,
     /// `--engine=shadow[:theory-branching|:simplex|:lia-bcp-implied|:sat-default|:hub-relevancy]`: run
     /// the CDCL(T) kernel beside the lane; `--engine=lane`: route every
     /// family to its lane; `--engine=own:<families>`: the kernel owns exactly
@@ -520,8 +492,6 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     engine_shadow_authored: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    force_array_euf: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     ab_maxsat_core_clause: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     ab_maxsat_descent_organic_slice: bool,
@@ -529,9 +499,6 @@ pub(super) struct SolveAbSwitches {
     ab_maxsat_kick_gap_abs: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     ab_maxsat_descent_kick_scale: bool,
-    /// `--uflia-arith-decisions`: forward UFLIA arith decision hints.
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    uflia_arith_decisions: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     lra_float_layer: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -542,15 +509,6 @@ pub(super) struct SolveAbSwitches {
     euf_cong_undo_debug: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     euf_diseq_undo_debug: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    probe_prescreen: bool,
-    #[arg(
-        long,
-        hide_short_help = true,
-        hide_long_help = true,
-        value_name = "MODE"
-    )]
-    lia_probe_qx: Option<String>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     probe_stats: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -576,12 +534,6 @@ pub(super) struct SolveAbSwitches {
     reve_debug: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
     max_propagate_rounds: Option<u64>,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    lra_cond_trail: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    lra_unit_pivot_pref: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    euf_inc_neg_pop: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     nra_diag: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]

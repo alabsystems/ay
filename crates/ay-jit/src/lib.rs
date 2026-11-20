@@ -67,6 +67,7 @@ pub mod conflict_jit;
 pub mod context;
 pub mod expr_eval;
 pub mod guards;
+pub mod known_bits_region;
 pub mod learned_clause_emit;
 #[allow(dead_code)] // #8876 foundation: production wiring lands in follow-up lanes
 pub mod lra_region;

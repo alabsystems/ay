@@ -165,6 +165,7 @@ mod adaptive_array_refutation;
 mod adaptive_bv_dual_lane;
 mod adaptive_bv_strategy;
 mod adaptive_cata;
+mod adaptive_chain_invariant;
 mod adaptive_collapse_first;
 mod adaptive_decision_log;
 mod adaptive_engines;

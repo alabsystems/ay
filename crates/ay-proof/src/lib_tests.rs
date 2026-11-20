@@ -697,7 +697,23 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
         assert!(!output.contains(":rule bitblast_"), "{output}");
     }
 
-    // A non-unit clause with unsupported addition still has no whole lowering.
+    // A non-unit clause that is not a theorem has no whole lowering: with
+    // `a = 1` and `b = 0`, neither `(bvand a b) = a` nor `(bvadd a 1) = 5`
+    // holds.
+    let distinct_operands = terms.mk_app(Symbol::named("="), [and_ab, a], Sort::Bool);
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind(
+        "bv",
+        vec![distinct_operands, non_constant],
+        TheoryLemmaKind::BvBitBlast,
+    );
+    let output = export_alethe(&proof, &terms);
+    assert!(output.contains(":rule hole"), "{output}");
+    assert!(!output.contains(":rule bitblast_"), "{output}");
+
+    // The same clause with a valid first literal is a theorem, and the
+    // complete-blast clause fallback now derives it by refuting the
+    // conjunction of both complements (DR-MIXED-BV-CLAUSE-EXPORT-20261117).
     let idempotency = terms.mk_app(Symbol::named("="), [and_aa, a], Sort::Bool);
     let mut proof = Proof::new();
     proof.add_theory_lemma_with_kind(
@@ -706,8 +722,8 @@ fn bv_bitblast_carcara_lowerings_fail_closed_on_near_misses_and_surface_drift() 
         TheoryLemmaKind::BvBitBlast,
     );
     let output = export_alethe(&proof, &terms);
-    assert!(output.contains(":rule hole"), "{output}");
-    assert!(!output.contains(":rule bitblast_"), "{output}");
+    assert!(!output.contains(":rule hole"), "{output}");
+    assert!(output.contains(":rule bitblast_"), "{output}");
 
     // Both lowerings read the BYTES the external checker parses. A surface
     // override that breaks the printed operand identity, or that re-spells a

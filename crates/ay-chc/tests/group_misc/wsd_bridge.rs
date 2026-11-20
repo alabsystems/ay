@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CHC-COMP 2026 Workstream D (DESIGN_lra_interp_tpa.md §4.1, §9) bridge
+//! CHC-COMP 2026 Workstream D (the development design notes at 9598c4206, §4.1, §9) bridge
 //! item D-1: executor admission counts UNIQUE nodes, and Search-lane
 //! executor scripts are printed DAG-linearly. Owner: WP-D1-M.
 //!

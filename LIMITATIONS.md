@@ -12,8 +12,10 @@ AY returns `unknown` rather than guess. The common reasons:
   many practical problems and is incomplete in general. CAD projection is
   implemented but is not wired into the search, so there is no complete
   fallback.
-- **Strings.** The string solver latches to `unknown` as soon as it applies a
-  reduction it cannot fully justify, rather than risk a wrong `sat`.
+- **Strings.** An unresolved reduction can leave the result `unknown`. After
+  an equality merge, the solver checks the reduced equations again. For example,
+  equal lengths and `x ++ "a" = y ++ "a"` allow it to infer `x = y` and return
+  `sat`. [String solver regressions](crates/ay-theories/strings/tests/sticky_incomplete.rs)
 - **Quantifiers.** E-matching, CEGQI and MBQI are heuristics. Undecidable
   fragments stay undecidable; a missing trigger means `unknown`.
 - **Resource limits.** `-t`/`--timeout` (milliseconds), z3-style `-T:`
@@ -335,11 +337,11 @@ two maps with the same entries can differ in the values outside their domains.
 
 ## Engines that are weaker than they look
 
-- **`ay lp`** is a dense tableau simplex with depth-first branch-and-bound
-  capped at 4096 nodes. It is sized for small test fixtures and says so in its
-  own source. The serious branch-and-cut MILP engine (`ay-milp`) has **no `ay`
-  subcommand**; it is reached from an SMT fast path, from inside `ay maxsat`
-  and `ay pb`, and through the separate `ay-milp` binary.
+- **`ay lp solve`** checks MPS incumbents against the exact input and reports
+  optimality or infeasibility only after exact confirmation. The sparse engine
+  lacks a checkable unbounded ray, so unboundedness remains unconfirmed.
+  CPLEX LP files use binary64 and a dense tableau with a 4,096-node search
+  limit. This route has no exact verdict check.
 - **`ay simplify`** implements four rewriting tactics. Z3's
   `ctx-solver-simplify` and quantifier elimination are not implemented.
 - **`ay qbf`** is a thin wrapper over a small QDIMACS solver.

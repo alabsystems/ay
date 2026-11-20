@@ -123,7 +123,7 @@ pub(super) fn version_for_sha(sha256: &str) -> Option<&'static str> {
     }
 }
 
-fn version_for_platform(
+pub(super) fn version_for_platform(
     platform: reference_platform::Platform,
     sha256: &str,
 ) -> Option<&'static str> {

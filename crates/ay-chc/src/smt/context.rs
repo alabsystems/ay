@@ -342,7 +342,7 @@ pub struct SmtContext {
     /// (`clamp_timeout_to_smt_deadline`), and a capped fallback is a spurious
     /// Unknown — on the Verification lane a lost solve (never a wrong answer),
     /// on the Search lane the T4 "fallback exhaustion" bucket (44–95 % Unknown
-    /// on some lustre instances, DIAG_LIA_LIN_2026-09-18.md).
+    /// on some lustre instances, the development design notes at 9598c4206).
     pub(super) executor_fallback_count: u32,
     /// Executor-first `check_sat` policy (inc-12 spacer lane).
     ///
@@ -431,7 +431,7 @@ impl Drop for SmtTermMemoryBudgetGuard {
 }
 
 /// Which verdict consumer an [`SmtContext`] serves (Rung 0 of the CHC-COMP 2026
-/// campaign, the development design notes
+/// campaign, the development design notes at `9598c4206`
 /// §5 pin 1).
 ///
 /// * `Verification` — the default. Final Safe/Unsafe re-verification

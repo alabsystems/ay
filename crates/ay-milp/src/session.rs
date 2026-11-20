@@ -30,7 +30,7 @@ use crate::exact::{Budget, ExactLp, LpFeasibility, LpOptimum};
 use crate::model::{exact, Col, Model, Row, Sense};
 use crate::opts::{FixedAssignmentTreeWarmStart, SolveOpts};
 use crate::outcome::{Outcome, UnknownReason};
-use crate::simplex::{Candidate, FloatLp, SimplexStatus, WarmSolveMode};
+use crate::simplex::{Candidate, FloatLp, NbBound, SimplexStatus, WarmSolveMode};
 use crate::tree_cert::{exact_farkas_from_float_ray, MilpInfeasibilityCertificate, TreeNode};
 
 mod affine;
@@ -3603,6 +3603,55 @@ pub struct LpSession {
     /// out so the next one gets a fresh sweep under its own budget, instead of
     /// pricing a degraded box for the life of the model box.
     implied_box_pinned: bool,
+    /// The float lane's lowered matrix, reused across queries. A session's
+    /// matrix never changes (only column boxes narrow), so each float query
+    /// installs its objective with [`FloatLp::set_objective`] instead of
+    /// lowering the whole model again. `None` until first use, and dropped
+    /// when an in-place bound update is refused (an equilibrated LP).
+    float_base: Option<FloatLp>,
+    /// The last float query's optimal basis, offered as the warm start of the
+    /// next one. Same matrix, so it is always dimensionally adoptable; a basis
+    /// the new objective or a narrowed box makes suboptimal or infeasible is
+    /// repaired by the simplex, and a warm solve that does not settle is
+    /// retried cold (see [`Self::cached_float_solve`]).
+    float_warm: Option<(Vec<usize>, Vec<NbBound>)>,
+    /// Work this session has done, by tier (see [`LpSessionWork`]).
+    work: LpSessionWork,
+}
+
+/// Work one [`LpSession`] has done since it was built, by tier.
+///
+/// Counts and wall time only for THIS session, so a caller running many
+/// sessions (concurrently or not) can attribute LP time without reading
+/// process-wide counters. Measurement only: nothing here is a verdict or
+/// changes what the session computes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LpSessionWork {
+    /// Float simplex solves of the query lane (bounds, duals, advice).
+    pub float_solves: u64,
+    /// Of those, warm attempts that did not settle and were re-solved cold.
+    pub float_cold_retries: u64,
+    /// Wall time in float solves, warm attempts and cold retries included.
+    pub float_time: Duration,
+    /// Exact rational rim solves (`optimize`, and rigorous fallbacks).
+    pub exact_solves: u64,
+    /// Wall time in the exact rim.
+    pub exact_time: Duration,
+    /// Implied-box sweeps for the NS tier (one per model box, normally).
+    pub implied_box_sweeps: u64,
+    /// Wall time in those sweeps.
+    pub implied_box_time: Duration,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only lever: run the cached float lane cold, to measure what the
+    /// warm start saves on this thread.
+    static FLOAT_WARM_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only lever: lower the model afresh for every float query, the
+    /// pre-cache behaviour, to measure what the cached lowering saves.
+    static FLOAT_CACHE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl LpSession {
@@ -3624,7 +3673,16 @@ impl LpSession {
             lp: None,
             implied_box: None,
             implied_box_pinned: false,
+            float_base: None,
+            float_warm: None,
+            work: LpSessionWork::default(),
         })
+    }
+
+    /// Work this session has done since it was built, by tier.
+    #[must_use]
+    pub fn work(&self) -> LpSessionWork {
+        self.work
     }
 
     /// Bounded constructor for a continuous model assembled internally by a
@@ -3653,6 +3711,9 @@ impl LpSession {
             lp: None,
             implied_box: None,
             implied_box_pinned: false,
+            float_base: None,
+            float_warm: None,
+            work: LpSessionWork::default(),
         }))
     }
 
@@ -3664,6 +3725,77 @@ impl LpSession {
             lp.request_range_logical_triangular_crash();
         }
         Some(lp)
+    }
+
+    /// The session's cached float LP with `objective` installed, for the
+    /// cold `plain_cold` query lane (`ns_bound`, `ns_bound_expr`, float
+    /// advice). Lowers the model only when no reusable LP is cached; the
+    /// result is the same LP [`Self::float_lp`] would build for this query,
+    /// minus the per-query lowering. Advice only, like every float result.
+    fn cached_float_lp(&mut self, objective: &[(u32, f64)], sense: Sense) -> Option<&FloatLp> {
+        #[cfg(test)]
+        if FLOAT_CACHE_OFF.with(std::cell::Cell::get) {
+            self.float_base = None;
+        }
+        let reused = self
+            .float_base
+            .as_mut()
+            .is_some_and(|lp| lp.set_objective(objective, sense));
+        if !reused {
+            self.float_base = Some(self.float_lp(objective, sense)?);
+        }
+        let lp = self.float_base.as_mut()?;
+        lp.plain_cold = true; // session lane: keep the classic measured path (see `FloatLp::plain_cold`)
+        lp.standalone = true; // not a tree node: see `Simplex::refactor_cadence`
+        Some(lp)
+    }
+
+    /// One float query on the cached LP: warm from the previous query's
+    /// optimal basis when there is one, else cold. A warm attempt that does
+    /// not reach `Optimal` is retried cold, so the warm start can only save
+    /// pivots, never lose an answer the cold lane would have given. The
+    /// result is advice exactly like a fresh lowering's.
+    fn cached_float_solve(
+        &mut self,
+        objective: &[(u32, f64)],
+        sense: Sense,
+        deadline: Option<Instant>,
+    ) -> Option<Candidate> {
+        let started = Instant::now();
+        let warm = self.float_warm.take();
+        #[cfg(test)]
+        let warm = if FLOAT_WARM_OFF.with(std::cell::Cell::get) {
+            None
+        } else {
+            warm
+        };
+        let lp = self.cached_float_lp(objective, sense)?;
+        let mut cand = None;
+        if let Some((basis, at)) = &warm {
+            let tried = lp.solve_bounded(
+                &lp.lower,
+                &lp.upper,
+                Some((basis.as_slice(), at.as_slice())),
+                deadline,
+            );
+            if tried.status == SimplexStatus::Optimal {
+                cand = Some(tried);
+            }
+        }
+        let retried = cand.is_none() && warm.is_some();
+        let cand = match cand {
+            Some(cand) => cand,
+            None => lp.solve(deadline),
+        };
+        if cand.status == SimplexStatus::Optimal {
+            self.float_warm = Some((cand.basis.clone(), cand.at.clone()));
+        } else {
+            self.float_warm = warm;
+        }
+        self.work.float_solves += 1;
+        self.work.float_cold_retries += u64::from(retried);
+        self.work.float_time += started.elapsed();
+        Some(cand)
     }
 
     /// Pin one public operation's deadline before waiting, and retain its
@@ -4019,7 +4151,39 @@ impl LpSession {
         )
     }
 
+    /// The exact rim entry every `LpSession` exact solve goes through; counts
+    /// it in [`LpSessionWork`].
+    #[allow(clippy::too_many_arguments)]
     fn optimize_linear_until_with_work<F>(
+        &mut self,
+        coeffs: &[(u32, f64)],
+        sense: Sense,
+        offset: f64,
+        model_obj_exact: Option<ExactObjective>,
+        deadline: Option<Instant>,
+        allow_float_lane: bool,
+        work: &mut F,
+    ) -> Outcome
+    where
+        F: FnMut(usize) -> bool + ?Sized,
+    {
+        let started = Instant::now();
+        let outcome = self.optimize_linear_until_with_work_inner(
+            coeffs,
+            sense,
+            offset,
+            model_obj_exact,
+            deadline,
+            allow_float_lane,
+            work,
+        );
+        self.work.exact_solves += 1;
+        self.work.exact_time += started.elapsed();
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_linear_until_with_work_inner<F>(
         &mut self,
         coeffs: &[(u32, f64)],
         sense: Sense,
@@ -4354,9 +4518,8 @@ impl LpSession {
             Sense::Maximize => (-1.0_f64, true),
         };
         let scaled: Vec<(u32, f64)> = expr.iter().map(|(c, w)| (c.0, w * scale)).collect();
-        let mut lp = self.float_lp(&scaled, Sense::Minimize)?;
-        lp.plain_cold = true;
-        let cand = lp.solve(self.opts.effective_deadline(Instant::now()));
+        let deadline = self.opts.effective_deadline(Instant::now());
+        let cand = self.cached_float_solve(&scaled, Sense::Minimize, deadline)?;
         if cand.status != SimplexStatus::Optimal {
             return None;
         }
@@ -4447,9 +4610,12 @@ impl LpSession {
     /// `implied_box_pinned`).
     fn ensure_implied_box(&mut self) {
         if self.implied_box.is_none() {
-            let deadline = self.opts.effective_deadline(Instant::now());
+            let started = Instant::now();
+            let deadline = self.opts.effective_deadline(started);
             self.implied_box = Some(crate::presolve::implied_box_f64(&self.model, deadline));
             self.implied_box_pinned = deadline.is_none_or(|d| Instant::now() < d);
+            self.work.implied_box_sweeps += 1;
+            self.work.implied_box_time += started.elapsed();
         }
     }
 
@@ -4499,9 +4665,8 @@ impl LpSession {
             Sense::Minimize => (1.0_f64, false),
             Sense::Maximize => (-1.0_f64, true),
         };
-        let mut lp = self.float_lp(&[(col.0, coeff)], Sense::Minimize)?;
-        lp.plain_cold = true; // session lane: keep the classic measured path (see `FloatLp::plain_cold`)
-        let cand = lp.solve(self.opts.effective_deadline(Instant::now()));
+        let deadline = self.opts.effective_deadline(Instant::now());
+        let cand = self.cached_float_solve(&[(col.0, coeff)], Sense::Minimize, deadline)?;
         if cand.status != SimplexStatus::Optimal {
             return None;
         }
@@ -4569,7 +4734,91 @@ impl LpSession {
         self.model.set_col_bounds(col, new_lb, new_ub);
         self.lp = None;
         self.implied_box = None;
+        if !self
+            .float_base
+            .as_mut()
+            .is_some_and(|lp| lp.set_structural_bounds(col.index(), new_lb, new_ub))
+        {
+            self.float_base = None;
+        }
         true
+    }
+
+    /// Append the row `lower <= coeffs·x <= upper` to this session's model
+    /// and keep the session: the cutting-plane primitive.
+    ///
+    /// A caller that adds one row between solves (Kelley's cutting-plane
+    /// method, a separation loop) otherwise builds a fresh session per row,
+    /// re-lowering the model and solving cold every time. Here the next float
+    /// query starts from the previous query's optimal basis with the new
+    /// row's slack basic, which stays dual feasible, so the re-solve is a
+    /// short dual-simplex repair of the one violated row. Repeated columns
+    /// are summed, as [`Model::add_row`] does.
+    ///
+    /// SOUND ONLY for rows the caller means to impose: the session's model
+    /// (and every later bound it proves) is the old model with this row. The
+    /// exact rim, the implied box and the lowered float LP are rebuilt on
+    /// their next use.
+    ///
+    /// # Errors
+    /// [`MilpError::Session`] for a NaN or empty range (`lower > upper`, or
+    /// an infinite side pointing inward), a non-finite coefficient or sum of
+    /// repeated coefficients, or an out-of-range column. The session is
+    /// unchanged then.
+    pub fn add_row(
+        &mut self,
+        lower: f64,
+        upper: f64,
+        coeffs: &[(Col, f64)],
+    ) -> Result<Row, MilpError> {
+        let refuse = |message: String| Err(MilpError::Session { message });
+        if lower.is_nan()
+            || upper.is_nan()
+            || lower > upper
+            || lower == f64::INFINITY
+            || upper == f64::NEG_INFINITY
+        {
+            return refuse(format!("invalid row range [{lower}, {upper}]"));
+        }
+        let mut sums: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
+        for &(col, a) in coeffs {
+            if col.index() >= self.model.num_cols() {
+                return refuse(format!("column {} out of range", col.index()));
+            }
+            if !a.is_finite() {
+                return refuse("non-finite row coefficient".to_string());
+            }
+            *sums.entry(col.0).or_insert(0.0) += a;
+        }
+        if sums.values().any(|a| !a.is_finite()) {
+            return refuse("repeated row coefficients sum to a non-finite value".to_string());
+        }
+        let n = self.model.num_cols();
+        let row = self.model.add_row(lower, upper, coeffs);
+        self.lp = None;
+        self.implied_box = None;
+        self.float_base = None;
+        let extended = match &mut self.float_warm {
+            // Logical column of row `r` is `n + r`; the new row is the last,
+            // and its slack enters the basis (its resting side is unused).
+            Some((basis, at)) if at.len() == n + basis.len() => {
+                at.push(if lower.is_finite() {
+                    NbBound::Lower
+                } else if upper.is_finite() {
+                    NbBound::Upper
+                } else {
+                    NbBound::Zero
+                });
+                basis.push(n + basis.len());
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if !extended {
+            self.float_warm = None;
+        }
+        Ok(row)
     }
 
     /// Optimization-based bound tightening over `cols`: a within-session
@@ -7083,6 +7332,10 @@ pub struct BabSession {
     model: Model,
     harvested_cuts: Vec<crate::CertifiedIntegerCut>,
     cut_harvest_summary: crate::CutHarvestSummary,
+    /// Adopted root-cut sides of the last finished native tree that the
+    /// finish-time rank-one checker could not certify. Advice for
+    /// [`Self::certify_cuts_by_split`]; invalidated with `harvested_cuts`.
+    unsupported_cut_sides: Vec<crate::integer_cut_capture::AdoptedSide>,
     opts: SolveOpts,
     lane: MilpLane,
     scopes: Vec<ScopeFrame>,
@@ -7311,6 +7564,7 @@ impl BabSession {
             hybrid_integer_lift_infeasibility_certificate: None,
             harvested_cuts: Vec::new(),
             cut_harvest_summary: crate::CutHarvestSummary::default(),
+            unsupported_cut_sides: Vec::new(),
         })
     }
 
@@ -7617,6 +7871,7 @@ impl BabSession {
     fn invalidate_last_evidence(&mut self) {
         self.admitted_infeasibility_evidence = None;
         self.harvested_cuts.clear();
+        self.unsupported_cut_sides.clear();
         self.cut_harvest_summary = crate::CutHarvestSummary::default();
         self.pending_network_design_replay = None;
         self.replay_claims.clear();
@@ -7680,6 +7935,7 @@ impl BabSession {
             smt.push()?;
         }
         self.harvested_cuts.clear();
+        self.unsupported_cut_sides.clear();
         self.cut_harvest_summary = crate::CutHarvestSummary::default();
         self.scopes.push(ScopeFrame {
             rows_len: self.model.num_rows(),
@@ -7911,6 +8167,7 @@ impl BabSession {
 
     fn validate_shared_binary_prefix(&mut self, split_cols: &[Col]) -> Result<(), MilpError> {
         self.harvested_cuts.clear();
+        self.unsupported_cut_sides.clear();
         self.cut_harvest_summary = crate::CutHarvestSummary::default();
         const MAX_SHARED_PREFIX_COLS: usize = 4;
         if split_cols.is_empty() || split_cols.len() > MAX_SHARED_PREFIX_COLS {
@@ -7970,6 +8227,7 @@ impl BabSession {
         // Invalidate before even entering the resource/census frame, so an
         // early admission failure or unwind cannot expose a previous batch.
         self.harvested_cuts.clear();
+        self.unsupported_cut_sides.clear();
         self.cut_harvest_summary = crate::CutHarvestSummary::default();
         let started = Instant::now();
         let frame = FtAdoptionFrame::enter(self);
@@ -8071,6 +8329,7 @@ impl BabSession {
                     !crate::integer_cut_capture::finished(outcome)
                 }) {
                     self.harvested_cuts.clear();
+                    self.unsupported_cut_sides.clear();
                     self.cut_harvest_summary = crate::CutHarvestSummary::default();
                 }
                 result
@@ -8078,6 +8337,7 @@ impl BabSession {
             Err(payload) => {
                 self.admitted_infeasibility_evidence = None;
                 self.harvested_cuts.clear();
+                self.unsupported_cut_sides.clear();
                 self.cut_harvest_summary = crate::CutHarvestSummary::default();
                 self.deferred_claim = None;
                 self.last_deferred = None;
@@ -8233,11 +8493,68 @@ impl BabSession {
     }
 
     /// Coverage of globally adopted root-cut sides from the last finished tree.
-    /// This initial checker covers source-row rank-one rounding; other recipes
-    /// are counted explicitly as unsupported, never silently certified.
+    /// The finish-time checker covers source-row rank-one rounding; other
+    /// recipes are counted as unsupported, never silently certified, until
+    /// [`Self::certify_cuts_by_split`] proves some of them.
     #[must_use]
     pub fn cut_harvest_summary(&self) -> crate::CutHarvestSummary {
         self.cut_harvest_summary
+    }
+
+    /// Search for elementary split proofs ([`crate::IntegerCutProof::ElementarySplit`])
+    /// of the last finished native tree's adopted root-cut sides that the
+    /// finish-time rank-one checker left unsupported.
+    ///
+    /// Unlike [`Self::harvest_cuts`], this RUNS proof search: one float LP
+    /// relaxation per side, then two branch LPs for each of at most a few
+    /// integral columns. The LPs are advice only; a side becomes a cut only
+    /// after its artifact passes [`crate::CertifiedIntegerCut::verify_with_deadline`]
+    /// against [`Self::model`]. All work stops at `deadline`. This is what
+    /// makes mixed-integer rounding, Gomory and disjunctive cuts on big-M
+    /// indicator rows exportable: their rows mix continuous columns, which
+    /// rank-one rounding refuses.
+    ///
+    /// Newly certified cuts join the batch [`Self::harvest_cuts`] drains, and
+    /// the summary's `certified_sides`/`unsupported_sides` move accordingly.
+    /// Sides tried and not proved are dropped; sides not reached before the
+    /// deadline stay available to a later call, and the summary records the
+    /// interruption. The retained sides are invalidated by everything that
+    /// invalidates the harvest batch (another check, mutation, push/pop).
+    pub fn certify_cuts_by_split(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> crate::SplitCertificationReport {
+        let mut report = crate::SplitCertificationReport::default();
+        let pending = std::mem::take(&mut self.unsupported_cut_sides);
+        let mut remaining = pending.into_iter();
+        for (coeffs, lb) in remaining.by_ref() {
+            report.attempted += 1;
+            match crate::integer_cut_split::reconstruct_split(&self.model, &coeffs, &lb, deadline) {
+                Ok(Some(cut)) => {
+                    report.certified += 1;
+                    self.harvested_cuts.push(cut);
+                    self.cut_harvest_summary.certified_sides += 1;
+                    self.cut_harvest_summary.unsupported_sides =
+                        self.cut_harvest_summary.unsupported_sides.saturating_sub(1);
+                }
+                Ok(None)
+                | Err(
+                    crate::IntegerCutVerificationError::SourceChanged
+                    | crate::IntegerCutVerificationError::NonIntegralPremise
+                    | crate::IntegerCutVerificationError::InvalidConclusion,
+                ) => {}
+                Err(crate::IntegerCutVerificationError::Interrupted) => {
+                    report.attempted -= 1;
+                    report.interrupted = true;
+                    self.cut_harvest_summary.interrupted = true;
+                    self.unsupported_cut_sides.push((coeffs, lb));
+                    break;
+                }
+            }
+        }
+        self.unsupported_cut_sides.extend(remaining);
+        report.remaining = self.unsupported_cut_sides.len();
+        report
     }
 
     /// The stored incumbent seed (advice; native engine).
@@ -8989,6 +9306,267 @@ mod tests {
         }
     }
 
+    /// A long query sequence on ONE session (cached lowering, warm starts,
+    /// in-place narrowing) must stay rigorous against the exact optimum, agree
+    /// with a fresh session per query, and lower the model only once.
+    #[test]
+    fn cached_float_lane_matches_fresh_sessions_and_lowers_once() {
+        use num_traits::ToPrimitive as _;
+        // A one-layer ReLU triangle relaxation: inputs in [-1,1], free
+        // pre-activations h = w·x + b, and y >= h, y >= 0, y <= (h - l)/2.
+        let mut m = Model::new();
+        let xs: Vec<Col> = (0..4).map(|_| m.add_col(-1.0, 1.0)).collect();
+        let weights = [0.5, -0.25, 0.75, -1.0, 0.125, 0.375];
+        let mut cols = xs.clone();
+        for i in 0..6 {
+            let h = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+            let y = m.add_col(0.0, f64::INFINITY);
+            let b = 0.125 * i as f64 - 0.25;
+            let mut row = vec![(h, -1.0)];
+            for (k, &x) in xs.iter().enumerate() {
+                row.push((x, weights[(i + k) % 6]));
+            }
+            m.add_row(-b, -b, &row);
+            m.add_row(0.0, f64::INFINITY, &[(y, 1.0), (h, -1.0)]);
+            m.add_row(f64::NEG_INFINITY, 1.5, &[(y, 2.0), (h, -1.0)]);
+            cols.push(h);
+            cols.push(y);
+        }
+        let opts = SolveOpts::new();
+        let mut cached = LpSession::new(&m, &opts).expect("session");
+        let mut identity = None;
+        let mut queries = 0usize;
+        for round in 0..3 {
+            for &col in &cols {
+                for sense in [Sense::Minimize, Sense::Maximize] {
+                    let a = cached.rigorous_bound(col, sense).expect("cached");
+                    let mut fresh = LpSession::new(&cached.model, &opts).expect("fresh");
+                    let b = fresh.rigorous_bound(col, sense).expect("fresh");
+                    let exact = match fresh.optimize(col, sense).expect("exact") {
+                        Outcome::Optimal { value, .. } => value,
+                        other => panic!("bounded LP must have an optimum: {other:?}"),
+                    };
+                    let (
+                        Outcome::Bound { dual_bound: a, .. },
+                        Outcome::Bound { dual_bound: b, .. },
+                    ) = (&a, &b)
+                    else {
+                        panic!("expected two bounds: {a:?} {b:?}");
+                    };
+                    match sense {
+                        Sense::Minimize => assert!(*a <= exact, "cached lower bound above optimum"),
+                        Sense::Maximize => assert!(*a >= exact, "cached upper bound below optimum"),
+                    }
+                    let (af, bf) = (a.to_f64().unwrap(), b.to_f64().unwrap());
+                    assert!(
+                        (af - bf).abs() <= 1e-6 * (1.0 + bf.abs()),
+                        "round {round} {col:?} {sense:?}: cached {af} vs fresh {bf}"
+                    );
+                    queries += 1;
+                    let now = cached.float_base.as_ref().map(FloatLp::matrix_identity);
+                    if let (Some(before), Some(now)) = (identity, now) {
+                        assert_eq!(before, now, "the matrix was lowered again");
+                    }
+                    identity = identity.or(now);
+                }
+            }
+            // Narrow two inputs between rounds: updated in place, not relowered.
+            let x = xs[round];
+            assert!(cached.narrow_col_bounds(x, -0.5, 0.75));
+        }
+        assert!(identity.is_some() && queries == 3 * 2 * cols.len());
+        // A float-dual query on the same session reuses the same lowering too.
+        let duals = cached
+            .float_dual_for_expr(&[(cols[5], 1.0), (cols[7], -1.0)], Sense::Minimize)
+            .expect("valid form");
+        assert!(duals.is_some());
+        assert_eq!(
+            cached.float_base.as_ref().map(FloatLp::matrix_identity),
+            identity
+        );
+    }
+
+    /// Measurement: simplex pivots of an OBBT-shaped query sequence (min and
+    /// max of every column) on one session, warm versus cold.
+    #[test]
+    fn cached_float_lane_warm_start_pivot_census() {
+        fn layered(width: usize, depth: usize, seed: u64) -> (Model, Vec<Col>) {
+            let mut m = Model::new();
+            let mut prev: Vec<Col> = (0..width).map(|_| m.add_col(-1.0, 1.0)).collect();
+            let mut all = prev.clone();
+            let mut rng = seed;
+            let mut w = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                ((rng % 2000) as f64 - 1000.0) / 1024.0
+            };
+            for _ in 0..depth {
+                let mut post = Vec::new();
+                for _ in 0..width {
+                    let h = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+                    let mut coeffs: Vec<(Col, f64)> = prev.iter().map(|&x| (x, w())).collect();
+                    coeffs.push((h, -1.0));
+                    m.add_row(0.0, 0.0, &coeffs);
+                    let y = m.add_col(0.0, f64::INFINITY);
+                    m.add_row(0.0, f64::INFINITY, &[(y, 1.0), (h, -1.0)]);
+                    m.add_row(f64::NEG_INFINITY, 4.0, &[(y, 2.0), (h, -1.0)]);
+                    all.push(h);
+                    all.push(y);
+                    post.push(y);
+                }
+                prev = post;
+            }
+            (m, all)
+        }
+        let mut lines = Vec::new();
+        for (width, depth) in [(8, 2), (16, 3), (32, 3)] {
+            let (m, cols) = layered(width, depth, 0x2545_F491_4F6C_DD1D);
+            let run = |cold: bool, relower: bool| {
+                FLOAT_WARM_OFF.with(|c| c.set(cold));
+                FLOAT_CACHE_OFF.with(|c| c.set(relower));
+                let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+                let before = crate::simplex::stats::work_local();
+                let start = Instant::now();
+                let mut sum = 0.0f64;
+                for &c in &cols {
+                    for sense in [Sense::Minimize, Sense::Maximize] {
+                        if let Ok(Outcome::Bound { dual_bound, .. }) = s.rigorous_bound(c, sense) {
+                            sum += num_traits::ToPrimitive::to_f64(&dual_bound)
+                                .unwrap_or(0.0)
+                                .abs();
+                        }
+                    }
+                }
+                FLOAT_WARM_OFF.with(|c| c.set(false));
+                FLOAT_CACHE_OFF.with(|c| c.set(false));
+                (
+                    crate::simplex::stats::work_local().wrapping_sub(before),
+                    start.elapsed(),
+                    sum,
+                )
+            };
+            let (old_it, old_t, old_sum) = run(true, true);
+            let (cold_it, cold_t, cold_sum) = run(true, false);
+            let (warm_it, warm_t, warm_sum) = run(false, false);
+            assert!((cold_sum - warm_sum).abs() <= 1e-6 * (1.0 + cold_sum));
+            assert!((old_sum - cold_sum).abs() <= 1e-6 * (1.0 + cold_sum));
+            lines.push(format!(
+                "{width}x{depth}: {} queries, relower+cold {old_it} pivots {old_t:?}, \
+                 cached+cold {cold_it} pivots {cold_t:?}, cached+warm {warm_it} pivots {warm_t:?}",
+                cols.len() * 2
+            ));
+        }
+        eprintln!("PIVOT-CENSUS {}", lines.join(" | "));
+    }
+
+    /// Kelley's cutting-plane loop on ONE session (rows added between
+    /// solves) reaches the same optima as a fresh session per iteration, with
+    /// fewer pivots, and every rigorous bound still brackets the exact optimum.
+    #[test]
+    fn add_row_keeps_the_session_through_a_cutting_plane_loop() {
+        use num_traits::ToPrimitive as _;
+        // max t  s.t.  t <= f(x) for f concave piecewise-linear, x in [-1,1]^4,
+        // with f's pieces revealed one cut at a time.
+        let mut base = Model::new();
+        let xs: Vec<Col> = (0..4).map(|_| base.add_col(-1.0, 1.0)).collect();
+        let t = base.add_col(-100.0, 100.0);
+        let pieces: Vec<(Vec<f64>, f64)> = (0..24)
+            .map(|k| {
+                let a: Vec<f64> = (0..4)
+                    .map(|i| ((k * 7 + i * 3) % 9) as f64 / 4.0 - 1.0)
+                    .collect();
+                (a, 0.25 * (k % 5) as f64)
+            })
+            .collect();
+        let mut reused = LpSession::new(&base, &SolveOpts::new()).expect("session");
+        let mut fresh_model = base.clone();
+        let (mut reused_pivots, mut fresh_pivots) = (0u64, 0u64);
+        for (a, c) in &pieces {
+            // t - a·x <= c
+            let mut row: Vec<(Col, f64)> = xs.iter().zip(a).map(|(&x, &w)| (x, -w)).collect();
+            row.push((t, 1.0));
+            reused
+                .add_row(f64::NEG_INFINITY, *c, &row)
+                .expect("valid row");
+            fresh_model.add_row(f64::NEG_INFINITY, *c, &row);
+            let before = crate::simplex::stats::work_local();
+            let a_dual = reused
+                .float_dual_for_expr(&[(t, 1.0)], Sense::Maximize)
+                .expect("valid form");
+            let a_bound = reused.rigorous_bound(t, Sense::Maximize).expect("bound");
+            reused_pivots += crate::simplex::stats::work_local().wrapping_sub(before);
+            let mut fresh = LpSession::new(&fresh_model, &SolveOpts::new()).expect("fresh");
+            let before = crate::simplex::stats::work_local();
+            let b_dual = fresh
+                .float_dual_for_expr(&[(t, 1.0)], Sense::Maximize)
+                .expect("valid form");
+            let b_bound = fresh.rigorous_bound(t, Sense::Maximize).expect("bound");
+            fresh_pivots += crate::simplex::stats::work_local().wrapping_sub(before);
+            assert_eq!(a_dual.is_some(), b_dual.is_some());
+            let exact = match fresh.optimize(t, Sense::Maximize).expect("exact") {
+                Outcome::Optimal { value, .. } => value,
+                other => panic!("bounded: {other:?}"),
+            };
+            for bound in [&a_bound, &b_bound] {
+                let Outcome::Bound { dual_bound, .. } = bound else {
+                    panic!("expected a bound: {bound:?}");
+                };
+                assert!(*dual_bound >= exact, "upper bound below the optimum");
+                let gap = (dual_bound - &exact).to_f64().unwrap();
+                assert!(gap <= 1e-6, "bound not tight: gap {gap}");
+            }
+        }
+        assert_eq!(reused.model.num_rows(), pieces.len());
+        assert!(
+            reused_pivots < fresh_pivots,
+            "warm continuation must save pivots: {reused_pivots} vs {fresh_pivots}"
+        );
+        eprintln!("ADD-ROW-CENSUS reused {reused_pivots} pivots, fresh {fresh_pivots}");
+        // Refusals leave the session unchanged.
+        let rows = reused.model.num_rows();
+        assert!(reused.add_row(1.0, 0.0, &[(t, 1.0)]).is_err());
+        assert!(reused.add_row(f64::NAN, 0.0, &[(t, 1.0)]).is_err());
+        assert!(reused.add_row(0.0, 1.0, &[(Col(99), 1.0)]).is_err());
+        assert!(reused.add_row(0.0, 1.0, &[(t, f64::INFINITY)]).is_err());
+        assert!(reused
+            .add_row(0.0, 1.0, &[(t, f64::MAX), (t, f64::MAX)])
+            .is_err());
+        assert_eq!(reused.model.num_rows(), rows);
+    }
+
+    /// Per-session work counters see only this session's tiers.
+    #[test]
+    fn lp_session_work_counts_its_own_tiers() {
+        let mut m = Model::new();
+        let x = m.add_col(-1.0, 1.0);
+        let y = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(y, 1.0), (x, -2.0)]);
+        let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        let mut other = LpSession::new(&m, &SolveOpts::new()).expect("session");
+        assert_eq!(s.work(), LpSessionWork::default());
+        for sense in [Sense::Minimize, Sense::Maximize] {
+            let _ = s.rigorous_bound(y, sense).expect("bound");
+        }
+        let after_bounds = s.work();
+        assert_eq!(after_bounds.float_solves, 2, "{after_bounds:?}");
+        assert_eq!(after_bounds.implied_box_sweeps, 1, "the box is cached");
+        let _ = s.optimize(x, Sense::Minimize).expect("exact");
+        let after_exact = s.work();
+        assert!(after_exact.exact_solves > after_bounds.exact_solves);
+        assert!(after_exact.exact_time >= after_bounds.exact_time);
+        assert_eq!(
+            other.work(),
+            LpSessionWork::default(),
+            "isolated per session"
+        );
+        let _ = other
+            .float_dual_for_expr(&[(y, 1.0)], Sense::Minimize)
+            .expect("valid");
+        assert_eq!(other.work().float_solves, 1);
+        assert_eq!(s.work().float_solves, after_exact.float_solves);
+    }
+
     #[test]
     fn rigorous_bound_declines_ns_on_exact_side_store_models() {
         let mut m = Model::new();
@@ -9248,6 +9826,12 @@ mod implied_box_session_tests {
     /// rigorous side while staying within 1e-6 of it.
     #[test]
     fn rigorous_bounds_on_free_columns_stay_on_the_ns_tier() {
+        // Tier routing is checked by bit-equality with a direct tier call, so
+        // the answers must not depend on query history. The cached float lane
+        // warm-starts from the previous query's basis, which moves the last
+        // bits of a float dual; run it cold here. Warm starts are covered by
+        // `cached_float_lane_matches_fresh_sessions_and_lowers_once`.
+        crate::session::FLOAT_WARM_OFF.with(|c| c.set(true));
         let (m, targets) = w2_slice();
         let mut s = LpSession::new(&m, &SolveOpts::new()).expect("session");
         let budget = Budget {
@@ -9268,7 +9852,8 @@ mod implied_box_session_tests {
             let (lo, hi) = (bound(lo), bound(hi));
             assert!(
                 lo == ns_lo && hi == ns_hi,
-                "the public query must report the NS tier's answer, not the rim's"
+                "the public query must report the NS tier's answer, not the rim's: \
+                 lo {lo} vs {ns_lo}, hi {hi} vs {ns_hi}"
             );
             let LpOptimum::Optimal {
                 value: exact_min, ..

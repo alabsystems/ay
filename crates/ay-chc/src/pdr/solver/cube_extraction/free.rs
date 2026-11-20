@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! The Spacer lane's free child constructor (Workstream B R2,
-//! `DESIGN_spacer_pob_lemma_pipeline.md` §4.1.3; Spacer `create_children`,
+//! the development design notes at `9598c4206`, §4.1.3; Spacer `create_children`,
 //! `spacer_context.cpp:4043-4160`).
 //!
 //! A child POB for a linear clause `c` is the projection of `T_c ∧ post(head)`

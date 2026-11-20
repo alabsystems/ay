@@ -78,6 +78,38 @@ fn test_clause_trace_basic() {
 }
 
 #[test]
+fn strip_hints_for_literals_only_keeps_entries_literals_and_empty() {
+    let mut trace = ClauseTrace::new();
+    let x = Literal::positive(Variable(0));
+    trace.add_clause_with_hints(1, vec![x], true, vec![]);
+    trace.add_clause_with_hints(2, vec![x.negated()], true, vec![]);
+    trace.add_clause_with_hints(3, vec![x, x.negated()], false, vec![1, 2]);
+    trace.add_clause_with_hints(4, vec![], false, vec![1, 2]);
+    assert!(trace.has_empty_clause());
+    assert!(!trace.literals_only_recording());
+
+    trace.strip_hints_for_literals_only_recording();
+
+    assert!(trace.literals_only_recording());
+    assert_eq!(trace.len(), 4);
+    assert!(trace.has_empty_clause());
+    assert!(trace.hint_pool.is_empty());
+    for entry in trace.entries() {
+        assert!(entry.resolution_hints.is_empty());
+    }
+    assert_eq!(trace.entries().at(0).clause, vec![x]);
+    assert_eq!(trace.entries().at(1).clause, vec![x.negated()]);
+    assert_eq!(trace.entries().at(2).clause, vec![x, x.negated()]);
+
+    // Recording continues after the strip: new entries land hint-free even
+    // when the caller still hands hints over.
+    trace.add_clause_with_hint_slices(5, &[x], false, &[1, 2, 3]);
+    assert_eq!(trace.len(), 5);
+    assert!(trace.entries().at(4).resolution_hints.is_empty());
+    assert_eq!(trace.entries().at(4).clause, vec![x]);
+}
+
+#[test]
 fn test_clause_trace_set_resolution_hints() {
     let mut trace = ClauseTrace::new();
     trace.add_clause(10, vec![Literal::positive(Variable(0))], false);

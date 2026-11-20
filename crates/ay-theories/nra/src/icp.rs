@@ -1334,6 +1334,12 @@ struct IcpProblem {
     constraints: Vec<MultiConstraint>,
     vars: Vec<TermId>,
     coverage: ParseCoverage,
+    /// Some constraints came from the relaxed second parse pass
+    /// (cleared division / opaque UF leaves). Coverage is always
+    /// `Partial` then; the flag additionally closes the one SAT
+    /// path not already gated by coverage (dense-box
+    /// certification), keeping relaxed problems UNSAT-only.
+    relaxed: bool,
 }
 
 enum ProblemPreparation {
@@ -1345,6 +1351,7 @@ impl NraSolver<'_> {
     fn prepare_icp_problem(&self) -> ProblemPreparation {
         let mut constraints = Vec::new();
         let mut coverage = ParseCoverage::Complete;
+        let mut unparsed: Vec<(TermId, bool)> = Vec::new();
         for &(atom, value) in &self.asserted {
             match self.atom_to_multi(atom, value) {
                 Some(MultiAtom::ConstFalse) => {
@@ -1352,7 +1359,80 @@ impl NraSolver<'_> {
                 }
                 Some(MultiAtom::ConstTrue) => {}
                 Some(MultiAtom::Constraint(constraint)) => constraints.push(constraint),
-                None => coverage = ParseCoverage::Partial,
+                None => {
+                    coverage = ParseCoverage::Partial;
+                    unparsed.push((atom, value));
+                }
+            }
+        }
+        // Relaxed second pass (UNSAT only; coverage stays Partial):
+        // cleared division under proven-nonzero denominators and
+        // opaque UF leaves join the problem. Bounds come from the
+        // exactly-parsed subset, so every original model meets the
+        // side conditions; see `atom_to_cleared_relaxed`. Two
+        // measured guards keep the pass from making preparations
+        // slower than the exact problem it extends: it runs only
+        // on tiny asserted sets (on sqrtStep7a/40f50-sized checks
+        // the enriched problems' box searches cost more decisions
+        // than the tangent/sign lanes they displace, measured at
+        // 31 -> 10 and 15.8k -> 37 decisions respectively),
+        // clearings are memoized per atom (only sign proofs
+        // repeat), and atoms may add at most two variables beyond
+        // the exact problem's — opaque leaves beyond that budget
+        // blow the search dimension up.
+        let mut relaxed = false;
+        if !unparsed.is_empty() && self.asserted.len() <= 8 {
+            let bounds = collect_variable_bounds(&constraints);
+            let mut known_vars: Vec<TermId> = Vec::new();
+            for constraint in &constraints {
+                for var in constraint.poly.variables() {
+                    if !known_vars.contains(&var) {
+                        known_vars.push(var);
+                    }
+                }
+            }
+            let var_budget = known_vars.len() + 2;
+            for &(atom, value) in &unparsed {
+                if constraints.len() >= MAX_ICP_CONSTRAINTS {
+                    break;
+                }
+                let cached = self
+                    .relaxed_atom_cache
+                    .borrow()
+                    .get(&(atom, value))
+                    .cloned();
+                let cleared = match cached {
+                    Some(hit) => hit,
+                    None => {
+                        let computed = self.atom_to_cleared_relaxed(atom, value);
+                        self.relaxed_atom_cache
+                            .borrow_mut()
+                            .insert((atom, value), computed.clone());
+                        computed
+                    }
+                };
+                let Some(cleared) = cleared else { continue };
+                let new_vars: Vec<TermId> = cleared
+                    .poly
+                    .variables()
+                    .into_iter()
+                    .filter(|var| !known_vars.contains(var))
+                    .collect();
+                if known_vars.len() + new_vars.len() > var_budget {
+                    continue;
+                }
+                match cleared.admit(&bounds) {
+                    Some(MultiAtom::ConstFalse) => {
+                        return ProblemPreparation::Decided(UniResult::Unsat);
+                    }
+                    Some(MultiAtom::ConstTrue) => relaxed = true,
+                    Some(MultiAtom::Constraint(constraint)) => {
+                        constraints.push(constraint);
+                        known_vars.extend(new_vars);
+                        relaxed = true;
+                    }
+                    None => {}
+                }
             }
         }
         diag!(
@@ -1381,7 +1461,11 @@ impl NraSolver<'_> {
             constraints.len(),
             coverage.allows_sat()
         );
-        if vars.len() < 2 || vars.len() > MAX_ICP_VARS {
+        // A relaxed problem may be single-variable (one opaque
+        // leaf, or one cleared self-division); the exact
+        // univariate lane cannot see those atoms, so ICP is the
+        // only refuter. Exact problems keep the two-variable gate.
+        if vars.is_empty() || (vars.len() < 2 && !relaxed) || vars.len() > MAX_ICP_VARS {
             diag!("NRA-DIAG exit=VAR_CAP vars={}", vars.len());
             return ProblemPreparation::Decided(UniResult::Unknown);
         }
@@ -1391,19 +1475,26 @@ impl NraSolver<'_> {
         {
             return ProblemPreparation::Decided(UniResult::Unknown);
         }
-        if !constraints.iter().any(|constraint| {
-            constraint
-                .poly
-                .terms
-                .iter()
-                .any(|(mono, _)| mono.len() >= 2)
-        }) {
+        // Cleared division can reduce to a purely linear problem
+        // (x/x < 1/2 with x >= 2 clears to x < 0) that no other
+        // lane can see, so relaxed problems are exempt from the
+        // nonlinear-presence gate.
+        if !relaxed
+            && !constraints.iter().any(|constraint| {
+                constraint
+                    .poly
+                    .terms
+                    .iter()
+                    .any(|(mono, _)| mono.len() >= 2)
+            })
+        {
             return ProblemPreparation::Decided(UniResult::Unknown);
         }
         ProblemPreparation::Ready(IcpProblem {
             constraints,
             vars,
             coverage,
+            relaxed,
         })
     }
 
@@ -1435,8 +1526,12 @@ impl NraSolver<'_> {
         if equality_count != 0 || problem.vars.len() <= PURE_INEQ_LOW_DIM {
             return None;
         }
-        if let Some(result) = self.try_certify_box(&problem.constraints, &problem.vars, root) {
-            return Some(result);
+        // Relaxed problems are UNSAT-only: box certification is a
+        // SAT path and must not read cleared/opaque constraints.
+        if !problem.relaxed {
+            if let Some(result) = self.try_certify_box(&problem.constraints, &problem.vars, root) {
+                return Some(result);
+            }
         }
         if problem.coverage.allows_sat() {
             if let Some(result) = self.ladder_model(&problem.vars, root) {
@@ -1538,6 +1633,28 @@ impl NraSolver<'_> {
             if let Some(model) = self.dyadic_grid_search(&problem.constraints, &problem.vars, &root)
             {
                 return model;
+            }
+        }
+        // Verified SOS certificate fallback, UNSAT only. The bounded
+        // Positivstellensatz search returns a certificate only after
+        // the independent checker verifies it against these parsed
+        // constraints, and infeasibility of a parsed subset refutes
+        // the whole asserted set — sound under partial coverage,
+        // exactly like a root contraction refutation. It runs only
+        // after branch-and-prune (and the dyadic grid) failed to
+        // decide, so no ICP-decided trajectory changes; the search's
+        // own degree/dimension/coefficient budgets and the check
+        // stop bound its cost.
+        if matches!(result, UniResult::Unknown)
+            && problem.vars.len() <= crate::sos::MAX_VARS
+            && !ay_core::resource::check_stop_requested()
+        {
+            let mut not_stopped = |_, _| !ay_core::resource::check_stop_requested();
+            let mut progress = crate::sos::budget::SosProgress::new(&mut not_stopped);
+            if crate::sos::search_with_progress(&problem.constraints, &problem.vars, &mut progress)
+                .is_some()
+            {
+                return UniResult::Unsat;
             }
         }
         result

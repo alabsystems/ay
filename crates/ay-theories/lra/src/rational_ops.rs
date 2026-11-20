@@ -382,6 +382,109 @@ impl Rational {
     /// where `bound_val = rhs_base / eq_c + ib.value`.
     #[inline]
     pub fn div_add_small(&self, divisor: &Self, addend: &Self) -> Option<Self> {
+        let (num, den) = self.div_add_unnormalized_small(divisor, addend)?;
+        if num == 0 {
+            return Some(Self::Small(0, 1));
+        }
+        let g = gcd_u128(num.unsigned_abs(), den.unsigned_abs());
+        let rn_out = num / g as i128;
+        let rd_out = den / g as i128;
+        if let (Ok(n), Ok(d)) = (i64::try_from(rn_out), i64::try_from(rd_out)) {
+            return Some(Self::Small(n, d));
+        }
+        None
+    }
+
+    /// Exact ordering of `self / divisor + addend` against `other`,
+    /// without materializing the normalized quotient: the unreduced
+    /// i128 numerator/denominator from the same fused pass as
+    /// [`Self::div_add_small`] is cross-multiplied against `other`.
+    /// Denominators are positive on both sides (the `Small`
+    /// invariant and the sign normalization in the fused pass), so
+    /// the cross-product order is the exact rational order.
+    ///
+    /// Returns `None` whenever the fused pass declines (a `Big`
+    /// operand, a zero divisor, or i128 overflow) or `other` is
+    /// `Big`; callers fall back to computing the value and comparing
+    /// with `cmp`, which agrees on every input this accepts.
+    ///
+    /// Hot path: the implied-bound candidate pre-filter drops the
+    /// overwhelming majority of derived candidates as not tighter
+    /// than an incumbent; deciding that by ordering alone avoids
+    /// the GCD reduction and shrink each dropped candidate paid.
+    #[inline]
+    pub fn div_add_cmp_small(
+        &self,
+        divisor: &Self,
+        addend: &Self,
+        other: &Self,
+    ) -> Option<Ordering> {
+        // Check `other` first: a `Big` incumbent declines here, and
+        // running the fused pass before noticing would pay it twice
+        // (here and again in the caller's generic computation).
+        if !matches!(other, Self::Small(..)) {
+            return None;
+        }
+        let (num, den) = self.div_add_unnormalized_small(divisor, addend)?;
+        Self::unnormalized_cmp(num, den, other)
+    }
+
+    /// Exact ordering of the unreduced fraction `num / den`
+    /// (denominator positive, as produced by the fused pass)
+    /// against a `Small` incumbent, by cross-multiplication.
+    /// `None` on a `Big` incumbent or i128 overflow.
+    #[inline]
+    pub(crate) fn unnormalized_cmp(num: i128, den: i128, other: &Self) -> Option<Ordering> {
+        let Self::Small(on, od) = other else {
+            return None;
+        };
+        debug_assert!(den > 0 && *od > 0, "Small invariant: denom > 0");
+        let lhs = num.checked_mul(i128::from(*od))?;
+        let rhs = i128::from(*on).checked_mul(den)?;
+        Some(lhs.cmp(&rhs))
+    }
+
+    /// Materialize the unreduced fraction `num / den` (denominator
+    /// positive, as produced by the fused pass) as a normalized
+    /// `Rational`: one GCD reduction, `Small` when the reduced
+    /// pair fits i64, otherwise the already-reduced `Big` backing.
+    /// The value is exactly `num / den`.
+    #[inline]
+    pub(crate) fn from_unnormalized_i128(num: i128, den: i128) -> Self {
+        debug_assert!(den > 0, "fused pass invariant: denom > 0");
+        if num == 0 {
+            return Self::Small(0, 1);
+        }
+        if den <= 0 {
+            // Defensive generic path; the fused pass never yields
+            // this, and saturation would silently change the value.
+            return Self::from_big(BigBacking::new(BigInt::from(num), BigInt::from(den)));
+        }
+        let g = gcd_u128(num.unsigned_abs(), den.unsigned_abs()) as i128;
+        let rn = num / g;
+        let rd = den / g;
+        if let (Ok(n), Ok(d)) = (i64::try_from(rn), i64::try_from(rd)) {
+            Self::Small(n, d)
+        } else {
+            // Already reduced by the gcd above, so new_raw carries
+            // its coprime/positive-denominator proof.
+            Self::from_big(BigBacking::new_raw(BigInt::from(rn), BigInt::from(rd)))
+        }
+    }
+
+    /// The fused divide-add pass shared by [`Self::div_add_small`]
+    /// and [`Self::div_add_cmp_small`]: the unreduced
+    /// `(numerator, denominator)` of `self / divisor + addend` over
+    /// i128, with the denominator normalized positive. `None` on a
+    /// `Big` operand, a zero divisor, or checked-arithmetic
+    /// overflow; `div_add_small` additionally declines when the
+    /// reduced result exceeds the i64 `Small` range.
+    #[inline]
+    pub(crate) fn div_add_unnormalized_small(
+        &self,
+        divisor: &Self,
+        addend: &Self,
+    ) -> Option<(i128, i128)> {
         if let (Self::Small(rn, rd), Self::Small(dn, dd), Self::Small(an, ad)) =
             (self, divisor, addend)
         {
@@ -431,15 +534,7 @@ impl Rational {
             } else {
                 (num, den)
             };
-            if num == 0 {
-                return Some(Self::Small(0, 1));
-            }
-            let g = gcd_u128(num.unsigned_abs(), den.unsigned_abs());
-            let rn_out = num / g as i128;
-            let rd_out = den / g as i128;
-            if let (Ok(n), Ok(d)) = (i64::try_from(rn_out), i64::try_from(rd_out)) {
-                return Some(Self::Small(n, d));
-            }
+            return Some((num, den));
         }
         None
     }
@@ -1565,6 +1660,122 @@ mod tests {
         let zero = Rational::zero();
         let c = Rational::from(1i64);
         assert!(a.div_add_small(&zero, &c).is_none());
+    }
+
+    // --- div_add_cmp_small tests: exact ordering of
+    // `self / divisor + addend` against an incumbent without
+    // materializing the normalized quotient. Every case must agree
+    // with the generic computation's ordering.
+
+    #[test]
+    fn test_div_add_cmp_small_matches_generic() {
+        use std::cmp::Ordering;
+        let cases: Vec<(Rational, Rational, Rational, Rational)> = vec![
+            // 1/3 / (2/5) + 7/11 = 97/66 > 1
+            (
+                Rational::new(1, 3),
+                Rational::new(2, 5),
+                Rational::new(7, 11),
+                Rational::from(1i64),
+            ),
+            // exact equality: 6/3 + 1 = 3
+            (
+                Rational::from(6i64),
+                Rational::from(3i64),
+                Rational::from(1i64),
+                Rational::from(3i64),
+            ),
+            // negative divisor: (-3/7)/(-5/2) + 1/4 = 59/140 < 1/2
+            (
+                Rational::new(-3, 7),
+                Rational::new(-5, 2),
+                Rational::new(1, 4),
+                Rational::new(1, 2),
+            ),
+            // negative result: 1/(-2) + 0 = -1/2 < 0
+            (
+                Rational::from(1i64),
+                Rational::from(-2i64),
+                Rational::zero(),
+                Rational::zero(),
+            ),
+            // equality through unreduced cross terms: (2/4)/(1/2) + 0 = 1
+            (
+                Rational::new(1, 2),
+                Rational::new(1, 2),
+                Rational::zero(),
+                Rational::from(1i64),
+            ),
+            // large-but-small operands
+            (
+                Rational::from(i64::MAX / 100),
+                Rational::from(50i64),
+                Rational::from(1i64),
+                Rational::from(i64::MAX / 100 / 50),
+            ),
+        ];
+        for (a, b, c, other) in &cases {
+            let generic = &(a / b) + c;
+            let fast = a
+                .div_add_cmp_small(b, c, other)
+                .expect("small operands must compare");
+            assert_eq!(
+                fast,
+                generic.cmp(other),
+                "div_add_cmp_small mismatch for a={a:?}, b={b:?}, c={c:?}, other={other:?}"
+            );
+            let _: Ordering = fast;
+        }
+    }
+
+    #[test]
+    fn test_from_unnormalized_i128_matches_generic() {
+        // Materializing the fused pass's unreduced fraction yields
+        // exactly the generic divide-add value, including a result
+        // whose reduced numerator exceeds the i64 Small range.
+        let cases: Vec<(Rational, Rational, Rational)> = vec![
+            (
+                Rational::new(1, 3),
+                Rational::new(2, 5),
+                Rational::new(7, 11),
+            ),
+            (
+                Rational::new(-3, 7),
+                Rational::new(-5, 2),
+                Rational::new(1, 4),
+            ),
+            (
+                Rational::from(i64::MAX / 2),
+                Rational::from(1i64),
+                Rational::from(i64::MAX / 2),
+            ),
+            (Rational::zero(), Rational::from(7i64), Rational::new(-5, 9)),
+        ];
+        for (a, b, c) in &cases {
+            let generic = &(a / b) + c;
+            let (num, den) = a
+                .div_add_unnormalized_small(b, c)
+                .expect("small operands produce parts");
+            assert_eq!(
+                Rational::from_unnormalized_i128(num, den),
+                generic,
+                "from_unnormalized_i128 mismatch for a={a:?}, b={b:?}, c={c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_div_add_cmp_small_declines() {
+        let big = Rational::from(i64::MAX) * Rational::from(2i64);
+        let small = Rational::from(1i64);
+        // Big operand on either side declines to the generic path.
+        assert!(big.div_add_cmp_small(&small, &small, &small).is_none());
+        assert!(small.div_add_cmp_small(&small, &small, &big).is_none());
+        // Zero divisor declines (the generic path never asks here:
+        // zero coefficients are skipped by callers).
+        assert!(small
+            .div_add_cmp_small(&Rational::zero(), &small, &small)
+            .is_none());
     }
 
     // --- neg_small tests (#8406) ---

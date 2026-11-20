@@ -15,29 +15,29 @@ struct Batch {
 
 impl Batch {
     fn read(step: &Step) -> Option<Self> {
-        if step.kind != StepKind::RustTests || step.program != "build-slot" {
+        if step.kind != StepKind::RustTests || step.needs_quiet_host() {
             return None;
         }
-        let prefix = ["--", "targo", "--unverified", "test"];
-        if !step.args.iter().take(4).map(String::as_str).eq(prefix) {
+        let args = step.compiler_payload()?;
+        if args.first()?.as_str() != "test" {
             return None;
         }
-        let mut common = step.args[..4].to_vec();
+        let mut common = args[..1].to_vec();
         let mut targets = Vec::new();
         let mut insertion = None;
         let mut package = false;
-        let mut index = 4;
-        while let Some(argument) = step.args.get(index) {
+        let mut index = 1;
+        while let Some(argument) = args.get(index) {
             match argument.as_str() {
                 "--" => {
                     // Harness filters/options must match byte-for-byte. They
                     // apply independently to every selected executable.
-                    common.extend_from_slice(&step.args[index..]);
+                    common.extend_from_slice(&args[index..]);
                     break;
                 }
                 "--test" => {
                     index += 1;
-                    let target = step.args.get(index)?;
+                    let target = args.get(index)?;
                     if target.is_empty()
                         || target.starts_with('-')
                         || target.contains(['*', '?', '[', ']'])
@@ -49,7 +49,7 @@ impl Batch {
                     targets.push(target.clone());
                 }
                 "-p" | "--package" | "--features" | "--profile" => {
-                    let value = step.args.get(index + 1)?;
+                    let value = args.get(index + 1)?;
                     if value.is_empty() || value.starts_with('-') {
                         return None;
                     }
@@ -103,11 +103,7 @@ impl Batch {
                 .into_iter()
                 .flat_map(|target| ["--test".into(), target]),
         );
-        Step {
-            program: "build-slot".into(),
-            args,
-            kind: StepKind::RustTests,
-        }
+        Step::compiler(args)
     }
 }
 

@@ -494,6 +494,24 @@ pub(super) fn validate_problem_bounds_with_control(
     problem: &ChcProblem,
     control: &mut GroundValidationControl<'_>,
 ) -> Result<(), ChcGroundDerivationArtifactError> {
+    validate_problem_cardinality(problem, control)?;
+    validate_ground_source_problem_with_control(problem, control)
+}
+
+fn validate_wire_problem(
+    problem: &ChcProblem,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<Option<usize>, ChcGroundDerivationArtifactError> {
+    validate_problem_cardinality(problem, control)?;
+    let sort_budget = source_identity::preflight(control, problem, true)?;
+    source_identity::validate_source_semantics(problem, control)?;
+    Ok(sort_budget)
+}
+
+fn validate_problem_cardinality(
+    problem: &ChcProblem,
+    control: &mut GroundValidationControl<'_>,
+) -> Result<(), ChcGroundDerivationArtifactError> {
     control.poll().map_err(interruption_error)?;
     if problem.predicates().len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_PREDICATES {
         return Err(error(
@@ -515,7 +533,7 @@ pub(super) fn validate_problem_bounds_with_control(
             ),
         ));
     }
-    validate_ground_source_problem_with_control(problem, control)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2544,7 +2562,7 @@ fn validate_ground_artifact_with_control(
             ),
         ));
     }
-    validate_problem_bounds_with_control(problem, control)?;
+    let sort_budget = validate_wire_problem(problem, control)?;
     control.poll().map_err(interruption_error)?;
     transport::validate_json_surface(bytes, control)?;
     let envelope: GroundDerivationEnvelope = transport::parse_envelope(bytes, control)?;
@@ -2587,6 +2605,7 @@ fn validate_ground_artifact_with_control(
         &envelope.normalized_input_sha256,
         &envelope.source_clause_sequence_sha256,
         "artifact",
+        sort_budget,
         control,
     )?;
     if envelope.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
@@ -2731,7 +2750,7 @@ fn validate_ground_artifact_v2_with_control(
             ),
         ));
     }
-    validate_problem_bounds_with_control(problem, control)?;
+    let sort_budget = validate_wire_problem(problem, control)?;
     control.poll().map_err(interruption_error)?;
     transport::validate_json_surface(bytes, control)?;
     let envelope: GroundDerivationEnvelopeV2 = transport::parse_envelope(bytes, control)?;
@@ -2774,6 +2793,7 @@ fn validate_ground_artifact_v2_with_control(
         &envelope.normalized_input_sha256,
         &envelope.source_clause_sequence_sha256,
         "v2 artifact",
+        sort_budget,
         control,
     )?;
     if envelope.steps.len() > CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS {
@@ -2873,6 +2893,9 @@ fn validate_ground_artifact_v2_with_control(
         derivation,
     })
 }
+
+#[cfg(test)]
+mod metered_identity_tests;
 
 #[cfg(test)]
 mod tests {

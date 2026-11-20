@@ -239,6 +239,9 @@ mod metering_dynamic;
 #[path = "quality_tests/metering_semantic.rs"]
 mod metering_semantic;
 
+#[path = "quality_tests/metering_bv_lia.rs"]
+mod metering_bv_lia;
+
 #[path = "quality_tests/metering_tightening.rs"]
 mod metering_tightening;
 

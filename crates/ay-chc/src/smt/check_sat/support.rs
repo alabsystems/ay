@@ -23,7 +23,7 @@ use ay_lia::{DiophState, HnfCutKey, LiaSolver, StoredCut};
 /// is UNSAT only modulo those lemmas came back SAT from the fresh solver, the
 /// defense installed that solver as the main one, and the loop re-derived the
 /// same lemmas from the same models forever (2026-09-23, 3 h 40 min observed;
-/// the development design notes).
+/// the development design notes at `9598c4206`).
 ///
 /// Two logs, because not every clause the loop adds is a lemma:
 ///

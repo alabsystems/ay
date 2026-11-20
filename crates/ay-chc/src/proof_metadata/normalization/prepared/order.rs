@@ -7,7 +7,7 @@
 use super::{bytes, Control, QueryError};
 use std::cmp::Ordering;
 
-pub(super) fn compare<C: Control>(
+pub(in super::super) fn compare<C: Control>(
     a: &[u8],
     b: &[u8],
     control: &mut C,
@@ -27,7 +27,7 @@ pub(super) fn compare<C: Control>(
     Ok(a.len().cmp(&b.len()))
 }
 
-pub(super) fn indices<C: Control>(
+pub(in super::super) fn indices<C: Control>(
     count: usize,
     control: &mut C,
     mut compare: impl FnMut(usize, usize, &mut C) -> Result<Ordering, QueryError>,

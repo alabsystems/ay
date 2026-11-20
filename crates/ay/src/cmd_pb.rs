@@ -1617,6 +1617,21 @@ fn try_opt_lin_cert_fallback(
 
     let (pbp, route, solution, portfolio_timings) = match outcome {
         ay_pb::opt_fallback::OptLinCertFallback::Declined { .. } => return Ok(None),
+        ay_pb::opt_fallback::OptLinCertFallback::CertifiedInfeasible { pbp, timings } => {
+            fs::write(temp_proof_path, pbp.as_bytes()).with_context(|| {
+                format!("failed to write proof '{}'", temp_proof_path.display())
+            })?;
+            commit_or_remove_proof(proof_path, temp_proof_path, true)?;
+            return Ok(Some(PbSolveOutcome {
+                solution: PbSolution {
+                    status: PbStatus::Unsatisfiable,
+                    assignment: Vec::new(),
+                    objective: None,
+                },
+                pb_native_code_helper_applications: 0,
+                portfolio_timings: timings,
+            }));
+        }
         ay_pb::opt_fallback::OptLinCertFallback::Certified {
             pbp,
             route,

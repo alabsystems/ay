@@ -5,7 +5,7 @@
 //! Regression: incremental QF_LRA (`#lra-inc-engine`) published a false
 //! `unsat` after a run of push/pop scopes (found 2026-09-18 by the CHC
 //! query-replay microbenchmark; `repros/lra-pushpop-false-unsat-2026-09-18/`,
-//! the development design notes).
+//! the development design notes at `9598c4206`).
 //!
 //! Root cause: the split loop seeded its fresh SAT-variable cursor as
 //! `user_num_vars() + scope_depth()`, which counts only LIVE scope selectors.

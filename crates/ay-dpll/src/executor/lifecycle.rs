@@ -1089,8 +1089,8 @@ impl Executor {
     /// An explicit `:rlimit` (see [`Self::set_resource_limit`]) always wins;
     /// otherwise the DEFAULT ground budget supplies
     /// [`Self::DEFAULT_GROUND_CONFLICT_ALLOWANCE`] unless disabled
-    /// (`set_ground_budget_enabled(false)`, `:rlimit 0`, or the
-    /// `AY_NO_GROUND_BUDGET` env knob). `None` = no conflict budget.
+    /// (`set_ground_budget_enabled(false)` or `:rlimit 0`). `None` = no
+    /// conflict budget.
     ///
     /// Field-only free-function core lives in `pipeline_fns` so the pipeline
     /// macros can call it while holding disjoint `&mut` borrows of other

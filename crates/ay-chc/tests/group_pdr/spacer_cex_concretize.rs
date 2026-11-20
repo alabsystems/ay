@@ -3,7 +3,7 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
-//! Workstream B lock L-C at the solve level (`DESIGN_spacer_pob_lemma_pipeline.md`
+//! Workstream B lock L-C at the solve level (the development design notes at `9598c4206`
 //! §4.1.5 / §6 S11, contract C6): the 3-step unsafe transition system whose
 //! MBP leaves a variable free (`x' = x + 1 ∧ y' = y`, init `x = 0`, query
 //! `x ≥ 3`) is refuted with a `Valid` counterexample under the lane, the

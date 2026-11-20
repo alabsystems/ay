@@ -101,6 +101,14 @@ mod counters {
     /// Measured at 97.4% of mint cost on `dillig12_m`.
     pub(super) static NESTED_CORROBORATION_SOLVES: AtomicU64 = AtomicU64::new(0);
     pub(super) static NESTED_CORROBORATION_NANOS: AtomicU64 = AtomicU64::new(0);
+    /// The two corroboration roles, split out of the totals above so a
+    /// census can price them apart (`DR-AY-CERT-CRUISE-CENSUS-20261118`:
+    /// cruise paid 12.88s across both, unattributed): the forged-UNSAT
+    /// guard's SAT search and the reconfirmation re-solve.
+    pub(super) static NESTED_GUARD_SOLVES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NESTED_GUARD_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NESTED_RECONFIRM_SOLVES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NESTED_RECONFIRM_NANOS: AtomicU64 = AtomicU64::new(0);
     /// Scope-authenticated raw admissions (#proof-capability B3).
     pub(super) static RAW_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
     /// Computed verdicts refused at the publication funnel.
@@ -155,6 +163,14 @@ pub struct CertificationAccounting {
     pub nested_corroboration_solves: u64,
     /// Wall nanoseconds inside those re-solves.
     pub nested_corroboration_nanos: u64,
+    /// Of `nested_corroboration_solves`, the forged-UNSAT guard's.
+    pub nested_guard_solves: u64,
+    /// Wall nanoseconds inside guard re-solves.
+    pub nested_guard_nanos: u64,
+    /// Of `nested_corroboration_solves`, the reconfirmations'.
+    pub nested_reconfirm_solves: u64,
+    /// Wall nanoseconds inside reconfirmation re-solves.
+    pub nested_reconfirm_nanos: u64,
     /// Scope-authenticated raw admissions published without a checked
     /// certificate (#proof-capability B3 competition shedding).
     pub raw_admissions: u64,
@@ -189,6 +205,10 @@ impl CertificationAccounting {
             mint_nanos_internal_lemma: load(&counters::MINT_NANOS_INTERNAL_LEMMA),
             nested_corroboration_solves: load(&counters::NESTED_CORROBORATION_SOLVES),
             nested_corroboration_nanos: load(&counters::NESTED_CORROBORATION_NANOS),
+            nested_guard_solves: load(&counters::NESTED_GUARD_SOLVES),
+            nested_guard_nanos: load(&counters::NESTED_GUARD_NANOS),
+            nested_reconfirm_solves: load(&counters::NESTED_RECONFIRM_SOLVES),
+            nested_reconfirm_nanos: load(&counters::NESTED_RECONFIRM_NANOS),
             raw_admissions: load(&counters::RAW_ADMISSIONS),
             publication_rejections: load(&counters::PUBLICATION_REJECTIONS),
             publication_rejections_nested: load(&counters::PUBLICATION_REJECTIONS_NESTED),
@@ -214,6 +234,10 @@ impl CertificationAccounting {
             &counters::MINT_NANOS_INTERNAL_LEMMA,
             &counters::NESTED_CORROBORATION_SOLVES,
             &counters::NESTED_CORROBORATION_NANOS,
+            &counters::NESTED_GUARD_SOLVES,
+            &counters::NESTED_GUARD_NANOS,
+            &counters::NESTED_RECONFIRM_SOLVES,
+            &counters::NESTED_RECONFIRM_NANOS,
             &counters::RAW_ADMISSIONS,
             &counters::PUBLICATION_REJECTIONS,
             &counters::PUBLICATION_REJECTIONS_NESTED,
@@ -258,6 +282,18 @@ impl CertificationAccounting {
             nested_corroboration_nanos: self
                 .nested_corroboration_nanos
                 .saturating_sub(earlier.nested_corroboration_nanos),
+            nested_guard_solves: self
+                .nested_guard_solves
+                .saturating_sub(earlier.nested_guard_solves),
+            nested_guard_nanos: self
+                .nested_guard_nanos
+                .saturating_sub(earlier.nested_guard_nanos),
+            nested_reconfirm_solves: self
+                .nested_reconfirm_solves
+                .saturating_sub(earlier.nested_reconfirm_solves),
+            nested_reconfirm_nanos: self
+                .nested_reconfirm_nanos
+                .saturating_sub(earlier.nested_reconfirm_nanos),
             raw_admissions: self.raw_admissions.saturating_sub(earlier.raw_admissions),
             publication_rejections: self
                 .publication_rejections
@@ -403,20 +439,41 @@ impl Drop for MintTimer {
     }
 }
 
+/// Which corroboration a nested re-solve serves; recorded so the two
+/// whole-problem re-solves inside a mint can be priced apart.
+#[derive(Clone, Copy)]
+pub(in crate::executor) enum NestedCorroborationRole {
+    /// Step (1): the forged-UNSAT guard's definitive-SAT search.
+    Guard,
+    /// Step (4/4a): the fresh-executor UNSAT reconfirmation.
+    Reconfirm,
+}
+
 /// Times one fresh-`Executor` whole-problem corroboration re-solve run from
 /// inside a certificate mint.
-pub(in crate::executor) struct NestedCorroborationTimer(Instant);
+pub(in crate::executor) struct NestedCorroborationTimer(Instant, NestedCorroborationRole);
 
 impl NestedCorroborationTimer {
-    pub(in crate::executor) fn start() -> Self {
-        Self(Instant::now())
+    pub(in crate::executor) fn start(role: NestedCorroborationRole) -> Self {
+        Self(Instant::now(), role)
     }
 }
 
 impl Drop for NestedCorroborationTimer {
     fn drop(&mut self) {
+        let nanos = elapsed_nanos(self.0);
         bump(&counters::NESTED_CORROBORATION_SOLVES, 1);
-        bump(&counters::NESTED_CORROBORATION_NANOS, elapsed_nanos(self.0));
+        bump(&counters::NESTED_CORROBORATION_NANOS, nanos);
+        match self.1 {
+            NestedCorroborationRole::Guard => {
+                bump(&counters::NESTED_GUARD_SOLVES, 1);
+                bump(&counters::NESTED_GUARD_NANOS, nanos);
+            }
+            NestedCorroborationRole::Reconfirm => {
+                bump(&counters::NESTED_RECONFIRM_SOLVES, 1);
+                bump(&counters::NESTED_RECONFIRM_NANOS, nanos);
+            }
+        }
     }
 }
 
@@ -435,7 +492,12 @@ mod tests {
         record_publication_rejection(RejectionScope::PublicQuery);
         record_publication_rejection(RejectionScope::NestedCertificationSolve);
         drop(MintTimer::start(QueryPublicationRole::InternalLemma));
-        drop(NestedCorroborationTimer::start());
+        drop(NestedCorroborationTimer::start(
+            NestedCorroborationRole::Guard,
+        ));
+        drop(NestedCorroborationTimer::start(
+            NestedCorroborationRole::Reconfirm,
+        ));
         drop(DecisionTimer::start());
         let delta = CertificationAccounting::snapshot().since(before);
 
@@ -446,10 +508,40 @@ mod tests {
         assert!(delta.proof_steps_recorded >= 7);
         assert!(delta.mints >= 1);
         assert!(delta.mints_internal_lemma >= 1);
-        assert!(delta.nested_corroboration_solves >= 1);
+        assert!(delta.nested_corroboration_solves >= 2);
+        assert!(delta.nested_guard_solves >= 1);
+        assert!(delta.nested_reconfirm_solves >= 1);
+        assert!(
+            delta.nested_corroboration_solves
+                >= delta.nested_guard_solves + delta.nested_reconfirm_solves,
+            "the role cells partition the nested total"
+        );
         assert!(delta.raw_admissions >= 1);
         assert!(delta.publication_rejections >= 2);
         assert!(delta.publication_rejections_nested >= 1);
+    }
+
+    /// Each corroboration role moves its own cells (and the shared
+    /// total), so a census can price the forged-UNSAT guard against
+    /// the reconfirmation re-solve. Exact under a name-filtered run;
+    /// in the full suite other threads can only inflate deltas.
+    #[test]
+    fn nested_roles_move_only_their_own_cells() {
+        let before = CertificationAccounting::snapshot();
+        drop(NestedCorroborationTimer::start(
+            NestedCorroborationRole::Guard,
+        ));
+        let mid = CertificationAccounting::snapshot().since(before);
+        assert!(mid.nested_guard_solves >= 1);
+        assert!(mid.nested_corroboration_solves >= mid.nested_guard_solves);
+
+        let before = CertificationAccounting::snapshot();
+        drop(NestedCorroborationTimer::start(
+            NestedCorroborationRole::Reconfirm,
+        ));
+        let delta = CertificationAccounting::snapshot().since(before);
+        assert!(delta.nested_reconfirm_solves >= 1);
+        assert!(delta.nested_corroboration_solves >= delta.nested_reconfirm_solves);
     }
 
     /// The nested cell is a SUBSET of the total, on every counter read.

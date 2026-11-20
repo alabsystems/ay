@@ -16,19 +16,7 @@ pub(super) struct Graph<'a> {
 
 impl<'a> Graph<'a> {
     fn manifest(package: &Package) -> PathBuf {
-        package
-            .manifest_path
-            .canonicalize()
-            .or_else(|error| {
-                // Workspace metadata can describe a deleted manifest. Keep its
-                // existing parent in the same physical namespace as sources.
-                let parent = package.manifest_path.parent().ok_or(error)?;
-                let parent = parent.canonicalize()?;
-                Ok::<_, std::io::Error>(
-                    parent.join(package.manifest_path.file_name().unwrap_or_default()),
-                )
-            })
-            .unwrap_or_else(|_| normalize(&package.manifest_path))
+        physical_input(&package.manifest_path)
     }
     pub(super) fn read(root: &Path, metadata: &'a Metadata) -> Result<Self> {
         let root = root.canonicalize().unwrap_or_else(|_| normalize(root));
@@ -69,7 +57,10 @@ impl<'a> Graph<'a> {
     }
 
     pub(super) fn physical_owner(&self, path: &Path) -> Option<&'a Package> {
-        let path = path.canonicalize().unwrap_or_else(|_| normalize(path));
+        // Deleted inputs still belong to the physical package containing their
+        // nearest surviving ancestor. Lexical fallback alone loses that owner
+        // when the checkout or a parent directory is reached through a symlink.
+        let path = physical_input(path);
         self.packages
             .iter()
             .copied()
@@ -296,6 +287,28 @@ impl<'a> Graph<'a> {
         }
         Ok(true)
     }
+}
+
+pub(super) fn physical_input(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    loop {
+        match ancestor.canonicalize() {
+            Ok(physical) => {
+                return physical.join(
+                    path.strip_prefix(ancestor)
+                        .unwrap_or_else(|_| Path::new("")),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = ancestor.parent() else {
+                    break;
+                };
+                ancestor = parent;
+            }
+            Err(_) => break,
+        }
+    }
+    normalize(path)
 }
 
 #[cfg(test)]

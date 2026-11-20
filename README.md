@@ -1,140 +1,67 @@
-# AY
+# ay
 
-A constraint solver in Rust. You give it a logical problem; it tells you whether
-the problem has a solution, shows you one if it does, and can hand you a
-machine-checkable proof when it says there is none.
+The solver that shows its work.
 
-AY covers SAT, SMT, Horn clauses, pseudo-Boolean, MaxSAT, QBF, LP/MILP,
-FlatZinc, and model counting in one binary.
+When ay finds no solution to a CNF or SMT-LIB problem, by default it writes a proof another program checks.
 
-## The idea
+One Rust binary covers SAT, SMT, Horn clauses, pseudo-Boolean, MaxSAT, QBF, LP/MILP, FlatZinc, and model counting. Run `ay FILE` on SMT-LIB 2.6, CNF, or Horn inputs for `sat` with a model, `unsat` with a proof artifact on supported paths, or `unknown` with the reason. Pass `--rigor certified` for fail-closed workflows, or `--z3-mode` for Z3-shaped CLI output.
 
-A solver answers one question: *can all of these requirements hold at once?*
-
-| Answer | Meaning | What you get |
-| --- | --- | --- |
-| `sat` | Yes | A solution, e.g. `x = 7, y = 0` |
-| `unsat` | No | A proof, which you can check with a tool that isn't AY |
-| `unknown` | AY couldn't decide | The reason |
-
-The `unsat` row is the point of the project. Every solver can claim "no
-solution exists" — a wrong claim there is silent and expensive. AY writes a
-proof of that claim to a file, and ships checkers that replay it
-independently. You do not have to trust the search to trust the answer.
+Part of [ALab](https://alab.systems): superhuman software for AIs. On Apple-silicon macOS, install [aterm](https://github.com/alabsystems/aterm#install) and run `aterm pkg install ay`.
 
 ## Build
 
-AY builds with ALab's Trust compiler, which `rust-toolchain.toml` pins. Install
-[aterm](https://github.com/alabsystems/aterm#install); atpkg installs Trust
-(`aterm pkg install trust` does it by hand; atpkg ships it for Apple-silicon
-macOS today).
+ay builds with ALab's trust compiler, pinned by `rust-toolchain.toml`. Install [aterm](https://github.com/alabsystems/aterm#install) and its trust package (`aterm pkg install trust`; atpkg ships it for Apple-silicon macOS today).
 
 ```bash
 git clone https://github.com/alabsystems/ay.git
 cd ay
-targo --unverified build --release -p ay --features cli --bin ay
+targo --unverified build --release --locked -p ay --features cli --bin ay
 export PATH="$PWD/target/release:$PATH"
 ```
 
-**The `--features cli` is not optional.** Without it Cargo builds the library
-and produces no executable, with no error explaining why.
-
-A **public snapshot's** `.cargo/config.toml` carries no verification policy.
-This **development** repo's requires `certify` policy on every unit, with no
-dependency or build-script exemptions. Name a lane:
+The `ay` executable requires `--features cli`; without it, `targo` builds no `ay` binary. Run tests without a proof claim:
 
 ```bash
-targo --unverified test -p ay-sat            # everyday: proof pipeline off,
-                                             # no proof claim
-offline deductive checker check -p ay-sat                  # fail-closed, per-unit proof report
-offline deductive checker test --allow-l0-gaps -p ay-sat   # advisory: run tests while the
-                                             # proof ratchet is still open
+targo --unverified test -p ay-sat
 ```
 
-The required posture is not a claim that the workspace currently discharges
-it — `ay-sat` alone still reports thousands of Level-0 gaps, mostly in derived
-`Clone`/`Default`/`thiserror` impls. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The development checkout requires level 2 `certify` with `unix_hardened`, strict frontend lowering, authenticated dependency MIR for host and target, and rustdoc verification, including dependencies and build scripts. A full workspace proof requires a verified build of every unit; `targo --unverified` makes no proof claim.
+
+[Development configuration](.cargo/config.toml) · [Tests and landing checks](CONTRIBUTING.md)
 
 ## Try it
 
-Give `ay` a file. It works out the format from the contents.
+ay detects the input format. This SMT-LIB example prints a model to stdout:
 
-```bash
+```console
 $ ay examples/quickstart.smt2
-c ay.session.start build.version=0.27.0 build.commit=…
-c writing Alethe proof to examples/quickstart.smt2.alethe on unsat
 sat
 (model
   (define-fun y () Int 0)
   (define-fun x () Int 7)
 )
-c ay.session.end exit.code=0 wall_time_ms=2
 ```
 
-Lines starting with `c` are comments recording which build ran and where a
-proof would go. `--z3-mode` suppresses them if you want bare Z3-shaped output.
+Session and proof diagnostics go to stderr. Add `--rigor strict` to answer `unknown` instead of an `unsat` whose proof has a `trust` step or an unproved step.
 
-An unsatisfiable problem writes a proof next to the input, then re-checks it:
+An unsatisfiable DIMACS input exits with code 20. Declare a DRAT checker so the proof written beside the CNF uses only steps that `ay check drat` accepts:
 
-```bash
-$ ay problem.cnf              # DIMACS CNF
-unsat                         # also writes problem.cnf.drat
+```console
+$ ay --proof-checker drat-trim problem.cnf
+s UNSATISFIABLE
 
 $ ay check drat problem.cnf problem.cnf.drat
 s VERIFIED
 ```
 
-For SMT-LIB input the proof is [Alethe](https://verit.loria.fr/documentation/alethe-spec.pdf),
-which the external checker `carcara` reads:
+Replay the bundled SMT-LIB example's Alethe proof with the pinned Carcara checker:
 
 ```bash
-$ ay problem.smt2             # writes problem.smt2.alethe on unsat
-$ carcara check problem.smt2.alethe problem.smt2
-valid
+ay --alethe-dialect pinned-carcara examples/quickstart_unsat.smt2
+carcara check -- examples/quickstart_unsat.smt2.alethe examples/quickstart_unsat.smt2
 ```
 
-Be aware that AY still emits some theory steps as opaque `trust` holes that
-carcara cannot expand. Fully hole-free proofs are demonstrated today only on
-small hand-written formulas, not across the board.
-
-Pinned carcara also parses neither AY's `Seq`, `FloatingPoint` and `Char`
-sorts nor symbols spelled with the AY/Z3 `\|` escape extension, nor a problem
-written with constructs AY accepts and its parser refuses: a qualified
-`(as C S)` on a constructor of a non-parametric datatype, Z3 names such as
-`bv2nat`, `is-C` or `iff`, an implicit Int/Real coercion, or a use of a
-`define-const` symbol. AY still writes the certificate its own strict checker
-accepted for those problems and says so on the `c ay.proof.certificate` line
-as `carcara_surface=unsupported`
-(the reason follows on a `c warning:` line; a library consumer reads
-`UnsatProofArtifact::carcara_surface`, or takes the problem-scoped document and
-its verdict from one rendering with
-`Executor::try_export_last_proof_alethe_for_problem_scope_with_carcara_surface`).
-Such a verdict stands on AY's strict checker alone: `--rigor strict` and
-`--rigor certified` (legacy spellings `--strict-proofs` / `--self-check`)
-refuse it with that reason.
-
-Pinned carcara and Clean's vendored carcara (which external-codegen replays with) also
-disagree on three spellings: the `bitblast_ashr` overshift layer,
-`zero_extend`, and the `bitblast_udiv`/`bitblast_urem` divider. They also
-disagree on one rule, `dt_project`, which checks a datatype selector over a
-constructor (`(= (fst (mk a b)) a)`): pinned carcara has no datatype rule and
-answers `unknown rule`, which rejects the whole document. By default AY
-prints Clean's (each names the Clean rule that admits it,
-`CleanOnlySpelling::consumer_rule`), and a certificate that keeps one says
-`carcara_surface=clean-dialect` (`CarcaraSurface::CleanDialect` on a library
-`UnsatProofArtifact`): pinned carcara refuses it. A problem pinned carcara
-cannot parse is `unsupported` in either dialect. `--alethe-dialect
-pinned-carcara` (`Executor::set_alethe_dialect`, `Solver::set_alethe_dialect`)
-prints the pinned spelling where one exists and is true, and prints the
-`dt_project` step as a `hole`. To check a QF_DT certificate with pinned
-carcara, write it with `--alethe-dialect pinned-carcara`. See LIMITATIONS.md.
-
-Check a certificate as `carcara check -- PROOF PROBLEM`. A `let` the problem
-writes is eliminated with `:rule let`, which pinned carcara checks only in
-that invocation, never under `--expand-let-bindings`; such a certificate says
-`carcara_surface=without-let-expansion`.
-
-`ay tutorial` is an interactive walkthrough if you'd rather start there.
+Read `unproved_steps` and `carcara_surface` on the `c ay.proof.certificate` line to see remaining proof holes and checker compatibility. By default, ay emits the Alethe dialect used by clean; pass `--alethe-dialect pinned-carcara` for the pinned Carcara checker's spellings. [Certificate coverage and checker compatibility](LIMITATIONS.md#certificate-coverage-is-uneven)
 
 ## Commands
 
@@ -148,75 +75,38 @@ ay diagnose        investigate a suspected wrong answer
 ay maxsat          WCNF
 ay pb              pseudo-Boolean, OPB / WBO
 ay qbf             QDIMACS
-ay lp              MPS / LP
-ay flatzinc        FlatZinc / MiniZinc
+ay lp solve FILE   solve an MPS or CPLEX LP model
+ay flatzinc solve FILE    solve a FlatZinc model with the CP or SMT backend
 ay tutorial        interactive lessons
 ay commands        this list, grouped, from the binary itself
 ay options         AY_* environment options and their defaults
 ay help            topic pages: z3, formats, exit-codes, output
 ```
 
-`ay commands` prints the live list, `ay help` the topic pages, and
-`ay <command> --help` the flags. About fifteen more maintainer commands
-(benchmarks, corpora, gates, release and audit tooling) are hidden from that
-list but ship in the binary, and each answers to `ay <name> --help`. In AY's
-development tree, the development design notes maps every command, hidden ones
-included, to the crates behind it.
+Use `ay <command> --help` for flags. Hidden maintainer tools and their implementing crates are listed in the CLI reference.
 
-`ay check veripb FORMULA PROOF` checks pseudo-Boolean certificates using AY's
-integrated checker. Incomplete conclusions, unproved assertions and weakened
-guarantees fail. A supplied output formula must be checked by an output FILE
-rule. No separate VeriPB installation is needed.
+`ay check veripb FORMULA PROOF` checks pseudo-Boolean certificates using ay's integrated checker. Incomplete conclusions, unproved assertions, and weakened guarantees fail, and a supplied output formula must be checked by an output FILE rule. No separate VeriPB installation is needed.
 
-`ay` also accepts Z3's command-line spellings (`-t:`, `-T:`, `-in`, `-model`,
-`-st`, …), so it can stand in for `z3` in an existing script. Symlinking the
-binary to `z3` turns that mode on automatically. Compatibility is partial —
-see [LIMITATIONS.md](LIMITATIONS.md).
+`ay` accepts Z3's command-line spellings (`-t:`, `-T:`, `-in`, `-model`, `-st`, …), and symlinking the binary to `z3` turns `--z3-mode` on automatically. In Python, `ayz3` mirrors a documented subset of `z3py`, so matching scripts generally need only an import change. Compatibility is partial: see [LIMITATIONS.md](LIMITATIONS.md).
 
-## What actually works
+## Engines and proof checkers
 
-Solid, with real algorithms and heavy test coverage:
+- **SAT**: a CDCL solver following CaDiCaL's design with two-watched-literal propagation, 1UIP clause learning, EVSIDS/VMTF/CHB branching, Luby and glue-based restarts, three-tier clause deletion, and preprocessing (variable elimination, vivification, subsumption, probing, blocked clause elimination, hyper-binary resolution).
+- **SMT**: DPLL(T) combining the SAT core with congruence closure (proof-producing explanations), dual simplex for linear real arithmetic (Farkas certificates), integer branch-and-bound with Gomory and Hermite-normal-form cuts, bit-blasted bitvectors and floating point, arrays, datatypes, difference logic, and E-matching/CEGQI/MBQI quantifiers.
+- **MILP**: branch-and-cut where a floating-point simplex proposes a basis and an exact-rational simplex re-verifies it, so floating point cannot corrupt the answer. Sparse LU with Forrest-Tomlin updates; cover, Gomory, MIR, flow-cover, and clique cuts re-checked in exact arithmetic before use.
+- **Pseudo-Boolean**: a native PB conflict-driven solver in the RoundingSat style, four PB-to-CNF encodings, and VeriPB proof output.
+- **MaxSAT**: core-guided OLL/RC2 on one incremental SAT instance.
+- **Proof checking**: independently written DRAT and LRAT checkers (two-watched-literal propagation, RUP and full RAT, forward and backward modes, text and binary formats), plus the integrated VeriPB checker. The `ay-pb` tests and the PB certified gate require the pinned VeriPB checker to reject [22 regression fixtures](ci/veripb-soundness/README.md) for 21 wrong-verdict defects found in published VeriPB 3.0.2.
+- **Measured proof validation**: on 2026-09-30, all 97 of 97 certificates marked `carcara_surface=supported` (out of a 128-query consumer corpus) checked `valid` under pinned Carcara 1.1.0 ([LIMITATIONS.md](LIMITATIONS.md)).
+- **Lean LRAT theorem**: `lratCheck_sound` in `verification/lean` proves in Lean 4 that when its checker `lratCheck` accepts a well-formed LRAT proof for a well-formed formula, the formula is unsatisfiable. It uses only the axioms `propext` and `Quot.sound`, and that Lean project has no external dependencies.
 
-- **SAT** — a CDCL solver following CaDiCaL's design: two-watched-literal
-  propagation, 1UIP clause learning, EVSIDS/VMTF/CHB branching, Luby and
-  glue-based restarts, three-tier clause deletion, and a full preprocessing
-  suite (variable elimination, vivification, subsumption, probing, blocked
-  clause elimination, hyper-binary resolution).
-- **SMT** — DPLL(T): the SAT search above runs in lockstep with theory
-  solvers. Equality is congruence closure with proof-producing explanations;
-  linear real arithmetic is dual simplex with Farkas certificates; integers
-  add branch-and-bound with Gomory and Hermite-normal-form cuts; bitvectors
-  and floating point are bit-blasted. Arrays, datatypes and difference logic
-  are there too. Quantifiers go through E-matching, CEGQI and MBQI.
-- **MILP** — branch-and-cut. A floating-point simplex proposes a basis and an
-  exact-rational simplex re-verifies it, so floating point can cost search
-  time but cannot corrupt the answer. Sparse LU with Forrest-Tomlin updates;
-  cover, Gomory, MIR, flow-cover and clique cuts, each re-checked in exact
-  arithmetic before use.
-- **Pseudo-Boolean** — a native PB conflict-driven solver in the RoundingSat
-  style, four PB-to-CNF encodings, and VeriPB proof output.
-- **MaxSAT** — core-guided OLL/RC2 on one incremental SAT instance.
-- **Proof checking** — the DRAT and LRAT checkers are independently written,
-  not wrappers: two-watched-literal propagation, RUP and full RAT, forward and
-  backward modes, text and binary formats. (The repo does not currently ship a
-  cross-check against drat-trim — the fixtures for that live in a `reference/`
-  checkout you'd have to clone yourself, and the tests skip without it.)
+### Limits
 
-Known to be incomplete — these are design limits, not bugs:
-
-- **Nonlinear arithmetic** returns `unknown` on problems it can't linearize.
-  CAD projection exists but is not wired into the search.
-- **Strings** deliberately latch to `unknown` rather than risk a wrong `sat`.
-- **`ay lp`** uses a small dense simplex capped at 4096 search nodes. It is
-  sized for test fixtures. The serious MILP engine has no `ay` subcommand
-  yet; it is reached through `ay solve`'s MILP fast path, inside `ay maxsat`
-  and `ay pb`, and through the separate `ay-milp` binary
-  (`targo --unverified run -p ay-milp -- solve FILE.mps`; with stock Rust,
-  `cargo run -p ay-milp -- solve FILE.mps`).
-- **Certificates are uneven.** CNF and SMT `unsat` produce externally
-  checkable proofs. `sat` answers get model validation only. MILP emits exact
-  Farkas certificates that only AY can read, because no external checker
-  format exists. Model counting, QBF and AllSAT have no certificates at all.
+- **Nonlinear arithmetic**: returns `unknown` on problems it cannot linearize. CAD projection exists but is not wired into the search.
+- **Strings**: unresolved word equations can yield `unknown`. An inferred equality can resolve the remaining equation and allow `sat`.
+- **`ay lp solve`**: reads MPS coefficients exactly and uses the sparse MILP engine. CPLEX LP files use a dense binary64 simplex with a 4,096-node branch-and-bound limit.
+- **Certificates**: a CNF or SMT proof is independently verified when the intended checker accepts it. Default proof emission can fail while ay still reports `unsat`. ay validates `sat` models. MILP emits exact Farkas certificates that only ay can read, because no external checker format exists. Model counting, QBF, and AllSAT have no certificates at all.
+- **DRAT/LRAT cross-check**: the repo does not currently ship a cross-check against `drat-trim` (the fixtures live in a `reference/` checkout you have to clone yourself, and the tests skip without it).
 
 [LIMITATIONS.md](LIMITATIONS.md) has the details.
 
@@ -234,10 +124,7 @@ scripts/         maintainer tooling
 
 ## Status
 
-AY is 0.x and under active development. The API is not stable and there is no
-release cadence yet. The two sections above are meant to be read together: the
-first lists what has been checked against the source, the second lists what is
-known not to work. If something is in neither list, assume it is untested.
+ay is in active 0.x development. Its API and release schedule can change.
 
 ## Contributing
 

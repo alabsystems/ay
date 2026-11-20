@@ -73,9 +73,10 @@ impl Workspace {
         for step in compatible(steps) {
             // The containing native gate test already retains machine
             // admission. Execute the actual produced Targo payload within
-            // that same owned budget, without a nested build-slot request.
-            let output = Command::new(&step.args[1])
-                .args(&step.args[2..])
+            // that same owned budget, without another native fixed claim.
+            let output = Command::new("targo")
+                .arg("--unverified")
+                .args(step.compiler_payload().unwrap())
                 .current_dir(self.root())
                 .env("AY_GATE_BATCH_MARKERS", &markers)
                 .output()
@@ -126,11 +127,14 @@ fn quiet_test_build_compiles_without_running_the_selected_failure() {
     let workspace = Workspace::new();
     let markers = workspace.root().join("markers");
     let mut runtime = selection("failure", Some("probe"), "selected", false);
-    runtime.args.insert(0, "--exclusive".into());
+    runtime
+        .args
+        .insert(Step::ADMISSION_PREFIX.len(), "--exclusive".into());
     let build = runtime.quiet_test_compilation().unwrap();
     // A compiler build for this fixture can use the containing test's admission.
-    let output = Command::new(&build.args[1])
-        .args(&build.args[2..])
+    let output = Command::new("targo")
+        .arg("--unverified")
+        .args(build.compiler_payload().unwrap())
         .current_dir(workspace.root())
         .env("AY_GATE_BATCH_MARKERS", &markers)
         .output()
@@ -144,7 +148,7 @@ fn quiet_test_build_compiles_without_running_the_selected_failure() {
 
     // The fixture has no benchmark planner. Its selected body must fail even
     // after a successful compilation while still honoring the feature/filter.
-    runtime.args.remove(0);
+    runtime.args.remove(Step::ADMISSION_PREFIX.len());
     assert_eq!(
         workspace.run(vec![runtime]),
         (false, 1, vec!["failure:selected:probe".into()])

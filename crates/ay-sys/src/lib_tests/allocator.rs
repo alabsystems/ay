@@ -74,7 +74,7 @@ fn test_counting_allocator_realloc_grow_and_shrink() {
 /// Before the stripes every allocation and every free was a read-modify-write
 /// of the one published atomic, from every thread. With the CHC portfolio's
 /// engines running in parallel that cache line was the largest single cost in
-/// the process (`PERF_vs_winners_2026-09-25.md`, row 5), and on
+/// the process (the development design notes at `9598c4206`, row 5), and on
 /// `faulty__barthe!_000` it held the 2 s BMC probe to depth 6-7 of the 12 the
 /// counterexample needs (11 once striped).
 #[test]
@@ -137,7 +137,7 @@ fn a_two_batch_live_byte_change_is_published_at_once() {
 }
 
 /// Threads that run at the same time write different stripes, which is the
-/// whole of the fix for row 5 of `PERF_vs_winners_2026-09-25.md`: every
+/// whole of the fix for row 5 of the development design notes at `9598c4206`: every
 /// allocation on every thread writing one cache line. Two engine-sized
 /// (8 MiB) stacks alive at once lie in different 1 MiB windows, and 256
 /// stripes of those windows meet again only 256 MiB apart. The sizes are

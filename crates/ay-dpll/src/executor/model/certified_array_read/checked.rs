@@ -3,12 +3,11 @@
 
 use super::*;
 
-impl CertifiedArrayRead {
-    pub(super) fn prepare(&mut self, exec: &Executor, model: &Model) -> bool {
+impl<'a> CertifiedArrayRead<'a> {
+    pub(super) fn prepare(&mut self, exec: &'a Executor, model: &'a Model) -> bool {
         if !self.live(exec) {
             return false;
         }
-        let before = self.remaining;
         let Some(declarations) = exec.ctx.bounded_projection_declaration_inventory_size() else {
             self.refused = true;
             return false;
@@ -21,24 +20,16 @@ impl CertifiedArrayRead {
         for (surface, info) in exec.ctx.symbol_iter() {
             let name = exec.ctx.symbol_identity_name(surface, info);
             let cost = surface.len().saturating_add(name.len()).saturating_add(3);
-            if !self.charge(exec, cost.saturating_mul(entries.len().saturating_add(1))) {
+            if !self.charge(exec, cost) {
                 return false;
             }
             inventory_work = inventory_work.saturating_add(cost);
-            if entries.iter().any(|entry| entry.name() == Some(name)) {
-                if !self.charge(exec, info.arg_sorts.len())
-                    || !self.same_sort(exec, &info.sort, &info.sort)
-                {
-                    return false;
-                }
-                for sort in &info.arg_sorts {
-                    if !self.same_sort(exec, sort, sort) {
-                        return false;
-                    }
-                }
-            }
+            // Signature equality below visits at most each bounded expected
+            // descriptor (a different length/constructor fails immediately).
+            // Unrelated declaration sorts need no semantic interpretation.
         }
-        for entry in entries {
+        let package = model.authenticate_const_interp_read(&exec.ctx, |entry| {
+            let before = self.remaining;
             if !self.charge(exec, entry.name().map_or(1, str::len))
                 || !self.charge(exec, entry.parameter_sorts().len())
                 || !self.charge(exec, entry.value_graph_slots().len())
@@ -65,15 +56,23 @@ impl CertifiedArrayRead {
                     return false;
                 }
             }
-        }
-        // Currentness scans the declaration inventory twice per entry and
-        // checks the retained graph/signatures. Preflight also bounds every
-        // descriptor before those established comparisons run.
-        self.package_cost = before.saturating_sub(self.remaining).saturating_add(
-            inventory_work
-                .saturating_mul(entries.len())
-                .saturating_mul(2),
-        );
+            // Prepay this entry's established currentness check once: two
+            // declaration-inventory walks plus its bounded graph/signatures.
+            // The returned immutable borrow retains that result for this read;
+            // every later lookup still pays and checks its actual signature.
+            let cost = before
+                .saturating_sub(self.remaining)
+                .saturating_add(inventory_work.saturating_mul(2));
+            self.lookup_work = self
+                .lookup_work
+                .saturating_add(entry.name().map_or(1, str::len).saturating_add(1));
+            self.charge(exec, cost)
+        });
+        let Ok(package) = package else {
+            self.refused = true;
+            return false;
+        };
+        self.package = Some(package);
         true
     }
 
@@ -98,6 +97,12 @@ impl CertifiedArrayRead {
                     }
                     pending.push((&a.index_sort, &b.index_sort, depth + 1));
                     pending.push((&a.element_sort, &b.element_sort, depth + 1));
+                }
+                (Sort::Seq(a), Sort::Seq(b)) => {
+                    if !self.charge(exec, 1) {
+                        return false;
+                    }
+                    pending.push((a, b, depth + 1));
                 }
                 _ => return false,
             }

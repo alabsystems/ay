@@ -94,7 +94,6 @@ mod set_materialize;
 pub(in crate::executor) mod stderr_diagnostics;
 mod string_materialize;
 pub(in crate::executor) mod string_witness;
-pub(in crate::executor) mod uflia_witness;
 pub(in crate::executor) mod unknown_candidate;
 mod validation;
 mod wrong_ctor_get_value;
@@ -236,6 +235,7 @@ pub(crate) fn eval_node_visits() -> u64 {
 }
 
 mod certificate_data;
+mod certificate_expression;
 use certificate_data::{
     eval_value_has_exact_sort, CertifiedConstInterpModel, CertifiedTotalUfInterpretation,
     CertifiedTotalUfModel, FormulaNeutralFunctionDefaults, QuantifiedConfirmationModelSeal,
@@ -247,6 +247,7 @@ pub(in crate::executor) use certificate_data::{
     FormulaNeutralFunctionDefaultEntry, FormulaNeutralFunctionDefaultReadError, LinearIntBody,
     QuantifiedConfirmationModelEpoch, QuantifiedGrantModelEpoch,
 };
+pub(in crate::executor) use certificate_expression::CertifiedExpressionBody;
 
 /// Model-owned scalar UF interpretations retained across internal transports.
 pub(super) type MaterializedScalarFunctions =
@@ -884,6 +885,23 @@ impl Executor {
     /// the memoized `evaluate_term` wrapper so shared subterms are computed once.
     fn evaluate_term_inner(&self, model: &Model, term_id: TermId) -> EvalValue {
         stacker::maybe_grow(EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE, || {
+            // An expression witness defines a total function. Ambient
+            // materializer pins at one application cannot replace its body.
+            // Keep the legacy package's read path unchanged when no expression
+            // is installed; expression packages still fail closed as a whole.
+            if model
+                .certified_const_interp_entries()
+                .iter()
+                .any(|entry| matches!(entry.body(), CertifiedConstInterpBody::Expression(_)))
+            {
+                match self.const_interp_witness_value(model, term_id) {
+                    Ok(Some(CertifiedConstInterpRead::Expression { body, arguments })) => {
+                        return self.evaluate_expression_application(model, &body, arguments);
+                    }
+                    Err(_) => return EvalValue::Unknown,
+                    _ => {}
+                }
+            }
             // Total-datatype-model pins (#dt-total-model): a datatype-sorted
             // term, selector application, or tester application whose value the
             // datatype model-construction phase pinned evaluates to that pinned
@@ -942,6 +960,9 @@ impl Executor {
                         Some(value) => EvalValue::Rational(BigRational::from(value)),
                         None => EvalValue::Unknown,
                     };
+                }
+                Ok(Some(CertifiedConstInterpRead::Expression { body, arguments })) => {
+                    return self.evaluate_expression_application(model, &body, arguments);
                 }
                 Ok(Some(_)) | Err(_) => return EvalValue::Unknown,
                 Ok(None) => {}
@@ -1081,6 +1102,23 @@ impl Executor {
                         "=" => {
                             // Equality: both arguments must evaluate to same value
                             if args.len() == 2 {
+                                // A bound index is not an ordinary argument to a UF.
+                                // Only whole-array evidence or a disagreeing concrete
+                                // read can decide equality of a residual source lambda.
+                                if args
+                                    .iter()
+                                    .any(|&a| self.ctx.terms.get_lambda_array(a).is_some())
+                                {
+                                    return self
+                                        .functional_array_equality(model, term_id, args)
+                                        .or_else(|| {
+                                            self.function_backed_array_equality(
+                                                model, args[0], args[1],
+                                            )
+                                            .map(EvalValue::Bool)
+                                        })
+                                        .unwrap_or(EvalValue::Unknown);
+                                }
                                 // Ground RegLan equality has no value carrier;
                                 // decide it by language before value comparison.
                                 if let Some(equal) =

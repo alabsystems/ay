@@ -537,8 +537,7 @@ impl Solver {
         let total_steps = stats.get_int("proof_checker_total_steps");
         let skipped_holes = stats.get_int("proof_checker_skipped_hole_steps");
         let trust_fallbacks = stats.get_int("proof_trust");
-        let proof_checking_active =
-            cfg!(feature = "proof-checker") && details.verification_level.has_proof_checking();
+        let proof_checking_active = details.verification_level.has_proof_checking();
         let all_steps_checked = matches!(
             (checked_steps, total_steps),
             (Some(checked), Some(total)) if total > 0 && checked == total

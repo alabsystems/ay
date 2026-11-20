@@ -4,7 +4,7 @@
 
 //! `HornSmt` — a persistent online CDCL(T) session for the CHC engines.
 //!
-//! Design: the development design notes (§2.1 is
+//! Design: the development design notes at `9598c4206` (§2.1 is
 //! this file's interface; §3 the data flow; §5 the lifetime plan; §9 the work
 //! breakdown and contracts C1–C8). This module tree is the Rung-1 skeleton:
 //! every contract type and signature of C1–C5, C7 and C8 is declared here so the

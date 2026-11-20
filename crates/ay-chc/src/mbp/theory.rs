@@ -16,7 +16,7 @@ use super::{BoundKind, Literal, Mbp};
 /// Above this many `lower_bounds.len() * upper_bounds.len()` resolvents,
 /// [`Mbp::project_real_var`] substitutes the model's own value for the
 /// variable instead of resolving every lower/upper pair (2026-09-24,
-/// `LRA_memouts_2026-09-24.md`).
+/// the development design notes at `9598c4206`).
 ///
 /// Unlike [`Mbp::project_integer_var`] (which the Omega-test-style tightest
 /// lower bound reduces to one `upper_bounds.len()` pass, see below), the LRA
