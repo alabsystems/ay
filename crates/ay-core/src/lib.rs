@@ -89,8 +89,8 @@ pub use proof::{
     CLEAN_DIALECT_ALETHE_RULES, UNPROVED_STEP_RULE,
 };
 pub use smtlib::{
-    escape_string_contents, quote_symbol, string_literal, symbol_token, unescape_string_contents,
-    SMTLIB_MAX_CODE_POINT,
+    escape_string_contents, is_smtlib_reserved_word, quote_symbol, string_literal, symbol_token,
+    unescape_string_contents, SMTLIB_MAX_CODE_POINT,
 };
 pub use smtlib_char::{
     first_surrogate_carrier, is_surrogate_carrier, smtlib_char, smtlib_char_cmp, smtlib_code_point,

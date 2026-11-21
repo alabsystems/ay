@@ -14,7 +14,7 @@ Usage:
       --solver ay=./target/release/ay [--solver kissat=/tmp/kissat/build/kissat] \
       --out results.json
 """
-import argparse, concurrent.futures as cf, datetime, functools, glob, hashlib, json, os, re, shutil, subprocess, sys, time
+import argparse, concurrent.futures as cf, datetime, functools, glob, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build
 
@@ -136,7 +136,7 @@ def solver_provenance(path):
 
 
 def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1, extra=(),
-            proof_mode=False):
+            proof_store=None):
     """Run one solver on one instance. Returns dict."""
     if solver_name.startswith("ay"):
         # `--no-proof` was hard-coded here, so NO sweep could ever measure a
@@ -145,8 +145,11 @@ def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1, extra=(
         # three separate defects: the orbitope route and the XOR route are both
         # skipped under a proof surface, and composite symmetry emits
         # certificates an external checker rejects. Pass --proof-mode to measure
-        # what a submission would actually score.
-        proof_args = [] if proof_mode else ["--no-proof"]
+        # what a submission would actually score. The proof goes to a proof
+        # store (`ay --proof-store`), never beside the corpus: a sweep that
+        # solved in place left 49.8 GiB of proofs beside benchmark inputs
+        # (DC-77). A wrapper that passes an explicit --proof still wins.
+        proof_args = ["--proof-store", proof_store] if proof_store else ["--no-proof"]
         cmd = [cmd_template, *proof_args, "-t", str(int(timeout_s * 1000)),
                "--memory", str(mem_mb), *extra, cnf]
     elif solver_name.startswith("kissat"):
@@ -231,7 +234,14 @@ def main():
                          "Pair with a solver wrapper that requests --proof, e.g. "
                          "~/ay-bench/bin/ay-proofmode. The wrapper RETAINS each certificate "
                          "and defers verification to scripts/verify_proof_manifest.py, so "
-                         "this sweep's unsat count is PROVISIONAL until that join runs.")
+                         "this sweep's unsat count is PROVISIONAL until that join runs. "
+                         "A default proof goes to --proof-store, never beside the corpus.")
+    ap.add_argument("--proof-store",
+                    help="with --proof-mode: the proof store ay* solvers write default "
+                         "proofs to (ay --proof-store; <store>/<input sha256>-<ay build>/, "
+                         "tagged CACHEDIR.TAG). Default: a new, empty store under $TMPDIR, "
+                         "since a proof a store already holds counts and ay then writes "
+                         "none, which would shed the proof cycle this mode measures")
     ap.add_argument("--phantom-memout-frac", type=float, default=0.15,
                     help="a memout/SIGKILL row that dies in under this fraction of "
                          "the timeout is suspect (rss watchdog tripped by CONCURRENT "
@@ -288,13 +298,17 @@ def main():
               f"--mem-mb {SATCOMP_MEMORY_LIMIT_MB} before counting it against the solver.",
               flush=True)
 
+    proof_store = None
+    if args.proof_mode:
+        proof_store = args.proof_store or tempfile.mkdtemp(prefix="ay-proof-store-")
+        print(f"proof store: {proof_store}", flush=True)
     jobs = [(name, path, cnf) for cnf in cnfs for name, path in solvers.items()]
     results = []
     row_jobs = []  # results[i] came from row_jobs[i]; needed to re-run a row
     done = 0
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(run_one, n, p, c, args.timeout, enforced_mem_mb,
-                          plan.nbcore, extras.get(n, ()), args.proof_mode): (n, p, c)
+                          plan.nbcore, extras.get(n, ()), proof_store): (n, p, c)
                 for (n, p, c) in jobs}
         for fut in cf.as_completed(futs):
             r = fut.result()
@@ -325,7 +339,7 @@ def main():
     for i in suspects:
         n, p, c = row_jobs[i]
         retry = run_one(n, p, c, args.timeout, enforced_mem_mb, plan.nbcore,
-                        extras.get(n, ()), args.proof_mode)
+                        extras.get(n, ()), proof_store)
         if retry["verdict"] != results[i]["verdict"]:
             retry["retried_phantom_memout"] = True
             results[i] = retry

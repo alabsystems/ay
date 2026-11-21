@@ -224,6 +224,8 @@ mod tests;
 #[cfg(test)]
 mod tests_benchmarks;
 #[cfg(test)]
+mod tests_const_sets;
+#[cfg(test)]
 mod tests_detect_disjunctive;
 #[cfg(test)]
 mod tests_false_unsat;
@@ -235,7 +237,37 @@ mod tests_nonlinear;
 mod tests_ordering;
 
 /// Entry point for the `solve-cp` subcommand.
+///
+/// When the direct-CP encoding exceeds the engine's capacity this prints
+/// `=====UNKNOWN=====`; use [`cmd_solve_cp_or_decline`] to hand such a model
+/// to another backend instead.
 pub fn cmd_solve_cp(
+    model: &FznModel,
+    timeout_ms: Option<u64>,
+    all_solutions: bool,
+    parallel_workers: usize,
+    prechecked_unsupported: Option<&[String]>,
+) -> Result<()> {
+    match cmd_solve_cp_or_decline(
+        model,
+        timeout_ms,
+        all_solutions,
+        parallel_workers,
+        prechecked_unsupported,
+    ) {
+        Err(Fzn2smtError::CpEncodingCapacity(_)) => {
+            let mut out = io::stdout().lock();
+            writeln!(out, "=====UNKNOWN=====")?;
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Like [`cmd_solve_cp`], but a model whose direct-CP encoding exceeds the
+/// engine's capacity is declined with [`Fzn2smtError::CpEncodingCapacity`]
+/// before anything is printed, so the caller can solve it another way.
+pub fn cmd_solve_cp_or_decline(
     model: &FznModel,
     timeout_ms: Option<u64>,
     all_solutions: bool,
@@ -255,7 +287,7 @@ pub fn cmd_solve_cp(
     )
 }
 
-fn cmd_solve_cp_with_writers(
+pub(crate) fn cmd_solve_cp_with_writers(
     model: &FznModel,
     timeout_ms: Option<u64>,
     all_solutions: bool,
@@ -264,12 +296,11 @@ fn cmd_solve_cp_with_writers(
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<()> {
-    if !(1..=PORTFOLIO_WORKERS.len()).contains(&parallel_workers) {
-        return Err(Fzn2smtError::InvalidWorkerCount {
-            requested: parallel_workers,
-            maximum: PORTFOLIO_WORKERS.len(),
-        });
-    }
+    // MiniZinc passes `-p <cores>` (8 in the Challenge's Parallel and Open
+    // classes). A core count is a resource grant, not a request AY can get
+    // wrong: run at most one worker per distinct portfolio configuration, and
+    // treat 0 as 1.
+    let parallel_workers = parallel_workers.clamp(1, PORTFOLIO_WORKERS.len());
     // A caller-provided probe can reject early, but is never authoritative:
     // every context built below rechecks its own `unsupported` list.
     if let Some(unsupported) = prechecked_unsupported {
@@ -298,6 +329,7 @@ fn cmd_solve_cp_with_writers(
                 )?;
             }
             let mut ctx = CpContext::new();
+            ctx.engine.set_memory_budget(engine_memory_share(1));
             ctx.build_model(model)?;
             if reject_unsupported_constraints(&ctx.unsupported, out, err)? {
                 return Ok(());
@@ -316,9 +348,8 @@ fn cmd_solve_cp_with_writers(
             // assignments without constructing the generic order encoding.
             // All generic solver paths still capacity-check before requesting
             // order literals.
-            if ctx.engine.try_pre_compile().is_err() {
-                writeln!(out, "=====UNKNOWN=====")?;
-                return Ok(());
+            if let Err(capacity) = ctx.engine.try_pre_compile() {
+                return Err(Fzn2smtError::CpEncodingCapacity(capacity.to_string()));
             }
             if let Some(dl) = deadline {
                 // Use set_deadline so the timer starts AFTER encoding,
@@ -340,6 +371,13 @@ fn cmd_solve_cp_with_writers(
     }
 
     Ok(())
+}
+
+/// The process memory each of `engines` concurrent CP engines may plan with:
+/// an equal share of the limit `ay flatzinc solve` stops at
+/// ([`crate::memory_guard`]), or `0` (no bound) when none is set.
+pub(crate) fn engine_memory_share(engines: usize) -> usize {
+    ay_sys::get_process_memory_limit() / engines.max(1)
 }
 
 pub fn unsupported_constraints(model: &FznModel) -> Result<Vec<String>> {
@@ -449,8 +487,10 @@ fn run_satisfaction_worker(
     deadline: Option<Instant>,
     config: PortfolioWorkerConfig,
     cancellation: Arc<AtomicBool>,
+    workers: usize,
 ) -> Result<SolveCpReport> {
     let mut ctx = CpContext::new();
+    ctx.engine.set_memory_budget(engine_memory_share(workers));
     // Portfolio winner cancellation and the coordinator deadline use one flag.
     // Do not install a separate engine deadline below: that would let workers
     // clear or replace each other's shared cancellation state.
@@ -472,12 +512,11 @@ fn run_satisfaction_worker(
     }
     apply_search_annotations(&mut ctx, &model.solve.annotations);
     ctx.set_default_search_vars_if_missing();
-    if ctx.engine.try_pre_compile().is_err() {
-        writeln!(stdout, "=====UNKNOWN=====")?;
-        return Ok(SolveCpReport {
-            status: SolveCpStatus::Unknown,
-            stdout,
-        });
+    if let Err(capacity) = ctx.engine.try_pre_compile() {
+        // Every worker builds the same model, so all of them decline alike;
+        // the portfolio reports the error and the caller may use another
+        // backend.
+        return Err(Fzn2smtError::CpEncodingCapacity(capacity.to_string()));
     }
     if cancellation.load(Ordering::Acquire) {
         writeln!(stdout, "=====UNKNOWN=====")?;
@@ -549,12 +588,12 @@ fn solve_satisfaction_parallel_with_activity(
                         stdout: b"=====UNKNOWN=====\n".to_vec(),
                     })
                 } else {
-                    run_satisfaction_worker(&model, deadline, config, cancellation)
+                    run_satisfaction_worker(&model, deadline, config, cancellation, worker_count)
                 };
                 #[cfg(not(test))]
                 let result = {
                     let _ = behavior;
-                    run_satisfaction_worker(&model, deadline, config, cancellation)
+                    run_satisfaction_worker(&model, deadline, config, cancellation, worker_count)
                 };
                 let _ = tx.send(result);
             })?;
@@ -712,7 +751,70 @@ impl CpContext {
             self.translate_constraint(constraint)?;
         }
         self.mark_unresolved_output_arrays_unsupported();
+        self.install_witness_from_env();
         Ok(())
+    }
+
+    /// Debug aid: when `AY_CP_WITNESS` names a file holding a known solution
+    /// in FlatZinc output form (`name = value;` and `name = [v, ...];` or
+    /// `array1d(.., [v, ...])` lines, Booleans as `true`/`false`), hand it
+    /// to the engine, which then reports every propagator clause the
+    /// solution falsifies (see `CpSatEngine::set_witness`). Name every
+    /// FlatZinc variable (for instance by annotating them all `output_var`
+    /// for a reference solver) to check every clause.
+    fn install_witness_from_env(&mut self) {
+        let Some(path) = std::env::var_os("AY_CP_WITNESS") else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!(
+                    "ay-cp witness: cannot read {}: {err}",
+                    path.to_string_lossy()
+                );
+                return;
+            }
+        };
+        let values = self.parse_witness(&text);
+        eprintln!(
+            "ay-cp witness: {} values from {}",
+            values.len(),
+            path.to_string_lossy()
+        );
+        self.engine.set_witness(&values);
+    }
+
+    fn parse_witness(&self, text: &str) -> Vec<(IntVarId, i64)> {
+        let parse_value = |token: &str| match token.trim() {
+            "true" => Some(1),
+            "false" => Some(0),
+            other => other.parse::<i64>().ok(),
+        };
+        let mut values = Vec::new();
+        for line in text.lines() {
+            let Some((name, rhs)) = line.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            let rhs = rhs.trim().trim_end_matches(';').trim();
+            if let (Some(open), Some(close)) = (rhs.rfind('['), rhs.rfind(']')) {
+                let Some(ids) = self.array_var_map.get(name) else {
+                    continue;
+                };
+                let Some(items) = rhs.get(open + 1..close) else {
+                    continue;
+                };
+                for (&id, item) in ids.iter().zip(items.split(',')) {
+                    if let Some(value) = parse_value(item) {
+                        values.push((id, value));
+                    }
+                }
+            } else if let (Some(&id), Some(value)) = (self.var_map.get(name), parse_value(rhs)) {
+                values.push((id, value));
+            }
+        }
+        values
     }
 
     fn eval_const_int(&self, expr: &Expr) -> Option<i64> {

@@ -4,7 +4,7 @@
 //! Derived publication through the ordinary database kernel.
 
 use super::*;
-use crate::counted_storage::{try_reserve, try_reserved_exact, Result};
+use crate::counted_storage::{try_reserve, Result};
 use crate::decision_trace::counted_decision::invalid;
 use ay_core::original_query::{CountedAdmission, CountedAdmissionError};
 
@@ -132,11 +132,13 @@ impl Solver {
         let end = offset
             .checked_add(1)
             .ok_or_else(|| owner.refuse(CountedAdmissionError::StorageExhausted))?;
-        if self.cold.clause_ids.capacity() == 0 && self.cold.clause_ids_reserve_hint > 0 {
-            self.cold.clause_ids = try_reserved_exact(owner, self.cold.clause_ids_reserve_hint)?;
+        let hint = self.cold.clause_ids_reserve_hint;
+        if !self.cold.clause_ids.is_allocated() && hint > 0 {
+            self.cold
+                .clause_ids
+                .try_reserve_exact_len_counted(owner, hint)?;
         }
-        let extra = end.saturating_sub(self.cold.clause_ids.len());
-        try_reserve(owner, &mut self.cold.clause_ids, extra)?;
+        self.cold.clause_ids.try_reserve_len_counted(owner, end)?;
         owner.admit(end.saturating_sub(self.cold.clause_ids.len()), 0)?;
         if self.cold.incremental_solve_count > 0 {
             let extra = end.saturating_sub(self.cold.clause_birth_solve.len());

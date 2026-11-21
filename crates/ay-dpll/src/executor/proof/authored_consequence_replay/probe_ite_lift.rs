@@ -67,6 +67,13 @@
 //! and the caller's unchanged whole-proof strict check still gates the
 //! rebuilt candidate. A declined leaf leaves the trust step byte-identical.
 //!
+//! The native clausification producer also reuses this checked emitter for
+//! individual consequences of an immutable native source. It authenticates
+//! every original occurrence against the current query epoch, then independently
+//! proves `H => G`; a target need not equal the complete arithmetic-ITE lift.
+//! Boolean equality congruence followed by equivalence elimination covers
+//! equality predicates when a direct EUF transfer plan does not apply.
+//!
 //! Why no theory oracle carries the arithmetic here: the closer's LRA oracle
 //! asserts only atoms over pure linear terms
 //! (`term_is_pure_linear_arith`), and this family's atoms are over
@@ -93,9 +100,9 @@ const MAX_LIFT_TRANSFERS: usize = 128;
 /// Subterm visits any single structural walk may spend.
 const MAX_LIFT_TERM_WORK: usize = 8_192;
 
-/// One promotable trust unit: `source` is the probe assertion (or its
-/// `and`-conjunct reached by `path` from `root`) whose arithmetic-ITE lift IS
-/// the trust term.
+/// An exact source for a candidate trust unit. Legacy plans require its full
+/// arithmetic-ITE lift to match the target; native plans instead authenticate
+/// the original source and let the checked emitter prove the consequence.
 #[derive(Clone)]
 struct LiftPlan {
     root: TermId,
@@ -140,11 +147,11 @@ fn bool_node(terms: &TermStore, term: TermId) -> BoolNode {
     }
 }
 
-/// Every distinct NON-Bool `ite` of `term`, in first-visit order. `None`
-/// when the walk meets a binder or `let`, a condition spelled as a negation
-/// (the branch clauses would need a double-negation bridge), a NESTED
-/// term-level `ite` (its raw substitution would mint an `ite` no `ite_intro`
-/// covers), or more sites than [`MAX_LIFT_ITE_TERMS`].
+/// Every distinct NON-Bool `ite` of `term`, with enclosing sites first.
+/// A branch may contain another original site. Replacing its enclosing site
+/// before replacing the branch's site avoids minting a new numeric `ite`
+/// that no `ite_intro` covers. A condition containing a numeric site, a
+/// negated condition, binders, and shapes beyond the site cap still decline.
 fn collect_ite_sites(terms: &TermStore, term: TermId) -> Option<Vec<IteSite>> {
     let mut sites: Vec<IteSite> = Vec::new();
     let mut stack = vec![term];
@@ -181,17 +188,28 @@ fn collect_ite_sites(terms: &TermStore, term: TermId) -> Option<Vec<IteSite>> {
             _ => return None,
         }
     }
-    // No nesting: a site's own subterms must hold no other site.
+    // Proper descendants always have fewer descendants than their parents.
+    // Stable ordering preserves the previous order for independent sites.
+    let mut ranked = Vec::with_capacity(sites.len());
     for site in &sites {
-        for &part in &[site.cond, site.then_branch, site.else_branch] {
-            for other in &sites {
-                if contains_term(terms, part, other.term) {
+        let mut descendants = 0usize;
+        for other in &sites {
+            if contains_term(terms, site.cond, other.term) {
+                return None;
+            }
+            if contains_term(terms, site.then_branch, other.term)
+                || contains_term(terms, site.else_branch, other.term)
+            {
+                if site.term == other.term {
                     return None;
                 }
+                descendants += 1;
             }
         }
+        ranked.push((descendants, *site));
     }
-    Some(sites)
+    ranked.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+    Some(ranked.into_iter().map(|(_, site)| site).collect())
 }
 
 /// Whether `needle` occurs in `haystack` (inclusive), bounded.
@@ -368,6 +386,24 @@ impl LiftDatabase {
     }
 }
 
+/// A private cumulative closer-work allowance. Reserving an attempt charges
+/// its full ceiling even if it declines; no source/target pair can reset it.
+struct LiftClosureBudget {
+    remaining: u64,
+    per_attempt: u64,
+}
+
+impl LiftClosureBudget {
+    fn reserve(&mut self) -> Option<u64> {
+        let allowance = self.remaining.min(self.per_attempt);
+        if allowance == 0 {
+            return None;
+        }
+        self.remaining -= allowance;
+        Some(allowance)
+    }
+}
+
 impl Executor {
     /// Replace every probe-local premiseless `trust` unit whose term is the
     /// arithmetic-ITE LIFT of a probe assertion (or of a positional
@@ -397,6 +433,17 @@ impl Executor {
             return;
         };
 
+        self.promote_planned_ite_lift_units(proof, &plans, None);
+    }
+
+    /// Common checked emitter; its caller supplies only a bounded source plan.
+    /// A plan is a hint: closure and the whole-proof checker still re-prove it.
+    fn promote_planned_ite_lift_units(
+        &mut self,
+        proof: &mut Proof,
+        plans: &[Option<LiftPlan>],
+        mut closure_budget: Option<&mut LiftClosureBudget>,
+    ) -> usize {
         let mut rebuilt = Proof::new();
         let mut root_units: HashMap<TermId, ProofId> = HashMap::default();
         let mut remap: Vec<ProofId> = Vec::with_capacity(proof.steps.len());
@@ -404,25 +451,35 @@ impl Executor {
         for (index, step) in proof.steps.iter().cloned().enumerate() {
             if let (Some(plan), ProofStep::Step { clause, .. }) = (&plans[index], &step) {
                 if let Some(&target) = clause.first() {
-                    let snapshot = rebuilt.steps.len();
-                    if let Some(unit) =
-                        self.emit_probe_ite_lift_unit(&mut rebuilt, &mut root_units, plan, target)
-                    {
-                        replay_note(|| {
-                            format!(
-                                "ite-lift: derived trust unit at probe step {index} from {} steps",
-                                rebuilt.steps.len() - snapshot
-                            )
-                        });
-                        remap.push(unit);
-                        promoted += 1;
-                        continue;
+                    let allowance = match closure_budget.as_deref_mut() {
+                        Some(budget) => budget.reserve().map(Some),
+                        None => Some(None),
+                    };
+                    if let Some(step_limit) = allowance {
+                        let snapshot = rebuilt.steps.len();
+                        if let Some(unit) = self.emit_probe_ite_lift_unit(
+                            &mut rebuilt,
+                            &mut root_units,
+                            plan,
+                            target,
+                            step_limit,
+                        ) {
+                            replay_note(|| {
+                                format!(
+                                    "ite-lift: derived trust unit at probe step {index} from {} steps",
+                                    rebuilt.steps.len() - snapshot
+                                )
+                            });
+                            remap.push(unit);
+                            promoted += 1;
+                            continue;
+                        }
+                        // Decline for this leaf: roll back everything it added,
+                        // including any assume it minted, and copy the step.
+                        rebuilt.steps.truncate(snapshot);
+                        root_units.retain(|_, id| (id.0 as usize) < snapshot);
+                        replay_note(|| format!("ite-lift: decline at probe step {index}"));
                     }
-                    // Decline for this leaf: roll back everything it added,
-                    // including any assume it minted, and copy the step.
-                    rebuilt.steps.truncate(snapshot);
-                    root_units.retain(|_, id| (id.0 as usize) < snapshot);
-                    replay_note(|| format!("ite-lift: decline at probe step {index}"));
                 }
             }
 
@@ -455,7 +512,7 @@ impl Executor {
             remap.push(rebuilt.add_step(step));
         }
         if promoted == 0 {
-            return;
+            return 0;
         }
 
         let mut remapped_named = proof.named_steps.clone();
@@ -469,6 +526,7 @@ impl Executor {
         });
         rebuilt.named_steps = remapped_named;
         *proof = rebuilt;
+        promoted
     }
 
     fn consequence_probe_ite_lift_plans(
@@ -572,12 +630,25 @@ impl Executor {
         root_units: &mut HashMap<TermId, ProofId>,
         plan: &LiftPlan,
         target: TermId,
+        step_limit: Option<u64>,
     ) -> Option<ProofId> {
         let source = plan.source;
         let sites = collect_ite_sites(&self.ctx.terms, source)?;
-        if sites.is_empty() {
+        if sites.is_empty() && !matches!(self.ctx.terms.get(source), TermData::Ite(..)) {
+            replay_note(|| format!("ite-lift: source {} has no admitted ITE", source.0));
             return None;
         }
+        // A Boolean ITE needs no term-equality lifting. Its own ITE Boolean
+        // rules below independently derive branch clauses from the source
+        // unit, including the checked AndPos path when it was a conjunct.
+        replay_note(|| {
+            format!(
+                "ite-lift: source={} target={} sites={}",
+                source.0,
+                target.0,
+                sites.len()
+            )
+        });
 
         // (1) The source as a unit: the authored assume plus its `and_pos`
         // projection chain, exactly as the conjunct promoter derives it.
@@ -653,19 +724,36 @@ impl Executor {
             &sites,
             &branch_eqs,
             &source_atoms,
-        )?;
+        );
+        if transferred.is_none() {
+            replay_note(|| "ite-lift: congruence transfers declined".to_owned());
+        }
+        let transferred = transferred?;
 
         // (5) Substituted atoms the lift folded away or re-spelled.
-        self.emit_probe_lift_bridges(
+        let bridges = self.emit_probe_lift_bridges(
             rebuilt,
             &mut database,
             &transferred,
             &source_atoms,
             &target_atoms,
-        )?;
+        );
+        if bridges.is_none() {
+            replay_note(|| "ite-lift: checked arithmetic bridges declined".to_owned());
+        }
+        bridges?;
 
         // (6) Propositional closure to exactly `(cl target)`.
-        self.close_probe_lift_database(rebuilt, &database, target)
+        let closed = self.close_probe_lift_database(rebuilt, &database, target, step_limit);
+        replay_note(|| {
+            format!(
+                "ite-lift: target={} closure={} seeded_clauses={}",
+                target.0,
+                closed.is_some(),
+                database.versions.len()
+            )
+        });
+        closed
     }
 
     /// `ite_intro` ⊢ `(= H (and H (ite c (= x u) (= x v))))`, then
@@ -912,12 +1000,52 @@ impl Executor {
                 let not_eq = self.ctx.terms.mk_not_raw(eq);
                 let not_atom = self.probe_lift_negated_literal(atom);
                 let not_substituted = self.probe_lift_negated_literal(substituted);
-                for clause in [
+                for (direction, clause) in [
                     vec![not_eq, not_atom, substituted],
                     vec![not_eq, atom, not_substituted],
-                ] {
-                    let plan = self.plan_euf_lemma_with_budget(&clause, &mut planning)?;
-                    let id = self.emit_euf_lemma(rebuilt, &plan);
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let id = if let Some(plan) =
+                        self.plan_euf_lemma_with_budget(&clause, &mut planning)
+                    {
+                        self.emit_euf_lemma(rebuilt, &plan)
+                    } else {
+                        // Equality predicates also obey congruence. The generic
+                        // equality-chain planner can decline a direct transfer
+                        // which is just one reversed equality hypothesis. Prove
+                        // equality of the two Boolean applications instead, then
+                        // eliminate it with the ordinary equivalence rule.
+                        let equivalent = self.ctx.terms.mk_app(
+                            Symbol::named("="),
+                            [atom, substituted],
+                            Sort::Bool,
+                        );
+                        let plan =
+                            self.plan_euf_lemma_with_budget(&[not_eq, equivalent], &mut planning)?;
+                        let congruence = self.emit_euf_lemma(rebuilt, &plan);
+                        let not_equivalent = self.ctx.terms.mk_not_raw(equivalent);
+                        let mut implication = vec![not_equivalent];
+                        implication.extend_from_slice(&clause[1..]);
+                        let implication = rebuilt.add_rule_step(
+                            if direction == 0 {
+                                AletheRule::EquivPos2
+                            } else {
+                                AletheRule::EquivPos1
+                            },
+                            implication,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                        replay_note(|| {
+                            format!(
+                            "ite-lift: Boolean congruence transfer atom={} substituted={} direction={direction}",
+                            atom.0, substituted.0,
+                        )
+                        });
+                        rebuilt.add_resolution(clause, equivalent, congruence, implication)
+                    };
                     let emitted = step_clause(rebuilt, id)?;
                     database.push(emitted, id);
                 }
@@ -1046,6 +1174,7 @@ impl Executor {
         rebuilt: &mut Proof,
         database: &LiftDatabase,
         target: TermId,
+        step_limit: Option<u64>,
     ) -> Option<ProofId> {
         let mut atom_to_var: HashMap<TermId, u32> = HashMap::default();
         let mut var_to_term: HashMap<u32, TermId> = HashMap::default();
@@ -1083,6 +1212,7 @@ impl Executor {
         }
         let target_sat = vec![literal_of(&self.ctx.terms, target)?];
         let mut manager = crate::SatProofManager::new(&var_to_term, &mut self.ctx.terms);
+        manager.set_step_budget(step_limit);
         manager.close_target_over_seeded_clauses(&sat_versions, &target_sat, rebuilt)
     }
 }
@@ -1090,3 +1220,5 @@ impl Executor {
 #[cfg(test)]
 #[path = "probe_ite_lift_tests.rs"]
 mod tests;
+
+mod native_clausification;

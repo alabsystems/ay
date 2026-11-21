@@ -288,13 +288,13 @@ pub(super) fn capture<'a>(
     // Borrow exact signatures once, paying all inventory scans. No RefCell
     // borrow survives into recovery, and no whole signature is cloned per app.
     let mut signatures: Vec<(&str, &SymbolInfo)> = Vec::new();
-    let mut adopted = Vec::new();
+    let mut adopted = Set::default();
     for slots in ctx.model_recovery_scan_capacities() {
         pay(slots, 0)?;
     }
     for id in ctx.model_recovery_adopted_declarations() {
         entries(pay, 1)?;
-        adopted.push(id);
+        adopted.insert(id);
     }
     for (surface, info) in ctx.model_recovery_symbol_iter() {
         probe.check("declaration-signature", None, None);
@@ -302,11 +302,9 @@ pub(super) fn capture<'a>(
         if info.declaration_kind() != DeclarationKind::Uninterpreted {
             continue;
         }
-        let mut is_adopted = false;
-        for id in &adopted {
-            pay(1, 0)?;
-            is_adopted |= *id == info.declaration_id();
-        }
+        // A set lookup, not a scan of every adopted id per symbol (AY-SMT-3).
+        pay(1, 0)?;
+        let is_adopted = adopted.contains(&info.declaration_id());
         if is_adopted || !supported(ctx, &info.sort, pay)? {
             continue;
         }
@@ -329,6 +327,18 @@ pub(super) fn capture<'a>(
         signatures.push((identity, info));
     }
 
+    // The signatures each application can match, by identity, in their
+    // original order (AY-SMT-3): every other entry was skipped by the
+    // `identity != symbol.name()` test below, after a scan of all of them per
+    // application.
+    let mut signatures_by_identity: Map<&str, Vec<(&str, &SymbolInfo)>> = Map::default();
+    for &(identity, info) in &signatures {
+        entries(pay, 1)?;
+        signatures_by_identity
+            .entry(identity)
+            .or_default()
+            .push((identity, info));
+    }
     let mut admitted = Vec::new();
     for &term in &scope {
         let TermData::App(symbol, arguments) = terms.get(term) else {
@@ -336,7 +346,11 @@ pub(super) fn capture<'a>(
         };
         probe.check("application-signature", Some(term), None);
         let mut selected: Option<&SymbolInfo> = None;
-        for &(identity, info) in &signatures {
+        pay(1, 0)?;
+        let candidates = signatures_by_identity
+            .get(symbol.name())
+            .map_or(&[][..], Vec::as_slice);
+        for &(identity, info) in candidates {
             charge(pay, &[1, identity.len(), symbol.name().len()], &[])?;
             // Indexed syntax cannot impersonate a named declaration. It needs
             // its own declaration resolver before this fragment may accept it.
@@ -383,6 +397,11 @@ pub(super) fn capture<'a>(
         });
     }
     let aliases = boolean_aliases(ctx, &scope, &relations, euf, lia, &booleans, pay, probe)?;
+    let mut admitted_sources = Set::default();
+    for app in &admitted {
+        entries(pay, 1)?;
+        admitted_sources.insert(app.source);
+    }
     let mut completed_outputs = 0usize;
     let mut nodes = Vec::new();
     let mut by_term = Map::default();
@@ -400,13 +419,8 @@ pub(super) fn capture<'a>(
             None => {
                 let mut admitted_bool = false;
                 if matches!(terms.sort(term), Sort::Bool) {
-                    for app in &admitted {
-                        pay(1, 0)?;
-                        if app.source == term {
-                            admitted_bool = true;
-                            break;
-                        }
-                    }
+                    pay(1, 0)?;
+                    admitted_bool = admitted_sources.contains(&term);
                 }
                 if !admitted_bool && alias.is_none() {
                     // A guard may short-circuit before evaluating this Var.
@@ -458,16 +472,38 @@ pub(super) fn capture<'a>(
             pending_completion,
         });
     }
+    // The nodes of each live class, in node order (AY-SMT-3). The pin and
+    // semantic-peer passes below visited every node per pinned term or peer
+    // and kept exactly these; on SMT-COMP incremental QF_AUFLIA 2721719d
+    // (985 nodes) those all-node scans and the pair scans of the closure
+    // took about 1 s of every check-sat that reached this recovery.
+    let mut nodes_of_class: Map<TermId, Vec<usize>> = Map::default();
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(class) = node.live_class {
+            entries(pay, 1)?;
+            nodes_of_class.entry(class).or_default().push(index);
+        }
+    }
     // Preserve every live-class hard pin, including a peer/constant absent from
     // the root DAG. Peers contribute constraints, never new application roots.
     let mut pin = |term: TermId, value: Atom, pay: &mut Pay<'_>| -> Checked<()> {
         probe.check("hard-pin", Some(term), None);
         let class = root_of(&parents, term, pay)?;
-        for node in &mut nodes {
-            pay(1, 0)?;
-            if node.term != term && (class.is_none() || node.live_class != class) {
-                continue;
+        // Exactly the nodes the former all-node scan kept: the node of `term`
+        // itself, and every node of its live class, once each, in node order.
+        let mut targets: Vec<usize> = class
+            .and_then(|class| nodes_of_class.get(&class))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(&own) = by_term.get(&term) {
+            if !targets.contains(&own) {
+                targets.push(own);
+                targets.sort_unstable();
             }
+        }
+        entries(pay, targets.len())?;
+        for index in targets {
+            let node = &mut nodes[index];
             if !same_sort(node.sort, terms.sort(term), pay)? {
                 return Err(Refusal::Conflict);
             }
@@ -536,13 +572,14 @@ pub(super) fn capture<'a>(
     // Only actual free applications, ordinary variables and rigid constants
     // are model leaves. Arithmetic, Boolean structure and ITEs are evaluated
     // exactly under current leaves, never keyed by speculative raw mappings.
+    let mut app_outputs = Set::default();
+    for app in &apps {
+        entries(pay, 1)?;
+        app_outputs.insert(app.output);
+    }
     for (index, node) in nodes.iter_mut().enumerate() {
         pay(1, 0)?;
-        let mut free_output = false;
-        for app in &apps {
-            pay(1, 0)?;
-            free_output |= app.output == index;
-        }
+        let free_output = app_outputs.contains(&index);
         node.leaf = node.alias.is_none()
             && (free_output
                 || matches!(terms.get(node.term), TermData::Var(..) | TermData::Const(_)));
@@ -559,15 +596,14 @@ pub(super) fn capture<'a>(
         let Some(class) = root_of(&parents, term, pay)? else {
             continue;
         };
-        for node in &nodes {
-            pay(1, 0)?;
-            if node.live_class == Some(class) {
-                if !same_sort(terms.sort(term), node.sort, pay)? {
-                    return Err(Refusal::Conflict);
-                }
-                entries(pay, 1)?;
-                semantic_peers.push((term, node.term));
+        pay(1, 0)?;
+        for &index in nodes_of_class.get(&class).map_or(&[][..], Vec::as_slice) {
+            let node = &nodes[index];
+            if !same_sort(terms.sort(term), node.sort, pay)? {
+                return Err(Refusal::Conflict);
             }
+            entries(pay, 1)?;
+            semantic_peers.push((term, node.term));
         }
     }
     let mut equalities = Vec::new();

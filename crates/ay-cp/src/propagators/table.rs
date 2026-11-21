@@ -94,15 +94,16 @@ impl Table {
         }
     }
 
-    /// Build explanation reasons from all variables' current bounds and
-    /// domain holes (excluding var at `skip_idx`).
+    /// Build explanation reasons from all variables' current bounds
+    /// (excluding var at `skip_idx`).
     ///
-    /// For each variable, includes `[var >= lb]`, `[var <= ub]`, and for each
-    /// hole value `w` in `[lb, ub]` where `!trail.contains(var, w)`, includes
-    /// `[var >= w+1]` as a reason. The hole literals are necessary for
-    /// soundness: `supported_tuples()` uses exact domain membership via
-    /// `trail.contains()`, so the explanation must also account for holes,
-    /// not just bounds.
+    /// `compute_supported` reads exact domain membership, but the trail
+    /// only ever tightens bounds: a value missing inside `[lb, ub]` is a hole
+    /// of the root domain, excluded for good by the clauses
+    /// `prepare_domain_holes` adds before search. It holds in every solution
+    /// and needs no reason literal. (Before 2026-11-18 each hole `w` added
+    /// `[var >= w + 1]` as a "reason": a literal false on the trail, which
+    /// made the clause non-unit, a conflict that was no conflict.)
     ///
     /// Returns `None` if any required literal lookup fails, indicating the
     /// encoder is missing pre-allocated literals for the current trail bounds.
@@ -118,16 +119,8 @@ impl Table {
             if j == skip_idx {
                 continue;
             }
-            let lb = trail.lb(var);
-            let ub = trail.ub(var);
-            reasons.push(encoder.lookup_ge(var, lb)?);
-            reasons.push(encoder.lookup_le(var, ub)?);
-            // Include domain hole reasons (same pattern as AllDifferentAc).
-            for w in lb..=ub {
-                if !trail.contains(var, w) {
-                    reasons.push(encoder.lookup_ge(var, w + 1)?);
-                }
-            }
+            reasons.push(encoder.lookup_ge(var, trail.lb(var))?);
+            reasons.push(encoder.lookup_le(var, trail.ub(var))?);
         }
         Some(reasons)
     }

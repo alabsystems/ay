@@ -290,7 +290,7 @@ fn test_factorize_missing_er_source_id_skips_before_mutation() {
         solver.cold.clause_ids[missing_source], 0,
         "source clause should start with a tracked clause ID"
     );
-    solver.cold.clause_ids[missing_source] = 0;
+    solver.cold.clause_ids.set(missing_source, 0);
 
     let num_vars_before = solver.num_vars;
     let active_before = solver.arena.active_clause_count();
@@ -387,7 +387,7 @@ fn test_factorize_lrat_missing_source_id_skips_before_mutation() {
         solver.cold.clause_ids[missing_source], 0,
         "source clause should start with a real LRAT ID"
     );
-    solver.cold.clause_ids[missing_source] = 0;
+    solver.cold.clause_ids.set(missing_source, 0);
     assert!(
         !solver.factor_result_has_lrat_transaction_contract(&planned),
         "missing source ID must reject before any factor mutation"
@@ -1203,4 +1203,47 @@ fn test_factor_lrat_dry_run_fails_closed_on_self_subsuming_factor() {
         Err(FactorLratTransactionReject::SelfSubsumingUnsupported),
         "self-subsuming factor results need a separate checker-visible LRAT contract"
     );
+}
+
+/// AY-SAT-1: the factor engine's literal-indexed arrays are allocated on the
+/// first factoring round. A round on a lazily built engine gives exactly what
+/// it gives on one whose arrays were allocated before any clause was added
+/// (the old eager construction).
+#[test]
+fn test_factorize_lazy_arrays_match_eager_arrays() {
+    let run = |eager: bool| {
+        let mut solver = Solver::new(5);
+        assert!(!solver.inproc.factor_engine.arrays_allocated());
+        if eager {
+            let num_vars = solver.num_vars;
+            solver.inproc.factor_engine.ensure_num_vars(num_vars);
+        }
+        for clause in ternary_factor_matrix() {
+            solver.add_clause(clause);
+        }
+        solver.factorize();
+        let mut clauses: Vec<Vec<usize>> = solver
+            .arena
+            .active_indices()
+            .map(|idx| {
+                let mut lits: Vec<usize> = solver
+                    .arena
+                    .literals(idx)
+                    .iter()
+                    .map(|lit| lit.index())
+                    .collect();
+                lits.sort_unstable();
+                lits
+            })
+            .collect();
+        clauses.sort();
+        (
+            solver.num_vars,
+            solver.er_extension_definition_count(),
+            clauses,
+        )
+    };
+    let lazy = run(false);
+    assert_eq!(lazy, run(true));
+    assert_eq!(lazy.1, 1, "the matrix factors once");
 }

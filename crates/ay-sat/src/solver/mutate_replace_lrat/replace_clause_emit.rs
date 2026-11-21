@@ -24,7 +24,7 @@ impl Solver {
                 clause_idx,
                 self.cold.clause_ids.len()
             );
-            self.cold.clause_ids[clause_idx] = new_clause_id;
+            self.cold.clause_ids.set(clause_idx, new_clause_id);
             // Do NOT advance next_clause_id here (#5239). Replacement
             // clauses get their IDs from the proof writer. Derived clauses
             // sync next_clause_id from the writer in add_learned_clause.

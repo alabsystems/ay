@@ -7,10 +7,11 @@
 //! The `la_disequality` lowering re-expresses the lemma through the GUARD's own
 //! operands — `(<= lhs rhs)` and `(<= rhs lhs)` — and pairs each with a branch.
 //! That pairing is licensed only while the guard and the branches share one
-//! linear form (`k = 1`). Once the checker accepts a guard scaled by `k >= 2`
+//! linear form when using unit weights (`k = 1`). A guard scaled by `k >= 2`
 //! (`q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`), those two `la_generic` sub-steps stop
 //! holding — `(cl (<= 2q+1 4q+1) (<= 1 q))` is `q >= 0 ∨ q >= 1`, false at
-//! `q = -1` — so the scaled clause must keep the honest `hole` wire instead.
+//! `q = -1`. The checked scale now supplies the required weights `(1, k)`;
+//! negative controls retain the rejection of the old invalid unit weights.
 //!
 //! The primitive lowering reads its operands off the guard AS PRINTED, in the
 //! orientation the clause fixes (`arith_disequality_split.rs`); the carcara
@@ -39,6 +40,111 @@ fn raw2(terms: &mut TermStore, op: &str, a: TermId, b: TermId, sort: Sort) -> Te
 }
 
 #[test]
+fn arithmetic_trichotomy_lowers_every_recorded_literal_order() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let eq = raw2(&mut terms, "=", q, zero, Sort::Bool);
+    let lt = raw2(&mut terms, "<", q, zero, Sort::Bool);
+    let le = raw2(&mut terms, "<=", q, zero, Sort::Bool);
+    let gt = terms.mk_not_raw(le);
+    for clause in [
+        [eq, lt, gt],
+        [eq, gt, lt],
+        [lt, eq, gt],
+        [lt, gt, eq],
+        [gt, eq, lt],
+        [gt, lt, eq],
+    ] {
+        assert!(crate::recognize_arith_clause_tautology(&terms, &clause));
+        let step = ProofStep::TheoryLemma {
+            theory: "arith".into(),
+            clause: clause.to_vec(),
+            farkas: None,
+            kind: TheoryLemmaKind::ArithClauseTautology,
+            lia: None,
+        };
+        let printer = AlethePrinter::new(&terms);
+        let rendered = printer
+            .format_step(&step, ProofId(3))
+            .expect("trichotomy renders");
+        assert!(!rendered.contains(":rule hole"), "{rendered}");
+        let last = rendered.lines().last().expect("final step");
+        assert!(
+            last.starts_with(&format!("(step t3 {} ", printer.format_clause(&clause))),
+            "the recorded order must be restored: {rendered}"
+        );
+        assert!(arith_disequality_split_lowering_supported(
+            &terms,
+            &TheoryLemmaKind::ArithClauseTautology,
+            &clause,
+            None
+        ));
+        assert_carcara_valid("permuted_trichotomy", &rendered);
+    }
+}
+
+#[test]
+fn arithmetic_trichotomy_refuses_forged_guards_and_changed_surface() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let eq = raw2(&mut terms, "=", q, zero, Sort::Bool);
+    let wrong_eq = raw2(&mut terms, "=", q, one, Sort::Bool);
+    let lt = raw2(&mut terms, "<", q, zero, Sort::Bool);
+    let le = raw2(&mut terms, "<=", q, zero, Sort::Bool);
+    let gt = terms.mk_not_raw(le);
+    let forged = [wrong_eq, lt, gt];
+    assert!(!crate::recognize_arith_clause_tautology(&terms, &forged));
+    assert!(!arith_disequality_split_lowering_supported(
+        &terms,
+        &TheoryLemmaKind::ArithClauseTautology,
+        &forged,
+        None
+    ));
+    let clause = [eq, lt, gt];
+    let mut overrides = HashMap::default();
+    overrides.insert(eq, "(= q 1)".to_string());
+    assert!(!arith_disequality_split_lowering_supported(
+        &terms,
+        &TheoryLemmaKind::ArithClauseTautology,
+        &clause,
+        Some(&overrides)
+    ));
+    assert!(!arith_disequality_split_lowering_supported(
+        &terms,
+        &TheoryLemmaKind::Generic,
+        &clause,
+        None
+    ));
+}
+
+#[test]
+fn arithmetic_trichotomy_reproves_the_clause_without_consuming_a_farkas_hint() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let eq = raw2(&mut terms, "=", q, zero, Sort::Bool);
+    let lt = raw2(&mut terms, "<", q, zero, Sort::Bool);
+    let le = raw2(&mut terms, "<=", q, zero, Sort::Bool);
+    let gt = terms.mk_not_raw(le);
+    let step = ProofStep::TheoryLemma {
+        theory: "arith".into(),
+        clause: vec![eq, lt, gt],
+        farkas: Some(ay_core::FarkasAnnotation::from_ints(&[1, 1, 1])),
+        kind: TheoryLemmaKind::ArithClauseTautology,
+        lia: None,
+    };
+    let rendered = AlethePrinter::new(&terms)
+        .format_step(&step, ProofId(3))
+        .expect("the independent derivation renders");
+    assert!(rendered.contains(":rule la_disequality"), "{rendered}");
+    assert!(!rendered.contains(":rule hole"), "{rendered}");
+    assert_carcara_valid("trichotomy_unused_hint", &rendered);
+}
+
+#[test]
 fn primitive_guard_still_lowers_to_la_disequality() {
     let mut terms = TermStore::new();
     let q = terms.mk_var("q", Sort::Int);
@@ -58,12 +164,11 @@ fn primitive_guard_still_lowers_to_la_disequality() {
 }
 
 #[test]
-fn scaled_guard_keeps_the_hole_wire() {
+fn scaled_guard_lowers_with_checked_positive_multipliers() {
     // The dillig12_m clause. The internal strict checker certifies it; the
-    // external lowering cannot reconstruct it, so it must NOT be printed as a
-    // `la_disequality` derivation whose sub-steps do not hold.
+    // weighted external lowering must reconstruct both actual sub-steps.
     let mut terms = TermStore::new();
-    let q = terms.mk_var("_mod_q_0", Sort::Int);
+    let q = terms.mk_var("q", Sort::Int);
     let minus_one = terms.mk_int(BigInt::from(-1));
     let one = terms.mk_int(BigInt::from(1));
     let two = terms.mk_int(BigInt::from(2));
@@ -78,13 +183,59 @@ fn scaled_guard_keeps_the_hole_wire() {
     let step = split_step(vec![first, second, guard]);
 
     let rendered = AlethePrinter::new(&terms)
-        .format_step(&step, ProofId(4))
+        .format_step(&step, ProofId(3))
         .expect("scaled guarded split must still render");
-    assert!(
-        !rendered.contains("la_disequality"),
-        "a scaled guard must not claim the la_disequality lowering: {rendered}"
-    );
-    assert!(rendered.contains("hole"), "{rendered}");
+    assert!(rendered.contains(":rule la_disequality"), "{rendered}");
+    assert!(rendered.contains(":args (1 2)"), "{rendered}");
+    assert!(!rendered.contains(":rule hole"), "{rendered}");
+    assert_carcara_valid("scaled_benchmark", &rendered);
+    for (case, coefficients) in [
+        ("zero", "1 0"),
+        ("wrong_negative_magnitude", "1 (- 1)"),
+        ("wrong", "1 1"),
+    ] {
+        let forged = rendered.replace(":args (1 2)", &format!(":args ({coefficients})"));
+        let (problem, document) = refutation(&forged);
+        if let Some(verdict) = carcara_verdict(case, &problem, &document) {
+            assert_eq!(verdict.lines().next(), Some("invalid"), "{case}: {verdict}");
+        }
+    }
+}
+
+#[test]
+fn scaled_disequality_split_rejects_changed_scale_target_sort_and_surface() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let r = terms.mk_var("r", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let two = terms.mk_int(BigInt::from(2));
+    let first = raw2(&mut terms, "<=", q, minus_one, Sort::Bool);
+    let second = raw2(&mut terms, "<=", one, q, Sort::Bool);
+    let scaled_q = raw2(&mut terms, "*", q, two, Sort::Int);
+    let scaled_r = raw2(&mut terms, "*", r, two, Sort::Int);
+    let valid = raw2(&mut terms, "=", scaled_q, zero, Sort::Bool);
+    let shifted = raw2(&mut terms, "=", scaled_q, one, Sort::Bool);
+    let unrelated = raw2(&mut terms, "=", scaled_r, zero, Sort::Bool);
+    let real_q = terms.mk_var("real_q", Sort::Real);
+    let real_guard = raw2(&mut terms, "=", real_q, real_q, Sort::Bool);
+    for guard in [shifted, unrelated, real_guard] {
+        assert!(!arith_disequality_split_lowering_supported(
+            &terms,
+            &TheoryLemmaKind::ArithClauseTautology,
+            &[first, second, guard],
+            None
+        ));
+    }
+    let mut overrides = HashMap::default();
+    overrides.insert(valid, "(= (* q 2) 1)".to_string());
+    assert!(!arith_disequality_split_lowering_supported(
+        &terms,
+        &TheoryLemmaKind::ArithClauseTautology,
+        &[first, second, valid],
+        Some(&overrides)
+    ));
 }
 
 /// `(cl (<= q 0) (<= 2 q) GUARD)` with `GUARD = (= a b)`, and the printed

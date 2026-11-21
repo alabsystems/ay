@@ -4,32 +4,14 @@
 
 //! MPS and CPLEX LP parsers.
 //!
-//! Both parsers normalize their output to [`crate::model::Problem`]. The
-//! parsers are deliberately tolerant of whitespace (MPS free form) but
-//! reject structurally invalid files.
+//! Both read a file exactly into a [`crate::exact::ExactProblem`]
+//! ([`parse_mps_exact`], [`parse_lp_exact`]), one documented reading per
+//! construct, and refuse what readers in common use read differently;
+//! [`parse_mps`] and [`parse_lp`] are its floating-point copy.
 
 pub(crate) mod lp;
 pub(crate) mod lp_tok;
 pub(crate) mod mps;
 
-pub use lp::parse_lp;
+pub use lp::{parse_lp, parse_lp_exact};
 pub use mps::{parse_mps, parse_mps_exact};
-
-/// Add two parser-produced finite values without letting an aggregate overflow
-/// smuggle an infinity into the normalized problem.
-pub(crate) fn checked_finite_add(
-    left: f64,
-    right: f64,
-    line: usize,
-    field: &str,
-) -> Result<f64, crate::error::LpError> {
-    let sum = left + right;
-    if sum.is_finite() {
-        Ok(sum)
-    } else {
-        Err(crate::error::LpError::Parse {
-            line,
-            msg: format!("{field} exceeds the finite numeric range"),
-        })
-    }
-}

@@ -1011,6 +1011,7 @@ impl Executor {
         // resolution reproduces the leaf's own clause, so every downstream
         // consumer is untouched. See `la_disequality_split`.
         let _derived_la_disequality_splits = self.derive_la_disequality_split_lemmas(proof);
+        self.replace_with_checked_small_integer_leaves(proof);
         // A document that still carries NO derivation — a bare `trust`/`hole`
         // closer, as a solve with no clause trace or a poisoned rewrite leaves
         // it — is refuted exactly when the authored roots hold a complementary

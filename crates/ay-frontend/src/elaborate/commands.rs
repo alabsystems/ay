@@ -14,6 +14,9 @@ use super::{
 };
 
 mod function_lookup;
+mod native_owned_constant;
+mod native_owned_function;
+pub use native_owned_constant::NativeOwnedConstantError;
 mod proof_definition_lookup;
 mod sort_surface;
 mod symbol_registration;
@@ -154,6 +157,7 @@ impl Context {
 
     /// Push a scope
     pub(crate) fn push(&mut self) {
+        self.advance_source_revision();
         self.scopes.push(ScopeFrame {
             symbols: HashMap::default(),
             assertion_count: self.assertions.len(),
@@ -170,12 +174,14 @@ impl Context {
             authored_assertion_count: self.authored_assertions.len(),
             polymorphic_declarations: Vec::new(),
         });
-        self.advance_source_revision();
     }
 
     /// Pop a scope. Returns `true` on success, `false` on underflow (no scopes).
     pub(crate) fn pop(&mut self) -> bool {
         if let Some(frame) = self.scopes.pop() {
+            // Retire leases before restoring any table. An allocation failure
+            // or unwind during a partial restore must not leave old authority.
+            self.advance_source_revision();
             // Restore the exact outer binding state. A scoped overload shares
             // its surface name with an outer declaration, so deleting by name
             // would incorrectly destroy the surviving declaration on pop.
@@ -278,7 +284,6 @@ impl Context {
                         .any(|name| name == &declaration.name)
                 });
             }
-            self.advance_source_revision();
             true
         } else {
             false
@@ -304,14 +309,17 @@ impl Context {
     /// without requiring a scope frame. Only intended for internal `__ay_*`
     /// symbols the solver created itself.
     pub fn remove_symbols(&mut self, names: &[String]) {
-        let mut changed = false;
-        for name in names {
-            changed |= self.symbols.remove(name).is_some();
-            changed |= self.overloaded_symbols.remove(name).is_some();
-            changed |= self.internal_symbols.remove(name);
-        }
-        if changed {
+        if names.iter().any(|name| {
+            self.symbols.contains_key(name)
+                || self.overloaded_symbols.contains_key(name)
+                || self.internal_symbols.contains(name)
+        }) {
             self.advance_source_revision();
+        }
+        for name in names {
+            self.symbols.remove(name);
+            self.overloaded_symbols.remove(name);
+            self.internal_symbols.remove(name);
         }
     }
 
@@ -519,11 +527,11 @@ impl Context {
             return false;
         }
         let declaration_id = info.declaration_id().clone();
+        self.advance_source_revision();
         self.adopted_macro_interps
             .insert(name.to_string(), (params.to_vec(), body));
         self.adopted_macro_declaration_ids
             .insert(name.to_string(), declaration_id);
-        self.advance_source_revision();
         true
     }
 
@@ -823,6 +831,7 @@ impl Context {
             return None;
         }
         // Adopt: future (re-)elaborations expand every `f`-application.
+        self.advance_source_revision();
         self.fun_defs
             .insert(fname.clone(), (params, ret_sort, parsed_rhs));
         self.adopted_macro_interps
@@ -832,19 +841,21 @@ impl Context {
         for label in labels {
             self.note_adopted_definition_label(&fname, label);
         }
-        self.advance_source_revision();
         Some(fname)
     }
 
     pub(super) fn rollback_adopted_macro(&mut self, name: &str) {
+        if self.fun_defs.contains_key(name)
+            || self.adopted_macro_interps.contains_key(name)
+            || self.adopted_macro_declaration_ids.contains_key(name)
+        {
+            self.advance_source_revision();
+        }
         self.fun_defs.remove(name);
-        let removed = self.adopted_macro_interps.remove(name).is_some();
+        self.adopted_macro_interps.remove(name);
         self.adopted_macro_declaration_ids.remove(name);
         self.adopted_definition_labels
             .retain(|(adopted, _)| adopted != name);
-        if removed {
-            self.advance_source_revision();
-        }
     }
 
     #[cfg(test)]
@@ -886,11 +897,11 @@ impl Context {
     /// The name is reserved or already names a sort in this scope.
     pub fn bind_native_sort_name(&mut self, name: &str, sort: Sort) -> Result<()> {
         self.ensure_sort_name_available(name)?;
+        self.advance_source_revision();
         self.sort_defs.insert(name.to_string(), sort.clone());
         self.public_sort_defs
             .insert(name.to_string(), super::PublicSort::Core(sort));
         self.track_scoped_sort_def(name.to_string());
-        self.advance_source_revision();
         Ok(())
     }
 
@@ -1092,6 +1103,24 @@ impl Context {
         // trusted alias of a datatype member. Check it before the collision
         // gates: after first registration, metadata intentionally classifies a
         // custom recognizer alias as a datatype-member surface name.
+        let changes_public_identity = replace_public_identity
+            && (self
+                .overloaded_symbols
+                .get(&surface_name)
+                .and_then(|aliases| aliases.iter().find(|info| is_same_engine_alias(info)))
+                .is_some_and(|info| {
+                    info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort
+                })
+                || self
+                    .symbols
+                    .get(&surface_name)
+                    .filter(|info| is_same_engine_alias(info))
+                    .is_some_and(|info| {
+                        info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort
+                    }));
+        if changes_public_identity {
+            self.advance_source_revision();
+        }
         if let Some(info) = self
             .overloaded_symbols
             .get_mut(&surface_name)
@@ -1110,9 +1139,6 @@ impl Context {
                     primary.public_arg_sorts = public_arg_sorts;
                     primary.public_sort = public_sort;
                 }
-                if changed {
-                    self.advance_source_revision();
-                }
                 return Ok(changed);
             }
             return Ok(false);
@@ -1127,9 +1153,6 @@ impl Context {
                     info.public_arg_sorts != public_arg_sorts || info.public_sort != public_sort;
                 info.public_arg_sorts = public_arg_sorts;
                 info.public_sort = public_sort;
-                if changed {
-                    self.advance_source_revision();
-                }
                 return Ok(changed);
             }
             return Ok(false);
@@ -1232,6 +1255,7 @@ impl Context {
     }
 
     pub(super) fn register_overloadable_symbol(&mut self, name: String, info: SymbolInfo) {
+        self.advance_source_revision();
         if self.global_declarations_enabled() {
             self.propagate_global_overload_to_snapshots(&name, &info);
         } else {
@@ -1247,7 +1271,6 @@ impl Context {
         }
 
         self.symbols.insert(name.clone(), info);
-        self.advance_source_revision();
     }
 
     fn propagate_global_symbol_replacement_to_snapshots(&mut self, name: &str, info: &SymbolInfo) {
@@ -2127,6 +2150,7 @@ impl Context {
                 Ok(None)
             }
             Command::ResetAssertions => {
+                self.advance_source_revision();
                 if self.strict_logic_compliance {
                     // SMT-LIB 2.7 removes every assertion level beyond the
                     // first. Popping the frames (instead of merely clearing
@@ -2170,7 +2194,6 @@ impl Context {
                 self.authored_assertions.clear();
                 self.materialized_polymorphic_assertions = 0;
                 self.polymorphic_instantiation_complete = true;
-                self.advance_source_revision();
                 Ok(None)
             }
             // Declare/define sort are stored but don't produce output
@@ -2195,6 +2218,7 @@ impl Context {
                 }
                 // Store a nominal identity that is never reused while terms
                 // from this context may survive a later scope pop.
+                self.advance_source_revision();
                 let identity = self.allocate_nominal_sort_identity(name, name);
                 let sort = Sort::Uninterpreted(identity);
                 self.sort_defs.insert(name.clone(), sort.clone());
@@ -2203,13 +2227,11 @@ impl Context {
                     super::PublicSort::Core(Sort::Uninterpreted(name.clone())),
                 );
                 self.track_scoped_sort_def(name.clone());
-                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
             Command::DeclareSortParameter(name) => {
                 self.declare_sort_parameter(name)?;
-                self.advance_source_revision();
                 Ok(None)
             }
             Command::DefineSort(name, params, sort) => {
@@ -2224,6 +2246,7 @@ impl Context {
                     )));
                 }
                 self.validate_define_sort_parameters(params, sort)?;
+                self.advance_source_revision();
                 if params.is_empty() {
                     // Monomorphic synonym: eagerly elaborate and store the sort.
                     let public_sort = self.elaborate_public_sort(sort)?;
@@ -2240,7 +2263,6 @@ impl Context {
                         .insert(name.clone(), (params.clone(), sort.clone()));
                 }
                 self.track_scoped_sort_def(name.clone());
-                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -2249,7 +2271,6 @@ impl Context {
                     return Err(ElaborateError::ReservedSymbol(name.clone()));
                 }
                 self.declare_datatype(name, datatype_dec)?;
-                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -2261,7 +2282,6 @@ impl Context {
                     return Err(ElaborateError::ReservedSymbol(sort_dec.name.clone()));
                 }
                 self.declare_datatypes(sort_decs, datatype_decs)?;
-                self.advance_source_revision();
                 self.refresh_polymorphic_declarations()?;
                 Ok(None)
             }
@@ -2535,7 +2555,105 @@ impl Context {
     /// Returns Some((dt_name, ctor_name)) if the symbol is a constructor,
     /// None otherwise. Used by theory solvers to identify constructor applications.
     pub fn is_constructor(&self, name: &str) -> Option<(String, String)> {
-        self.constructors.get(name).cloned()
+        self.constructor_metadata(name)
+            .map(|(datatype, constructor)| (datatype.to_owned(), constructor.to_owned()))
+    }
+
+    /// Borrow a constructor's datatype and member names without copying.
+    pub fn constructor_metadata(&self, name: &str) -> Option<(&str, &str)> {
+        self.constructors
+            .get(name)
+            .map(|(datatype, constructor)| (datatype.as_str(), constructor.as_str()))
+    }
+
+    /// Constructor-table capacity for resource-bounded borrowed lookup.
+    #[doc(hidden)]
+    pub fn native_input_constructor_storage_capacity(&self) -> usize {
+        self.constructors.capacity()
+    }
+
+    /// Sparse backing-table work for a borrowed exact constructor inventory.
+    /// Actual allocated bytes/length include tombstones and retained domains;
+    /// remaining insertion capacity is deliberately not a scan price.
+    #[doc(hidden)]
+    pub fn native_datatype_seed_iteration_work(&self) -> Option<usize> {
+        use ay_core::kani_compat::hash_table_cost as table;
+        table::iteration::<(String, Vec<String>)>(
+            self.datatypes.allocation_size(),
+            self.datatypes.len(),
+        )?
+        .checked_add(table::iteration::<(String, ())>(
+            self.live_datatype_carriers.allocation_size(),
+            self.live_datatype_carriers.len(),
+        )?)?
+        .checked_add(table::iteration::<(String, (String, String))>(
+            self.constructors.allocation_size(),
+            self.constructors.len(),
+        )?)?
+        .checked_add(table::iteration::<(String, SymbolInfo)>(
+            self.datatype_member_symbols.allocation_size(),
+            self.datatype_member_symbols.len(),
+        )?)
+    }
+
+    /// Exact incoming string hash/equality work BEFORE any selected lookup.
+    /// Resource data conveys no declaration identity or inhabitance evidence.
+    #[doc(hidden)]
+    pub fn native_datatype_seed_lookup_work(
+        &self,
+        carrier: &str,
+        member: Option<&str>,
+    ) -> Option<usize> {
+        use ay_core::kani_compat::hash_table_cost as table;
+        let base = table::string_lookup::<(String, Vec<String>)>(
+            self.datatypes.allocation_size(),
+            self.datatypes.len(),
+            carrier.len(),
+        )?
+        .checked_add(table::string_lookup::<(String, ())>(
+            self.live_datatype_carriers.allocation_size(),
+            self.live_datatype_carriers.len(),
+            carrier.len(),
+        )?)?;
+        let Some(member) = member else {
+            return Some(base);
+        };
+        base.checked_add(table::string_lookup::<(String, (String, String))>(
+            self.constructors.allocation_size(),
+            self.constructors.len(),
+            member.len(),
+        )?)?
+        .checked_add(table::string_lookup::<(String, SymbolInfo)>(
+            self.datatype_member_symbols.allocation_size(),
+            self.datatype_member_symbols.len(),
+            member.len(),
+        )?)
+    }
+
+    /// Raw lookup capacity for an optional monomorphic datatype presentation.
+    /// An absent live carrier or a definition/definition overlay declines the
+    /// codec. This resource hint grants no declaration or proof authority.
+    #[doc(hidden)]
+    pub fn proof_transport_datatype_capacity(&self) -> Option<usize> {
+        if self.live_datatype_carriers.is_empty()
+            || !self.fun_defs.is_empty()
+            || !self.adopted_macro_declaration_ids.is_empty()
+        {
+            return None;
+        }
+        Some(
+            [
+                self.native_input_symbol_storage_capacity(),
+                self.native_input_sort_storage_capacity(),
+                self.constructors.capacity(),
+                self.ctor_selectors.capacity(),
+                self.ctor_selector_info.capacity(),
+                self.dt_internal_surface.capacity(),
+                self.parametric_instance_args.capacity(),
+            ]
+            .into_iter()
+            .fold(0usize, usize::saturating_add),
+        )
     }
 
     /// Get the selector names for a constructor symbol.

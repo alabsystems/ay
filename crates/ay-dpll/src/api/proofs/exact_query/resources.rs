@@ -9,8 +9,8 @@ use ay_proof::{
     re_check_bundle_strict_with_resource_control, ProofCheckError, SerializableProofBundle,
 };
 
-mod construction;
-mod control;
+pub(in crate::api::proofs) mod construction;
+pub(in crate::api::proofs) mod control;
 mod retained;
 use control::Control;
 

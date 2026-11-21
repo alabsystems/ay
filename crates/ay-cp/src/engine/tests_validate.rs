@@ -153,9 +153,10 @@ fn test_validate_catches_circuit_violation() {
         engine.new_int_var(Domain::new(0, 2), None),
         engine.new_int_var(Domain::new(0, 2), None),
     ];
-    engine
-        .debug_constraints
-        .push(Constraint::Circuit(vars.clone()));
+    engine.debug_constraints.push(Constraint::Circuit {
+        succ: vars.clone(),
+        base: 0,
+    });
     engine.debug_validate_assignment(&[(vars[0], 1), (vars[1], 0), (vars[2], 2)]);
 }
 
@@ -177,6 +178,8 @@ fn test_validate_catches_inverse_violation() {
     engine.debug_constraints.push(Constraint::Inverse {
         x: x.clone(),
         y: y.clone(),
+        base_x: 0,
+        base_y: 0,
     });
     engine.debug_validate_assignment(&[
         (x[0], 1),

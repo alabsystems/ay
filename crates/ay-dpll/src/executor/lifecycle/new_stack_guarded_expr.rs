@@ -10,6 +10,9 @@ macro_rules! new_stack_guarded_expr {
             ctx: Context::new(),
             clause_event_capture: ay_sat::ClauseEventCapture::Additions,
             query_authority_epoch: QueryAuthorityEpoch::fresh(),
+            native_proof_source_scope: None,
+            native_universal_budget: Default::default(),
+            checked_external_proof_support: std::cell::RefCell::new(None),
             #[cfg(test)]
             last_authored_query_authority_seen: false,
             string_lemma_kinds_all_valid: true, // No string lemma lowered yet.
@@ -235,6 +238,9 @@ macro_rules! new_stack_guarded_expr {
             strict_grant_evidence_required: false,
             pivot_enum_depth: 0,
             mod_div_or_branch_rescue_depth: 0,
+            nia_persist_allowed: false,
+            nia_box_allowed: false,
+            nia_persist_forbidden: false,
             post_split_verify_depth: 0,
             lra_in_assignment_recheck: false,
             final_lia_resolve_disabled: false,

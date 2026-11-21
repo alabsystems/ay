@@ -6,7 +6,9 @@ use crate::sort::ArraySort;
 use crate::term::Symbol;
 use num_bigint::BigInt;
 
+mod integer;
 mod resources;
+mod sequence;
 
 fn app(store: &TermStore) -> TermData {
     TermData::App(Symbol::named("controlled_probe"), vec![store.true_term()])
@@ -151,7 +153,6 @@ fn unsupported_owning_payloads_and_binders_refuse_without_minting() {
     let unsupported = [
         TermData::Var("caller_selected_identity".to_owned(), 7),
         TermData::Const(Constant::String("owned".to_owned())),
-        TermData::Const(Constant::Int(BigInt::from(2u8))),
         TermData::App(Symbol::indexed("extract", vec![7, 0]), vec![t]),
         TermData::App(Symbol::named("wide"), vec![t; 4]),
         TermData::App(Symbol::named("x".repeat(65)), Vec::new()),
@@ -176,7 +177,6 @@ fn unsupported_array_sorts_refuse_before_recursive_clone() {
     let sorts = [
         Sort::bitvec(0),
         Sort::bitvec(129),
-        Sort::Int,
         Sort::Array(Box::new(ArraySort::new(Sort::bitvec(32), Sort::Bool))),
         Sort::Array(Box::new(ArraySort::new(
             Sort::bitvec(64),

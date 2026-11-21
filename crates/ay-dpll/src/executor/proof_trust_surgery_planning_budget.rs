@@ -61,6 +61,8 @@ pub(in crate::executor) struct SurgeryPlanningBudget {
     canonical_work: HashMap<TermId, usize>,
     source_work: HashMap<TermId, (usize, usize)>,
     retained_row_signability: HashMap<TermId, (usize, bool)>,
+    stop: Option<Box<dyn Fn() -> bool>>,
+    admission: Option<Box<dyn Fn(usize, usize) -> bool>>,
 }
 
 impl SurgeryPlanningBudget {
@@ -71,13 +73,59 @@ impl SurgeryPlanningBudget {
             canonical_work: HashMap::default(),
             source_work: HashMap::default(),
             retained_row_signability: HashMap::default(),
+            stop: None,
+            admission: None,
         }
     }
 
+    pub(in crate::executor) fn with_stop(stop: impl Fn() -> bool + 'static) -> Self {
+        Self {
+            stop: Some(Box::new(stop)),
+            ..Self::new()
+        }
+    }
+
+    pub(in crate::executor) fn with_stop_and_admission(
+        stop: impl Fn() -> bool + 'static,
+        admission: Option<Box<dyn Fn(usize, usize) -> bool>>,
+    ) -> Self {
+        Self {
+            admission,
+            ..Self::with_stop(stop)
+        }
+    }
+
+    pub(in crate::executor) fn admit_owned(&mut self, work: usize, bytes: usize) -> bool {
+        if !self.poll_stop() || self.admission.as_ref().is_some_and(|pay| !pay(work, bytes)) {
+            self.remaining_work = 0;
+            return false;
+        }
+        true
+    }
+
+    /// Cancellation is sticky on the original planning allowance.
+    pub(in crate::executor) fn poll_stop(&mut self) -> bool {
+        if self.stop.as_ref().is_some_and(|stop| stop()) {
+            self.remaining_work = 0;
+        }
+        self.remaining_work != 0
+    }
+
     pub(in crate::executor) fn spend_work(&mut self, work: usize) -> bool {
+        if !self.poll_stop() {
+            return false;
+        }
         let Some(remaining) = self.remaining_work.checked_sub(work.max(1)) else {
             return false;
         };
+        if self
+            .admission
+            .as_ref()
+            .is_some_and(|pay| !pay(work.max(1), 0))
+        {
+            self.remaining_work = 0;
+            return false;
+        }
         self.remaining_work = remaining;
         true
     }
@@ -148,7 +196,9 @@ impl SurgeryPlanningBudget {
                     if self.canonical_work.len() >= MAX_CACHED_TERMS {
                         return false;
                     }
-                    let Some(work) = canonical_term_work(terms, operand) else {
+                    let (work, _) =
+                        canonical_term_work_probe_metered(terms, operand, |_| self.poll_stop());
+                    let Some(Ok(work)) = work else {
                         return false;
                     };
                     self.canonical_work.insert(operand, work);

@@ -15,8 +15,9 @@
 //! * [`rules`] states each transfer rule's directions once.
 //! * [`cone`] builds the region program from a term store.
 //! * [`engine`] runs it as ordinary Rust (the interpreted region).
-//! * `ay_jit::known_bits_region` compiles the same program per obligation
-//!   family through external-codegen-ir and external-codegen (the compiled region).
+//! * `ay_jit::known_bits_region` states the program's vocabulary; a build
+//!   with a native backend also compiles it per obligation family there
+//!   (the compiled region).
 //! * [`replay`] re-derives the refutation from the assertions alone.
 
 pub mod cone;

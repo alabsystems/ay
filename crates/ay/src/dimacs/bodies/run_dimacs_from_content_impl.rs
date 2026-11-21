@@ -16,6 +16,7 @@ fn run_dimacs_proof_content_route(
             "separator-cover sidecar accepted but proof-mode public artifact replay is not implemented",
         );
     }
+    exit_if_parity_space_model_in_content(content, stats_cfg, proof);
     run_proof_streaming(content, stats_cfg, variant, proof);
 }
 
@@ -301,6 +302,7 @@ fn run_parsed_dimacs_formula(formula: ay_sat::DimacsFormula, mut run: ParsedDima
         }
         return;
     }
+    exit_if_parity_space_model(&formula, run.stats_cfg, None);
     if try_run_xor_dimacs_formula(
         &formula,
         run.stats_cfg,

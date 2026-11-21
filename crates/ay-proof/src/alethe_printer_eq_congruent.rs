@@ -22,7 +22,7 @@
 //! certified packing where the judgement holds and as the honest hole where
 //! it does not.
 
-use ay_core::{ProofId, TermId, UNPROVED_STEP_RULE};
+use ay_core::{ProofId, Sort, Symbol, TermData, TermId, UNPROVED_STEP_RULE};
 
 use super::surface_literal::same_printed_term;
 use super::surface_tokens::split_smt_term_slices_bounded;
@@ -53,6 +53,121 @@ pub(super) enum PrintedCongruence {
 }
 
 impl AlethePrinter<'_> {
+    /// A typed native tester's standard `(_ is C)` spelling needs the same
+    /// discharged `cong` derivation as an indexed bit-vector application.
+    /// Pinned Carcara rejects `eq_congruent` over either indexed head. This
+    /// producer re-derives the actual printed clause; it authenticates no
+    /// symbol binding or source override by itself.
+    pub(super) fn format_native_tester_eq_congruent(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Option<String> {
+        // The measured lane is one exact equality guard over two ground
+        // variables. Keep its entire pre-render payload bounded before any
+        // raw symbol or override String can be copied.
+        const MAX_ATOM_BYTES: usize = 16 * 1024;
+        let overrides = self.term_overrides?;
+        let &[negative_guard, conclusion] = clause else {
+            return None;
+        };
+        if !premises.is_empty() || !args.is_empty() {
+            return None;
+        }
+        let data = |term| {
+            self.terms.entry_stamp(term)?;
+            Some(self.terms.get(term))
+        };
+        let equality = |term| -> Option<[TermId; 2]> {
+            match data(term)? {
+                TermData::App(Symbol::Named(name), children) if name == "=" => {
+                    children.as_slice().try_into().ok()
+                }
+                _ => None,
+            }
+        };
+        let TermData::Not(guard) = data(negative_guard)? else {
+            return None;
+        };
+        let [guard_a, guard_b] = equality(*guard)?;
+        let [left, right] = equality(conclusion)?;
+        if [negative_guard, *guard, conclusion]
+            .iter()
+            .any(|&term| self.terms.sort(term) != &Sort::Bool)
+        {
+            return None;
+        }
+        let TermData::App(Symbol::Named(left_name), left_args) = data(left)? else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(right_name), right_args) = data(right)? else {
+            return None;
+        };
+        let ([a], [b]) = (left_args.as_slice(), right_args.as_slice()) else {
+            return None;
+        };
+        if left_name.as_str().len() > MAX_ATOM_BYTES
+            || right_name.as_str().len() > MAX_ATOM_BYTES
+            || left_name != right_name
+            || self.terms.sort(left) != &Sort::Bool
+            || self.terms.sort(right) != &Sort::Bool
+            || !((guard_a == *a && guard_b == *b) || (guard_a == *b && guard_b == *a))
+        {
+            return None;
+        }
+        let constructor = left_name.as_str().strip_prefix("is-")?;
+        if constructor.is_empty()
+            || constructor
+                .chars()
+                .any(|c| c == '|' || c == '\\' || c.is_control())
+        {
+            return None;
+        }
+        let mut bytes = constructor.len().checked_add(128)?;
+        for term in [*a, *b] {
+            let TermData::Var(name, _) = data(term)? else {
+                return None;
+            };
+            let Sort::Uninterpreted(carrier) = self.terms.sort(term) else {
+                return None;
+            };
+            if name.len() > MAX_ATOM_BYTES || carrier.len() > MAX_ATOM_BYTES {
+                return None;
+            }
+            bytes = bytes.checked_add(name.len())?.checked_add(carrier.len())?;
+        }
+        if self.terms.sort(*a) != self.terms.sort(*b) {
+            return None;
+        }
+        for term in [negative_guard, *guard, conclusion, left, right, *a, *b] {
+            if let Some(text) = overrides.get(&term) {
+                if text.len() > MAX_ATOM_BYTES {
+                    return None;
+                }
+                bytes = bytes.checked_add(text.len())?;
+            }
+        }
+        self.charge(u64::try_from(bytes.checked_mul(8)?).ok()?);
+        if self.emission_progress.refused() || self.work_budget_exhausted() {
+            return None;
+        }
+        let printed = self.format_term(conclusion);
+        let (printed_left, printed_right) = split_printed_equality(&printed)?;
+        let (left_head, left_args) = super::split_printed_indexed_application(printed_left)?;
+        let (right_head, right_args) = super::split_printed_indexed_application(printed_right)?;
+        let expected = format!("(_ is {})", ay_core::quote_symbol(constructor));
+        if left_head != expected
+            || right_head != expected
+            || left_args.len() != 1
+            || right_args.len() != 1
+        {
+            return None;
+        }
+        self.format_indexed_eq_congruent(id, clause, premises, args)
+    }
+
     /// Judge an `eq_congruent` step over the text it ships and spell it, or
     /// decline it to `hole`.
     ///

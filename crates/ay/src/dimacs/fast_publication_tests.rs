@@ -37,6 +37,7 @@ fn write_fast_publication(path: &str, named: bool, steps: usize) -> Arc<DimacsPr
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: true,
+        label: None,
     };
     let mut reservation = None;
     let file = create_owned_dimacs_proof_file_with_status(
@@ -207,6 +208,7 @@ fn the_fast_publication_predicate_requires_every_term() {
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: true,
+        label: None,
     };
     assert!(dimacs_fast_publication_for(
         true, false, false, false, &explicit

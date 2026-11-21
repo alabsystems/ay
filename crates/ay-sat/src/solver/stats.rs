@@ -2619,10 +2619,10 @@ impl Solver {
             return None;
         }
         // Build reverse map: clause_id -> arena_index.
-        // cold.clause_ids[arena_idx] = clause_id (1-based LRAT IDs).
+        // cold.clause_ids: arena_idx -> clause_id (1-based LRAT IDs).
         let clause_ids = &self.cold.clause_ids;
         let mut id_to_arena: crate::kani_compat::DetHashMap<u64, usize> = Default::default();
-        for (arena_idx, &cid) in clause_ids.iter().enumerate() {
+        for (arena_idx, cid) in clause_ids.iter_recorded() {
             if cid > 0 {
                 id_to_arena.insert(cid, arena_idx);
             }

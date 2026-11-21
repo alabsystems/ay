@@ -4,6 +4,7 @@
 //! Storage-only transactions over genuine independent completion DATA.
 
 use super::*;
+use crate::executor::Executor;
 use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort, Symbol};
 use ay_model_check::{GateVerdict, ModelView};
 
@@ -190,4 +191,32 @@ fn fresh_query_terms_preserve_data_but_scope_roundtrip_never_revives_old_package
             .residual_array_value(&source.ctx, source.array)
             .is_err());
     }
+}
+
+#[test]
+fn qmc_array_default_preserves_an_existing_residual_owner() {
+    let source = Source::new();
+    let mut owned = source.model();
+    let before = retained(&owned);
+    let mut exec = Executor::new();
+    exec.ctx = source.ctx;
+    exec.execute_all(&ay_frontend::parse("(declare-fun data (Int) (Array Int Int))").unwrap())
+        .unwrap();
+    let zero = exec.ctx.terms.mk_int(0.into());
+    let value = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+    let row = (
+        Symbol::named("data"),
+        vec![Sort::Int],
+        Sort::array(Sort::Int, Sort::Int),
+        value,
+    );
+    let mut fresh = Model::empty();
+    assert!(exec
+        .install_model_check_array_defaults(&mut fresh, vec![row.clone()])
+        .is_some());
+    assert!(exec
+        .install_model_check_array_defaults(&mut owned, vec![row])
+        .is_none());
+    assert!(Arc::ptr_eq(&before, &retained(&owned)));
+    assert!(owned.certified_const_interp_entries().is_empty());
 }

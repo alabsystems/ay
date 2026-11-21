@@ -677,14 +677,19 @@ const MARK_QUOTIENT: u8 = 2;
 const MARK_NOUNTED: u8 = 4;
 
 impl Factor {
+    /// A factor engine for `num_vars` variables. Its five literal-indexed
+    /// arrays (17 bytes per literal) are allocated on the first factoring
+    /// round (`ensure_arrays`), not here: a solver that never
+    /// factors never pays them, and on e85fb114 (32.2 M variables) they were
+    /// 1.08 GB of the construction that broke the 16 GB ceiling (AY-SAT-1).
     pub(crate) fn new(num_vars: usize) -> Self {
         Self {
             num_vars,
-            marks: vec![0; num_vars * 2],
-            counts: vec![0; num_vars * 2],
-            occ_binary_counts: vec![0; num_vars * 2],
-            occ_large_counts: vec![0; num_vars * 2],
-            occ_next_large_counts: vec![0; num_vars * 2],
+            marks: Vec::new(),
+            counts: Vec::new(),
+            occ_binary_counts: Vec::new(),
+            occ_large_counts: Vec::new(),
+            occ_next_large_counts: Vec::new(),
             occ_candidates: Vec::new(),
             counted: Vec::new(),
             nounted: Vec::new(),
@@ -747,15 +752,41 @@ impl Factor {
         self.lrat_preflight_stats
     }
 
+    /// Cover `num_vars` variables and allocate the literal-indexed arrays.
+    /// Called by the factoring driver before every use of the arrays.
     pub(crate) fn ensure_num_vars(&mut self, num_vars: usize) {
+        self.grow_num_vars(num_vars);
+        self.ensure_arrays();
+    }
+
+    /// Cover `num_vars` variables without allocating arrays the engine has
+    /// not used yet (the solver's variable growth).
+    pub(crate) fn grow_num_vars(&mut self, num_vars: usize) {
         if num_vars > self.num_vars {
             self.num_vars = num_vars;
-            self.marks.resize(num_vars * 2, 0);
-            self.counts.resize(num_vars * 2, 0);
-            self.occ_binary_counts.resize(num_vars * 2, 0);
-            self.occ_large_counts.resize(num_vars * 2, 0);
-            self.occ_next_large_counts.resize(num_vars * 2, 0);
+            if !self.marks.is_empty() {
+                self.ensure_arrays();
+            }
         }
+    }
+
+    /// Size the literal-indexed arrays to `num_vars`; new entries are 0, as
+    /// the eager construction left them.
+    fn ensure_arrays(&mut self) {
+        let lits = self.num_vars * 2;
+        if self.marks.len() < lits {
+            self.marks.resize(lits, 0);
+            self.counts.resize(lits, 0);
+            self.occ_binary_counts.resize(lits, 0);
+            self.occ_large_counts.resize(lits, 0);
+            self.occ_next_large_counts.resize(lits, 0);
+        }
+    }
+
+    /// Whether the literal-indexed arrays are allocated.
+    #[cfg(test)]
+    pub(crate) fn arrays_allocated(&self) -> bool {
+        !self.marks.is_empty()
     }
 
     fn mark(&mut self, lit: Literal, flag: u8) {
@@ -817,6 +848,7 @@ impl Factor {
         var_states: &[crate::solver::lifecycle::VarState],
         config: &FactorConfig,
     ) -> FactorResult {
+        self.ensure_arrays();
         // CaDiCaL factor.cpp:960: vals must cover all variables (2 entries per var)
         debug_assert!(
             vals.len() >= self.num_vars * 2,
@@ -1388,6 +1420,7 @@ impl Factor {
         vals: &[i8],
         var_states: &[crate::solver::lifecycle::VarState],
     ) {
+        self.ensure_arrays();
         self.schedule.clear();
         self.in_schedule.clear();
         self.in_schedule.resize(self.num_vars * 2, false);
@@ -1487,6 +1520,7 @@ impl Factor {
         var_states: &[crate::solver::lifecycle::VarState],
         config: &FactorConfig,
     ) -> FactorResult {
+        self.ensure_arrays();
         debug_assert!(
             vals.len() >= self.num_vars * 2,
             "BUG: factor vals.len()={} < num_vars*2={}",

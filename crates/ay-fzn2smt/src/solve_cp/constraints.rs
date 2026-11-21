@@ -63,7 +63,7 @@ impl CpContext {
             "fzn_table_int" | "table_int" => {
                 self.translate_table(c)?;
             }
-            "fzn_circuit" | "circuit" => {
+            "fzn_circuit" | "circuit" | "ay_circuit" => {
                 self.translate_circuit(c)?;
             }
             "fzn_cumulative" | "cumulative" => {

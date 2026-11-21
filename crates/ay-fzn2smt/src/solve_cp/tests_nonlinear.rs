@@ -96,6 +96,53 @@ fn test_int_times_var() {
     assert!(output.contains("c = 15;"), "output: {output}");
 }
 
+/// Above the 10,000-tuple table, `int_times` gets the CP engine's bounds
+/// propagator instead of marking the model unsupported (AY-OTHER-5).
+#[test]
+fn int_times_on_large_domains_is_supported() {
+    let fzn = "\
+        var 2..300: x :: output_var;\n\
+        var 2..300: y :: output_var;\n\
+        var -90000..90000: c :: output_var;\n\
+        constraint int_eq(c, 391);\n\
+        constraint int_le(x, y);\n\
+        constraint int_times(x, y, c);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let unsupported = super::unsupported_constraints(&model).expect("probe");
+    assert!(unsupported.is_empty(), "unsupported: {unsupported:?}");
+    // 391 = 17 * 23, and x <= y.
+    let output = solve_cp_output(fzn, false);
+    assert!(
+        output.contains("x = 17;") && output.contains("y = 23;"),
+        "output: {output}"
+    );
+}
+
+/// The same for `int_div`, with a variable and a constant divisor.
+#[test]
+fn int_div_on_large_domains_is_supported() {
+    let fzn = "\
+        var -100000..100000: a :: output_var;\n\
+        var -400..400: b :: output_var;\n\
+        var -1000..1000: q :: output_var;\n\
+        var -100000..100000: h :: output_var;\n\
+        constraint int_eq(a, 99999);\n\
+        constraint int_eq(q, -333);\n\
+        constraint int_div(a, b, q);\n\
+        constraint int_div(a, 7, h);\n\
+        solve satisfy;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let unsupported = super::unsupported_constraints(&model).expect("probe");
+    assert!(unsupported.is_empty(), "unsupported: {unsupported:?}");
+    // 99999 div b = -333 only for b = -300; 99999 div 7 = 14285.
+    let output = solve_cp_output(fzn, false);
+    assert!(
+        output.contains("b = -300;") && output.contains("h = 14285;"),
+        "output: {output}"
+    );
+}
+
 // --- int_abs tests ---
 
 #[test]
@@ -554,10 +601,11 @@ fn test_int_times_neg_const() {
     assert!(output.contains("c = -15;"), "output: {output}");
 }
 
-/// int_times: large domain falls back to mark_unsupported → UNKNOWN.
+/// int_times: a large domain (a 40,000-tuple product) is solved by the
+/// bounds propagator. Before AY-OTHER-5 it was marked unsupported and
+/// answered UNKNOWN.
 #[test]
-fn test_int_times_large_domain_unsupported() {
-    // Both vars have domain 200, cross-product = 200*200 = 40000 > 10000.
+fn test_int_times_large_domain_is_solved() {
     let fzn = "\
         var 1..200: x :: output_var;\n\
         var 1..200: y :: output_var;\n\
@@ -565,10 +613,19 @@ fn test_int_times_large_domain_unsupported() {
         constraint int_times(x, y, c);\n\
         solve satisfy;\n";
     let output = solve_cp_output(fzn, false);
-    assert!(
-        output.contains("=====UNKNOWN====="),
-        "should be UNKNOWN for large domain, output: {output}"
-    );
+    let value = |name: &str| -> i64 {
+        let start = output
+            .find(&format!("{name} = "))
+            .unwrap_or_else(|| panic!("no {name} in {output}"))
+            + name.len()
+            + 3;
+        output[start..]
+            .split(';')
+            .next()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no value of {name} in {output}"))
+    };
+    assert_eq!(value("x") * value("y"), value("c"), "output: {output}");
 }
 
 /// int_div: 0 / x = 0.

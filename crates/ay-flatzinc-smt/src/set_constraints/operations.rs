@@ -15,9 +15,9 @@ fn set_bitwise_op(
     complement_s2: bool,
 ) -> Result<(), TranslateError> {
     check_args(name, args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
-    let s3 = ctx.expr_to_smt(&args[2])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
+    let s3 = set_operand(ctx, &args[2])?;
 
     let (lo, hi) = resolve_set_domain3(ctx, &s1, &s2, &s3, name)?;
 
@@ -65,8 +65,8 @@ pub(crate) fn resolve_set_domain(
 /// `set_subset(S1, S2)` → for each bit: S1_bit_i => S2_bit_i
 pub(crate) fn set_subset(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_subset", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_subset")?;
 
@@ -81,8 +81,8 @@ pub(crate) fn set_subset(ctx: &mut Context, args: &[Expr]) -> Result<(), Transla
 /// `set_superset(S1, S2)` → for each bit: S2_bit_i => S1_bit_i (reverse of subset)
 pub(crate) fn set_superset(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_superset", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_superset")?;
 
@@ -97,8 +97,8 @@ pub(crate) fn set_superset(ctx: &mut Context, args: &[Expr]) -> Result<(), Trans
 /// `set_eq(S1, S2)` → for each bit: S1_bit_i = S2_bit_i
 pub(crate) fn set_eq(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_eq", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_eq")?;
 
@@ -113,8 +113,8 @@ pub(crate) fn set_eq(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateEr
 /// `set_ne(S1, S2)` → at least one bit position differs
 pub(crate) fn set_ne(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_ne", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_ne")?;
 
@@ -193,8 +193,8 @@ pub(crate) fn set_lex_condition(
 /// less than or equal to that of S2.
 pub(crate) fn set_le(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_le", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let condition = set_lex_condition(ctx, &s1, &s2, SetLexOrder::LessEqual, "set_le")?;
     ctx.emit_fmt(format_args!("(assert {condition})"));
     Ok(())
@@ -204,8 +204,8 @@ pub(crate) fn set_le(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateEr
 /// less than that of S2.
 pub(crate) fn set_lt(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_lt", args, 2)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let condition = set_lex_condition(ctx, &s1, &s2, SetLexOrder::Less, "set_lt")?;
     ctx.emit_fmt(format_args!("(assert {condition})"));
     Ok(())

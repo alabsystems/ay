@@ -91,6 +91,20 @@ impl Solver {
         self.timeout = timeout;
     }
 
+    /// Honour the caller's timeout exactly: an untimed check-sat runs until it
+    /// decides or is interrupted, with no 5-minute safety deadline of AY's
+    /// own, and a timeout is never relaxed. See
+    /// [`crate::Executor::set_exact_deadline`].
+    pub fn set_exact_deadline(&mut self, exact: bool) {
+        self.executor.set_exact_deadline(exact);
+    }
+
+    /// Whether [`Self::set_exact_deadline`] is in force.
+    #[must_use]
+    pub fn exact_deadline(&self) -> bool {
+        self.executor.exact_deadline()
+    }
+
     /// Opt in to the quantified wall-clock BACKSTOP (off by default).
     ///
     /// When enabled, a decision containing a quantifier receives one relative
@@ -538,7 +552,10 @@ impl Solver {
     /// Build a `SolveDetails` envelope from a completed solve result.
     ///
     /// Shared implementation behind all `*_with_details` entrypoints.
-    fn build_solve_details(&self, verified: VerifiedSolveResult) -> SolveDetails {
+    pub(in crate::api) fn build_solve_details(
+        &self,
+        verified: VerifiedSolveResult,
+    ) -> SolveDetails {
         let raw = verified.result();
         let statistics = self.statistics().clone();
         let (independent, delegated, incomplete) =

@@ -28,22 +28,21 @@
 //! exactly. The float lane still gets doubles; they are now the RIGHT doubles, and the exact rim
 //! recovers the file's true numbers from them.
 //!
-//! Both the fixed-column and free-form layouts are accepted, because the difference between them
-//! only matters for names with embedded spaces, which no benchmark uses. What is deliberately NOT
-//! accepted, rather than guessed at: semi-continuous columns, SOS sets, and quadratic sections.
-//! Each would need real modelling support, and reading one as though it were an ordinary column
-//! would answer a question about a model the caller did not pose.
+//! The file itself is read by `ay_lp::parse_mps_exact`, the one MPS reader of AY (the MIPLIB
+//! 2017 checker's reading, refusing a construct readers in common use read differently, and
+//! keeping every number as the rational it denotes); this module builds the engine's model from
+//! that reading. AY-N12: this module once had a reader of its own, which read some files
+//! differently (lower-case markers, the last of two objective entries, a negative `UP` on a
+//! column with lower bound 0, the default bounds of a marker integer column).
 
-use std::collections::HashMap;
 use std::fmt;
 
 use num_bigint::BigInt;
 use num_integer::Integer;
 use num_rational::BigRational;
-use num_traits::{One, Signed, ToPrimitive, Zero};
-use smallvec::SmallVec;
+use num_traits::{One, ToPrimitive, Zero};
 
-use crate::model::{exact, Col, Model, Sense};
+use crate::model::{Col, Model, Sense};
 
 /// A model read from an MPS file, with the names needed to report a solution in the
 /// caller's own vocabulary.
@@ -130,341 +129,71 @@ impl fmt::Display for MpsError {
 
 impl std::error::Error for MpsError {}
 
-/// The row types MPS distinguishes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowType {
-    /// `N` — no constraint. The first one is the objective; any others are free rows.
-    Free,
-    /// `L` — `a·x <= rhs`.
-    Le,
-    /// `G` — `a·x >= rhs`.
-    Ge,
-    /// `E` — `a·x == rhs`.
-    Eq,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
-    None,
-    Rows,
-    Columns,
-    Rhs,
-    Ranges,
-    Bounds,
-    ObjSense,
-}
-
-/// A column under construction: MPS gives its coefficients before its bounds.
+/// A column under construction: its bounds and type, before [`build`].
 #[derive(Clone)]
 struct ColBuild {
     lb: Option<BigRational>, // None = infinite on that side
     ub: Option<BigRational>,
     integral: bool,
-    /// Whether a `BOUNDS` entry has touched the lower bound. The `UP`-with-a-negative-value rule
-    /// keys off exactly this.
-    lb_set: bool,
 }
 
-/// Parse `text` as MPS.
+/// Parse `text` as MPS: the one reading of `ay_lp::parse_mps_exact` (the
+/// MIPLIB 2017 checker's reading, refusing where readers in common use
+/// differ; documented construct by construct in `ay-lp/src/parser/mps.rs`),
+/// built into a model by [`model_from_exact_problem`]. No tool of AY reads
+/// an MPS file in a second way (AY-N12).
 ///
 /// # Errors
-/// Returns [`MpsError`] on a malformed file, an unknown section, a reference to an undeclared row
-/// or column, a construct this reader refuses to guess at (see the module docs), or a row whose
-/// coefficients cannot be made exactly representable without exceeding `f64`'s integer range.
-#[allow(clippy::too_many_lines)]
+/// Returns [`MpsError`] with the line of a malformed or refused construct
+/// (`ay_lp`'s error), or for a row whose coefficients cannot be made exactly
+/// representable without exceeding `f64`'s integer range.
 pub fn read_mps(text: &str) -> Result<MpsProblem, MpsError> {
-    let mut name = String::new();
-    let mut sense = Sense::Minimize;
-    let mut section = Section::None;
-
-    let mut row_type: Vec<RowType> = Vec::new();
-    let mut row_names: Vec<String> = Vec::new();
-    let mut row_of: HashMap<String, usize> = HashMap::new();
-    let mut obj_row: Option<usize> = None;
-
-    let mut col_names: Vec<String> = Vec::new();
-    let mut col_of: HashMap<String, usize> = HashMap::new();
-    let mut cols: Vec<ColBuild> = Vec::new();
-    let mut obj_coeff: Vec<BigRational> = Vec::new();
-    // (row, col, value) triples for the constraint rows.
-    let mut nz: Vec<(usize, usize, BigRational)> = Vec::new();
-
-    let mut rhs: Vec<BigRational> = Vec::new();
-    let mut ranges: Vec<Option<BigRational>> = Vec::new();
-    let mut obj_offset = BigRational::zero();
-    let mut integral_now = false;
-    // Generator-produced MPS files commonly repeat a very small coefficient
-    // vocabulary thousands of times.  In particular, exact decimal expansions
-    // of dyadic f64 values are expensive enough to parse that reconstructing the
-    // same rational for every nonzero dominates small-model process wall.  Cache
-    // only successful parses; callers still receive an owned value, and the
-    // mathematical result is exactly `number(text, line)`.
-    let mut number_cache: HashMap<&str, BigRational> = HashMap::new();
-
-    for (i, raw) in text.lines().enumerate() {
-        let line = i + 1;
-        // A `*` in column 1 is a comment; a blank line is nothing.
-        if raw.starts_with('*') || raw.trim().is_empty() {
-            continue;
-        }
-        let indented = raw.starts_with([' ', '\t']);
-        // Free-form MPS data lines normally contain at most two (name, value)
-        // pairs. Keep those fields inline instead of allocating once per line;
-        // SmallVec still preserves the reader's existing acceptance of longer
-        // extension lines by spilling only those exceptional records.
-        let f: SmallVec<[&str; 6]> = raw.split_whitespace().collect();
-        if f.is_empty() {
-            continue;
-        }
-
-        // An unindented line starts a section (MPS's only structural marker).
-        if !indented {
-            match f[0].to_ascii_uppercase().as_str() {
-                "NAME" => {
-                    name = (*f.get(1).unwrap_or(&"")).to_string();
-                    section = Section::None;
-                }
-                "OBJSENSE" => {
-                    // Either `OBJSENSE MAX` on one line, or the word on the next.
-                    if let Some(w) = f.get(1) {
-                        sense = parse_sense(w, line)?;
-                        section = Section::None;
-                    } else {
-                        section = Section::ObjSense;
-                    }
-                }
-                "ROWS" => section = Section::Rows,
-                "COLUMNS" => section = Section::Columns,
-                "RHS" => section = Section::Rhs,
-                "RANGES" => section = Section::Ranges,
-                "BOUNDS" => section = Section::Bounds,
-                "ENDATA" => break,
-                other => {
-                    return Err(err(
-                        line,
-                        &format!(
-                            "unsupported section `{other}` -- this reader will not guess at what \
-                             it means"
-                        ),
-                    ))
-                }
-            }
-            continue;
-        }
-
-        match section {
-            Section::None => {}
-            Section::ObjSense => {
-                sense = parse_sense(f[0], line)?;
-                section = Section::None;
-            }
-            Section::Rows => {
-                let nm = *f.get(1).ok_or_else(|| err(line, "a row needs a name"))?;
-                let ty = match f[0].to_ascii_uppercase().as_str() {
-                    "N" => RowType::Free,
-                    "L" => RowType::Le,
-                    "G" => RowType::Ge,
-                    "E" => RowType::Eq,
-                    o => return Err(err(line, &format!("unknown row type `{o}`"))),
-                };
-                if ty == RowType::Free && obj_row.is_none() {
-                    obj_row = Some(row_type.len());
-                }
-                row_of.insert(nm.to_string(), row_type.len());
-                row_names.push(nm.to_string());
-                row_type.push(ty);
-                rhs.push(BigRational::zero());
-                ranges.push(None);
-            }
-            Section::Columns => {
-                // `MARKER` lines carry no data; they toggle integrality for what follows.
-                if f.iter().any(|t| t.eq_ignore_ascii_case("'MARKER'")) {
-                    if f.iter().any(|t| t.eq_ignore_ascii_case("'INTORG'")) {
-                        integral_now = true;
-                    } else if f.iter().any(|t| t.eq_ignore_ascii_case("'INTEND'")) {
-                        integral_now = false;
-                    }
-                    continue;
-                }
-                let cname = f[0];
-                let c = if let Some(&existing) = col_of.get(cname) {
-                    existing
-                } else {
-                    let index = cols.len();
-                    let owned_name = cname.to_owned();
-                    col_of.insert(owned_name.clone(), index);
-                    col_names.push(owned_name);
-                    obj_coeff.push(BigRational::zero());
-                    cols.push(ColBuild {
-                        lb: Some(BigRational::zero()),
-                        ub: None,
-                        integral: integral_now,
-                        lb_set: false,
-                    });
-                    index
-                };
-                // Two (row, value) pairs per line is the norm, not the exception.
-                for pair in f[1..].chunks(2) {
-                    let [rname, v] = pair else {
-                        return Err(err(line, "a COLUMNS entry needs a row and a value"));
-                    };
-                    let r = *row_of
-                        .get(*rname)
-                        .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    let v = cached_number(&mut number_cache, v, line)?;
-                    if Some(r) == obj_row {
-                        obj_coeff[c] = v;
-                    } else if row_type[r] != RowType::Free {
-                        nz.push((r, c, v));
-                    }
-                }
-            }
-            Section::Rhs => {
-                for (rname, v) in pairs(&f) {
-                    let r = *row_of
-                        .get(rname)
-                        .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    let v = cached_number(&mut number_cache, v, line)?;
-                    if Some(r) == obj_row {
-                        // An RHS on the objective row is the NEGATIVE of the objective constant.
-                        obj_offset = -v;
-                    } else {
-                        rhs[r] = v;
-                    }
-                }
-            }
-            Section::Ranges => {
-                for (rname, v) in pairs(&f) {
-                    let r = *row_of
-                        .get(rname)
-                        .ok_or_else(|| err(line, &format!("no row named `{rname}`")))?;
-                    ranges[r] = Some(cached_number(&mut number_cache, v, line)?);
-                }
-            }
-            Section::Bounds => {
-                let ty = f[0].to_ascii_uppercase();
-                // `FR`/`MI`/`PL`/`BV` take no value, so the column may be the 2nd or 3rd field.
-                let (cname, val) = match f.len() {
-                    0 | 1 => return Err(err(line, "a BOUNDS entry needs a column")),
-                    2 => (f[1], None),
-                    3 => {
-                        // Either `TY set col` or `TY col value` -- tell them apart by asking
-                        // whether the last field names a column we have seen.
-                        if col_of.contains_key(f[2]) {
-                            (f[2], None)
-                        } else {
-                            (f[1], Some(f[2]))
-                        }
-                    }
-                    _ => (f[2], Some(f[3])),
-                };
-                let c = *col_of
-                    .get(cname)
-                    .ok_or_else(|| err(line, &format!("no column named `{cname}`")))?;
-                let mut value = || -> Result<BigRational, MpsError> {
-                    let v = val.ok_or_else(|| err(line, &format!("bound `{ty}` needs a value")))?;
-                    cached_number(&mut number_cache, v, line)
-                };
-                match ty.as_str() {
-                    "UP" | "UI" => {
-                        let v = value()?;
-                        // The format's ugliest corner: `UP` with a negative value on a column
-                        // whose lower bound is still the default 0 means the modeller wanted a
-                        // negative column, and 0 was never its intended floor. Every solver reads
-                        // it this way; reading it literally yields an empty box.
-                        if v.is_negative() && !cols[c].lb_set {
-                            cols[c].lb = None;
-                        }
-                        cols[c].ub = Some(v);
-                        cols[c].integral |= ty == "UI";
-                    }
-                    "LO" | "LI" => {
-                        cols[c].lb = Some(value()?);
-                        cols[c].lb_set = true;
-                        cols[c].integral |= ty == "LI";
-                    }
-                    "FX" => {
-                        let v = value()?;
-                        cols[c].lb = Some(v.clone());
-                        cols[c].ub = Some(v);
-                        cols[c].lb_set = true;
-                    }
-                    "FR" => {
-                        cols[c].lb = None;
-                        cols[c].ub = None;
-                        cols[c].lb_set = true;
-                    }
-                    "MI" => {
-                        cols[c].lb = None;
-                        cols[c].lb_set = true;
-                    }
-                    "PL" => cols[c].ub = None,
-                    "BV" => {
-                        cols[c].lb = Some(BigRational::zero());
-                        cols[c].ub = Some(BigRational::one());
-                        cols[c].lb_set = true;
-                        cols[c].integral = true;
-                    }
-                    o => {
-                        return Err(err(
-                            line,
-                            &format!(
-                                "bound type `{o}` is not supported -- it would have to be \
-                                 modelled, not approximated"
-                            ),
-                        ))
-                    }
-                }
-            }
-        }
-    }
-
-    let row_bounds = row_type
-        .iter()
-        .enumerate()
-        .map(|(r, ty)| row_interval(*ty, &rhs[r], ranges[r].as_ref()))
-        .collect::<Vec<_>>();
-    build(
-        name,
-        sense,
-        &row_bounds,
-        &row_names,
-        col_names,
-        cols,
-        &obj_coeff,
-        nz,
-        &obj_offset,
-    )
+    let exact = ay_lp::parse_mps_exact(text).map_err(|e| match e {
+        ay_lp::LpError::Parse { line, msg } => err(line, &msg),
+        ay_lp::LpError::InvalidNumber { line, raw } => err(
+            line,
+            &format!("`{raw}` is not a number this reader accepts"),
+        ),
+        other => err(0, &other.to_string()),
+    })?;
+    model_from_exact_problem(&exact)
 }
 
-/// The interval `[lo, hi]` (`None` = infinite) of a row of type `ty` with
-/// right-hand side `rhs` and an optional RANGES value; `None` for a free row.
-fn row_interval(
-    ty: RowType,
-    rhs: &BigRational,
-    range: Option<&BigRational>,
-) -> Option<(Option<BigRational>, Option<BigRational>)> {
-    let (lo, hi) = match ty {
-        RowType::Free => return None, // the objective, or a row that constrains nothing
-        RowType::Le => (None, Some(rhs.clone())),
-        RowType::Ge => (Some(rhs.clone()), None),
-        RowType::Eq => (Some(rhs.clone()), Some(rhs.clone())),
+/// The model of an exactly read problem: column `j` is `exact.columns[j]`,
+/// one row per constraint row, the same objective and constant, every number
+/// the rational read.
+///
+/// # Errors
+/// As [`model_from_exact`].
+pub(crate) fn model_from_exact_problem(
+    exact: &ay_lp::ExactProblem,
+) -> Result<MpsProblem, MpsError> {
+    let columns: Vec<RationalColumn> = exact
+        .columns
+        .iter()
+        .map(|c| RationalColumn {
+            name: c.name.clone(),
+            lower: c.lower.clone(),
+            upper: c.upper.clone(),
+            integral: c.is_integral(),
+            objective: c.objective.clone(),
+        })
+        .collect();
+    let rows: Vec<RationalRow> = exact
+        .rows
+        .iter()
+        .map(|r| RationalRow {
+            name: r.name.clone(),
+            coeffs: r.coeffs.clone(),
+            lower: r.lower.clone(),
+            upper: r.upper.clone(),
+        })
+        .collect();
+    let sense = match exact.sense {
+        ay_lp::Sense::Min => Sense::Minimize,
+        ay_lp::Sense::Max => Sense::Maximize,
     };
-    // RANGES turns a one-sided row into a two-sided one. The sign convention for `E` rows is
-    // the format's, not mine: a positive range extends upward, a negative one downward.
-    Some(match (range, ty) {
-        (None, _) => (lo, hi),
-        (Some(g), RowType::Le) => (Some(rhs - g.abs()), hi),
-        (Some(g), RowType::Ge) => (lo, Some(rhs + g.abs())),
-        (Some(g), RowType::Eq) => {
-            if g.is_negative() {
-                (Some(rhs + g), Some(rhs.clone()))
-            } else {
-                (Some(rhs.clone()), Some(rhs + g))
-            }
-        }
-        (Some(_), RowType::Free) => return None,
-    })
+    model_from_exact(&exact.name, sense, &columns, &rows, &exact.offset)
 }
 
 /// One column of a model given to [`model_from_exact`].
@@ -522,7 +251,6 @@ pub fn model_from_exact(
             lb: c.lower.clone(),
             ub: c.upper.clone(),
             integral: c.integral,
-            lb_set: true,
         })
         .collect();
     let obj_coeff: Vec<BigRational> = columns.iter().map(|c| c.objective.clone()).collect();
@@ -937,132 +665,6 @@ fn to_f64(v: &BigRational) -> f64 {
     v.to_f64().unwrap_or(f64::NAN)
 }
 
-/// Split a data line into (name, value) pairs, tolerating a leading set name.
-///
-/// `RHS`/`RANGES` lines carry an optional set name that nothing else references, so the field
-/// count is the only thing that says whether it is there. An odd count means it is.
-fn pairs<'text, 'slice>(
-    f: &'slice [&'text str],
-) -> impl Iterator<Item = (&'text str, &'text str)> + 'slice
-where
-    'text: 'slice,
-{
-    let body = if f.len().is_multiple_of(2) {
-        f
-    } else {
-        &f[1..]
-    };
-    body.chunks(2).filter_map(|c| match c {
-        [a, b] => Some((*a, *b)),
-        _ => None,
-    })
-}
-
-fn parse_sense(w: &str, line: usize) -> Result<Sense, MpsError> {
-    match w.to_ascii_uppercase().as_str() {
-        "MAX" | "MAXIMIZE" => Ok(Sense::Maximize),
-        "MIN" | "MINIMIZE" => Ok(Sense::Minimize),
-        o => Err(err(line, &format!("unknown objective sense `{o}`"))),
-    }
-}
-
-/// Parse a number from its DECIMAL TEXT into the exact rational it denotes.
-///
-/// `"0.9"` is nine tenths. It is not `0.90000000000000002220446…`, which is what it becomes the
-/// moment it passes through an `f64`, and the difference is the difference between solving the
-/// file's model and solving a nearby one. See the module docs.
-fn number(s: &str, line: usize) -> Result<BigRational, MpsError> {
-    let t = s.trim();
-    let bad = || err(line, &format!("`{s}` is not a number"));
-
-    // MPS matrices are overwhelmingly integral after generator-side scaling.
-    // Avoid building 10^0 and asking BigRational to run a GCD for that common
-    // case. This is only a representation fast path: the returned integer is
-    // exactly the same mathematical value as the general decimal parser.
-    if !t
-        .as_bytes()
-        .iter()
-        .any(|&byte| matches!(byte, b'.' | b'e' | b'E'))
-    {
-        let (digits, negative) = match t.strip_prefix('-') {
-            Some(rest) => (rest, true),
-            None => (t.strip_prefix('+').unwrap_or(t), false),
-        };
-        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            let magnitude: BigInt = digits.parse().map_err(|_| bad())?;
-            return Ok(BigRational::from_integer(if negative {
-                -magnitude
-            } else {
-                magnitude
-            }));
-        }
-    }
-
-    // Split off an exponent, then read the mantissa as a plain decimal.
-    let (mant, exp) = match t.find(['e', 'E']) {
-        Some(i) => {
-            let e: i32 = t[i + 1..].parse().map_err(|_| bad())?;
-            (&t[..i], e)
-        }
-        None => (t, 0),
-    };
-    let (mant, neg) = match mant.strip_prefix('-') {
-        Some(r) => (r, true),
-        None => (mant.strip_prefix('+').unwrap_or(mant), false),
-    };
-    let (int_part, frac_part) = match mant.find('.') {
-        Some(i) => (&mant[..i], &mant[i + 1..]),
-        None => (mant, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return Err(bad());
-    }
-    let digits = format!("{int_part}{frac_part}");
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad());
-    }
-    let magnitude: BigInt = digits.parse().map_err(|_| bad())?;
-    let mut numer = if neg { -magnitude } else { magnitude };
-    let decimal_power = i64::try_from(frac_part.len())
-        .map_err(|_| bad())?
-        .checked_sub(i64::from(exp))
-        .ok_or_else(bad)?;
-    let ten = BigInt::from(10u8);
-    let denom = if decimal_power >= 0 {
-        ten.pow(u32::try_from(decimal_power).map_err(|_| bad())?)
-    } else {
-        numer *= ten.pow(u32::try_from(-decimal_power).map_err(|_| bad())?);
-        BigInt::one()
-    };
-
-    // Many generated MPS files print the complete decimal expansion of an
-    // f64 dyadic. Recognize that case by exact cross multiplication and reuse
-    // the already-reduced dyadic representation. A value such as 0.9 fails
-    // this equality and takes the general decimal-rational path below.
-    if let Ok(float) = t.parse::<f64>() {
-        if let Some(candidate) = exact(float) {
-            if &numer * candidate.denom() == candidate.numer() * &denom {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    Ok(BigRational::new(numer, denom))
-}
-
-fn cached_number<'a>(
-    cache: &mut HashMap<&'a str, BigRational>,
-    text: &'a str,
-    line: usize,
-) -> Result<BigRational, MpsError> {
-    if let Some(value) = cache.get(text) {
-        return Ok(value.clone());
-    }
-    let value = number(text, line)?;
-    cache.insert(text, value.clone());
-    Ok(value)
-}
-
 fn err(line: usize, message: &str) -> MpsError {
     MpsError {
         line,
@@ -1077,57 +679,13 @@ mod tests {
     /// The whole reason this reader does arithmetic: nine tenths is not a double.
     #[test]
     fn a_decimal_coefficient_is_read_as_the_rational_it_denotes() {
-        let v = number("0.9", 1).expect("parses");
-        assert_eq!(v, BigRational::new(9.into(), 10.into()));
+        let exact =
+            ay_lp::parse_mps_exact("NAME t\nROWS\n N obj\nCOLUMNS\n    x obj 0.9\nENDATA\n")
+                .expect("reads");
+        let v = &exact.columns[0].objective;
+        assert_eq!(*v, BigRational::new(9.into(), 10.into()));
         // ... and NOT the f64 nearest it, which is what `"0.9".parse::<f64>()` would have given.
-        assert_ne!(v, BigRational::from_float(0.9_f64).expect("finite"));
-    }
-
-    #[test]
-    fn scientific_and_signed_forms_parse() {
-        assert_eq!(
-            number("-1.5e-3", 1).expect("parses"),
-            BigRational::new((-15).into(), 10_000.into())
-        );
-        assert_eq!(
-            number("1e6", 1).expect("parses"),
-            BigRational::from_integer(1_000_000.into())
-        );
-        assert_eq!(
-            number("+60", 1).expect("parses"),
-            BigRational::from_integer(60.into())
-        );
-    }
-
-    #[test]
-    fn complete_f64_decimal_expansions_reuse_the_exact_dyadic_value() {
-        for encoded in [
-            "1.00001013278961181640625",
-            "0.0000000000000000000000000000000000000000001205116679319342680994407441629327872901025270013803563711078724145220331109840117278508841991424560546875",
-        ] {
-            let parsed = number(encoded, 1).expect("complete decimal expansion parses");
-            let float: f64 = encoded.parse().expect("finite f64");
-            assert_eq!(parsed, exact(float).expect("exact dyadic"));
-        }
-    }
-
-    #[test]
-    fn repeated_numbers_share_one_exact_parse_cache_entry() {
-        let mut cache = HashMap::new();
-        let encoded = "1.00001013278961181640625";
-        let first = cached_number(&mut cache, encoded, 1).expect("first parse");
-        let second = cached_number(&mut cache, encoded, 2).expect("cached parse");
-        assert_eq!(first, second);
-        assert_eq!(cache.len(), 1);
-
-        // Invalid text must not poison a later line's diagnostic or the cache.
-        assert_eq!(
-            cached_number(&mut cache, "not-a-number", 17)
-                .unwrap_err()
-                .line,
-            17
-        );
-        assert_eq!(cache.len(), 1);
+        assert_ne!(*v, BigRational::from_float(0.9_f64).expect("finite"));
     }
 
     #[test]
@@ -1187,30 +745,60 @@ ENDATA
         }
     }
 
-    /// Although ordinary column-major MPS input yields already ordered rows,
-    /// a repeated non-contiguous column record must still consolidate exactly.
-    /// This pins the fallback behind the parser's prepared-row fast path.
+    /// Repeated entries of one (column, row) are summed; a column whose
+    /// records are split by another column's is refused (the checker reads
+    /// it as two columns), with its line.
     #[test]
-    fn noncontiguous_column_records_still_sum_exactly() {
-        let src = "\
+    fn repeated_column_records_sum_and_split_ones_are_refused() {
+        let summed = "\
 NAME          repeats
 ROWS
  N  obj
  E  r1
 COLUMNS
     x         r1                 1
-    y         r1                 4
     x         r1                 2
+    y         r1                 4
 RHS
     R         r1                 7
 ENDATA
 ";
-        let problem = read_mps(src).expect("reads repeated columns");
+        let problem = read_mps(summed).expect("reads repeated entries");
         let (coefficients, lower, upper) = problem
             .model
             .row(problem.model.row_at(0).expect("constraint row"));
         assert_eq!(coefficients, &[(0, 3.0), (1, 4.0)]);
         assert_eq!((lower, upper), (7.0, 7.0));
+        let split = summed.replace(
+            "    x         r1                 2\n    y         r1                 4\n",
+            "    y         r1                 4\n    x         r1                 2\n",
+        );
+        assert_eq!(read_mps(&split).expect_err("split records").line, 8);
+    }
+
+    /// AY-N12: `read_mps` reads every file as `ay lp solve` does. Before, it
+    /// was a second reader: it took lower-case markers, kept the last of two
+    /// objective entries, gave an `UP` below 0 on a column with lower bound
+    /// 0 a lower bound of -inf, and gave a marker integer column without
+    /// bounds `[0, +inf)`. The first three are refused by the one reader
+    /// (readers in common use differ); the last is the checker's `[0, 1]`.
+    #[test]
+    fn read_mps_reads_as_the_one_reader_does() {
+        let refused = [
+            "NAME L\nROWS\n N OBJ\n L C1\nCOLUMNS\n    M 'MARKER' 'intorg'\n    X OBJ -1 C1 2\n    M 'MARKER' 'intend'\nRHS\n    RHS C1 3\nENDATA\n",
+            "NAME D\nROWS\n N OBJ\n L C1\nCOLUMNS\n    X OBJ -3 C1 1\n    X OBJ 2\nRHS\n    RHS C1 10\nENDATA\n",
+            "NAME U\nROWS\n N OBJ\n L C1\nCOLUMNS\n    X OBJ 1 C1 1\nRHS\n    RHS C1 10\nBOUNDS\n UP BND X -1\nENDATA\n",
+        ];
+        for text in refused {
+            let e = read_mps(text).expect_err("refused");
+            assert!(e.line > 0, "{e}");
+            assert!(ay_lp::parse_mps_exact(text).is_err());
+        }
+        let marker = "NAME B\nROWS\n N OBJ\n L C1\nCOLUMNS\n    M 'MARKER' 'INTORG'\n    X OBJ 1 C1 1\n    M 'MARKER' 'INTEND'\nRHS\n    RHS C1 5\nENDATA\n";
+        let problem = read_mps(marker).expect("reads");
+        let x = problem.model.col_at(0).expect("x");
+        assert_eq!(problem.model.col_bounds(x), (0.0, 1.0));
+        assert!(problem.model.col_kind(x).is_integral());
     }
 
     #[test]
@@ -1228,6 +816,6 @@ BOUNDS
 ENDATA
 ";
         let e = read_mps(src).expect_err("offset has no finite advice representation");
-        assert!(e.message.contains("objective offset"), "{e:?}");
+        assert_eq!(e.line, 7, "{e:?}");
     }
 }

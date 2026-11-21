@@ -205,11 +205,48 @@ fn run_proof_streaming_reader_body<R: Read>(
     source: DimacsInputSource<'_>,
     content_max_var: Option<usize>,
 ) {
+    run_proof_streaming_reader_body_then(
+        reader,
+        stats_cfg,
+        variant,
+        proof,
+        source,
+        content_max_var,
+        // Dropped as soon as parsing ends: an in-memory buffer is freed
+        // before the solve (the giant-mode memory lever).
+        |reader| {
+            drop(reader);
+            Ok(())
+        },
+    );
+}
+
+/// [`run_proof_streaming_reader_body`], with `finish_input` given the reader
+/// once parsing ends and before anything is solved. An error from it ends
+/// the run as a parse error (`s UNKNOWN`): the large-file route drains the
+/// rest of the file through its SHA-256 check there, so a parse that stopped
+/// early (a `%` trailer) still checks every byte (AY-SAT-1).
+fn run_proof_streaming_reader_body_then<R: Read>(
+    mut reader: R,
+    stats_cfg: stats_output::StatsConfig,
+    variant: SolverVariant,
+    proof: &ProofConfig,
+    source: DimacsInputSource<'_>,
+    content_max_var: Option<usize>,
+    finish_input: impl FnOnce(R) -> io::Result<()>,
+) {
     let mut load = ProofStreamingLoad::new(proof, content_max_var);
     if let Err(error) =
-        ay_sat::dimacs_core::parse_dimacs_events(reader, |event| load.accept_event(event))
+        ay_sat::dimacs_core::parse_dimacs_events(&mut reader, |event| load.accept_event(event))
     {
         exit_after_streaming_proof_parse_error(load.solver, proof, error);
+    }
+    if let Err(error) = finish_input(reader) {
+        exit_after_streaming_proof_parse_error(
+            load.solver,
+            proof,
+            DimacsCoreError::IoError(error.to_string()),
+        );
     }
     let mut solver = require_streaming_proof_solver(load.solver);
     solver.set_veripb_original_clauses(load.num_clauses_read);

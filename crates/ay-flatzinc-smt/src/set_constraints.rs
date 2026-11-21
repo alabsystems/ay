@@ -181,6 +181,38 @@ pub(crate) fn set_membership_term(
     }
 }
 
+/// Name the set for a set-constraint operand.
+///
+/// A set variable is named by its identifier. A constant set (a range such
+/// as the empty `1..0` that MiniZinc's `disjoint` produces, a set literal,
+/// `{}`, or a par set identifier) is introduced as fixed Boolean member bits
+/// over min..max under a fresh auxiliary name, so every set encoding below
+/// reads constant and variable operands alike.
+pub(crate) fn set_operand(ctx: &mut Context, expr: &Expr) -> Result<String, TranslateError> {
+    if let Expr::Ident(name) = expr {
+        if ctx.set_vars.contains_key(name) {
+            return Ok(name.clone());
+        }
+    }
+    let mut values = ctx.resolve_set(expr)?;
+    values.sort_unstable();
+    values.dedup();
+    let name = format!("_cset{}", ctx.next_aux_id());
+    let (lo, hi) = match (values.first(), values.last()) {
+        (Some(&lo), Some(&hi)) => (lo, hi),
+        _ => (0, -1),
+    };
+    let width = materialized_range_len(lo, hi, "constant set operand")?;
+    for offset in 0..width {
+        let bit = set_bit_name(&name, offset as u32);
+        let member = values.binary_search(&(lo + offset as i64)).is_ok();
+        ctx.emit_fmt(format_args!("(declare-const {bit} Bool)"));
+        ctx.emit_fmt(format_args!("(assert (= {bit} {member}))"));
+    }
+    ctx.set_vars.insert(name.clone(), (lo, hi));
+    Ok(name)
+}
+
 fn resolve_set_domain3(
     ctx: &Context,
     s1: &str,
@@ -217,7 +249,7 @@ fn union_set_domains(
 /// Encodes as: n = sum of (ite S__bit__i 1 0) for each bit position.
 pub(crate) fn set_card(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_card", args, 2)?;
-    let s_name = ctx.expr_to_smt(&args[0])?;
+    let s_name = set_operand(ctx, &args[0])?;
     let n = ctx.expr_to_smt(&args[1])?;
 
     let (lo, hi) = ctx
@@ -247,9 +279,9 @@ pub(crate) fn set_card(ctx: &mut Context, args: &[Expr]) -> Result<(), Translate
 /// `set_union(S1, S2, S3)` → for each bit: S3_bit_i = S1_bit_i or S2_bit_i
 pub(crate) fn set_union(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_union", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
-    let s3 = ctx.expr_to_smt(&args[2])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
+    let s3 = set_operand(ctx, &args[2])?;
 
     let (lo, hi) = resolve_set_domain3(ctx, &s1, &s2, &s3, "set_union")?;
 
@@ -324,7 +356,7 @@ pub(crate) fn set_in_var(ctx: &mut Context, args: &[Expr]) -> Result<(), Transla
 pub(crate) fn array_set_element(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("array_set_element", args, 3)?;
     let idx = ctx.expr_to_smt(&args[0])?;
-    let s_result = ctx.expr_to_smt(&args[2])?;
+    let s_result = set_operand(ctx, &args[2])?;
 
     let (lo, hi) = ctx
         .set_vars

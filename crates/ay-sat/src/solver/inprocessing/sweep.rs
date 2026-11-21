@@ -429,7 +429,7 @@ impl Solver {
                             // Update clause_ids so later deletions use the new
                             // proof ID, not the stale original.
                             if new_id != 0 && *clause_idx < self.cold.clause_ids.len() {
-                                self.cold.clause_ids[*clause_idx] = new_id;
+                                self.cold.clause_ids.set(*clause_idx, new_id);
                             }
                         }
                         crate::decompose::ClauseMutation::Unit { unit, old, .. } => {

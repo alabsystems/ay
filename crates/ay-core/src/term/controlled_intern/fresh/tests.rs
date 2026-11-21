@@ -256,3 +256,27 @@ fn fresh_binder_and_existing_controlled_app_form_the_exact_lambda_representation
     assert_eq!(store.get(output), &lambda);
     assert_eq!(store.sort(output), &array_sort);
 }
+
+#[test]
+fn integer_factory_preserves_full_freshness_and_original_stop_admission() {
+    let mut store = TermStore::new();
+    let original = store.mk_var("__ay_range_pin!73", Sort::Bool);
+    let born = store.entry_stamp(original);
+    let binder = store
+        .try_fresh_int_binder_with_progress(&mut |_, _| true)
+        .unwrap();
+    assert_eq!(store.sort(binder), &Sort::Int);
+    assert_ne!(binder, original);
+    assert_eq!(spelling(&store, binder), "__ay_range_pin!74");
+    assert_eq!(store.entry_stamp(original), born);
+    assert_eq!(store.find_var("__ay_range_pin!73"), Some(original));
+    let before = store.var_counter();
+    assert_eq!(
+        store.try_fresh_int_binder_with_progress(&mut |_, _| false),
+        Err(ControlledTermInternError::ResourceLimit)
+    );
+    assert_eq!(store.var_counter(), before);
+    let bv = fresh(&mut store).unwrap();
+    assert_eq!(store.sort(bv), &Sort::bitvec(64));
+    assert_ne!(bv, binder);
+}

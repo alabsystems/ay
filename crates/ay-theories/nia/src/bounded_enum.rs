@@ -67,6 +67,26 @@ pub(crate) fn enum_deadline_polls() -> u64 {
     ENUM_DEADLINE_POLLS.with(std::cell::Cell::get)
 }
 
+/// Floor of the geometric box split of a factor bounded on ONE side only
+/// (#nia-persist-until-deadline): `[lo, +inf)` splits as
+/// `v <= lo + max(|lo|, 1) OR v >= that + 1`, so the first branch is the
+/// finite box `[lo, 2*lo]` (`[lo, lo + 1]` for `|lo| < 1`); `(-inf, hi]`
+/// mirrors it, `v <= hi - max(|hi|, 1) - 1 OR v >= hi - max(|hi|, 1)`.
+/// `None` for a factor bounded on both sides or on neither.
+pub(crate) fn half_bounded_box_floor(lo: Option<&BigInt>, hi: Option<&BigInt>) -> Option<BigInt> {
+    match (lo, hi) {
+        (Some(lo), None) => {
+            let step = std::cmp::max(num_traits::Signed::abs(lo), BigInt::one());
+            Some(lo + step)
+        }
+        (None, Some(hi)) => {
+            let step = std::cmp::max(num_traits::Signed::abs(hi), BigInt::one());
+            Some(hi - step - BigInt::one())
+        }
+        _ => None,
+    }
+}
+
 impl NiaSolver<'_> {
     /// Wall-clock poll for the point-enumeration loops (#nia-enum-deadline).
     ///
@@ -1229,7 +1249,7 @@ impl NiaSolver<'_> {
                     offers.push((&hi - &lo, v, mid));
                 }
                 (Some(_), Some(_)) => {}
-                _ => {
+                (lo, hi) => {
                     let determined_nonneg = lb.is_some_and(|b| b.value_big() >= zero);
                     let determined_negative = ub.is_some_and(|b| {
                         let value = b.value_big();
@@ -1237,6 +1257,28 @@ impl NiaSolver<'_> {
                     });
                     if !determined_nonneg && !determined_negative {
                         offers.push((BigInt::from(i64::MAX), v, BigInt::from(-1)));
+                    }
+                    // #nia-persist-until-deadline (AY-SMT-5): a factor bounded
+                    // on ONE side only gets a geometric box split, so one
+                    // branch is a finite box (which the bisection above, the
+                    // bounded enumeration and the factor split can then
+                    // decide exactly) and the other moves the open bound
+                    // outward by the box width. `[lo, +inf)` splits at
+                    // `lo + max(|lo|, 1)`; `(-inf, hi]` mirrors it. The split
+                    // is a tautology over the integers, so it is sound in
+                    // every branch; it is offered only under the persistence
+                    // policy, where the alternative is giving up the rest of
+                    // the deadline (QF_NIA/fd01aea0 stalled with
+                    // `lo=Some(1), hi=None` on its only unbounded factor and
+                    // ended `unknown` at 48 s of 60).
+                    let box_floor = if self.persisting_until_deadline() {
+                        half_bounded_box_floor(lo.as_ref(), hi.as_ref())
+                    } else {
+                        None
+                    };
+                    if let Some(floor) = box_floor {
+                        // Sorts after every finite box and sign split.
+                        offers.push((BigInt::from(i64::MAX) + BigInt::one(), v, floor));
                     }
                 }
             }

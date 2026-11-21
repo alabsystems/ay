@@ -39,10 +39,10 @@ use num_traits::{Signed, Zero};
 use super::run_solve;
 
 /// A small deterministic generator (64-bit LCG).
-struct Lcg(u64);
+pub(super) struct Lcg(pub(super) u64);
 
 impl Lcg {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -50,26 +50,26 @@ impl Lcg {
         self.0 >> 33
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         usize::try_from(self.next()).unwrap_or(0) % n
     }
 
-    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+    pub(super) fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
         items[self.below(items.len())]
     }
 
-    fn chance(&mut self, percent: usize) -> bool {
+    pub(super) fn chance(&mut self, percent: usize) -> bool {
         self.below(100) < percent
     }
 }
 
-fn q(text: &str) -> BigRational {
+pub(super) fn q(text: &str) -> BigRational {
     parse_decimal(text).expect("generator number")
 }
 
 /// Coefficients: small integers, decimals that are not binary fractions,
 /// integers an `f64` cannot hold (and their exponent spelling).
-const COEFFS: [&str; 16] = [
+pub(super) const COEFFS: [&str; 16] = [
     "1",
     "-1",
     "2",
@@ -89,7 +89,7 @@ const COEFFS: [&str; 16] = [
 ];
 /// Pairs written as two entries of one (column, row): their exact sums are
 /// 9007199254740993, 0.3, 0 (the entry vanishes) and 2.
-const SPLITS: [(&str, &str); 4] = [
+pub(super) const SPLITS: [(&str, &str); 4] = [
     ("9007199254740992", "1"),
     ("0.1", "0.2"),
     ("1", "-1"),
@@ -191,7 +191,7 @@ fn continuous_bounds(
 }
 
 /// A value inside `[lo, hi]` (an integer for an integer column).
-fn witness(rng: &mut Lcg, col: &ExactColumn) -> BigRational {
+pub(super) fn witness(rng: &mut Lcg, col: &ExactColumn) -> BigRational {
     let lo = col.lower.clone().unwrap_or_else(|| q("-2"));
     let hi = col.upper.clone().unwrap_or_else(|| &lo + q("3"));
     if col.is_integral() {
@@ -370,7 +370,7 @@ fn generate(rng: &mut Lcg) -> Case {
 
 /// The exact decimal text of a terminating rational (every generated side
 /// is one), however long.
-fn rational_text(v: &BigRational) -> String {
+pub(super) fn rational_text(v: &BigRational) -> String {
     let ten = BigRational::from_integer(10.into());
     let mut scaled = v.clone();
     let mut places = 0usize;
@@ -393,7 +393,7 @@ fn rational_text(v: &BigRational) -> String {
 }
 
 #[derive(Debug, PartialEq)]
-enum Answer {
+pub(super) enum Answer {
     Infeasible,
     Unbounded,
     Optimal(BigRational),
@@ -401,7 +401,7 @@ enum Answer {
 
 /// The exact answer by enumeration of the integer columns and, for the
 /// continuous column, an exact one-variable LP.
-fn brute_force(model: &ExactProblem) -> Answer {
+pub(super) fn brute_force(model: &ExactProblem) -> Answer {
     let ints: Vec<usize> = (0..model.columns.len())
         .filter(|&j| model.columns[j].is_integral())
         .collect();
@@ -538,7 +538,7 @@ fn lp_1d(
 }
 
 /// The last written block: (objective text, value texts in column order).
-fn last_point(out: &str, model: &ExactProblem) -> Option<(String, Vec<String>)> {
+pub(super) fn last_point(out: &str, model: &ExactProblem) -> Option<(String, Vec<String>)> {
     let start = out.rfind("\no ")? + 1;
     let mut lines = out[start..].lines();
     let objective = lines.next()?.strip_prefix("o ")?.to_string();

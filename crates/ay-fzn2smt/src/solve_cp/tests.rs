@@ -106,22 +106,55 @@ fn test_portfolio_workers_are_unique() {
     }
 }
 
+/// MiniZinc passes `-p <cores>`; the Challenge's Parallel and Open classes
+/// use 8, more than there are portfolio configurations (AY-N2). Any count,
+/// including 0, is clamped to what the portfolio supports and still solves.
 #[test]
-fn invalid_parallel_worker_counts_are_rejected() {
-    let model = ay_flatzinc_parser::parse_flatzinc("solve satisfy;\n").expect("parse failed");
-    for requested in [0, super::PORTFOLIO_WORKERS.len() + 1] {
-        let err = super::cmd_solve_cp(&model, None, false, requested, Some(&[]))
-            .expect_err("invalid worker count must fail");
+fn any_parallel_worker_count_is_clamped_not_rejected() {
+    let sat = ay_flatzinc_parser::parse_flatzinc(
+        "var 1..3: x :: output_var;\nconstraint int_ne(x, 1);\nsolve satisfy;\n",
+    )
+    .expect("parse failed");
+    let opt = ay_flatzinc_parser::parse_flatzinc(
+        "var 1..3: x :: output_var;\nconstraint int_ne(x, 1);\nsolve minimize x;\n",
+    )
+    .expect("parse failed");
+    let over = super::PORTFOLIO_WORKERS.len() + 1;
+    for requested in [0, 1, over, 8, 64] {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        super::cmd_solve_cp_with_writers(
+            &sat,
+            None,
+            false,
+            requested,
+            Some(&[]),
+            &mut out,
+            &mut err,
+        )
+        .unwrap_or_else(|e| panic!("-p {requested} must not fail: {e}"));
+        let out = String::from_utf8(out).expect("utf8");
         assert!(
-            matches!(
-                err,
-                Fzn2smtError::InvalidWorkerCount {
-                    requested: actual,
-                    maximum
-                } if actual == requested && maximum == super::PORTFOLIO_WORKERS.len()
-            ),
-            "{err}"
+            out.contains("x = 2;") || out.contains("x = 3;"),
+            "-p {requested}: {out}"
         );
+        assert!(out.contains("----------"), "-p {requested}: {out}");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        super::cmd_solve_cp_with_writers(
+            &opt,
+            None,
+            false,
+            requested,
+            Some(&[]),
+            &mut out,
+            &mut err,
+        )
+        .unwrap_or_else(|e| panic!("-p {requested} must not fail: {e}"));
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(out.contains("x = 2;"), "-p {requested}: {out}");
+        assert!(out.contains("=========="), "-p {requested}: {out}");
     }
 }
 
@@ -1950,3 +1983,77 @@ fn test_count_neq_rejects_undercount() {
 
 // Lex, set_le, count_eq ordering, and asymmetric-domain tests are in
 // tests_ordering.rs (split for file size).
+
+/// A model whose dense order encoding exceeds the CP engine's capacity is
+/// declined before anything is printed, so `ay flatzinc solve` can hand it
+/// to the SMT path with the time that remains (AY-N4). It used to print
+/// =====UNKNOWN===== and stop within seconds of a 1200 s limit.
+#[test]
+fn order_encoding_capacity_is_declined_without_output() {
+    for solve in ["solve satisfy;", "solve minimize x;"] {
+        let fzn = format!("var 0..4000000: x :: output_var;\nconstraint int_ge(x, 3);\n{solve}\n");
+        let model = ay_flatzinc_parser::parse_flatzinc(&fzn).expect("parse failed");
+        // One worker, and the full satisfaction portfolio, whose workers
+        // decline too.
+        for workers in [1, super::PORTFOLIO_WORKERS.len()] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let result = super::cmd_solve_cp_with_writers(
+                &model,
+                None,
+                false,
+                workers,
+                Some(&[]),
+                &mut out,
+                &mut err,
+            );
+            assert!(
+                matches!(result, Err(Fzn2smtError::CpEncodingCapacity(_))),
+                "{solve} -p {workers}: {result:?}"
+            );
+            assert!(
+                out.is_empty(),
+                "{solve} -p {workers}: nothing may be printed before a decline: {}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+    }
+}
+
+/// A structurally matched incumbent (here the jobshop dispatch schedule) is
+/// printed before the generic encoding is built. When that encoding then
+/// exceeds the capacity, the incumbent stays the answer: no decline (the
+/// SMT path would print a second stream) and no =====UNKNOWN===== after a
+/// solution, which the measured build 268ebff6e252 printed.
+#[test]
+fn a_printed_incumbent_stays_the_answer_when_the_encoding_is_too_large() {
+    let fzn = "\
+var 0..4000000: s1 :: output_var;
+var 0..4000000: s2 :: output_var;
+var 0..4000000: makespan :: output_var;
+var bool: b12;
+var bool: b21;
+constraint int_lin_le([1, -1], [s1, makespan], -2);
+constraint int_lin_le([1, -1], [s2, makespan], -3);
+constraint int_lin_le_reif([1, -1], [s1, s2], -2, b12);
+constraint int_lin_le_reif([1, -1], [s2, s1], -3, b21);
+constraint bool_clause([b12, b21], []);
+solve minimize makespan;
+";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("parse failed");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result =
+        super::cmd_solve_cp_with_writers(&model, None, false, 1, Some(&[]), &mut out, &mut err);
+    let out = String::from_utf8(out).expect("UTF-8");
+    let err = String::from_utf8(err).expect("UTF-8");
+    assert!(result.is_ok(), "{result:?}\n{err}");
+    assert!(err.contains("jobshop dispatch incumbent"), "{err}");
+    assert!(err.contains("keeping the incumbent"), "{err}");
+    assert!(out.contains("makespan = 5;"), "{out}");
+    assert!(
+        out.ends_with("----------\n"),
+        "nothing may follow the incumbent: {out}"
+    );
+    assert!(!out.contains("=====UNKNOWN====="), "{out}");
+}

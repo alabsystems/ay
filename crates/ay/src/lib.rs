@@ -24,6 +24,7 @@
 //! | [`allsat`] | **Stable** | Solution enumeration (ALL-SAT) |
 //! | [`solution_visualization`] | Stable | ASCII/SVG rendering for recognized solution models |
 //! | [`proof_emission`] | **Stable** | **Proof artifacts for supported UNSAT paths (Alethe / DRAT / LRAT / bit-blast) — start here for proofs** |
+//! | [`proof_store`] | Stable | Where proofs go: sidecar pairs, `--proof-store`, labels |
 //! | [`proof_internals`] | Unstable | Deep proof reconstruction types |
 //! | [`translate`] | Unstable | Formula translation framework |
 //!
@@ -76,9 +77,11 @@ pub use ay_dpll::api::{
     validate_raw_smt_solve_profile_summary_text_lines, AssumptionSolveDetails,
     ConsumerAcceptanceError, FpSpecialKind, FuncDecl, Logic, Model, ModelBlockingAssignment,
     ModelBlockingClause, ModelBlockingClauseEvidence, ModelValue, NativeReplayArtifact,
-    NativeReplayEvidenceManifest, NativeReplayMetadata, NativeReplaySolverIdentity,
-    RawSmtProcessSolveProfileInput, RawSmtSolveProfileReason, RawSmtSolveProfileSource,
-    RawSmtSolveProfileStatus, RawSmtSolveProfileSummary, RawSmtSolveProfileValidationIssue,
+    NativeReplayEvidenceManifest, NativeReplayExportBudget, NativeReplayExportError,
+    NativeReplayExportLimits, NativeReplayExportResource, NativeReplayExportUsage,
+    NativeReplayMetadata, NativeReplaySolverIdentity, RawSmtProcessSolveProfileInput,
+    RawSmtSolveProfileReason, RawSmtSolveProfileSource, RawSmtSolveProfileStatus,
+    RawSmtSolveProfileSummary, RawSmtSolveProfileValidationIssue,
     RawSmtSolveProfileValidationReason, RawSmtSolveProfileValidationReport,
     RawSmtSolveProfileValidationStatus, SolveDecisionProfileModelConsumerDecision,
     SolveDecisionProfileModelConsumerReason, SolveDecisionProfileModelConsumerStatus,
@@ -365,16 +368,17 @@ pub mod api {
         validate_raw_smt_solve_profile_summary_text_lines, AssumptionSolveDetails,
         ConsumerAcceptanceError, CounterexampleStyle, FpSpecialKind, FuncDecl, Logic, Model,
         ModelBlockingAssignment, ModelBlockingClause, ModelBlockingClauseEvidence, ModelValue,
-        NativeReplayArtifact, NativeReplayEvidenceManifest, NativeReplayMetadata,
-        NativeReplaySolverIdentity, RawSmtProcessSolveProfileInput, RawSmtSolveProfileReason,
-        RawSmtSolveProfileSource, RawSmtSolveProfileStatus, RawSmtSolveProfileSummary,
-        RawSmtSolveProfileValidationIssue, RawSmtSolveProfileValidationReason,
-        RawSmtSolveProfileValidationReport, RawSmtSolveProfileValidationStatus,
-        SolveDecisionProfileModelConsumerDecision, SolveDecisionProfileModelConsumerReason,
-        SolveDecisionProfileModelConsumerStatus, SolveDecisionProfileSummary, SolveDetails,
-        SolveResult, Solver, SolverConfig, SolverError, SolverScope, Sort, StatValue, Statistics,
-        Term, TermId, TermKind, UnknownDiagnostic, UnknownReason, VerificationLevel,
-        VerificationSummary, VerifiedModel, VerifiedSolveResult,
+        NativeReplayArtifact, NativeReplayEvidenceManifest, NativeReplayExportBudget,
+        NativeReplayExportError, NativeReplayExportLimits, NativeReplayExportResource,
+        NativeReplayExportUsage, NativeReplayMetadata, NativeReplaySolverIdentity,
+        RawSmtProcessSolveProfileInput, RawSmtSolveProfileReason, RawSmtSolveProfileSource,
+        RawSmtSolveProfileStatus, RawSmtSolveProfileSummary, RawSmtSolveProfileValidationIssue,
+        RawSmtSolveProfileValidationReason, RawSmtSolveProfileValidationReport,
+        RawSmtSolveProfileValidationStatus, SolveDecisionProfileModelConsumerDecision,
+        SolveDecisionProfileModelConsumerReason, SolveDecisionProfileModelConsumerStatus,
+        SolveDecisionProfileSummary, SolveDetails, SolveResult, Solver, SolverConfig, SolverError,
+        SolverScope, Sort, StatValue, Statistics, Term, TermId, TermKind, UnknownDiagnostic,
+        UnknownReason, VerificationLevel, VerificationSummary, VerifiedModel, VerifiedSolveResult,
         AY_MODEL_BLOCKING_CLAUSE_EVIDENCE_ACCEPTED_REASON,
         AY_MODEL_BLOCKING_CLAUSE_EVIDENCE_ACCEPTED_STATUS,
         AY_MODEL_BLOCKING_CLAUSE_EVIDENCE_FAIL_CLOSED_REASON,
@@ -950,6 +954,10 @@ pub mod proof_emission {
         try_export_alethe(proof, terms)
     }
 }
+
+/// Where ay's proofs go and the label each carries: the sidecar pairs beside an
+/// input, the `--proof-store` layout, and the label's read and check.
+pub mod proof_store;
 
 /// Formula translation surface for consumers that transform ay terms into
 /// external representations (Lean expressions, other solver formats, etc.).

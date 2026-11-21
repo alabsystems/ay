@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Ground instances of single-binder authored universals, as clauses.
+//! Ground clauses with explicit authored or universal-instance provenance.
 //!
 //! Each universal is instantiated at the registered ground terms of its binder
 //! sort (bit-vector constants first) with the literal substitution
@@ -13,6 +13,10 @@
 
 use super::facts::{literal_atom, GroundSearch};
 use super::*;
+use crate::executor::proof::native_universal_lineage::{
+    NativeUniversalSource, NativeUniversalWitness,
+};
+use std::sync::Arc;
 
 /// Universal instances one search may take.
 const MAX_INSTANCES: usize = 64;
@@ -32,11 +36,24 @@ pub(super) enum InstanceShape {
     Implies,
 }
 
-/// One ground instance of an authored universal, as a clause.
+/// The original proof-producing source of a clause.
+#[derive(Clone, Debug)]
+pub(super) enum ClauseOrigin {
+    Forall {
+        root: TermId,
+        value: TermId,
+        exact: TermId,
+    },
+    /// An initial authored root or conjunction projection. It precedes every
+    /// propagated fact, so emission cannot form a fact dependency cycle.
+    AuthoredFact(usize),
+    NativeWitness(NativeUniversalWitness),
+}
+
+/// One ground clause with an explicit proof-producing origin.
 #[derive(Clone, Debug)]
 pub(super) struct InstanceClause {
-    pub(super) forall_root: TermId,
-    pub(super) value: TermId,
+    pub(super) origin: ClauseOrigin,
     pub(super) instance: TermId,
     pub(super) shape: InstanceShape,
     pub(super) literals: Vec<TermId>,
@@ -48,9 +65,71 @@ pub(super) struct FlatForall {
     pub(super) binder: String,
     pub(super) sort: Sort,
     pub(super) body: TermId,
+    pub(super) native: Option<Arc<NativeUniversalSource>>,
 }
 
 impl Executor {
+    /// Prepay the old emitter before entering it, including spare vector/map
+    /// capacity. Each path contains at most MAX_EDGES; each congruence/goal
+    /// call recurses through checked edge/fact memoization. The emitter checks
+    /// its 16k step ceiling before every recursive edge/fact/goal, so even its
+    /// final unchecked resolution/projection tail fits the conservative 64k
+    /// step allowance below. Clauses/args are bounded by an actual path or an
+    /// actual source application, never by the whole arena's arbitrary data.
+    pub(super) fn reserve_native_ground_emission(&self, search: &GroundSearch) -> Option<()> {
+        self.charge_native_universal(search.closure.nodes().len(), 0)?;
+        let mut width = search.closure.edges().len().checked_add(3)?;
+        for &term in search.closure.nodes() {
+            if let TermData::App(_, args) = self.ctx.terms.get(term) {
+                width = width.max(args.len().checked_add(2)?);
+            }
+        }
+        for clause in search.facts.clauses() {
+            width = width.max(clause.literals.len().checked_add(2)?);
+        }
+        self.charge_native_universal(
+            search.facts.facts().len(),
+            search.facts.facts().len().checked_mul(8)?,
+        )?;
+        let mut pending: Vec<_> = search.facts.facts().iter().map(|f| f.literal).collect();
+        let mut left = 4096usize;
+        while let Some(term) = pending.pop() {
+            left = left.checked_sub(1)?;
+            self.charge_native_universal(1, 0)?;
+            let children: &[TermId] = match self.ctx.terms.get(term) {
+                TermData::App(_, args) => {
+                    width = width.max(args.len().checked_add(2)?);
+                    args
+                }
+                TermData::Not(child) => std::slice::from_ref(child),
+                TermData::Ite(c, t, e) => {
+                    self.charge_native_universal(3, 24)?;
+                    if pending.len().checked_add(3)? > left {
+                        return None;
+                    }
+                    pending.extend([*c, *t, *e]);
+                    continue;
+                }
+                _ => &[],
+            };
+            if pending.len().checked_add(children.len())? > left {
+                return None;
+            }
+            self.charge_native_universal(children.len(), children.len().checked_mul(8)?)?;
+            pending.extend(children.iter().copied());
+        }
+        let steps = 65_536usize;
+        let slots = width.checked_add(2)?.checked_mul(8)?;
+        let bytes = steps
+            .checked_mul(
+                std::mem::size_of::<ProofStep>()
+                    .checked_add(slots.checked_mul(std::mem::size_of::<TermId>())?)?,
+            )?
+            .checked_add((MAX_NODES + MAX_EDGES).checked_mul(256)?)?;
+        let work = steps.checked_mul(width.checked_add(4)?.checked_pow(2)?)?;
+        self.charge_native_universal(work, bytes)
+    }
+
     /// Single-binder, quantifier-free-body universals of the authored scope
     /// that a top-level parsed assertion states without a source macro.
     ///
@@ -58,6 +137,31 @@ impl Executor {
     /// publication; a `define-fun` the elaborator expanded there prints as
     /// its symbol, and the instance would no longer print the clause checked.
     pub(super) fn flat_ground_closure_foralls(&mut self) -> Vec<FlatForall> {
+        if let Some(source) = NativeUniversalSource::capture(self) {
+            let source = Arc::new(source);
+            return source
+                .roots()
+                .iter()
+                .filter_map(|&root| {
+                    let TermData::Forall(bindings, body, _) = self.ctx.terms.get(root) else {
+                        return None;
+                    };
+                    let [(binder, sort)] = bindings.as_slice() else {
+                        return None;
+                    };
+                    if crate::ematching::contains_quantifier(&self.ctx.terms, *body) {
+                        return None;
+                    }
+                    Some(FlatForall {
+                        root,
+                        binder: binder.clone(),
+                        sort: sort.clone(),
+                        body: *body,
+                        native: Some(Arc::clone(&source)),
+                    })
+                })
+                .collect();
+        }
         let parsed: Vec<FrontendTerm> = self.ctx.raw_reinternable_parsed_assertions().to_vec();
         let mut authored: Vec<TermId> = Vec::new();
         for assertion in &parsed {
@@ -89,6 +193,7 @@ impl Executor {
                     binder: binder.clone(),
                     sort: sort.clone(),
                     body: *body,
+                    native: None,
                 })
             })
             .collect()
@@ -101,7 +206,31 @@ impl Executor {
         search: &mut GroundSearch,
         foralls: &[FlatForall],
     ) -> Option<()> {
+        let mut instances = 0usize;
+        if let Some(source) = foralls.iter().find_map(|f| f.native.as_ref()) {
+            for plan in self.native_universal_witnesses(source)? {
+                let instance = plan.asserted;
+                let (shape, literals) = self.instance_literals(instance);
+                self.register_ground_subterms(&mut search.closure, instance)?;
+                search.facts.push_clause(InstanceClause {
+                    origin: ClauseOrigin::NativeWitness(plan),
+                    instance,
+                    shape,
+                    literals,
+                });
+                instances += 1;
+            }
+        }
         for forall in foralls {
+            if let Some(source) = &forall.native {
+                if !source.admits(self, forall.root) {
+                    return None;
+                }
+                // Each sort comparison below may traverse a nested nominal/
+                // array/sequence sort. Admit actual borrowed candidate data,
+                // not only the expected binder sort, before that first use.
+                self.admit_native_universal_terms(search.closure.nodes())?;
+            }
             let mut values: Vec<TermId> = search
                 .closure
                 .nodes()
@@ -109,31 +238,52 @@ impl Executor {
                 .copied()
                 .filter(|&node| self.ctx.terms.sort(node) == &forall.sort)
                 .collect();
+            if forall.native.is_some() {
+                self.seed_native_universal_values(&forall.sort, &mut values)?;
+            }
+            if let Some(source) = &forall.native {
+                self.seed_native_universal_source_values(source, &forall.sort, &mut values)?;
+            }
             values.sort_by_key(|&value| !Self::is_bitvec_constant(&self.ctx.terms, value));
             values.truncate(MAX_VALUES_PER_BINDER);
             for value in values {
-                if search.facts.clauses().len() >= MAX_INSTANCES {
+                if instances >= MAX_INSTANCES {
                     return Some(());
                 }
-                let Some(instance) = Self::substitute_single_binder_structurally(
-                    &mut self.ctx.terms,
-                    forall.body,
-                    &forall.binder,
-                    value,
-                ) else {
+                let exact = if let Some(source) = &forall.native {
+                    self.native_universal_instance(source, forall.root, &[value])
+                } else {
+                    Self::substitute_single_binder_structurally(
+                        &mut self.ctx.terms,
+                        forall.body,
+                        &forall.binder,
+                        value,
+                    )
+                };
+                let Some(exact) = exact else {
                     continue;
+                };
+                let instance = if forall.native.is_some() {
+                    self.admit_native_universal_terms(&[exact])?;
+                    self.normalize_native_universal_boolean(exact, 0)?
+                } else {
+                    exact
                 };
                 let (shape, literals) = self.instance_literals(instance);
                 for &literal in &literals {
                     self.register_literal_operands(&mut search.closure, literal)?;
                 }
                 search.facts.push_clause(InstanceClause {
-                    forall_root: forall.root,
-                    value,
+                    origin: ClauseOrigin::Forall {
+                        root: forall.root,
+                        value,
+                        exact,
+                    },
                     instance,
                     shape,
                     literals,
                 });
+                instances += 1;
             }
         }
         Some(())
@@ -187,7 +337,7 @@ impl Executor {
 
     /// Register the operands of a literal's atom: both sides of an equality,
     /// the arguments of any other application.
-    fn register_literal_operands(
+    pub(super) fn register_literal_operands(
         &self,
         closure: &mut GroundClosure,
         literal: TermId,

@@ -72,6 +72,7 @@ include!("dimacs/dense_assets.rs");
 include!("dimacs/dense_admission.rs");
 include!("dimacs/dense_route.rs");
 include!("dimacs/dense_rejection.rs");
+include!("dimacs/parity_space_route.rs");
 include!("dimacs/stats_output.rs");
 include!("dimacs/proof_authority.rs");
 include!("dimacs/input_runs.rs");
@@ -111,6 +112,12 @@ mod custody_tests;
 /// The competition fast publication (2026-09-13).
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod fast_publication_tests;
+/// The large-input pre-scan equals the whole-buffer facts (AY-SAT-1).
+#[cfg(test)]
+mod large_prescan_tests;
+/// The parity-space route (AY-SAT-2, 2026-11-19).
+#[cfg(test)]
+mod parity_space_route_tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod proof_hash_tests;
 /// The status reservation's custody and its exit settlement (2026-10-08).

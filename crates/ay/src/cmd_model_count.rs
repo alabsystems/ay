@@ -53,6 +53,12 @@ pub(crate) struct ModelCountArgs {
     /// directory, or PATH).
     #[arg(long, value_name = "PATH")]
     pub(crate) flow_cutter: Option<PathBuf>,
+
+    /// Also run definability elimination on the unshown variables of a
+    /// projected instance (pmc, pwmc). Count-preserving but off by default
+    /// until its speed on the projected tracks is measured.
+    #[arg(long)]
+    pub(crate) projected_definability_elimination: bool,
 }
 
 /// Entry point dispatched from `main.rs`.
@@ -75,6 +81,7 @@ pub(crate) fn run(args: &ModelCountArgs) -> Result<()> {
         phase1_secs: args.phase1,
         decow: args.decow,
         flow_cutter: args.flow_cutter.clone(),
+        projected_definability_elimination: args.projected_definability_elimination,
     };
     let outcome = solve_instance_big_stack(instance, options);
     print!("{}", render(&outcome));

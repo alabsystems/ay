@@ -4720,6 +4720,8 @@ impl Executor {
         exec.random_seed = self.random_seed;
         exec.core_shrinking_suppressed = true;
         exec.certification_resolve = true;
+        // Only this re-solve's UNSAT is read; it never persists (AY-SMT-5).
+        exec.nia_persist_forbidden = true;
         // The re-solve re-decides the same problem: its proof builds carry on
         // from the exact-division sweeps this executor's build saw fail.
         exec.exact_division_sweeps = self.exact_division_sweeps.share_with_derived();
@@ -5638,7 +5640,10 @@ impl Executor {
             member_signatures.as_slice(),
             Some(problem.as_slice()),
         )
-        .map_err(|error| reject(format!("{NON_TRUST_STEP_REJECTION}: {error}")))?;
+        .map_err(|error| {
+            probe_cert_reject(|| self.rejected_step_probe_message(proof, &error));
+            reject(format!("{NON_TRUST_STEP_REJECTION}: {error}"))
+        })?;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             for (step, clause) in &collected {

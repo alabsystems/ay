@@ -169,6 +169,18 @@ fn seal_owned_dimacs_proof_body(path: &str) -> io::Result<PublishedDimacsProof> 
     }
     publish_owned_dimacs_proof_state(state, &resolved)?;
     let published = authenticate_published_dimacs_proof(state, &resolved)?;
+    // The label written at creation now records the published bytes' sha256,
+    // which is what lets a proof store count it again later. A proof whose
+    // label cannot be completed is still this run's proof; it just never
+    // counts for a later one.
+    if let Err(error) =
+        ay::proof_store::seal_label(&state.descriptor, &ay::proof_store::hex(&published.sha256))
+    {
+        safe_eprintln!(
+            "c warning: the label of {} records no proof sha256: {error}",
+            resolved.display()
+        );
+    }
     #[cfg(unix)]
     if let Some(parent) = resolved.parent() {
         File::open(parent)?.sync_all()?;

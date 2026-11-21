@@ -1420,6 +1420,17 @@ impl Executor {
             let before = preprocessed_assertions.clone();
             let var_subst_changed =
                 var_subst.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
+            // Keep the same checked replay evidence as the LIA route: a
+            // substituted arithmetic guard can disappear from an `or`, so
+            // its reduced clause must be derived from the original assertion
+            // and the equality licensing the substitution, not assumed.
+            if var_subst_changed && self.produce_proofs_enabled() {
+                self.extend_propagated_value_provenance_from_var_subst(
+                    &before,
+                    &preprocessed_assertions,
+                    &var_subst,
+                );
+            }
             // Record eliminated-variable definitions for model completion at
             // finalize time (model/completion.rs).
             self.record_var_substitutions(&var_subst);

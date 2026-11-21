@@ -32,6 +32,8 @@ use ay_core::{AletheRule, Proof, ProofId, Sort, Symbol, TermId};
 use super::proof_trust_surgery_provenance::SurgeryPlanningBudget;
 use super::Executor;
 
+#[path = "proof_euf_lemma_input.rs"]
+mod input;
 #[path = "proof_euf_lemma_packed_surface.rs"]
 mod packed_surface;
 #[path = "proof_euf_lemma_plan.rs"]
@@ -40,6 +42,7 @@ mod plan;
 mod surface;
 #[path = "proof_euf_lemma_volume.rs"]
 mod volume;
+use input::ProofInput;
 
 /// Justification for one needed equality `s = t` inside the recipe.
 #[derive(Clone, Copy, Debug)]
@@ -852,15 +855,121 @@ impl Executor {
         proof: &mut Proof,
         output_limit: usize,
     ) {
-        let Some(preflight) = volume::preflight_promotion(proof) else {
+        let Some(rebuilt) = self.build_generic_euf_leaf_candidate(proof, output_limit) else {
             return;
         };
 
+        // Array-extensionality claims are conservative-extension lemmas, not
+        // EUF tautologies. Authenticate them only on the validation clone so
+        // this local gate can see the complete derivation without mutating the
+        // real proof before later array surgery has finished. The final array
+        // pass installs the same provenance-checked promotion for real.
+        let mut validation = rebuilt.clone();
+        self.promote_array_extensionality_axioms(&mut validation);
+        match self.check_proof_strict_derivation_with_datatypes(&validation) {
+            Ok(_) => {
+                *proof = rebuilt;
+            }
+            Err(error) => {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
+                    eprintln!("[euf-leaf] atomic strict gate refused: {error}");
+                }
+            }
+        }
+    }
+
+    /// Stage the same bounded EUF leaf repair without installing it. This is
+    /// proof data, not authority: the caller must check the complete staged
+    /// derivation before replacing a retained proof. In particular, an ITE
+    /// source repair and this repair can both be needed by one derivation.
+    pub(super) fn build_generic_euf_leaf_candidate(
+        &mut self,
+        proof: &Proof,
+        output_limit: usize,
+    ) -> Option<Proof> {
+        self.build_generic_euf_leaf_candidate_admitted(
+            ProofInput::Borrowed(proof),
+            output_limit,
+            None,
+        )
+    }
+
+    pub(super) fn build_generic_euf_leaf_candidate_with_admission(
+        &mut self,
+        proof: &Proof,
+        output_limit: usize,
+        admission: impl Fn(usize, usize) -> bool + 'static,
+    ) -> Option<Proof> {
+        self.build_generic_euf_leaf_candidate_admitted(
+            ProofInput::Borrowed(proof),
+            output_limit,
+            Some(Box::new(admission)),
+        )
+    }
+
+    /// Consume only a disposable owned candidate. No plan preserves it; any
+    /// structural/resource refusal consumes it and requires the caller to
+    /// abort this staging attempt. This method never installs authority.
+    pub(super) fn build_generic_euf_leaf_candidate_owned_with_admission(
+        &mut self,
+        proof: Proof,
+        output_limit: usize,
+        admission: impl Fn(usize, usize) -> bool + 'static,
+    ) -> Option<Proof> {
+        // Poll the original owner before the local planner's stop shortcut,
+        // so cancellation is latched by that SAME owner as well.
+        if !admission(1, std::mem::size_of_val(&admission)) {
+            return None;
+        }
+        self.build_generic_euf_leaf_candidate_admitted(
+            ProofInput::Owned(proof),
+            output_limit,
+            Some(Box::new(admission)),
+        )
+    }
+
+    fn build_generic_euf_leaf_candidate_admitted(
+        &mut self,
+        input: ProofInput<'_>,
+        output_limit: usize,
+        admission: Option<Box<dyn Fn(usize, usize) -> bool>>,
+    ) -> Option<Proof> {
+        let stop = self.make_proof_assembly_should_stop();
+        if stop() {
+            return None;
+        }
+        let proof = input.proof();
+        let owned = input.is_owned();
         let n = proof.steps.len();
-        let mut planning = SurgeryPlanningBudget::new();
+        let mut planning = SurgeryPlanningBudget::with_stop_and_admission(stop, admission);
+        let scratch = n
+            .checked_mul(
+                std::mem::size_of::<Option<EufLemmaPlan>>()
+                    .checked_add(std::mem::size_of::<ProofId>())?
+                    .checked_add(std::mem::size_of::<usize>())?
+                    .checked_add(2)?,
+            )?
+            .checked_mul(2)?;
+        if !planning.admit_owned(
+            n.checked_add(proof.named_steps.capacity().checked_mul(2)?)?,
+            scratch,
+        ) {
+            return None;
+        }
+        let preflight = if owned {
+            volume::preflight_promotion_with_progress(proof, &mut |work| planning.spend_work(work))?
+        } else {
+            volume::preflight_promotion(proof)?
+        };
+        if !planning.poll_stop() {
+            return None;
+        }
         let mut plans: Vec<Option<EufLemmaPlan>> = vec![None; n];
         let mut typed_packed_transitive = vec![false; n];
         for (idx, step) in proof.steps.iter().enumerate() {
+            if !planning.spend_work(1) {
+                return None;
+            }
             if !preflight.reachable[idx] {
                 continue;
             }
@@ -872,13 +981,16 @@ impl Executor {
             if !planning.spend_work(clause.len().saturating_add(1))
                 || !planning.spend_terms(&self.ctx.terms, clause)
             {
-                return;
+                return None;
             }
             plans[idx] = self.plan_euf_lemma_with_budget(clause, &mut planning);
             typed_packed_transitive[idx] = is_typed_packed_transitive && plans[idx].is_some();
         }
         if ay_core::misc_cli_flags().trace_cegqi_attr {
             for (idx, step) in proof.steps.iter().enumerate() {
+                if !planning.poll_stop() {
+                    return None;
+                }
                 let generic = matches!(
                     step,
                     ay_core::ProofStep::TheoryLemma {
@@ -901,8 +1013,11 @@ impl Executor {
                 }
             }
         }
+        if !planning.poll_stop() {
+            return None;
+        }
         if plans.iter().all(Option::is_none) {
-            return;
+            return input.unchanged();
         }
         if !packed_surface::promotion_surfaces_are_safe(
             self,
@@ -913,22 +1028,73 @@ impl Executor {
             if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!("[euf-leaf] surface audit refused");
             }
-            return;
+            return None;
+        }
+        if !planning.poll_stop() {
+            return None;
         }
         if !volume::promotion_output_within(&preflight, &plans, output_limit) {
             if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!("[euf-leaf] volume bound refused");
             }
-            return;
+            return None;
+        }
+        // A nonempty emitted clause contributes at least one literal per
+        // owned step. This bounds all emitted step/vector/inline payload
+        // backings before emission, in addition to the unchanged volume gate.
+        let emitted = plans.iter().flatten().try_fold(0usize, |total, plan| {
+            total.checked_add(plan.emitted_literal_volume()?)
+        })?;
+        let output_bytes = if owned {
+            // Retained row/vector/string backings already belong to this
+            // original RepairBudget. Allocate only the new steps headers;
+            // fresh emission retains its original complete payload envelope.
+            n.checked_add(emitted)?
+                .checked_mul(std::mem::size_of::<ay_core::ProofStep>())?
+                .checked_add(
+                    emitted
+                        .checked_mul(std::mem::size_of::<ay_core::ProofStep>().checked_add(64)?)?
+                        .checked_mul(2)?,
+                )?
+        } else {
+            preflight
+                .input_volume
+                .checked_add(emitted)?
+                .checked_mul(std::mem::size_of::<ay_core::ProofStep>().checked_add(64)?)?
+                .checked_mul(2)?
+        };
+        let text_bytes = if owned {
+            0
+        } else {
+            preflight.owned_text_bytes.checked_mul(2)?
+        };
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
+            eprintln!("[euf-leaf] output owned={owned} retained_steps={n} input_volume={} emitted_volume={emitted} retained_text={} requested_storage={}",
+                preflight.input_volume, preflight.owned_text_bytes, output_bytes.checked_add(text_bytes)?);
+        }
+        if !planning.admit_owned(
+            preflight
+                .input_volume
+                .checked_add(emitted)?
+                .checked_add(if owned { 0 } else { preflight.owned_text_bytes })?,
+            output_bytes.checked_add(text_bytes)?,
+        ) {
+            return None;
         }
 
-        let mut rebuilt = Proof::new();
-        let mut remap: Vec<ProofId> = Vec::with_capacity(n);
-        for (idx, step) in proof.steps.iter().cloned().enumerate() {
+        let mut remap: Vec<ProofId> = Vec::new();
+        remap.try_reserve_exact(n).ok()?;
+        let mut assembly = input.assembly(n.checked_add(emitted)?, &mut planning)?;
+        for idx in 0..n {
+            if !planning.spend_work(1) {
+                return None;
+            }
+            let step = assembly.next()?;
             if let Some(plan) = &plans[idx] {
-                remap.push(self.emit_euf_lemma(&mut rebuilt, plan));
+                remap.push(self.emit_euf_lemma(&mut assembly.proof, plan));
                 continue;
             }
+            let step = step.into_owned();
             let remap_id = |id: ProofId| remap.get(id.0 as usize).copied().unwrap_or(id);
             let step = match step {
                 ay_core::ProofStep::Resolution {
@@ -945,52 +1111,27 @@ impl Executor {
                 ay_core::ProofStep::Step {
                     rule,
                     clause,
-                    premises,
+                    mut premises,
                     args,
-                } => ay_core::ProofStep::Step {
-                    rule,
-                    clause,
-                    premises: premises.into_iter().map(remap_id).collect(),
-                    args,
-                },
+                } => {
+                    for premise in &mut premises {
+                        if owned && !planning.spend_work(1) {
+                            return None;
+                        }
+                        *premise = remap_id(*premise);
+                    }
+                    ay_core::ProofStep::Step {
+                        rule,
+                        clause,
+                        premises,
+                        args,
+                    }
+                }
                 other => other,
             };
-            remap.push(rebuilt.add_step(step));
+            remap.push(assembly.proof.add_step(step));
         }
-        let mut remapped_named = proof.named_steps.clone();
-        remapped_named.retain(|_, id| {
-            let old_idx = id.0 as usize;
-            if !matches!(
-                proof.steps.get(old_idx),
-                Some(ay_core::ProofStep::Assume(_))
-            ) {
-                return false;
-            }
-            let Some(new_id) = remap.get(old_idx) else {
-                return false;
-            };
-            *id = *new_id;
-            true
-        });
-        rebuilt.named_steps = remapped_named;
-
-        // Array-extensionality claims are conservative-extension lemmas, not
-        // EUF tautologies. Authenticate them only on the validation clone so
-        // this local gate can see the complete derivation without mutating the
-        // real proof before later array surgery has finished. The final array
-        // pass installs the same provenance-checked promotion for real.
-        let mut validation = rebuilt.clone();
-        self.promote_array_extensionality_axioms(&mut validation);
-        match self.check_proof_strict_derivation_with_datatypes(&validation) {
-            Ok(_) => {
-                *proof = rebuilt;
-            }
-            Err(error) => {
-                if ay_core::misc_cli_flags().trace_cegqi_attr {
-                    eprintln!("[euf-leaf] atomic strict gate refused: {error}");
-                }
-            }
-        }
+        assembly.finish(&remap, &mut planning)
     }
 }
 

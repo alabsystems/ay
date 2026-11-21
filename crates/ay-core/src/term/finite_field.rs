@@ -4,6 +4,15 @@
 //! computes reachability once; incomplete snapshot/sort metadata stays `None`.
 use super::*;
 
+#[derive(Clone, Copy)]
+enum BinderSortPresence {
+    Inspect,
+    // Only the controlled validated grammar may supply this receipt. Its
+    // borrowed owned-sort admission has visited every physical binder sort
+    // before commit, and rejects FiniteField even beneath Array/Seq.
+    KnownFieldFree,
+}
+
 fn union(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     match (a, b) {
         (Some(true), _) | (_, Some(true)) => Some(true),
@@ -77,6 +86,20 @@ impl TermStore {
     ) -> Option<bool> {
         entry_from_sort(&self.terms, term, own)
     }
+
+    /// Dispatch metadata for a controlled-validated producer node. The
+    /// controlled grammar proves BOTH output and binder sorts field-free.
+    /// Child syntax can still carry true/unknown field presence and is always
+    /// unioned. This path performs no sort walk or scratch allocation during
+    /// the already-reserved commit; it grants no typing/source/proof authority.
+    pub(super) fn entry_field_presence_for_controlled(&self, term: &TermData) -> Option<bool> {
+        entry_with_binder_presence(
+            &self.terms,
+            term,
+            Some(false),
+            BinderSortPresence::KnownFieldFree,
+        )
+    }
 }
 
 pub(super) fn entry(entries: &[TermEntry], term: &TermData, sort: &Sort) -> Option<bool> {
@@ -86,6 +109,15 @@ pub(super) fn entry_from_sort(
     entries: &[TermEntry],
     term: &TermData,
     own: Option<bool>,
+) -> Option<bool> {
+    entry_with_binder_presence(entries, term, own, BinderSortPresence::Inspect)
+}
+
+fn entry_with_binder_presence(
+    entries: &[TermEntry],
+    term: &TermData,
+    own: Option<bool>,
+    binders: BinderSortPresence,
 ) -> Option<bool> {
     if own == Some(true) {
         return own;
@@ -121,8 +153,10 @@ pub(super) fn entry_from_sort(
             presence = union(presence, child(*body));
         }
         TermData::Forall(bindings, body, triggers) | TermData::Exists(bindings, body, triggers) => {
-            for (_, sort) in bindings {
-                presence = union(presence, sort_presence(sort));
+            if matches!(binders, BinderSortPresence::Inspect) {
+                for (_, sort) in bindings {
+                    presence = union(presence, sort_presence(sort));
+                }
             }
             presence = union(presence, child(*body));
             for trigger in triggers {

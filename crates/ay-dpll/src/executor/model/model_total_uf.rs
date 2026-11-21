@@ -293,6 +293,7 @@ impl Model {
     /// disagree about the function's else value.
     pub(in crate::executor) fn has_certified_total_uf(&self, name: &str) -> bool {
         self.certified_total_ufs.by_symbol.contains_key(name)
+            || self.certified_total_ufs.symbolic.contains_name(name)
     }
 
     /// Seal the model after every CEGQI-certified table has been installed.

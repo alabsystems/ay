@@ -1707,7 +1707,7 @@ mod tests {
     struct BveMutationSnapshot {
         active_clause_count: usize,
         num_vars: usize,
-        clause_ids: Vec<u64>,
+        clause_ids: ClauseIdTable,
         reconstruction_len: usize,
         lifecycle_removed: usize,
         proof_added: u64,
@@ -2226,7 +2226,7 @@ mod tests {
         solver.freeze(a);
         solver.freeze(b);
         let clause_indices: Vec<usize> = solver.arena.indices().collect();
-        solver.cold.clause_ids[clause_indices[0]] = 0;
+        solver.cold.clause_ids.set(clause_indices[0], 0);
 
         solver.set_circuit_bve_lrat_route_enabled(true);
         let inproc_ctrl_before = format!("{:?}", solver.inproc_ctrl);
@@ -2377,7 +2377,7 @@ mod tests {
         assert_ne!(solver.clause_id(ClauseRef(pos_ante as u32)), 0);
         assert_ne!(solver.clause_id(ClauseRef(neg_ante as u32)), 0);
 
-        solver.cold.clause_ids[pos_ante] = 0;
+        solver.cold.clause_ids.set(pos_ante, 0);
         let active_before = solver.arena.active_clause_count();
         let clause_ids_before = solver.cold.clause_ids.clone();
         let proof_added_before = solver.proof_manager.as_ref().unwrap().added_count();
@@ -2455,7 +2455,7 @@ mod tests {
             .expect("hidden trusted unit ID");
         assert_ne!(hidden_id, 0);
         assert!(!solver.lrat_hint_id_visible(hidden_id));
-        solver.cold.clause_ids[pos_ante] = hidden_id;
+        solver.cold.clause_ids.set(pos_ante, hidden_id);
 
         let active_before = solver.arena.active_clause_count();
         let clause_ids_before = solver.cold.clause_ids.clone();
@@ -2585,7 +2585,7 @@ mod tests {
         let target = clause_indices[0];
         let neg_ante = clause_indices[1];
         let target_before = solver.arena.literals(target).to_vec();
-        solver.cold.clause_ids[target] = 0;
+        solver.cold.clause_ids.set(target, 0);
 
         let active_before = solver.arena.active_clause_count();
         let clause_ids_before = solver.cold.clause_ids.clone();

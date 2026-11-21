@@ -300,7 +300,7 @@ impl VSIDS {
                 )
             };
 
-        Self {
+        let mut vsids = Self {
             activities: vec![0.0; num_vars],
             increment: 1.0,
             decay: default_vsids_decay(),
@@ -328,7 +328,60 @@ impl VSIDS {
             vmtf_deferred: false,
             queue_freeze: ay_core::sat_ab_switches().queue_freeze_kissat == Some(true),
             bucket_queue: BucketQueue::new(),
+        };
+        vsids.apply_initial_order_switch();
+        vsids
+    }
+
+    /// `--sat-initial-order-high-first <bool>`: install the initial decision
+    /// order with the HIGHEST variable index first, in both the focused VMTF
+    /// queue and the stable heap. This is CaDiCaL's default `init_queue`
+    /// (variables are enqueued 1..n, and the search starts at the queue's
+    /// last, i.e. highest, element) and, on files whose variables first occur
+    /// in index order, Kissat's: Kissat enqueues each variable when it is
+    /// activated during parsing and gives it the heap score
+    /// `1 - 1/activated` (`flags.c` `activate_literal`), so the variable seen
+    /// last is decided first. AY's default decides the LOWEST index first.
+    ///
+    /// Search heuristic only: the order in which unassigned variables are
+    /// picked. It changes no clause, model check or proof step.
+    fn apply_initial_order_switch(&mut self) {
+        if ay_core::sat_ab_switches().initial_order_high_first == Some(true) {
+            self.install_high_index_first_order();
         }
+    }
+
+    /// See [`Self::apply_initial_order_switch`]. Only valid on a freshly
+    /// constructed `VSIDS` (no bumps yet, every variable unassigned).
+    pub(crate) fn install_high_index_first_order(&mut self) {
+        let n = self.activities.len();
+        if n == 0 {
+            return;
+        }
+        // VMTF: oldest = 0, newest = n - 1; the search starts at the newest.
+        for i in 0..n {
+            self.bump_order[i] = i as u64 + 1;
+            self.vmtf_prev[i] = if i > 0 { (i - 1) as u32 } else { INVALID_VAR };
+            self.vmtf_next[i] = if i + 1 < n {
+                (i + 1) as u32
+            } else {
+                INVALID_VAR
+            };
+        }
+        self.vmtf_first = 0;
+        self.vmtf_last = (n - 1) as u32;
+        self.vmtf_unassigned = self.vmtf_last;
+        self.vmtf_unassigned_bumped = self.bump_order[n - 1];
+        self.bump_counter = n as u64 + 1;
+        // Heap: Kissat's activation score 1 - 1/k for the k-th variable, so a
+        // higher index wins every tie-free comparison until it is bumped.
+        for (i, activity) in self.activities.iter_mut().enumerate() {
+            *activity = 1.0 - 1.0 / (i as f64 + 1.0);
+        }
+        self.rebuild_heap();
+
+        #[cfg(debug_assertions)]
+        self.debug_assert_vmtf_consistent();
     }
 
     /// Ensure VSIDS has storage for `num_vars` variables.
@@ -1125,6 +1178,8 @@ impl VSIDS {
     }
 }
 
+#[cfg(test)]
+mod initial_order_tests;
 #[cfg(test)]
 mod queue_freeze_tests;
 #[cfg(test)]

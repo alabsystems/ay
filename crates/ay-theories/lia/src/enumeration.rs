@@ -32,6 +32,20 @@ use crate::{
     SubstitutionTriple,
 };
 
+/// Outcome of checking an enumeration witness against LIA's shared
+/// (cross-theory) disequalities; see
+/// [`LiaSolver::witness_shared_disequality_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedDiseqWitnessStatus {
+    /// Every shared disequality is determined by the witness and holds.
+    Holds,
+    /// None is shown violated, but at least one mentions a variable the
+    /// witness does not determine.
+    Undetermined,
+    /// Some shared disequality is determined by the witness and violated.
+    Violated,
+}
+
 mod bounds;
 mod bounds_single;
 mod bounds_two_var;
@@ -222,6 +236,18 @@ impl LiaSolver<'_> {
         solution: &[(usize, BigInt)],
         idx_to_term: &[TermId],
     ) -> bool {
+        // A witness must satisfy the WHOLE cross-theory interface LIA holds,
+        // the disequalities too (AY-SMT-2, 2026-11-19). Checked first: the
+        // early return below must not skip them.
+        // Only `Holds` lets the witness through on these LIA-only lanes: an
+        // `Undetermined` pair hands the disequality on to the simplex path,
+        // which carries it (enumeration is an optimization, so this costs
+        // time, never a verdict).
+        if self.witness_shared_disequality_status(solution, idx_to_term)
+            != SharedDiseqWitnessStatus::Holds
+        {
+            return false;
+        }
         if self.shared_equalities.is_empty() {
             // INTERFACE-DIET C4/R2 (empty-unlocks-Sat site): with a withheld
             // equality the empty interface is not complete, so "no constraints
@@ -261,6 +287,74 @@ impl LiaSolver<'_> {
             }
         }
         true
+    }
+
+    /// How the enumerated `solution` stands against the CROSS-THEORY
+    /// disequalities LIA holds (AY-SMT-2, 2026-11-19).
+    ///
+    /// The enumeration lanes (finite-domain search, direct enumeration) build
+    /// their systems from the asserted literals only. A disequality that EUF
+    /// forwards through `assert_shared_disequality` — `(not (= 0 (f 1)))`,
+    /// routed to LIA as a shared pair instead of an asserted literal — is
+    /// invisible to them, so a witness can violate it: with `0 <= f(1) <= 0`
+    /// asserted and `f(1) != 0` shared, the finite-domain search returned the
+    /// witness `f(1) = 0` and LIA answered `Sat`. Inside a Nelson-Oppen
+    /// combiner that `Sat` short-circuits the simplex (no bounds, no reasons,
+    /// no equality for EUF), so the combiner reported the UNSAT set
+    /// `{0 <= f(1), f(1) <= 0, f(1) != 0}` satisfiable: the fail-closed
+    /// conflict verifier then refused a genuine conflict and the query ended
+    /// `unknown` (QF_UFLIA one-liners in the default mode; quantified AUFLIA
+    /// instances whose skolem-function instances have constant arguments).
+    ///
+    /// `Violated` only when every variable of the pair's linear form has a
+    /// value in the witness and the two sides are equal: a refusal is always
+    /// backed by a shown violation. A pair that mentions a variable the
+    /// enumeration did not determine is `Undetermined` (the free variable can
+    /// still separate the sides); each caller decides what that means for its
+    /// lane. Sorts are not filtered: a determined pair is evaluated exactly
+    /// over the rationals whatever its sort.
+    pub(crate) fn witness_shared_disequality_status(
+        &self,
+        solution: &[(usize, BigInt)],
+        idx_to_term: &[TermId],
+    ) -> SharedDiseqWitnessStatus {
+        if self.shared_disequalities.is_empty() {
+            return SharedDiseqWitnessStatus::Holds;
+        }
+        let mut values: HashMap<TermId, BigRational> = HashMap::default();
+        for (col, val) in solution {
+            let Some(&term) = idx_to_term.get(*col) else {
+                return SharedDiseqWitnessStatus::Undetermined;
+            };
+            values.insert(term, BigRational::from(val.clone()));
+        }
+        let mut status = SharedDiseqWitnessStatus::Holds;
+        for (lhs, rhs, _) in &self.shared_disequalities {
+            let lhs_coeffs = self.term_to_linear_coeffs(*lhs);
+            let rhs_coeffs = self.term_to_linear_coeffs(*rhs);
+            let mut acc = &lhs_coeffs.constant - &rhs_coeffs.constant;
+            let mut determined = true;
+            for (var, coeff) in lhs_coeffs
+                .vars
+                .iter()
+                .map(|(v, c)| (v, c.clone()))
+                .chain(rhs_coeffs.vars.iter().map(|(v, c)| (v, -c.clone())))
+            {
+                let Some(val) = values.get(var) else {
+                    determined = false;
+                    break;
+                };
+                acc += coeff * val;
+            }
+            if !determined {
+                status = SharedDiseqWitnessStatus::Undetermined;
+                continue;
+            }
+            if acc.is_zero() {
+                return SharedDiseqWitnessStatus::Violated;
+            }
+        }
+        status
     }
 
     pub(crate) fn try_direct_enumeration(&mut self) -> DirectEnumResult {

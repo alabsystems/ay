@@ -92,6 +92,15 @@ pub(in crate::executor) fn thread_observations() -> u64 {
     OBSERVED.try_with(Cell::get).unwrap_or(u64::MAX)
 }
 
+/// Can the current allowance cover this known lower bound on future observations?
+/// This read-only admission check leaves the count available to the enclosing proof.
+pub(in crate::executor) fn can_observe(additional: usize) -> bool {
+    u64::try_from(additional)
+        .ok()
+        .and_then(|count| thread_observations().checked_add(count))
+        .is_some_and(|projected| !spent_at(projected))
+}
+
 /// Charge one observation. `true` once an open allowance is spent: the
 /// caller treats it as a stop, never as an answer.
 pub(in crate::executor) fn observe() -> bool {

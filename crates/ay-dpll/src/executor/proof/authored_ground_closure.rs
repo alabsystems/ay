@@ -21,7 +21,9 @@
 //!
 //! This lane decides that fragment directly over the raw re-interns of the
 //! parsed assertions, so every term prints exactly as authored and no surface
-//! bridge is needed.
+//! bridge is needed. Native API rows instead contribute their exact paired
+//! concrete source roots, already in the frozen problem scope; the reserved
+//! parsed-row marker is never interpreted as an assumption or a symbol.
 //!
 //! RECORD CONSTANTS are the one place a raw re-intern cannot be print
 //! faithful. A declared constant of a single-constructor datatype elaborates
@@ -67,9 +69,11 @@
 //!
 //! Boolean facts ride on top (`facts.rs`): authored atoms and conjuncts
 //! (`and_pos`), closed bit-vector literals (`BvBitBlast`), predicate
-//! congruence (`EufCongruentPred`), and unit propagation over ground instances
-//! of single-binder authored universals (`instances.rs`, `forall_inst`) — the
-//! Horn fragment, so no case split is ever made.
+//! congruence (`EufCongruentPred`), and unit propagation over authored clauses
+//! (`or`/`implies`) and ground instances of single-binder authored universals
+//! (`instances.rs`, `forall_inst`). Every propagated fact is forced; no case
+//! split is ever made. Candidates using authored clauses must retain exact
+//! concrete source authority for every reachable assumption.
 //!
 //! It closes on two different bit-vector constants in one class, an authored
 //! disequality whose sides merged, a complementary pair of facts, or an
@@ -96,6 +100,7 @@
 
 use super::*;
 
+mod authored_clauses;
 mod bv_intrinsics;
 mod congruence;
 mod early;
@@ -106,6 +111,7 @@ mod goal;
 mod goal_boolean;
 mod goal_read_range;
 mod instances;
+mod native_roots;
 mod offset;
 mod packing;
 mod packing_emit;
@@ -126,8 +132,10 @@ use instances::FlatForall;
 use state::{EdgeReason, GroundClosure};
 use work::SharedGroundWork;
 
-/// Parsed assertions beyond which this lane declines.
+/// Distinct native roots and ordinary parsed rows beyond which this lane declines.
 const MAX_AUTHORED_ROOTS: usize = 64;
+/// Duplicate native rows are bounded separately from their distinct roots.
+const MAX_NATIVE_AUTHORED_ROWS: usize = 128;
 /// Registered terms (authored subterms, introduced base reads and slice
 /// rewrites). A translation-validation root names one 64-bit word per SSA
 /// value on both sides of the claim. The exact original TY conditional
@@ -167,7 +175,8 @@ const EVALUATED_OPERATORS: &[&str] = &[
 ];
 
 /// The roots of one search, and which of them are raw re-interns (only those
-/// enter the raw premise ledger; a twin is already in the concrete scope).
+/// enter the raw premise ledger; twins and native roots are already in the
+/// concrete scope).
 #[derive(Default)]
 pub(super) struct GroundRoots {
     pub(super) raw: Vec<TermId>,
@@ -293,6 +302,16 @@ impl Executor {
     /// decline, so a caller that has them does not pay it twice).
     fn rebuild_raw_ground_closure_from(&mut self, proof: &mut Proof, roots: &GroundRoots) -> bool {
         let foralls = self.flat_ground_closure_foralls();
+        if foralls.iter().any(|f| f.native.is_some())
+            && self
+                .charge_native_universal(
+                    MAX_NODES * MAX_NODES + MAX_ROUNDS * MAX_EDGES,
+                    MAX_NODES * 256 + MAX_EDGES * 128,
+                )
+                .is_none()
+        {
+            return false;
+        }
         let mut search = GroundSearch::default();
         let Some(conflict) = self.saturate_ground_search(&mut search, &roots.search, &foralls)
         else {
@@ -306,10 +325,22 @@ impl Executor {
             });
             return false;
         };
+        if foralls.iter().any(|f| f.native.is_some())
+            && self.reserve_native_ground_emission(&search).is_none()
+        {
+            return false;
+        }
         let Some(candidate) = self.emit_ground_closure_refutation(&search, conflict.clone()) else {
             closure_note(|| format!("emission declined for {conflict:?}"));
             return false;
         };
+        if foralls
+            .iter()
+            .filter_map(|f| f.native.as_ref())
+            .any(|scope| !scope.is_current(self))
+        {
+            return false;
+        }
         let steps = candidate.steps.len();
         let committed = self.commit_raw_ground_closure(proof, candidate, &roots.raw);
         closure_note(|| {
@@ -353,6 +384,7 @@ impl Executor {
             let disequalities = self.seed_ground_closure(&mut search.closure, roots)?;
             phase = "seed-facts";
             self.seed_ground_root_facts(search, roots)?;
+            self.seed_authored_ground_clauses(search)?;
             phase = "seed-goals";
             self.seed_ground_goal_terms(search)?;
             phase = "seed-instances";
@@ -546,19 +578,22 @@ impl Executor {
     /// authored) is not available to this lane at all; one raw interning
     /// refuses (a binder, an over-budget tree, a field read) contributes only
     /// a twin that the exact concrete authored scope holds, that reads a
-    /// record field, and that contains no binder.
+    /// record field, and that contains no binder. Native placeholder rows use
+    /// their exact, aligned concrete source term and never enter the raw
+    /// premise ledger. Repeated native rows have a separate finite row bound.
     fn ground_closure_roots(&mut self) -> Option<GroundRoots> {
         let parsed = self.ctx.raw_reinternable_parsed_assertions();
-        if parsed.is_empty() || parsed.len() > MAX_AUTHORED_ROOTS {
+        if parsed.is_empty() || parsed.len() > MAX_NATIVE_AUTHORED_ROWS {
             return None;
         }
         let parsed: Vec<FrontendTerm> = parsed.to_vec();
         let scope = self.exact_concrete_authored_scope();
+        let native = self.native_ground_closure_roots(&parsed, &scope)?;
         let fields = self.ctx.dt_field_surface_overrides();
         let mut roots = GroundRoots::default();
         let mut twins = Vec::new();
         for assertion in &parsed {
-            if self.mentions_source_macro(assertion) {
+            if native_roots::is_native_row(assertion) || self.mentions_source_macro(assertion) {
                 continue;
             }
             let raw = self.raw_intern_surface(assertion);
@@ -582,12 +617,24 @@ impl Executor {
             }
         }
         roots.search = roots.raw.clone();
-        for twin in twins {
+        for twin in twins.into_iter().chain(native) {
             if !roots.search.contains(&twin) {
                 roots.search.push(twin);
             }
         }
-        (!roots.search.is_empty()).then_some(roots)
+        // A native false universal over an actual registered constructor can
+        // refute a query with no ground source row. The receipt, not an empty
+        // working-stack guess, licenses the later exact forall_inst premise.
+        let native_universal = roots.search.is_empty()
+            && super::native_universal_lineage::NativeUniversalSource::capture(self).is_some_and(
+                |source| {
+                    source
+                        .roots()
+                        .iter()
+                        .any(|&root| matches!(self.ctx.terms.get(root), TermData::Forall(..)))
+                },
+            );
+        (!roots.search.is_empty() || native_universal).then_some(roots)
     }
 
     /// Admit the candidate's raw roots and commit it, but only after its

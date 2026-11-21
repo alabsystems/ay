@@ -37,7 +37,8 @@ impl SatProofManager<'_> {
     /// assertion — over a database it seeded entirely from checker-validated
     /// steps (Tseitin tautologies, `ite_intro` branch equalities, EUF
     /// congruence transfers, Farkas-verified constant evaluations). Every
-    /// emitted step is an ordinary `Resolution` over those leaves; the theory
+    /// emitted step is resolution over those leaves, with explicit weakening
+    /// if the database itself refutes before using the unit target. The theory
     /// oracle only ever adds solver-certified `la_generic` lemmas.
     pub(crate) fn close_target_over_seeded_clauses(
         &mut self,

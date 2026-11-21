@@ -17,7 +17,8 @@ use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, Symbol, TermData, Ter
 #[cfg(test)]
 pub(crate) use bundle::authenticate_bundle_skolems;
 pub(crate) use bundle::{
-    authenticate_bundle_skolems_with_progress, validate_sko_forall_uniqueness,
+    authenticate_bundle_skolems_with_progress,
+    validate_registered_skolem_source_scope_with_progress, validate_sko_forall_uniqueness,
     validate_sko_forall_uniqueness_with_progress,
 };
 #[cfg(test)]

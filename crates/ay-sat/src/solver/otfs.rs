@@ -190,7 +190,7 @@ impl super::Solver {
             // clause_id(reason_ref) returns the stale deleted ID.
             let idx = reason_ref.0 as usize;
             if new_id != 0 && idx < self.cold.clause_ids.len() {
-                self.cold.clause_ids[idx] = new_id;
+                self.cold.clause_ids.set(idx, new_id);
             }
             // Sync next_clause_id so subsequent learned clauses don't
             // collide with IDs allocated by the proof manager.

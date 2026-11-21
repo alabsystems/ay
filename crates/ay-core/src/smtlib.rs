@@ -116,6 +116,11 @@ const RESERVED: &[&str] = &[
     "declare-rare-rule",
 ];
 
+/// Returns whether the SMT-LIB emitter reserves this unquoted spelling.
+pub fn is_smtlib_reserved_word(name: &str) -> bool {
+    RESERVED.contains(&name)
+}
+
 /// Whether [`quote_symbol`] quotes `name`: it is empty, starts with a digit,
 /// reads as a signed number, is one of `RESERVED`, or holds a character
 /// `is_symbol_char` refuses.
@@ -123,7 +128,7 @@ fn needs_quoting(name: &str) -> bool {
     name.is_empty()
         || name.starts_with(|c: char| c.is_ascii_digit())
         || reads_as_signed_number(name)
-        || RESERVED.contains(&name)
+        || is_smtlib_reserved_word(name)
         || name.contains(|c: char| !is_symbol_char(c))
 }
 

@@ -243,16 +243,20 @@ impl<'k> Ctx<'k> {
         self
     }
 
-    /// Report `cost` units of work (design R1). Fails, and the plug-in must
-    /// return the give-up, once the check's guard says stop; the guard is
-    /// polled every `TICKS_PER_POLL` (64) units.
+    /// Spend `cost` units on the original resource owner on EVERY call,
+    /// including charges smaller than 64. Effects retain statistics only;
+    /// kernel aggregation must not spend these ticks for a second time.
+    /// External deadline/stop predicates keep their existing 64-unit poll.
     pub fn tick(&mut self, cost: u64) -> Result<(), GiveUp> {
         let before = self.out.ticks;
         self.out.ticks = before.saturating_add(cost);
-        if before / TICKS_PER_POLL == self.out.ticks / TICKS_PER_POLL {
-            return Ok(());
-        }
-        match self.guard.and_then(Guard::exhausted) {
+        // Observe the existing external precedence before the debit can latch
+        // a newly exhausted resource allowance. Still debit on that refusal.
+        let external = (before / TICKS_PER_POLL != self.out.ticks / TICKS_PER_POLL)
+            .then(|| self.guard.and_then(Guard::exhausted))
+            .flatten();
+        let charged = self.guard.map_or(Ok(()), |guard| guard.charge_ticks(cost));
+        match external.or_else(|| charged.err()) {
             Some(why) => Err(GiveUp::new(why.reason())),
             None => Ok(()),
         }
@@ -463,3 +467,6 @@ pub trait TheoryPlugin: Send {
         None
     }
 }
+
+#[cfg(test)]
+mod tick_tests;

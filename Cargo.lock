@@ -130,12 +130,13 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ay"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "anyhow",
  "ay-allsat",
  "ay-bench",
  "ay-bisect",
+ "ay-bv",
  "ay-chc",
  "ay-core",
  "ay-count",
@@ -186,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "ay-allsat"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-sat",
  "tracing",
@@ -194,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "ay-arrays"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -205,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "ay-bench"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-chc",
  "ay-core",
@@ -229,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "ay-bindings"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-chc",
  "ay-core",
@@ -247,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "ay-bisect"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "anyhow",
  "ay-sys",
@@ -261,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "ay-bv"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-arrays",
  "ay-core",
@@ -281,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "ay-cdclt"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-diff-logic",
@@ -296,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "ay-chc"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-arrays",
  "ay-bv",
@@ -334,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "ay-core"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-sys",
  "clap",
@@ -354,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "ay-count"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -369,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "ay-cp"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-sat",
  "num-bigint",
@@ -382,14 +383,14 @@ dependencies = [
 
 [[package]]
 name = "ay-criterion-main"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "ay-diff-logic"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-test-support",
  "num-bigint",
@@ -402,14 +403,14 @@ dependencies = [
 
 [[package]]
 name = "ay-dispatch"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "rustc-hash",
 ]
 
 [[package]]
 name = "ay-dpll"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "anyhow",
  "ay-arrays",
@@ -460,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "ay-drat-check"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-proof-common",
  "ay-sys",
@@ -471,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "ay-dt"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-euf",
@@ -481,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "ay-encode"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -492,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "ay-euf"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-criterion-main",
@@ -507,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "ay-ffi"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-chc",
  "ay-core",
@@ -529,14 +530,14 @@ dependencies = [
 
 [[package]]
 name = "ay-flatzinc-parser"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-flatzinc-smt"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -549,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "ay-fp"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -562,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "ay-frontend"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "logos 0.15.1",
@@ -576,17 +577,19 @@ dependencies = [
 
 [[package]]
 name = "ay-fzn2smt"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
+ "ay-core",
  "ay-cp",
  "ay-flatzinc-parser",
  "ay-flatzinc-smt",
+ "ay-sys",
  "thiserror",
 ]
 
 [[package]]
 name = "ay-intsat"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -597,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "ay-jit"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "proptest",
@@ -608,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lean-bridge"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay",
  "ay-core",
@@ -618,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lia"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-intsat",
@@ -633,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lp"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "num-bigint",
  "num-integer",
@@ -645,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lra"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -661,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "ay-lrat-check"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-proof-common",
@@ -672,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "ay-map"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-rational",
@@ -680,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "ay-maxsat"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-lp",
@@ -690,9 +693,10 @@ dependencies = [
 
 [[package]]
 name = "ay-milp"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-dpll",
+ "ay-lp",
  "ay-lra",
  "ay-pb-core",
  "ay-sat",
@@ -712,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "ay-model-check"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -724,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "ay-multiset"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-rational",
@@ -732,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nia"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-lia",
@@ -749,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nonlinear-common"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -757,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nra"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-lra",
@@ -776,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "ay-nra-oracle"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-nra",
  "ay-sys",
@@ -792,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "ay-pb"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -817,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "ay-pb-core"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-jit",
@@ -840,11 +844,11 @@ dependencies = [
 
 [[package]]
 name = "ay-prefetch"
-version = "0.28.9"
+version = "0.28.10"
 
 [[package]]
 name = "ay-proof"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-frontend",
@@ -865,14 +869,14 @@ dependencies = [
 
 [[package]]
 name = "ay-proof-common"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ay-proof-complexity"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-sat",
@@ -887,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "ay-qbf"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-criterion-main",
  "ay-sat",
@@ -897,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "ay-replay"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-drat-check",
  "ay-lrat-check",
@@ -907,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "ay-sat"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-criterion-main",
@@ -942,11 +946,11 @@ dependencies = [
 
 [[package]]
 name = "ay-sat-congruence-core"
-version = "0.28.9"
+version = "0.28.10"
 
 [[package]]
 name = "ay-search"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-cp",
  "serde",
@@ -956,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "ay-seq"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -965,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "ay-set"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-rational",
@@ -973,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "ay-strings"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "num-bigint",
@@ -983,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "ay-sys"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "libc",
  "nix",
@@ -995,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "ay-test-support"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-sys",
  "serde_json",
@@ -1007,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "ay-tla-bridge"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ntest",
  "tempfile",
@@ -1016,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "ay-translate"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-dpll",
@@ -1025,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "ay-xor"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-core",
  "ay-criterion-main",
@@ -1039,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "ay-z3-parity"
-version = "0.28.9"
+version = "0.28.10"
 dependencies = [
  "ay-bench",
  "ay-core",

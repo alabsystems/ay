@@ -462,7 +462,9 @@ impl Solver {
                             self.cold.clause_ids_reserve_hint,
                             idx,
                         );
-                        self.cold.clause_ids[idx] = self.cold.original_ledger.clause_id(ordinal);
+                        self.cold
+                            .clause_ids
+                            .set(idx, self.cold.original_ledger.clause_id(ordinal));
                     }
                 }
                 // #8375: Re-add preserved learned clauses after rebuilding
@@ -525,7 +527,9 @@ impl Solver {
                             self.cold.clause_ids_reserve_hint,
                             idx,
                         );
-                        self.cold.clause_ids[idx] = self.cold.original_ledger.clause_id(clause_idx);
+                        self.cold
+                            .clause_ids
+                            .set(idx, self.cold.original_ledger.clause_id(clause_idx));
                     }
 
                     // Subsumption scheduling (#8376): mark variables in new

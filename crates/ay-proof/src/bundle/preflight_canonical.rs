@@ -141,3 +141,27 @@ fn entries_equal(
         }
     }
 }
+
+/// Compare borrowed complete entries under the same payload/rational pricing
+/// used by snapshot canonicalization. This follows no term handles and cannot
+/// turn serialized ids into source authority.
+pub(super) fn borrowed_entries_equal(
+    left: (&TermData, &Sort),
+    right: (&TermData, &Sort),
+    progress: Progress<'_>,
+) -> Result<bool, ProofCheckError> {
+    let mut meter = CanonicalMeter::new(progress);
+    let left = CanonicalEntry {
+        data: left.0,
+        sort: left.1,
+        data_work: payload::data(left.0, &mut meter)?,
+        sort_work: payload::sort(left.1, &mut meter, 0)?,
+    };
+    let right = CanonicalEntry {
+        data: right.0,
+        sort: right.1,
+        data_work: payload::data(right.0, &mut meter)?,
+        sort_work: payload::sort(right.1, &mut meter, 0)?,
+    };
+    entries_equal(&left, &right, &mut meter)
+}

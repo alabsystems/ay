@@ -4,15 +4,22 @@
 
 use ay_core::{Symbol, TermData, TermId};
 
-use super::{equality_sides, GroundRefuter, FALSE_NODE, TRUE_NODE};
+use super::{equality_sides, Control, GroundRefuter, FALSE_NODE, TRUE_NODE};
 
 impl GroundRefuter<'_> {
-    pub(super) fn close_boolean_semantics(&mut self, changed: &mut bool) {
+    pub(super) fn close_boolean_semantics(
+        &mut self,
+        changed: &mut bool,
+        control: &mut Control<'_>,
+    ) {
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return;
+            }
             let term = self.universe[index];
             self.close_not_semantics(term, changed);
             self.close_equality_semantics(term, changed);
-            self.close_nary_boolean_semantics(term, changed);
+            self.close_nary_boolean_semantics(term, changed, control);
             self.close_ite_semantics(term, changed);
         }
     }
@@ -58,7 +65,12 @@ impl GroundRefuter<'_> {
     }
 
     /// Propagate `and` and `or` facts in both truth-table directions.
-    fn close_nary_boolean_semantics(&mut self, term: TermId, changed: &mut bool) {
+    fn close_nary_boolean_semantics(
+        &mut self,
+        term: TermId,
+        changed: &mut bool,
+        control: &mut Control<'_>,
+    ) {
         let TermData::App(Symbol::Named(name), args) = self.terms.get(term) else {
             return;
         };
@@ -79,6 +91,9 @@ impl GroundRefuter<'_> {
         };
         if self.find(node) == self.find(unit_pole) {
             for &child in &children {
+                if !control.poll() {
+                    return;
+                }
                 let child_node = self.node(child);
                 *changed |= self.union(child_node, unit_pole);
             }
@@ -89,6 +104,9 @@ impl GroundRefuter<'_> {
         let mut undetermined = None;
         let mut multiple_undetermined = false;
         for &child in &children {
+            if !control.poll() {
+                return;
+            }
             let child_node = self.node(child);
             if self.find(child_node) == self.find(absorb_pole) {
                 *changed |= self.union(node, absorb_pole);

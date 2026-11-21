@@ -9,7 +9,8 @@
 ///
 /// This is evidence about the input, not authority supplied by a model. The
 /// evaluator constructs a variant only after checking the defining condition
-/// (a non-finite IEEE value or an exact zero divisor), and still validates the
+/// (a non-finite IEEE value, an exact zero divisor, or an exact index outside
+/// independently evaluated finite sequence bounds), and still validates the
 /// returned value's result sort. Generic applications, finite `fp.to_real`, and
 /// nonzero division never reach the typed model-completion hook.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,4 +24,7 @@ pub enum ProvenUnconstrainedKind {
     IntDivByZero,
     /// Integer `mod` with an exactly zero divisor.
     IntModByZero,
+    /// Native sequence element access with an independently evaluated index
+    /// strictly outside the finite sequence's bounds.
+    SeqNthOutOfBounds,
 }

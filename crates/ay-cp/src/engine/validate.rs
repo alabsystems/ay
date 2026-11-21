@@ -159,18 +159,16 @@ fn validate_constraint(
             Ok(())
         }
 
-        Constraint::Circuit(vars) => {
+        Constraint::Circuit { succ: vars, base } => {
             let n = vars.len();
             if n == 0 {
                 return Ok(());
             }
             let values: Vec<i64> = vars.iter().map(|v| val(assignment, *v)).collect();
-            // Check all values are in range [0, n) or [1, n] depending on encoding.
-            // ay-cp uses 0-indexed circuits: succ[i] ∈ [0, n-1].
-            // But FlatZinc uses 1-indexed. Check both.
-            let min_val = *values.iter().min().expect("invariant: non-empty circuit");
-            let offset = min_val; // usually 0 or 1
-                                  // Check: forms a single Hamiltonian cycle
+            // Nodes `base..base + n` (the constraint's own numbering; until
+            // 2026-11-19 the smallest value of the solution was taken).
+            let offset = *base;
+            // Check: forms a single Hamiltonian cycle
             let mut visited = vec![false; n];
             let mut current = 0usize;
             for _ in 0..n {
@@ -180,10 +178,13 @@ fn validate_constraint(
                     ));
                 }
                 visited[current] = true;
-                let next = (values[current] - offset) as usize;
+                // In i128: a wrong successor may lie anywhere in i64.
+                let next = usize::try_from(i128::from(values[current]) - i128::from(offset))
+                    .unwrap_or(usize::MAX);
                 if next >= n {
                     return Err(format!(
-                        "Circuit violated: successor {next} out of range for node {current}"
+                        "Circuit violated: successor {} out of range for node {current}",
+                        values[current]
                     ));
                 }
                 current = next;
@@ -194,24 +195,49 @@ fn validate_constraint(
             Ok(())
         }
 
-        Constraint::Inverse { x, y } => {
+        Constraint::Inverse {
+            x,
+            y,
+            base_x,
+            base_y,
+        } => {
             // x[y[i]] = i for all i, and y[x[i]] = i for all i
             let n = x.len();
+            if y.len() != n {
+                return Err(format!(
+                    "Inverse violated: arrays of lengths {n} and {}",
+                    y.len()
+                ));
+            }
             let x_vals: Vec<i64> = x.iter().map(|v| val(assignment, *v)).collect();
             let y_vals: Vec<i64> = y.iter().map(|v| val(assignment, *v)).collect();
-            let min_x = *x_vals.iter().min().unwrap_or(&0);
-            let min_y = *y_vals.iter().min().unwrap_or(&0);
-            for (i, &y_val) in y_vals.iter().enumerate().take(n) {
-                let yi = (y_val - min_x) as usize;
-                if yi >= n {
-                    return Err(format!("Inverse violated: y[{i}]={y_val} out of range"));
+            // Each array has its own node numbering (`encode_inverse`:
+            // x[i] = j + base_x  <=>  y[j] = i + base_y). A value of y is
+            // decoded with y's base and names a position of x, whose value
+            // is compared in x's numbering. Until 2026-11-18 the two bases
+            // were swapped here, which rejected every correct solution whose
+            // arrays are numbered from different starts; until 2026-11-19
+            // each base was the smallest value of the solution's array.
+            let (base_x, base_y) = (*base_x, *base_y);
+            // Every value of x in x's numbering (with y's check below, the
+            // two arrays are inverse permutations).
+            for (i, &x_val) in x_vals.iter().enumerate() {
+                let j = i128::from(x_val) - i128::from(base_x);
+                if usize::try_from(j).map_or(true, |j| j >= n) {
+                    return Err(format!("Inverse violated: x[{i}]={x_val} out of range"));
                 }
-                if x_vals[yi] != (i as i64 + min_y) {
+            }
+            for (j, &y_val) in y_vals.iter().enumerate() {
+                let i =
+                    usize::try_from(i128::from(y_val) - i128::from(base_y)).unwrap_or(usize::MAX);
+                if i >= n {
+                    return Err(format!("Inverse violated: y[{j}]={y_val} out of range"));
+                }
+                let expected = i128::from(base_x) + j as i128;
+                if i128::from(x_vals[i]) != expected {
                     return Err(format!(
-                        "Inverse violated: x[y[{i}]] = x[{}] = {} != {}",
-                        yi,
-                        x_vals[yi],
-                        i as i64 + min_y
+                        "Inverse violated: x[y[{j}]] = x[{i}] = {} != {expected}",
+                        x_vals[i]
                     ));
                 }
             }
@@ -219,9 +245,12 @@ fn validate_constraint(
         }
 
         Constraint::BoolClause { pos, neg } => {
-            // At least one pos var = 1 or one neg var = 0
-            let satisfied = pos.iter().any(|v| val(assignment, *v) != 0)
-                || neg.iter().any(|v| val(assignment, *v) == 0);
+            // The engine reads a Boolean as `[x >= 1]` (`encode_bool_clause`):
+            // a positive literal holds when the value is at least 1, a
+            // negative one when it is at most 0. Comparing with 0 instead
+            // called a clause violated that a negative value satisfies.
+            let satisfied = pos.iter().any(|v| val(assignment, *v) >= 1)
+                || neg.iter().any(|v| val(assignment, *v) < 1);
             if satisfied {
                 Ok(())
             } else {
@@ -235,10 +264,38 @@ fn validate_constraint(
         Constraint::Abs { result, arg } => {
             let r = val(assignment, *result);
             let a = val(assignment, *arg);
-            if r != a.abs() {
-                Err(format!("Abs violated: |{a}| = {} != result={r}", a.abs()))
+            // `|i64::MIN|` is not an i64: compare in i128.
+            let abs = i128::from(a).abs();
+            if i128::from(r) != abs {
+                Err(format!("Abs violated: |{a}| = {abs} != result={r}"))
             } else {
                 Ok(())
+            }
+        }
+
+        Constraint::Times { x, y, result } => {
+            let (a, b, r) = (
+                val(assignment, *x),
+                val(assignment, *y),
+                val(assignment, *result),
+            );
+            if i128::from(a) * i128::from(b) == i128::from(r) {
+                Ok(())
+            } else {
+                Err(format!("Times violated: {a} * {b} != result={r}"))
+            }
+        }
+
+        Constraint::Div { x, y, result } => {
+            let (a, b, r) = (
+                val(assignment, *x),
+                val(assignment, *y),
+                val(assignment, *result),
+            );
+            if b != 0 && i128::from(a) / i128::from(b) == i128::from(r) {
+                Ok(())
+            } else {
+                Err(format!("Div violated: {a} div {b} != result={r}"))
             }
         }
 
@@ -388,8 +445,8 @@ fn format_constraint_vars(constraint: &Constraint, assignment: &HashMap<IntVarId
             v.extend(demands);
             v
         }
-        Constraint::Circuit(v) => v.clone(),
-        Constraint::Inverse { x, y } => {
+        Constraint::Circuit { succ, .. } => succ.clone(),
+        Constraint::Inverse { x, y, .. } => {
             let mut v = x.clone();
             v.extend(y);
             v
@@ -400,6 +457,9 @@ fn format_constraint_vars(constraint: &Constraint, assignment: &HashMap<IntVarId
             v
         }
         Constraint::Abs { result, arg } => vec![*result, *arg],
+        Constraint::Times { x, y, result } | Constraint::Div { x, y, result } => {
+            vec![*x, *y, *result]
+        }
         Constraint::Maximum { result, args } => {
             let mut v = vec![*result];
             v.extend(args);

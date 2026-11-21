@@ -193,7 +193,22 @@ pub struct CpSatEngine {
     /// capacity preflight, avoiding unbounded SAT allocation during variable
     /// registration.
     domain_holes_encoded: usize,
+    /// A known solution to check propagator clauses against (debug aid, see
+    /// [`CpSatEngine::set_witness`]).
+    witness: Option<Arc<extension::Witness>>,
+    /// Process memory this engine may plan with (see
+    /// [`CpSatEngine::set_memory_budget`]); taken when the first search
+    /// starts.
+    memory_budget: Option<usize>,
+    /// The clause-database ceiling installed from `memory_budget`.
+    clause_db_ceiling: Option<usize>,
 }
+
+/// Peak bytes one dense order literal costs (SAT variable, ordering clause and
+/// its watches, the encoder's maps while it allocates). Measured with
+/// `ay flatzinc solve` on one variable: 2,000,001 values 1,539 MB resident,
+/// 8,000,001 values 6,013 MB (about 750 bytes each).
+pub const ORDER_LITERAL_BYTES: usize = 800;
 
 impl CpSatEngine {
     /// Create a new CP-SAT engine.
@@ -219,6 +234,12 @@ impl CpSatEngine {
         // gives the solver more time to explore between restarts.
         sat.set_glucose_restarts(false);
         sat.set_restart_base(250);
+        // The engine writes no proof and no clause trace, so nothing reads the
+        // SAT core's clause-ID table. That table is indexed by arena word (8
+        // bytes per word, twice the arena), and propagator explanations are
+        // long: on MiniZinc `orthorio/challenge_04` it held 2,148 MB of a
+        // 2,927 MB clause database (726 MB arena) after 8 s.
+        sat.set_clause_ids_disabled(true);
         Self {
             sat,
             trail: IntegerTrail::new(),
@@ -240,6 +261,114 @@ impl CpSatEngine {
             timer: Mutex::new(None),
             permanently_inconsistent: false,
             domain_holes_encoded: 0,
+            witness: None,
+            memory_budget: None,
+            clause_db_ceiling: None,
+        }
+    }
+
+    /// Bound the SAT core's clause database by a share of `process_bytes`,
+    /// the memory this engine may use (`0`: no bound, the default).
+    ///
+    /// Every bound change a propagator makes is handed to the SAT core with
+    /// its explanation clause, and those clauses stay until a reduction
+    /// deletes them. Without a ceiling the database grows until the process
+    /// is killed (MiniZinc `orthorio/challenge_04`: 16 GB in 37 s). The
+    /// ceiling is installed when the first search starts, after compilation,
+    /// so that its floor covers the compiled model.
+    ///
+    /// The same budget sizes the dense order encoding: up to half of it, at
+    /// [`ORDER_LITERAL_BYTES`] each, and never fewer literals than the
+    /// default [`MAX_PREALLOCATED_ORDER_LITERALS`](crate::encoder::MAX_PREALLOCATED_ORDER_LITERALS).
+    /// Call it before the first compilation.
+    pub fn set_memory_budget(&mut self, process_bytes: usize) {
+        self.memory_budget = (process_bytes > 0).then_some(process_bytes);
+        let default = crate::encoder::MAX_PREALLOCATED_ORDER_LITERALS;
+        let scaled = (process_bytes / 2 / ORDER_LITERAL_BYTES) as u128;
+        self.encoder.set_literal_limit(scaled.max(default));
+    }
+
+    /// The clause-database ceiling installed from
+    /// [`set_memory_budget`](Self::set_memory_budget), once a search started.
+    pub fn clause_db_ceiling(&self) -> Option<usize> {
+        self.clause_db_ceiling
+    }
+
+    /// Test hook: install a clause-database byte limit on the SAT core
+    /// directly, below the floor `set_memory_budget` keeps (the loaded
+    /// formula plus 64 MB of headroom), so that tests on small models make
+    /// the clause-DB limit reductions fire.
+    #[cfg(test)]
+    pub(crate) fn set_clause_db_limit_for_tests(&mut self, bytes: usize) {
+        self.sat.set_max_clause_db_bytes(Some(bytes));
+    }
+
+    /// Debug aid: check every clause a propagator hands to the SAT core
+    /// against a known solution of the model.
+    ///
+    /// Each propagation reason and conflict clause is learned for good, so
+    /// it must hold in every solution. When `values` assigns all variables
+    /// of such a clause and falsifies every literal, the engine reports the
+    /// propagator and the clause on stderr: either that propagator's
+    /// inference or explanation is unsound, or `values` is not a solution.
+    /// Variables missing from `values` and not fixed in their root domain
+    /// make a clause unknown: never reported, but counted (see
+    /// [`CpSatEngine::witness_counts`]; the count is printed when a solve
+    /// ends without a solution). Clauses the encoders add before search are
+    /// checked too, when the witness is set before the first solve; the
+    /// encoders give their auxiliary variables (`Diffn` separation
+    /// indicators, `Circuit` positions) the values the witness determines.
+    /// Checking changes no search decision.
+    pub fn set_witness(&mut self, values: &[(IntVarId, i64)]) {
+        let mut known = vec![None; self.encoder.num_vars()];
+        for &(var, value) in values {
+            if let Some(slot) = known.get_mut(var.index()) {
+                *slot = Some(value);
+            }
+        }
+        let names = (0..self.encoder.num_vars())
+            .map(|i| {
+                self.var_names
+                    .get(i)
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(|| format!("v{i}"))
+            })
+            .collect();
+        self.witness = Some(Arc::new(extension::Witness::new(known, names)));
+    }
+
+    /// Clause counts of the witness check so far: `(checked, falsified,
+    /// unknown)`, `None` without a witness.
+    pub fn witness_counts(&self) -> Option<(usize, usize, usize)> {
+        self.witness.as_ref().map(|w| w.counts())
+    }
+
+    /// The witness value of `var`, if a witness is set and determines it.
+    pub(super) fn witness_value(&self, var: IntVarId) -> Option<i64> {
+        self.witness.as_ref()?.value(&self.encoder, var)
+    }
+
+    /// Give an auxiliary variable an encoder created its witness value, so
+    /// that clauses over it are checked instead of counted unknown.
+    pub(super) fn witness_define(&mut self, var: IntVarId, value: Option<i64>, name: &str) {
+        if let Some(witness) = self.witness.as_mut().and_then(Arc::get_mut) {
+            witness.define(var, value, name.to_string());
+        }
+    }
+
+    /// Add a clause of the model's encoding to the SAT core, checking it
+    /// against the witness first when one is set.
+    pub(super) fn add_model_clause(&mut self, origin: &str, clause: Vec<ay_sat::Literal>) {
+        if let Some(witness) = &self.witness {
+            witness.check_clause(&self.encoder, origin, "encoding", &clause);
+        }
+        self.sat.add_clause(clause);
+    }
+
+    /// Print the witness summary (when a solve ends without a solution).
+    pub(super) fn report_witness(&self) {
+        if let Some(witness) = &self.witness {
+            eprintln!("{}", witness.summary());
         }
     }
 
@@ -361,6 +490,40 @@ impl CpSatEngine {
         self.new_int_var(crate::domain::Domain::new(0, 1), name)
     }
 
+    /// The smallest value in any of `vars`' current domains (0 for none).
+    fn smallest_domain_value(&self, vars: &[IntVarId]) -> i64 {
+        vars.iter()
+            .map(|&v| self.encoder.var_bounds(v).0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// A [`Constraint::Circuit`] numbered by the rule the variant followed
+    /// before 2026-11-19: the nodes start at the smallest value in any
+    /// successor's domain, read now. Prefer the variant with the array's
+    /// index base (FlatZinc: the index set), whose meaning does not depend
+    /// on the domains: a successor domain that cannot take the first node
+    /// shifts this numbering.
+    pub fn circuit_numbered_by_domains(&self, succ: Vec<IntVarId>) -> Constraint {
+        let base = self.smallest_domain_value(&succ);
+        Constraint::Circuit { succ, base }
+    }
+
+    /// A [`Constraint::Inverse`] numbered by the rule the variant followed
+    /// before 2026-11-19: each array's values start at the smallest value in
+    /// any of its domains, read now. Prefer the variant with explicit bases
+    /// (see [`Self::circuit_numbered_by_domains`]).
+    pub fn inverse_numbered_by_domains(&self, x: Vec<IntVarId>, y: Vec<IntVarId>) -> Constraint {
+        let base_x = self.smallest_domain_value(&x);
+        let base_y = self.smallest_domain_value(&y);
+        Constraint::Inverse {
+            x,
+            y,
+            base_x,
+            base_y,
+        }
+    }
+
     /// Add a constraint to the model.
     pub fn add_constraint(&mut self, constraint: Constraint) {
         self.constraints.push(constraint);
@@ -446,8 +609,16 @@ impl Default for CpSatEngine {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_branching;
+#[cfg(test)]
 mod tests_brute_force;
 #[cfg(test)]
 mod tests_disjunctive;
 #[cfg(test)]
+mod tests_endpoints;
+#[cfg(test)]
 mod tests_incremental;
+#[cfg(test)]
+mod tests_memory;
+#[cfg(test)]
+mod tests_witness;

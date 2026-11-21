@@ -56,18 +56,31 @@ impl TotalizerNode {
     }
 
     /// Returns the output variable for the smallest weight >= w, or None.
+    ///
+    /// Binary search: `weights` is strictly ascending (a leaf has one weight;
+    /// a merged node collects its weights from a `BTreeSet`). The merge calls
+    /// this inside a loop over parent weights x child weights, so the linear
+    /// scan it replaces made one merge cubic in the core size (AY-SAT-8: on
+    /// the all-soft WBO `elf.rf9` every gdb sample of the native-OLL pre-pass
+    /// from 3 s to 25 s sat in these scans, inlined into the disjoint-core
+    /// round's totalizer encoding). Same result as the scan by the ordering.
     fn var_ge(&self, w: i128) -> Option<i32> {
-        self.weights
-            .iter()
-            .position(|&wt| wt >= w)
-            .map(|idx| self.outputs[idx])
+        debug_assert!(self.weights.windows(2).all(|pair| pair[0] < pair[1]));
+        let idx = self.weights.partition_point(|&wt| wt < w);
+        if idx < self.weights.len() {
+            Some(self.outputs[idx])
+        } else {
+            None
+        }
     }
 
-    /// Returns the output variable for exact weight w, or None.
+    /// Returns the output variable for exact weight w, or None (binary
+    /// search over the strictly ascending `weights`; see [`Self::var_ge`]).
     fn var_eq(&self, w: i128) -> Option<i32> {
+        debug_assert!(self.weights.windows(2).all(|pair| pair[0] < pair[1]));
         self.weights
-            .iter()
-            .position(|&wt| wt == w)
+            .binary_search(&w)
+            .ok()
             .map(|idx| self.outputs[idx])
     }
 
@@ -699,5 +712,82 @@ mod aux_ceiling_tests {
             start.elapsed() < Duration::from_secs(50),
             "decline must come from the aux ceiling, not the deadline"
         );
+    }
+}
+
+// AY-SAT-8: the binary-search lookups return exactly what the linear scans
+// they replace returned, on every strictly ascending weight list (the only
+// shape a node has), for probes below, at, between and above its weights.
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    fn linear_ge(node: &TotalizerNode, w: i128) -> Option<i32> {
+        node.weights
+            .iter()
+            .position(|&wt| wt >= w)
+            .map(|idx| node.outputs[idx])
+    }
+
+    fn linear_eq(node: &TotalizerNode, w: i128) -> Option<i32> {
+        node.weights
+            .iter()
+            .position(|&wt| wt == w)
+            .map(|idx| node.outputs[idx])
+    }
+
+    #[test]
+    fn totalizer_node_lookups_match_the_linear_scan() {
+        // Deterministic xorshift so the test needs no RNG crate.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..40usize {
+            let mut weights: Vec<i128> = Vec::new();
+            let mut w: i128 = i128::from(next() % 3) + 1;
+            for _ in 0..len {
+                weights.push(w);
+                w += i128::from(next() % 4) + 1;
+            }
+            let outputs: Vec<i32> = (0..len).map(|i| 1000 + i as i32).collect();
+            let node = TotalizerNode { weights, outputs };
+            for probe in -1..=w + 1 {
+                assert_eq!(
+                    node.var_ge(probe),
+                    linear_ge(&node, probe),
+                    "ge {probe} len {len}"
+                );
+                assert_eq!(
+                    node.var_eq(probe),
+                    linear_eq(&node, probe),
+                    "eq {probe} len {len}"
+                );
+            }
+        }
+    }
+
+    // The unit-weight cardinality totalizer of a 600-literal core, the shape
+    // native OLL builds per core, still yields one output per count.
+    #[test]
+    fn totalizer_large_unit_core_keeps_every_output() {
+        let n: usize = 600;
+        let coeffs = vec![1_i128; n];
+        let lits: Vec<i32> = (1..=n as i32).collect();
+        let mut clauses = Vec::new();
+        let mut next_var = n as u32 + 1;
+        let outputs = encode_totalizer_with_outputs_interruptible(
+            &coeffs,
+            &lits,
+            n as i128,
+            &mut clauses,
+            &mut next_var,
+            &mut || false,
+        )
+        .expect("the build completes");
+        assert_eq!(outputs.weights, (1..=n as i128).collect::<Vec<_>>());
     }
 }

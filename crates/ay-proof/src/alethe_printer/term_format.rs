@@ -8,6 +8,46 @@ use super::*;
 mod tests;
 
 impl AlethePrinter<'_> {
+    /// Copy a pre-rendered channel only after its borrowed byte count has
+    /// been admitted. No RefCell borrow survives the caller's progress poll.
+    pub(super) fn write_rendering_channel_into(
+        &self,
+        out: &mut String,
+        term_id: TermId,
+        channel: &std::cell::RefCell<HashMap<TermId, String>>,
+        prefix: &str,
+        suffix: &str,
+    ) -> bool {
+        let Some(bytes) = channel.borrow().get(&term_id).map(String::len) else {
+            return false;
+        };
+        let Some(total) = bytes
+            .checked_add(prefix.len())
+            .and_then(|n| n.checked_add(suffix.len()))
+        else {
+            self.rendering_channel_refused.set(true);
+            out.push_str("@a2b_emission_budget_exhausted");
+            return true;
+        };
+        if self.work_budget.is_some() && !self.admit_emission_work(total as u64) {
+            out.push_str("@a2b_emission_budget_exhausted");
+            return true;
+        }
+        let channel = channel.borrow();
+        let Some(text) = channel.get(&term_id).filter(|text| text.len() == bytes) else {
+            self.rendering_channel_refused.set(true);
+            out.push_str("@a2b_emission_budget_exhausted");
+            return true;
+        };
+        if self.work_budget.is_none() {
+            self.charge(total as u64);
+        }
+        out.push_str(prefix);
+        out.push_str(text);
+        out.push_str(suffix);
+        true
+    }
+
     /// Format a term as an SMT-LIB expression
     pub(crate) fn format_term(&self, term_id: TermId) -> String {
         let mut out = String::new();
@@ -32,18 +72,14 @@ impl AlethePrinter<'_> {
             out.push_str(EMISSION_BUDGET_EXHAUSTED_PLACEHOLDER);
             return;
         }
-        if let Some(term_str) = self.skolem_overrides.borrow().get(&term_id).cloned() {
-            self.charge(term_str.len() as u64);
-            out.push_str(&term_str);
+        if self.write_rendering_channel_into(out, term_id, &self.skolem_overrides, "", "") {
             return;
         }
         // A `let`-bridged assertion prints as its eliminated form from the
         // bridge step onwards; the surface `(let ...)` spelling survives only
         // inside the bridge itself (the `assume` and the equivalence it
         // discharges), which embeds it literally.
-        if let Some(term_str) = self.let_bridge_renderings.borrow().get(&term_id).cloned() {
-            self.charge(term_str.len() as u64);
-            out.push_str(&term_str);
+        if self.write_rendering_channel_into(out, term_id, &self.let_bridge_renderings, "", "") {
             return;
         }
         // An authored override whose `Assume` rows are all unused belongs only
@@ -54,17 +90,19 @@ impl AlethePrinter<'_> {
                 .term_overrides
                 .and_then(|overrides| overrides.get(&term_id))
             {
-                self.charge(term_str.len() as u64);
+                if self.work_budget.is_some() {
+                    if !self.admit_emission_work(term_str.len() as u64) {
+                        out.push_str("@a2b_emission_budget_exhausted");
+                        return;
+                    }
+                } else {
+                    self.charge(term_str.len() as u64);
+                }
                 out.push_str(term_str);
                 return;
             }
         }
-        if let Some(cached) = self.format_cache.borrow().get(&term_id) {
-            // A cache hit still copies the rendered bytes; on proofs whose
-            // steps repeat megabyte literals that copy IS the dominant cost,
-            // so it is charged against the emission work budget (#A2b).
-            self.charge(cached.len() as u64);
-            out.push_str(cached);
+        if self.write_rendering_channel_into(out, term_id, &self.format_cache, "", "") {
             return;
         }
         let term = self.terms.get(term_id);
@@ -85,7 +123,14 @@ impl AlethePrinter<'_> {
         } else {
             self.format_term_data(term)
         };
-        self.charge(formatted.len() as u64);
+        if self.work_budget.is_some() {
+            if !self.admit_emission_work(formatted.len() as u64) {
+                out.push_str("@a2b_emission_budget_exhausted");
+                return;
+            }
+        } else {
+            self.charge(formatted.len() as u64);
+        }
         out.push_str(&formatted);
         self.format_cache.borrow_mut().insert(term_id, formatted);
     }

@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Complete immutable BV64 array data. A range node denotes its entire domain;
+//! Complete immutable finite, BV64 range and periodic integer array data.
+//! A range or residue quotient denotes its entire domain;
 //! neither construction nor equality samples or enumerates the written range.
 
 use std::sync::Arc;
@@ -13,20 +14,21 @@ use num_traits::{One, Signed};
 use crate::{value_eq, ArrayValue, ModelValue};
 
 mod partition;
+pub(crate) mod periodic;
 mod recipe;
 mod scalar_data;
 use scalar_data::{compose, scalar, scalar_cost};
 pub(crate) mod topology;
 pub use recipe::{
-    recognize_fill_lambda, recognize_identity_lambda, recognize_range_lambda, FillInterval,
-    FillLambda, IdentityLambda, RangeLambda,
+    recognize_fill_lambda, recognize_identity_lambda, recognize_int_scalar_lambda,
+    recognize_range_lambda, FillInterval, FillLambda, IdentityLambda, IntScalarLambda, RangeLambda,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum FunctionalArrayError {
     #[error("functional array work or depth budget exceeded")]
     Resource,
-    #[error("functional array requires exact BV64 indices and Bool/BV cells")]
+    #[error("functional array requires BV64 Bool/BV cells or integer Bool/Int cells")]
     Sort,
     #[error("functional array contains an invalid captured value")]
     Value,
@@ -44,6 +46,7 @@ pub struct ArraySnapshot {
 #[derive(Clone, Debug)]
 enum Node {
     Finite(ArrayValue),
+    Periodic(Vec<ModelValue>),
     Store {
         base: Arc<ArraySnapshot>,
         index: ModelValue,
@@ -78,7 +81,7 @@ fn key(value: &ModelValue) -> Result<&BigInt, FunctionalArrayError> {
 
 fn cell(value: &ModelValue, sort: &Sort) -> Result<(), FunctionalArrayError> {
     match (value, sort) {
-        (ModelValue::Bool(_), Sort::Bool) => Ok(()),
+        (ModelValue::Bool(_), Sort::Bool) | (ModelValue::Int(_), Sort::Int) => Ok(()),
         (ModelValue::BitVec { width, value }, Sort::BitVec(expected))
             if *width == expected.width
                 && *width > 0
@@ -88,6 +91,23 @@ fn cell(value: &ModelValue, sort: &Sort) -> Result<(), FunctionalArrayError> {
             Ok(())
         }
         _ => Err(FunctionalArrayError::Value),
+    }
+}
+
+fn supported_sort(sort: &Sort) -> bool {
+    matches!(sort, Sort::Array(array) if
+        (array.index_sort == Sort::Int && matches!(&array.element_sort, Sort::Bool | Sort::Int))
+        || (matches!(&array.index_sort, Sort::BitVec(index) if index.width == 64)
+            && matches!(&array.element_sort, Sort::Bool | Sort::BitVec(_))))
+}
+
+fn array_key<'a>(value: &'a ModelValue, sort: &Sort) -> Result<&'a BigInt, FunctionalArrayError> {
+    match (value, sort) {
+        (ModelValue::Int(value), Sort::Array(array)) if array.index_sort == Sort::Int => Ok(value),
+        (_, Sort::Array(array)) if matches!(&array.index_sort, Sort::BitVec(index) if index.width == 64) => {
+            key(value)
+        }
+        _ => Err(FunctionalArrayError::Sort),
     }
 }
 
@@ -101,15 +121,20 @@ impl ArraySnapshot {
         let Sort::Array(array) = sort else {
             return Err(FunctionalArrayError::Sort);
         };
-        if !matches!(&array.index_sort, Sort::BitVec(index) if index.width == 64) {
+        if !supported_sort(sort) {
             return Err(FunctionalArrayError::Sort);
         }
         cell(&value.default, &array.element_sort)?;
         charge(work, scalar_cost(&value.default)?)?;
         for (index, value) in &value.store {
-            key(index)?;
+            array_key(index, sort)?;
             cell(value, &array.element_sort)?;
-            charge(work, scalar_cost(value)? + 8)?;
+            charge(
+                work,
+                scalar_cost(index)?
+                    .checked_add(scalar_cost(value)?)
+                    .ok_or(FunctionalArrayError::Resource)?,
+            )?;
         }
         Ok(Arc::new(Self {
             sort: sort.clone(),
@@ -128,7 +153,9 @@ impl ArraySnapshot {
     ) -> Result<Arc<Self>, FunctionalArrayError> {
         charge(work, 1)?;
         let (lo, hi, source_lo) = (key(lo)?, key(hi)?, key(source_lo)?);
-        if destination.sort != source.sort {
+        if destination.sort != source.sort
+            || !matches!(&destination.sort, Sort::Array(sort) if matches!(&sort.index_sort, Sort::BitVec(index) if index.width == 64))
+        {
             return Err(FunctionalArrayError::Sort);
         }
         // Exact unsigned interval semantics: no index can satisfy lo <= i < hi.
@@ -159,8 +186,14 @@ impl ArraySnapshot {
         value: &ModelValue,
         work: &mut usize,
     ) -> Result<Arc<Self>, FunctionalArrayError> {
-        charge(work, 1 + scalar_cost(value)?)?;
-        key(index)?;
+        charge(
+            work,
+            scalar_cost(index)?
+                .checked_add(scalar_cost(value)?)
+                .and_then(|cost| cost.checked_add(1))
+                .ok_or(FunctionalArrayError::Resource)?,
+        )?;
+        array_key(index, &base.sort)?;
         let Sort::Array(sort) = &base.sort else {
             return Err(FunctionalArrayError::Sort);
         };
@@ -222,7 +255,7 @@ impl ArraySnapshot {
                 }
                 Ok(Some(ModelValue::Array(Box::new(value.clone()))))
             }
-            Node::Range { .. } | Node::Store { .. } => Ok(None),
+            Node::Range { .. } | Node::Store { .. } | Node::Periodic(_) => Ok(None),
         }
     }
 
@@ -244,8 +277,9 @@ impl ArraySnapshot {
             return Err(FunctionalArrayError::Resource);
         }
         charge(work, 1)?;
-        let index_value = key(index)?;
+        let index_value = array_key(index, &self.sort)?;
         match &self.node {
+            Node::Periodic(values) => periodic::read(values, index_value, work),
             Node::Finite(value) => {
                 charge(
                     work,
@@ -259,7 +293,14 @@ impl ArraySnapshot {
                     if stop() {
                         return Err(FunctionalArrayError::Resource);
                     }
-                    if key(stored)? == index_value {
+                    charge(
+                        work,
+                        scalar_cost(stored)?
+                            .checked_add(scalar_cost(index)?)
+                            .ok_or(FunctionalArrayError::Resource)?,
+                    )?;
+                    if array_key(stored, &self.sort)? == index_value {
+                        charge(work, scalar_cost(datum)?)?;
                         return Ok(datum.clone());
                     }
                 }
@@ -270,7 +311,13 @@ impl ArraySnapshot {
                 index: stored,
                 value,
             } => {
-                if key(stored)? == index_value {
+                charge(
+                    work,
+                    scalar_cost(stored)?
+                        .checked_add(scalar_cost(index)?)
+                        .ok_or(FunctionalArrayError::Resource)?,
+                )?;
+                if array_key(stored, &self.sort)? == index_value {
                     charge(work, scalar_cost(value)?)?;
                     Ok(value.clone())
                 } else {
@@ -311,6 +358,17 @@ impl ArraySnapshot {
         work: &mut usize,
         stop: &mut dyn FnMut() -> bool,
     ) -> Result<bool, FunctionalArrayError> {
+        Ok(self.equality_with_stop(other, work, stop)? == Some(true))
+    }
+
+    /// Integer arrays have an exact comparison over every residue and finite
+    /// exception. A mismatch between two BV range programs can be inconclusive.
+    pub(crate) fn equality_with_stop(
+        &self,
+        other: &Self,
+        work: &mut usize,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<bool>, FunctionalArrayError> {
         if stop() {
             return Err(FunctionalArrayError::Resource);
         }
@@ -318,21 +376,24 @@ impl ArraySnapshot {
         if self.sort != other.sort {
             return Err(FunctionalArrayError::Sort);
         }
-        match (&self.node, &other.node) {
+        if matches!(&self.sort, Sort::Array(sort) if sort.index_sort == Sort::Int) {
+            return periodic::same_function(self, other, work, stop).map(Some);
+        }
+        let established = match (&self.node, &other.node) {
             (Node::Finite(left), Node::Finite(right)) => {
                 for (index, _) in left.store.iter().chain(&right.store) {
                     let left = self.read_with_stop(index, work, stop)?;
                     let right = other.read_with_stop(index, work, stop)?;
                     if !value_eq(&left, &right).map_err(|_| FunctionalArrayError::Value)? {
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
                 if value_eq(&left.default, &right.default)
                     .map_err(|_| FunctionalArrayError::Value)?
                 {
-                    Ok(true)
+                    true
                 } else {
-                    Err(FunctionalArrayError::Value)
+                    return Err(FunctionalArrayError::Value);
                 }
             }
             (
@@ -346,9 +407,11 @@ impl ArraySnapshot {
                     index: ri,
                     value: rv,
                 },
-            ) => Ok(value_eq(li, ri).map_err(|_| FunctionalArrayError::Value)?
-                && value_eq(lv, rv).map_err(|_| FunctionalArrayError::Value)?
-                && lb.same_function_with_stop(rb, work, stop)?),
+            ) => {
+                value_eq(li, ri).map_err(|_| FunctionalArrayError::Value)?
+                    && value_eq(lv, rv).map_err(|_| FunctionalArrayError::Value)?
+                    && lb.same_function_with_stop(rb, work, stop)?
+            }
             (
                 Node::Range {
                     destination: ld,
@@ -364,13 +427,16 @@ impl ArraySnapshot {
                     hi: rh,
                     source_lo: rx,
                 },
-            ) => Ok(ll == rl
-                && lh == rh
-                && lx == rx
-                && ld.same_function_with_stop(rd, work, stop)?
-                && ls.same_function_with_stop(rs, work, stop)?),
-            _ => Ok(false),
-        }
+            ) => {
+                ll == rl
+                    && lh == rh
+                    && lx == rx
+                    && ld.same_function_with_stop(rd, work, stop)?
+                    && ls.same_function_with_stop(rs, work, stop)?
+            }
+            _ => false,
+        };
+        Ok(established.then_some(true))
     }
 
     pub fn to_smtlib(&self, work: &mut usize) -> Result<String, FunctionalArrayError> {
@@ -390,17 +456,26 @@ impl ArraySnapshot {
             return Err(FunctionalArrayError::Sort);
         };
         match &self.node {
+            Node::Periodic(values) => periodic::render(values, work, stop),
             Node::Finite(value) => {
                 let element = match &sort.element_sort {
                     Sort::Bool => "Bool".to_owned(),
+                    Sort::Int => "Int".to_owned(),
                     Sort::BitVec(bv) => format!("(_ BitVec {})", bv.width),
                     _ => return Err(FunctionalArrayError::Sort),
+                };
+                let index_sort = if sort.index_sort == Sort::Int {
+                    "Int"
+                } else {
+                    "(_ BitVec 64)"
                 };
                 let default = scalar(&value.default, work)?;
                 let mut output = compose(
                     work,
                     &[
-                        "((as const (Array (_ BitVec 64) ",
+                        "((as const (Array ",
+                        index_sort,
+                        " ",
                         &element,
                         ")) ",
                         &default,

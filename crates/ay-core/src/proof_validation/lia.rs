@@ -318,12 +318,11 @@ pub fn recognize_arith_disequality_split(terms: &TermStore, clause: &[TermId]) -
 /// form is the branch form itself (every `Real` split is primitive by
 /// construction).
 ///
-/// This is the emission-side narrowing of [`recognize_arith_disequality_split`]:
-/// a printer that lowers the lemma to `(<= lhs rhs)` / `(<= rhs lhs)` over the
-/// GUARD's own operands justifies those two sub-steps only when the guard and
-/// the branches share one linear form. For `k >= 2` the guard's operands span a
-/// wider interval than the branches do, so that lowering is not licensed and
-/// the caller must fall back to an unreconstructed wire step.
+/// This is the narrowing for UNIT-COEFFICIENT emission. A printer lowering
+/// through the guard's operands with weights `(1, 1)` needs the guard and
+/// branches to share the same linear form. A scaled guard needs independently
+/// checked weights `(1, k)`, recovered by
+/// [`arith_disequality_split_lowering_witness`].
 #[must_use]
 pub fn arith_disequality_split_has_primitive_guard(terms: &TermStore, clause: &[TermId]) -> bool {
     use num_traits::One;
@@ -419,8 +418,8 @@ pub fn arith_disequality_split_guard_multiplier(
         }
         Sort::Int => {
             let (eq_coeffs, eq_target) = canonical_int_equality(terms, lhs, rhs)?;
-            let (a_coeffs, a_upper, a_value) = parse_int_comparison(terms, *first, true)?;
-            let (b_coeffs, b_upper, b_value) = parse_int_comparison(terms, *second, true)?;
+            let (a_coeffs, a_upper, a_value) = parse_asserted_int_literal(terms, *first)?;
+            let (b_coeffs, b_upper, b_value) = parse_asserted_int_literal(terms, *second)?;
             // The two branches must bracket ONE shared linear form with the
             // exact one-value gap `C_b <= T_b - 1` / `C_b >= T_b + 1`.
             if a_coeffs != b_coeffs || !a_upper || b_upper {
@@ -735,6 +734,23 @@ pub(super) fn parse_int_comparison_row(
     parse_int_comparison(terms, bound, asserted_value)
 }
 
+/// The integer row asserted by a branch literal, preserving its Boolean
+/// polarity. In particular `not (<= a b)` is the strict `a > b` branch,
+/// rather than an unsupported wrapper or a positive non-strict bound.
+fn parse_asserted_int_literal(
+    terms: &TermStore,
+    literal: TermId,
+) -> Option<(
+    std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+    bool,
+    num_bigint::BigInt,
+)> {
+    match terms.get(literal) {
+        crate::term::TermData::Not(inner) => parse_int_comparison(terms, *inner, false),
+        _ => parse_int_comparison(terms, literal, true),
+    }
+}
+
 fn parse_int_comparison(
     terms: &TermStore,
     bound: TermId,
@@ -778,6 +794,7 @@ fn parse_int_comparison(
 }
 
 include!("lia/canonical_equality.rs");
+include!("lia/proportional_equality.rs");
 
 /// Validate a CuttingPlane LIA proof.
 ///
@@ -846,3 +863,11 @@ fn blocking_lit_to_conflict(terms: &TermStore, lit: TermId) -> TheoryLit {
         },
     }
 }
+
+#[path = "lia/inconsistent_equality_subset.rs"]
+mod inconsistent_equality_subset;
+pub use inconsistent_equality_subset::{
+    arith_inconsistent_equality_subset_witness,
+    arith_inconsistent_equality_subset_witness_with_progress,
+    ArithInconsistentEqualitySubsetWitness,
+};

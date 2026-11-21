@@ -52,9 +52,9 @@ pub use retained_api::{
     re_check_retained_bundle_strict_with_resource_control,
     read_retained_proof_bundle_with_resource_control,
     read_retained_proof_bundle_with_resource_control_and_diagnostics, RetainedProofBundle,
-    RetainedProofCapture, RetainedProofTransportLimits, RetainedReadDiagnostics,
-    RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal, RetainedReadStage,
-    RetainedReadTerminal, RETAINED_PROOF_BUNDLE_SCHEMA,
+    RetainedProofCapture, RetainedProofSourceView, RetainedProofTransportLimits,
+    RetainedReadDiagnostics, RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal,
+    RetainedReadStage, RetainedReadTerminal, RETAINED_PROOF_BUNDLE_SCHEMA,
 };
 #[cfg(test)]
 mod nra_sos;

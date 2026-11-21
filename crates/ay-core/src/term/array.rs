@@ -5,9 +5,13 @@
 //! Array operations for TermStore.
 
 use super::*;
+mod substitution;
+use substitution::{annotation_is_available, replacement_contains_name, replacement_contains_term};
 
 #[cfg(test)]
 mod select_walk_tests;
+#[cfg(test)]
+mod substitution_scope_tests;
 
 enum StoreIndexRewrite {
     Keep,
@@ -701,20 +705,16 @@ impl TermStore {
     /// Performs a recursive tree walk with memoization. Used for lambda array
     /// beta reduction: `select(lambda(x) body, idx) → body[x/idx]`.
     ///
-    /// Respects variable scoping: does not substitute inside nested binders
-    /// (forall/exists) that shadow the same variable name.
+    /// Lambda arrays bind their exact variable identity. SMT-LIB quantifiers
+    /// and lets shadow by variable name. Colliding inner binders are
+    /// alpha-renamed before inserting the replacement.
     pub fn substitute_var(
         &mut self,
         term: TermId,
         var_term: TermId,
         replacement: TermId,
     ) -> TermId {
-        // Fast path: if the term IS the variable, return replacement.
-        if term == var_term {
-            return replacement;
-        }
-
-        // Extract the var name for shadow-checking inside binders.
+        // Extract the variable name for SMT-LIB name-bound shadowing.
         let var_name = match self.get(var_term) {
             TermData::Var(name, _) => name.clone(),
             _ => {
@@ -723,6 +723,12 @@ impl TermStore {
             }
         };
 
+        if term == var_term {
+            return replacement;
+        }
+        if var_term == replacement {
+            return term;
+        }
         let mut cache = crate::kani_compat::det_hash_map_new();
         self.substitute_var_inner(term, var_term, replacement, &var_name, &mut cache)
     }
@@ -735,6 +741,9 @@ impl TermStore {
         var_name: &str,
         cache: &mut crate::kani_compat::DetHashMap<TermId, TermId>,
     ) -> TermId {
+        if self.entry_stamp(term).is_none() {
+            return term;
+        }
         if term == var_term {
             return replacement;
         }
@@ -747,6 +756,41 @@ impl TermStore {
             TermData::Var(_, _) => {
                 // Different var (we already checked term == var_term above).
                 term
+            }
+            TermData::App(Symbol::Named(name), args)
+                if name == "lambda-array" && args.len() == 2 =>
+            {
+                let binder = args[0];
+                let body = args[1];
+                if binder == var_term {
+                    term
+                } else {
+                    let new_body =
+                        self.substitute_var_inner(body, var_term, replacement, var_name, cache);
+                    if new_body == body {
+                        term
+                    } else if replacement_contains_term(self, replacement, binder) {
+                        // The replacement keeps its free identity. Freshen
+                        // this nested binder before inserting the replacement.
+                        let sort = self.sort(binder).clone();
+                        let fresh = self.fresh_substitution_binder(
+                            "__ay_lambda_substitution_bound",
+                            &sort,
+                            &[body, replacement],
+                        );
+                        let renamed = self.substitute_var(body, binder, fresh);
+                        let substituted = self.substitute_var_inner(
+                            renamed,
+                            var_term,
+                            replacement,
+                            var_name,
+                            cache,
+                        );
+                        self.mk_lambda_array(fresh, substituted)
+                    } else {
+                        self.mk_lambda_array(binder, new_body)
+                    }
+                }
             }
             TermData::App(sym, args) => {
                 let mut changed = false;
@@ -790,70 +834,144 @@ impl TermStore {
                     term
                 }
             }
-            TermData::Let(bindings, body) => {
+            TermData::Let(mut bindings, mut body) => {
                 let mut changed = false;
-                let new_bindings: Vec<(String, TermId)> = bindings
-                    .iter()
-                    .map(|(name, val)| {
-                        let new_val =
-                            self.substitute_var_inner(*val, var_term, replacement, var_name, cache);
-                        if new_val != *val {
-                            changed = true;
-                        }
-                        (name.clone(), new_val)
-                    })
-                    .collect();
-                // Check if any let binding shadows our variable.
-                let shadowed = new_bindings.iter().any(|(name, _)| name == var_name);
-                let new_body = if shadowed {
-                    body
-                } else {
-                    let nb =
+                for (_, value) in &mut bindings {
+                    let new_value =
+                        self.substitute_var_inner(*value, var_term, replacement, var_name, cache);
+                    changed |= new_value != *value;
+                    *value = new_value;
+                }
+                // Simultaneous RHSs have already been rewritten in the
+                // enclosing scope. Only the body sees these binding names.
+                if !bindings.iter().any(|(name, _)| name == var_name) {
+                    let tentative =
                         self.substitute_var_inner(body, var_term, replacement, var_name, cache);
-                    if nb != body {
+                    if tentative != body {
+                        let mut freshened = false;
+                        for (name, value) in &mut bindings {
+                            if replacement_contains_name(self, replacement, name) {
+                                let sort = self.sort(*value).clone();
+                                let fresh = self.fresh_substitution_binder(
+                                    "__ay_let_substitution_bound",
+                                    &sort,
+                                    &[term, replacement],
+                                );
+                                body = self.rename_bound_name(body, name, &sort, fresh);
+                                let TermData::Var(fresh_name, _) = self.get(fresh) else {
+                                    unreachable!("fresh bound variable");
+                                };
+                                *name = fresh_name.clone();
+                                freshened = true;
+                            }
+                        }
+                        body = if freshened {
+                            self.substitute_var_inner(body, var_term, replacement, var_name, cache)
+                        } else {
+                            tentative
+                        };
                         changed = true;
                     }
-                    nb
-                };
+                }
                 if changed {
-                    let sort = self.sort(term).clone();
-                    self.intern(TermData::Let(new_bindings, new_body), sort)
+                    self.mk_let(bindings, body)
                 } else {
                     term
                 }
             }
-            TermData::Forall(bindings, body, triggers) => {
-                // If the quantifier shadows our variable, do not descend.
+            TermData::Forall(mut bindings, mut body, mut triggers)
+            | TermData::Exists(mut bindings, mut body, mut triggers) => {
                 if bindings.iter().any(|(name, _)| name == var_name) {
                     term
                 } else {
-                    let new_body =
+                    let original_patterns = self.quantifier_no_patterns(term).to_vec();
+                    let mut tentative_body =
                         self.substitute_var_inner(body, var_term, replacement, var_name, cache);
-                    if new_body != body {
-                        let sort = self.sort(term).clone();
-                        let rebuilt =
-                            self.intern(TermData::Forall(bindings, new_body, triggers), sort);
-                        self.copy_quantifier_metadata(term, rebuilt);
-                        rebuilt
-                    } else {
-                        term
+                    let mut tentative_triggers = triggers.clone();
+                    let mut tentative_patterns = original_patterns.clone();
+                    for trigger in tentative_triggers.iter_mut().flatten() {
+                        *trigger = self.substitute_var_annotation(
+                            *trigger,
+                            var_term,
+                            replacement,
+                            var_name,
+                            cache,
+                        );
                     }
-                }
-            }
-            TermData::Exists(bindings, body, triggers) => {
-                if bindings.iter().any(|(name, _)| name == var_name) {
-                    term
-                } else {
-                    let new_body =
-                        self.substitute_var_inner(body, var_term, replacement, var_name, cache);
-                    if new_body != body {
-                        let sort = self.sort(term).clone();
-                        let rebuilt =
-                            self.intern(TermData::Exists(bindings, new_body, triggers), sort);
-                        self.copy_quantifier_metadata(term, rebuilt);
-                        rebuilt
-                    } else {
+                    for pattern in &mut tentative_patterns {
+                        *pattern = self.substitute_var_annotation(
+                            *pattern,
+                            var_term,
+                            replacement,
+                            var_name,
+                            cache,
+                        );
+                    }
+                    if tentative_body == body
+                        && tentative_triggers == triggers
+                        && tentative_patterns == original_patterns
+                    {
                         term
+                    } else {
+                        let mut no_patterns = original_patterns;
+                        let mut freshened = false;
+                        for (name, sort) in &mut bindings {
+                            if replacement_contains_name(self, replacement, name) {
+                                let fresh = self.fresh_substitution_binder(
+                                    "__ay_quantifier_substitution_bound",
+                                    sort,
+                                    &[term, replacement],
+                                );
+                                body = self.rename_bound_name(body, name, sort, fresh);
+                                for trigger in triggers.iter_mut().flatten() {
+                                    *trigger = self.rename_bound_hint(*trigger, name, sort, fresh);
+                                }
+                                for pattern in &mut no_patterns {
+                                    *pattern = self.rename_bound_hint(*pattern, name, sort, fresh);
+                                }
+                                let TermData::Var(fresh_name, _) = self.get(fresh) else {
+                                    unreachable!("fresh bound variable");
+                                };
+                                *name = fresh_name.clone();
+                                freshened = true;
+                            }
+                        }
+                        if freshened {
+                            tentative_body = self.substitute_var_inner(
+                                body,
+                                var_term,
+                                replacement,
+                                var_name,
+                                cache,
+                            );
+                            tentative_triggers = triggers;
+                            tentative_patterns = no_patterns;
+                            for trigger in tentative_triggers.iter_mut().flatten() {
+                                *trigger = self.substitute_var_annotation(
+                                    *trigger,
+                                    var_term,
+                                    replacement,
+                                    var_name,
+                                    cache,
+                                );
+                            }
+                            for pattern in &mut tentative_patterns {
+                                *pattern = self.substitute_var_annotation(
+                                    *pattern,
+                                    var_term,
+                                    replacement,
+                                    var_name,
+                                    cache,
+                                );
+                            }
+                        }
+                        self.rebuild_substituted_quantifier(
+                            term,
+                            bindings,
+                            tentative_body,
+                            tentative_triggers,
+                            tentative_patterns,
+                        )
                     }
                 }
             }
@@ -861,6 +979,21 @@ impl TermStore {
 
         cache.insert(term, result);
         result
+    }
+
+    fn substitute_var_annotation(
+        &mut self,
+        term: TermId,
+        var_term: TermId,
+        replacement: TermId,
+        var_name: &str,
+        cache: &mut crate::kani_compat::DetHashMap<TermId, TermId>,
+    ) -> TermId {
+        if annotation_is_available(self, term) {
+            self.substitute_var_inner(term, var_term, replacement, var_name, cache)
+        } else {
+            term
+        }
     }
 
     /// Substitute whole sub-terms according to `map` (key term -> replacement),

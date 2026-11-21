@@ -31,6 +31,7 @@ fn make_var_data(trail_pos: &[usize], level: &[u32], reason: &[Option<ClauseRef>
 fn test_prober_new() {
     let prober = Prober::new(10);
     assert_eq!(prober.num_vars, 10);
+    assert!(prober.bin_occs.is_empty() && prober.uip_seen.is_empty());
     assert_eq!(prober.probes.len(), 0);
     assert_eq!(prober.stats.rounds, 0);
 }
@@ -138,6 +139,9 @@ fn test_mark_probed() {
     let mut prober = Prober::new(3);
     let lit = Literal::positive(Variable(1));
 
+    // AY-SAT-1: nothing is allocated before first use.
+    assert!(prober.propfixed.is_empty());
+    prober.ensure_arrays();
     assert!(prober.propfixed[lit.index()] < 0);
 
     prober.mark_probed(lit, 5);

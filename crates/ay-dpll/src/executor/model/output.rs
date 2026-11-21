@@ -215,6 +215,14 @@ impl Executor {
         if !model.residual_arrays_are_current(&self.ctx) {
             return "(error \"retained array model is stale\")".to_string();
         }
+        if !model.certified_total_ufs.symbolic.is_empty() {
+            let work = model.certified_total_ufs.symbolic.lookup_work();
+            if !model.certified_total_ufs.symbolic.pay_for(self, work, 0)
+                || !model.certified_total_ufs.symbolic.is_current(self)
+            {
+                return "(error \"symbolic function model is stale or exhausted\")".to_owned();
+            }
+        }
 
         // Collect model values for user-declared symbols.
         //
@@ -324,6 +332,40 @@ impl Executor {
             // overloaded surface name from selecting the wrong definition.
             let identity = self.ctx.symbol_identity_name(name, info);
             let symbol = Symbol::named(identity);
+            if !model.certified_total_ufs.symbolic.is_empty() {
+                let work = model
+                    .certified_total_ufs
+                    .symbolic
+                    .head_lookup_work(identity.len())
+                    .unwrap_or(usize::MAX);
+                if !model.certified_total_ufs.symbolic.pay_for(self, work, 0) {
+                    return "(error \"symbolic function lookup admission refused\")".to_owned();
+                }
+            }
+            if let Some(definition) = model.certified_total_ufs.symbolic.definition(&symbol) {
+                let Some(rendered) = model.certified_total_ufs.symbolic.render_definition(
+                    self,
+                    name,
+                    &info.arg_sorts,
+                    &info.sort,
+                    definition,
+                    definitions.len(),
+                    definitions.capacity(),
+                ) else {
+                    return format!(
+                        "(error \"symbolic function output admission refused: {:?}\")",
+                        model.certified_total_ufs.symbolic.refusal()
+                    );
+                };
+                // Backing capacity and all copied payload were prepaid by
+                // render_definition under the same retained original owner.
+                if definitions.try_reserve_exact(1).is_err() {
+                    model.certified_total_ufs.symbolic.refuse();
+                    return "(error \"symbolic function output allocation refused\")".to_owned();
+                }
+                definitions.push(rendered);
+                continue;
+            }
             match model.projection_ufs.projected_argument_for_signature(
                 &symbol,
                 &info.arg_sorts,
@@ -448,20 +490,8 @@ impl Executor {
                 .iter()
                 .find(|entry| entry.name() == Some(name.as_str()))
             {
-                let params_str = entry
-                    .parameter_sorts()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, sort)| {
-                        let parameter = format!("x!{index}");
-                        format!(
-                            "({} {})",
-                            quote_symbol(&parameter),
-                            format_sort_surface(&self.ctx, sort)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let names = self.model_formal_names("x!", entry.parameter_sorts().len());
+                let params_str = self.format_model_parameters(&names, entry.parameter_sorts());
                 // The printing channel has always been a TERM channel — the
                 // body below is whatever the certified interpretation says,
                 // and for a CONSTANT body that is the published constant.
@@ -476,7 +506,7 @@ impl Executor {
                         self.format_model_expression(body)
                     }
                     CertifiedConstInterpBody::LinearInt(linear) => {
-                        match format_linear_int_body(linear) {
+                        match format_linear_int_body(linear, &names) {
                             Some(rendered) => rendered,
                             None => {
                                 tracing::error!(
@@ -523,19 +553,8 @@ impl Executor {
                     return "(error \"formula-neutral function default conflicts with current declaration\")"
                         .to_string();
                 }
-                let params_str = entry
-                    .parameter_sorts()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, sort)| {
-                        format!(
-                            "({} {})",
-                            quote_symbol(&format!("x!{index}")),
-                            format_sort_surface(&self.ctx, sort)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let names = self.model_formal_names("x!", entry.parameter_sorts().len());
+                let params_str = self.format_model_parameters(&names, entry.parameter_sorts());
                 definitions.push(format!(
                     "  (define-fun {} ({}) {}\n    {})",
                     quote_symbol(name),
@@ -1358,6 +1377,13 @@ impl Executor {
         term_id: TermId,
         read: Option<&dyn ModelRead>,
     ) -> Result<String, String> {
+        if let Some(value) = self.symbolic_function_value(model, term_id)? {
+            return self
+                .format_gate_model_value(&value, self.ctx.terms.sort(term_id))
+                .ok_or_else(|| {
+                    "symbolic function model value cannot be rendered exactly".to_owned()
+                });
+        }
         match self.completed_model_value(model, term_id) {
             Ok(Some(value)) => {
                 if model.has_constant_array_functions() {
@@ -2102,6 +2128,28 @@ mod uf_interp_bv_lane_tests {
     }
 
     #[test]
+    fn finite_function_formals_avoid_global_symbols_and_keep_their_ite_references() {
+        let out = model_of(
+            "(set-logic QF_UF)
+             (declare-sort U 0)
+             (declare-const u U)
+             (declare-const v U)
+             (declare-const |x1!0| U)
+             (declare-fun |x1| (U U) U)
+             (assert (distinct u v))
+             (assert (= (x1 u v) u))
+             (assert (= (x1 v u) v))
+             (check-sat)",
+        );
+        assert!(out.contains("(define-fun x1 ((x0 U) (x1!1 U)) U"), "{out}");
+        assert!(
+            out.contains("(and (= x0 ") && out.contains("(= x1!1 "),
+            "{out}"
+        );
+        assert!(!out.contains("(= x1 "), "{out}");
+    }
+
+    #[test]
     fn qf_ufbv_sat_publishes_a_bv_function_interpretation() {
         let out = model_of(
             "(set-logic QF_UFBV)
@@ -2224,26 +2272,20 @@ mod uf_interp_bv_lane_tests {
 }
 
 /// Render `lambda x-bar. k + sum_i c_i * x_i` as an SMT-LIB body over the
-/// printer's own `x!i` parameter spellings.
-///
-/// The parameter names are minted here from the body's arity rather than
-/// passed in, so they cannot drift from the `(define-fun f ((x!0 Int) ..) ..)`
-/// signature emitted beside them — both come from the same `x!{index}` rule.
-/// `None` on an empty body: a nullary head is published as a constant, never
-/// through this path.
-fn format_linear_int_body(linear: &LinearIntBody) -> Option<String> {
-    if linear.arity() == 0 {
+/// parameter names emitted in the same definition's signature.
+fn format_linear_int_body(linear: &LinearIntBody, names: &[String]) -> Option<String> {
+    if linear.arity() == 0 || linear.arity() != names.len() {
         return None;
     }
     let zero = num_bigint::BigInt::from(0);
     let one = num_bigint::BigInt::from(1);
     let minus_one = num_bigint::BigInt::from(-1);
     let mut summands: Vec<String> = Vec::new();
-    for (index, coefficient) in linear.coefficients().iter().enumerate() {
+    for (coefficient, name) in linear.coefficients().iter().zip(names) {
         if *coefficient == zero {
             continue;
         }
-        let parameter = quote_symbol(&format!("x!{index}"));
+        let parameter = quote_symbol(name);
         summands.push(if *coefficient == one {
             parameter
         } else if *coefficient == minus_one {
@@ -2310,7 +2352,11 @@ mod linear_int_body_printing_tests {
             (&[3, -2][..], -7, "(+ (* 3 x!0) (* (- 2) x!1) (- 7))"),
         ] {
             assert_eq!(
-                format_linear_int_body(&body(coefficients, constant)).as_deref(),
+                format_linear_int_body(
+                    &body(coefficients, constant),
+                    &Executor::new().model_formal_names("x!", coefficients.len())
+                )
+                .as_deref(),
                 Some(expected),
                 "rendering of {coefficients:?} + {constant}"
             );
@@ -2342,7 +2388,8 @@ mod linear_int_body_printing_tests {
             (&[3, -2][..], -7),
         ] {
             let linear = body(coefficients, constant);
-            let rendered = format_linear_int_body(&linear).expect("a renderable body");
+            let names = Executor::new().model_formal_names("x!", linear.arity());
+            let rendered = format_linear_int_body(&linear, &names).expect("a renderable body");
             let signature = (0..linear.arity())
                 .map(|index| format!("(x!{index} Int)"))
                 .collect::<Vec<_>>()

@@ -14,7 +14,34 @@ use std::sync::Arc;
 /// executor's interrupt flag after the deadline, causing check-sat to
 /// return `unknown`.
 pub(crate) fn run_ay(script: &str, config: &SolverConfig) -> Result<String, SolverError> {
-    run_ay_library(script, config.timeout_ms)
+    run_ay_library(script, call_timeout_ms(config, Instant::now()))
+}
+
+/// The interrupt timer of one call: the per-call `timeout_ms`, but never past
+/// the run's global deadline (`-t` bounds the whole run, not each call).
+/// `None` when neither is set: then the call has no time limit at all.
+pub(crate) fn call_timeout_ms(config: &SolverConfig, now: Instant) -> Option<u64> {
+    let remaining = config.global_deadline.map(|deadline| {
+        u64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX)
+    });
+    match (config.timeout_ms, remaining) {
+        (Some(per_call), Some(remaining)) => Some(per_call.min(remaining)),
+        (per_call, remaining) => per_call.or(remaining),
+    }
+}
+
+/// What a call answers when its time is up before its check-sat.
+const UNKNOWN_OUTPUT: &str = "unknown\n";
+
+/// A fresh executor for one FlatZinc call. Its deadline is exactly the
+/// caller's: without one, AY adds no safety deadline of its own (by default
+/// an untimed check-sat stops at 5 minutes, which ended untimed MiniZinc runs
+/// at about 300 s with UNKNOWN). The process that runs `ay flatzinc solve`
+/// owns the time limit.
+pub(crate) fn flatzinc_executor() -> ay_dpll::Executor {
+    let mut executor = ay_dpll::Executor::new();
+    executor.set_exact_deadline(true);
+    executor
 }
 
 /// Run ay via the library API: parse SMT-LIB text, then execute commands
@@ -23,10 +50,21 @@ pub(crate) fn run_ay(script: &str, config: &SolverConfig) -> Result<String, Solv
 ///
 /// When `timeout_ms` is set, a watchdog thread sets the executor's interrupt
 /// flag after the deadline, causing check-sat to return `unknown`.
+///
+/// The deadline also holds outside check-sat: a call whose time is up
+/// before its check-sat starts answers `unknown` without parsing or
+/// declaring the rest of the script. Declaring a large model is not
+/// interruptible and took longer than the whole `-t` on MiniZinc
+/// `nside/EASY_1000_100` (2026-11-19: `-t 30000` still running at 60 s).
 fn run_ay_library(script: &str, timeout_ms: Option<u64>) -> Result<String, SolverError> {
+    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+    if expired() {
+        return Ok(UNKNOWN_OUTPUT.to_string());
+    }
     let commands =
         ay_frontend::parse(script).map_err(|e| SolverError::SolverError(format!("parse: {e}")))?;
-    let mut executor = ay_dpll::Executor::new();
+    let mut executor = flatzinc_executor();
 
     // Wire interrupt flag for cooperative timeout (#5931).
     // Timer thread uses park_timeout so it can be woken early when the
@@ -47,8 +85,29 @@ fn run_ay_library(script: &str, timeout_ms: Option<u64>) -> Result<String, Solve
         None
     };
 
-    let mut outputs = Vec::new();
+    let mut outputs: Vec<String> = Vec::new();
+    let mut checked = false;
     for cmd in &commands {
+        let is_check = matches!(
+            cmd,
+            ay_frontend::Command::CheckSat | ay_frontend::Command::CheckSatAssuming(_)
+        );
+        // Out of time before the check-sat: `unknown`, as the check-sat
+        // would answer. After an `unknown` the rest (get-value) is skipped;
+        // after `sat` it runs, since the caller reads the values.
+        if expired() {
+            if !checked {
+                outputs = vec![UNKNOWN_OUTPUT.trim_end().to_string()];
+                break;
+            }
+            if outputs
+                .first()
+                .is_some_and(|status| status.trim() == "unknown")
+            {
+                break;
+            }
+        }
+        checked |= is_check;
         match executor.execute(cmd) {
             Ok(Some(out)) => outputs.push(out),
             Ok(None) => {}

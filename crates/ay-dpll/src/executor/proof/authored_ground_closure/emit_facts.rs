@@ -14,12 +14,12 @@
 //! * `EqualityHolds` / `EqualityRefuted` — the closure's `EufTransitive`
 //!   explanation, refuted against two constants by `BvBitBlast`;
 //! * `PredCongruent` — `EufCongruentPred` over the explained arguments;
-//! * `Propagated` — the shared `forall_inst` → `or` → `resolution` prologue,
+//! * `Propagated` — an exact authored fact, or a `forall_inst` prologue,
 //!   clausified by `or`/`implies`, with every other literal resolved away.
 
 use super::emit::ClosureEmitter;
 use super::facts::{literal_atom, FactReason};
-use super::instances::InstanceShape;
+use super::instances::{ClauseOrigin, InstanceShape};
 use super::*;
 
 impl Executor {
@@ -156,6 +156,11 @@ impl Executor {
                 vec![literal],
                 TheoryLemmaKind::BvBitBlast,
             ),
+            FactReason::BooleanConstant => emitter.proof.add_theory_lemma_with_kind(
+                "bool",
+                vec![literal],
+                TheoryLemmaKind::BoolTautology,
+            ),
             FactReason::EqualityHolds => {
                 let (lhs, rhs) = decode_eq_local(&self.ctx.terms, literal)?;
                 let unit = self.emit_closure_path_unit(emitter, lhs, rhs, fact.edge_limit)?;
@@ -248,12 +253,33 @@ impl Executor {
         expected: &[TermId],
     ) -> Option<ProofId> {
         let instance = emitter.facts.clauses().get(clause)?.clone();
-        let mut step = self.add_forall_instance_prologue(
-            &mut emitter.proof,
-            instance.forall_root,
-            instance.value,
-            instance.instance,
-        );
+        let mut step = match instance.origin {
+            ClauseOrigin::Forall { root, value, exact } => {
+                let unit =
+                    self.add_forall_instance_prologue(&mut emitter.proof, root, value, exact);
+                if exact == instance.instance {
+                    unit
+                } else {
+                    let negative = self.ctx.terms.mk_not_raw(exact);
+                    let bridge = emitter.proof.add_theory_lemma_with_kind(
+                        "bool",
+                        vec![negative, instance.instance],
+                        TheoryLemmaKind::BoolTautology,
+                    );
+                    emitter
+                        .proof
+                        .add_resolution(vec![instance.instance], exact, unit, bridge)
+                }
+            }
+            ClauseOrigin::AuthoredFact(fact) => {
+                emitter.used_authored_clause = true;
+                let unit = self.emit_ground_fact(emitter, fact)?;
+                (unit.literal == instance.instance).then_some(unit.step)?
+            }
+            ClauseOrigin::NativeWitness(plan) => {
+                self.emit_native_universal_witness(&mut emitter.proof, &plan)?
+            }
+        };
         match instance.shape {
             InstanceShape::Unit => {}
             InstanceShape::Or => {
@@ -265,11 +291,24 @@ impl Executor {
                 );
             }
             InstanceShape::Implies => {
-                step = emitter.proof.add_rule_step(
-                    AletheRule::Implies,
-                    instance.literals.clone(),
-                    vec![step],
+                // `ImpliesPos` is independently checked both internally and
+                // on the printed surface. The direct `Implies` elimination
+                // rule has no strict checker arm; do not emit an unchecked
+                // shortcut for a native, structurally preserved implication.
+                let not_source = self.ctx.terms.mk_not_raw(instance.instance);
+                let mut clause = vec![not_source];
+                clause.extend(instance.literals.iter().copied());
+                let clausified = emitter.proof.add_rule_step(
+                    AletheRule::ImpliesPos,
+                    clause,
                     Vec::new(),
+                    Vec::new(),
+                );
+                step = emitter.proof.add_resolution(
+                    instance.literals.clone(),
+                    instance.instance,
+                    clausified,
+                    step,
                 );
             }
         }

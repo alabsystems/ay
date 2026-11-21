@@ -17,10 +17,17 @@ mod compat;
 mod constants;
 mod conversions;
 mod datatypes;
+mod declaration_budget;
 mod function_application;
 mod function_declarations;
 mod function_definitions;
+mod opaque_sorts;
+mod owned_constants;
+mod owned_functions;
 mod quantifiers;
+mod sequence_constants;
+mod sequence_operations;
+mod sort_inspection;
 mod variables;
 
 pub(super) use binder_separation::BinderTwins;

@@ -42,6 +42,7 @@ mod dt_opaque_completion_scope;
 mod dt_opaque_parser_scope;
 mod dt_opaque_resource_scope;
 mod dt_recursive_model_faithfulness;
+mod dt_structural_nullary_depth;
 mod euf_datatype_constructor_aliases;
 mod eval_term_array_select;
 mod eval_term_array_select_ite;

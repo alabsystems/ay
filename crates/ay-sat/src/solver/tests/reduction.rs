@@ -2446,21 +2446,21 @@ fn load_slack_reclamation_does_not_move_the_reduce_db_trigger() {
         solver.add_clause_db(&[Literal::positive(a), Literal::negative(b)], false);
     }
 
-    // Slack well past the 16MB reclamation floor (2M u64 entries).
-    solver.cold.clause_ids.reserve_exact(3_000_000);
-    let cap_before = solver.cold.clause_ids.capacity();
+    // Slack well past the 16MB reclamation floor (2M slots of 9 bytes).
+    solver.cold.clause_ids.reserve_exact_len(6_000_000);
+    let cap_before = solver.cold.clause_ids.heap_bytes();
     let billed_before = solver.clause_db_memory_bytes();
     assert!(
-        (cap_before - solver.cold.clause_ids.len()) * size_of::<u64>() >= 16 << 20,
+        solver.cold.clause_ids.slack_bytes() >= 16 << 20,
         "precondition: clause_ids slack must exceed the reclamation floor"
     );
 
     solver.reclaim_load_time_slack(0);
 
     assert!(
-        solver.cold.clause_ids.capacity() < cap_before,
+        solver.cold.clause_ids.heap_bytes() < cap_before,
         "real capacity must actually be handed back: {cap_before} -> {}",
-        solver.cold.clause_ids.capacity()
+        solver.cold.clause_ids.heap_bytes()
     );
     assert!(
         solver.cold.load_slack_reclaimed_bytes > 0,
@@ -2489,9 +2489,8 @@ fn clause_ids_reservation_is_lazy_and_trigger_basis_is_preserved() {
         hint > 0,
         "precondition: the clause hint must produce a hint"
     );
-    assert_eq!(
-        solver.cold.clause_ids.capacity(),
-        0,
+    assert!(
+        !solver.cold.clause_ids.is_allocated(),
         "construction must not allocate clause_ids"
     );
     // The phantom charge stands in for the deferred reservation.
@@ -2500,8 +2499,8 @@ fn clause_ids_reservation_is_lazy_and_trigger_basis_is_preserved() {
     let mut solver2 = Solver::with_clause_hint(64, 32);
     solver2.cold.clause_ids_grow_for(0);
     assert_eq!(
-        solver2.cold.clause_ids.capacity(),
-        hint,
+        solver2.cold.clause_ids.heap_bytes(),
+        ClauseIdTable::bytes_for_len(hint),
         "first write must take exactly the deferred reservation"
     );
     assert_eq!(

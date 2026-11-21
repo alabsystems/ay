@@ -209,6 +209,8 @@ mod candidate;
 pub use candidate::{CandidateSearchOutcome, CandidateSearchWork, CandidateSolver};
 mod clause_add;
 mod clause_add_internal;
+mod clause_id_table;
+pub(crate) use clause_id_table::ClauseIdTable;
 mod clause_add_theory;
 mod clone;
 #[allow(dead_code)]

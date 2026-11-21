@@ -191,6 +191,19 @@ pub struct SatAbSwitches {
     /// externally checked throughout (ab_xor_proof_route_300s.json +
     /// _confirm_900s.json). `false` is the opt-out; None = ON.
     pub xor_proof_route: Option<bool>,
+    /// `--sat-parity-space-route <bool>` (AY-SAT-2, 2026-11-19). Default
+    /// ON: before the XOR and ordinary routes, a CNF of at most 50k clauses
+    /// whose recovered XORs cover at least half of it is answered SAT by a
+    /// model from the affine solution space of its XOR system, checked
+    /// against every input clause; the route never answers UNSAT and writes
+    /// no proof, and it falls through after its own wall budget
+    /// (`--sat-parity-space-budget-ms`). `false` is the opt-out; None = ON.
+    pub parity_space_route: Option<bool>,
+    /// `--sat-parity-space-budget-ms <N>`: the parity-space route's wall
+    /// budget in milliseconds, after which it hands the formula on to the
+    /// ordinary routes. None = the shipped budget (8,000 ms); 0 disables
+    /// the route like `--sat-parity-space-route false`.
+    pub parity_space_budget_ms: Option<u64>,
     /// `--sat-gf-probe <bool>` (bare-numeric landing). Default ON — the
     /// GF(p) one-hot linear-system startup probe constructs models for
     /// random mod-p linear-system CNFs (the SAT-COMP 2026 "1".."16"
@@ -462,6 +475,13 @@ pub struct SatAbSwitches {
     /// output explicitly; the default policy is the reserve above, because a
     /// ceiling can only lose an UNSAT that the disk could have held.
     pub proof_cap_bytes: Option<u64>,
+    /// `--sat-signed-symmetry-max-clauses <N>`: the active-clause cap of the
+    /// opt-in signed-symmetry route (`--sat-signed-symmetry`); default
+    /// 1,000,000 (`SIGNED_SYMMETRY_MAX_CLAUSES`). Measurement lever only: the
+    /// knights instance 4551c996 has 1,297,025 clauses and Satsuma finds four
+    /// polarity-flipping generators on it (AY-SAT-3). A larger cap lets the
+    /// route look; it changes no clause it emits.
+    pub signed_symmetry_max_clauses: Option<u64>,
     /// `--sat-symmetry-large-caps <bool>`. Default ON since 2026-09-17; `false` opts out. ON
     /// raises the orbitope and aux-free SR caps (2M, 1M) to 8M, and the orbitope detector's 1M
     /// to match; IR caps stay. Lever 2 of the SAT plan (proof-posture-parity); `size_caps.rs`.
@@ -922,6 +942,14 @@ pub struct SatAbSwitches {
     /// default records stable bumps in `bump_order` and rebuilds the queue
     /// from them on every switch into focused mode.
     pub queue_freeze_kissat: Option<bool>,
+    /// `--sat-initial-order-high-first <bool>`: the first decisions take the
+    /// highest variable index first (focused VMTF queue and stable heap), as
+    /// CaDiCaL's `init_queue` and Kissat's parse-order activation do. AY's
+    /// default takes the lowest index first. On the SHA-256 circuit 4e64ffc1
+    /// the low-index order decides the circuit inputs first and every
+    /// decision propagates most of the circuit (AY-SAT-3). Decision order
+    /// only; no effect on models or proofs.
+    pub initial_order_high_first: Option<bool>,
     /// `--sat-analysis-ticks-kissat <bool>`: conflict analysis charges
     /// search ticks as Kissat 4.0.4 does, one per large (3+ literal) reason
     /// visited by minimization, shrinking and reason-side bumping

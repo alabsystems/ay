@@ -10,7 +10,7 @@ use super::*;
 /// synthesized default does before its proof file exists.
 fn reserve_in(dir: &Path) -> DimacsProofStatusReservation {
     let proof = dir.join("t.cnf.drat");
-    reserve_dimacs_proof_status(proof.to_str().expect("UTF-8 path")).expect("reserve status")
+    reserve_dimacs_proof_status(proof.to_str().expect("UTF-8 path"), None).expect("reserve status")
 }
 
 fn names_in(dir: &Path) -> Vec<String> {
@@ -178,7 +178,7 @@ fn an_exit_removes_a_lock_whose_marker_already_exists() {
     let marker = std::fs::read_to_string(&first.status_path).expect("marker");
 
     let proof = dir.path().join("t.cnf.drat");
-    let second = create_dimacs_status_reservation(proof.to_str().expect("UTF-8 path"))
+    let second = create_dimacs_status_reservation(proof.to_str().expect("UTF-8 path"), None)
         .expect("the lock itself is free");
     assert_eq!(
         names_in(dir.path()),

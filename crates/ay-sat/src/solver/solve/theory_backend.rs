@@ -763,6 +763,18 @@ impl Solver {
                 self.maybe_run_restart_pure()
             };
             if restarted {
+            } else if self.clause_db_limit_reduction_due() {
+                // A clause-DB limit is exceeded and no conflict came to
+                // schedule the reduction: an extension that adds a clause for
+                // every propagation (ay's direct-CP engine) can fill memory
+                // between two conflicts. Reduce here, where BCP and theory
+                // propagation are at their fixpoint, as a conflict would.
+                if USE_CALLBACK && self.reduce_db_backjumps_to_root() {
+                    callback.backtrack_after_materializing_lazy_reasons(self, 0);
+                    self.cold.lazy_materialization_failed = false;
+                }
+                self.reduce_db();
+                continue;
             } else if self.should_rephase() {
                 if self.decision_level != 0 {
                     self.backtrack(0);

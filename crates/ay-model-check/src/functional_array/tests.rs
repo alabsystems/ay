@@ -141,6 +141,11 @@ fn program_mismatch_is_never_disequality_evidence() {
         .same_function(&base(7, &[]), &mut 1000)
         .expect("no structural proof"));
     assert_eq!(
+        a.equality_with_stop(&base(7, &[]), &mut 1000, &mut || false)
+            .expect("comparison"),
+        None
+    );
+    assert_eq!(
         read(&a, 2),
         7,
         "these different programs actually denote equal arrays"

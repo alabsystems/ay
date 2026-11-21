@@ -97,6 +97,8 @@ mod lnh_symmetry_domain_soundness;
 mod lnh_wrong_unsat_regression;
 #[path = "group_regression/nia_cube_decline_keeps_point.rs"]
 mod nia_cube_decline_keeps_point;
+#[path = "group_regression/nia_persist_until_deadline.rs"]
+mod nia_persist_until_deadline;
 #[path = "group_regression/nia_sign_cut_wrong_unsat.rs"]
 mod nia_sign_cut_wrong_unsat;
 #[path = "group_regression/nia_split_probe_sat.rs"]

@@ -153,7 +153,11 @@ impl CpSatEngine {
     /// Run propagators at root level and feed resulting clauses to SAT.
     /// Returns `Some(CpSolveResult)` on root conflict, `None` to continue.
     fn apply_root_propagation(&mut self) -> Option<CpSolveResult> {
-        match self.propagate_all() {
+        let root = self.propagate_all();
+        if let Some(witness) = &self.witness {
+            witness.check(&self.encoder, "root propagation", &root);
+        }
+        match root {
             PropagationResult::Conflict(clause) => {
                 if clause.is_empty() {
                     return Some(CpSolveResult::Unsat);
@@ -199,6 +203,15 @@ impl CpSatEngine {
 
     /// SAT solving with CP extension (LCG propagation during search).
     fn solve_with_cp_extension(&mut self, assumptions: &[ay_sat::Literal]) -> CpSolveResult {
+        if let Some(budget) = self.memory_budget.take() {
+            // A third of the budget is planned with (the SAT core then gives
+            // the clause database 60% of that): a reduction compacts the
+            // arena by copying it, so the peak is twice the database, and
+            // the engine's own structures share the rest. Measured on
+            // `orthorio/challenge_04` with 3,686 MB: half the budget gave a
+            // 1,486 MB database whose compaction crossed the limit.
+            self.clause_db_ceiling = self.sat.arm_clause_db_budget_from_process_limit(budget / 3);
+        }
         loop {
             let num_vars = self.trail.num_vars();
             // Reuse search state from previous solve if available (preserves
@@ -229,6 +242,8 @@ impl CpSatEngine {
                 level_trail_pos: Vec::new(),
                 needs_resync: false,
                 ws_all_clauses: Vec::new(),
+                witness: self.witness.clone(),
+                restarts: std::cell::Cell::new(super::extension::first_restart()),
             };
             ext.build_var_to_props();
 
@@ -262,6 +277,7 @@ impl CpSatEngine {
             }
 
             self.restore_cp_extension(ext);
+            self.report_witness();
             return if sat_result.is_unsat() {
                 CpSolveResult::Unsat
             } else {

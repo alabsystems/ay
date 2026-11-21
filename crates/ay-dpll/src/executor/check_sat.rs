@@ -1593,7 +1593,49 @@ impl Executor {
             self.fp_persistent_armed =
                 !self.original_problem_had_quantifiers && self.last_assumptions.is_none();
             self.trace_unknown_funnel("route-enter", Some(category), None, false);
+            // #nia-persist-until-deadline (AY-SMT-5): a NIA solve may spend
+            // its whole deadline only when nothing waits for its `unknown`:
+            //
+            // * the partition rescue below cannot follow it, i.e. the
+            //   assertions form one symbol-connected component
+            //   (`try_partition_rescue` returns the primary result unchanged
+            //   for fewer than two);
+            // * the problem is quantifier-free as the user wrote it, and its
+            //   category is a quantifier-free one. The first version armed
+            //   for `LogicCategory::Nia` too, and nothing kept it out of the
+            //   ground probes a quantifier strategy runs: each probe is a
+            //   fresh executor with a sub-budget, whose `unknown` the
+            //   strategy reads to try something else. Persisting spent every
+            //   probe's whole budget, and `forall x. exists y. y*y >= x`
+            //   (answered `sat` before) ended `unknown` (first compiled run
+            //   of the combined fixes, 19 November 2026);
+            // * this executor is not such a probe or re-solve
+            //   (`nia_persist_forbidden`), and no dispatch of another
+            //   executor is open on this thread (`NiaPersistWindow`), which
+            //   covers nested executors however they are built.
+            //
+            // Armed for this one dispatch. The symbol walk is computed only
+            // for the categories that route to `solve_nia`.
+            let window = NiaPersistWindow::open();
+            // An untimed command has a five-minute search safety net. Only
+            // the publication deadline records a relative or inherited caller grant.
+            self.nia_box_allowed = window.outermost
+                && self.certification_deadline.get().is_some()
+                && !self.nia_persist_forbidden
+                && !self.original_problem_had_quantifiers
+                && matches!(
+                    category,
+                    LogicCategory::QfNia
+                        | LogicCategory::QfEia
+                        | LogicCategory::QfNira
+                        | LogicCategory::QfLia
+                );
+            self.nia_persist_allowed =
+                self.nia_box_allowed && self.single_symbol_component(&pre_dispatch_assertions);
             let dispatched = self.route_to_solver(category, &features);
+            drop(window);
+            self.nia_persist_allowed = false;
+            self.nia_box_allowed = false;
             self.trace_unknown_funnel(
                 "route-return",
                 Some(category),
@@ -1904,9 +1946,27 @@ impl Executor {
         self.with_scope_root_depths(|this| this.check_sat_shadowed(Some(permit)))
     }
 
+    pub(in crate::executor) fn check_sat_with_authored_query_observed(
+        &mut self,
+        permit: AuthoredPlainHardQueryPermit,
+        observer: super::NativeProofObserver<'_>,
+    ) -> Result<SolveResult> {
+        self.with_scope_root_depths(|this| {
+            this.check_sat_shadowed_observed(Some(permit), Some(observer))
+        })
+    }
+
     pub(in crate::executor) fn check_sat_with_authority(
         &mut self,
         authority: Option<AuthoredPlainHardQueryPermit>,
+    ) -> Result<SolveResult> {
+        self.check_sat_with_authority_observed(authority, None)
+    }
+
+    pub(in crate::executor) fn check_sat_with_authority_observed(
+        &mut self,
+        authority: Option<AuthoredPlainHardQueryPermit>,
+        observer: Option<super::NativeProofObserver<'_>>,
     ) -> Result<SolveResult> {
         // Evidence policy P1: a checking re-solve's nested probes run no
         // strengthening either (`strengthening.rs`).
@@ -1986,6 +2046,13 @@ impl Executor {
         // A stale capability loses only the projection opportunity; the normal
         // solver remains available and must still pass the SAT chokepoint.
         let authority = authority.filter(|permit| permit.is_current(self));
+        // Only this current audited input boundary may capture native source
+        // authority. Generic/nested solves cannot mint it from working roots.
+        if let Some(permit) = authority.as_ref() {
+            self.native_proof_source_scope =
+                super::proof::native_source_scope::NativeProofSourceScope::capture(self, permit)
+                    .map(std::sync::Arc::new);
+        }
         #[cfg(test)]
         {
             self.last_authored_query_authority_seen = authority.is_some();
@@ -2006,7 +2073,7 @@ impl Executor {
             self.simplifier_stage_suspended,
         );
         let result = stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
-            self.check_sat_guarded(projection_authority)
+            self.check_sat_guarded(projection_authority, observer)
         });
         (
             self.simplifier_rewrite_adopted,
@@ -2644,6 +2711,7 @@ impl Executor {
     fn check_sat_guarded(
         &mut self,
         projection_authority: Option<AuthoredPlainHardQueryPermit>,
+        mut observer: Option<super::NativeProofObserver<'_>>,
     ) -> Result<SolveResult> {
         let authored_plain = projection_authority.is_some();
         self.begin_exact_ite_uf_definition_recovery(authored_plain);
@@ -3146,6 +3214,16 @@ impl Executor {
         // gate. The outer `check_sat` boundary finalizes the matching CNF and
         // runs AY's native DRAT checker before returning the result to ANY
         // caller; a failed check is revoked and degraded to `Unknown` there.
+        if result.is_unsat() && self.is_producing_proofs() {
+            if let Some(observer) = observer.as_mut() {
+                // Observation may retain independently checked diagnostic
+                // evidence, but cannot alter this verdict or any policy gate.
+                observer(self);
+            }
+        }
+        if self.self_check && result.is_unsat() {
+            self.prepare_external_proof_support();
+        }
         let bv_drat_self_cert = self.last_bv_drat_self_cert;
         let result = if self.self_check
             && result.is_unsat()
@@ -3274,8 +3352,13 @@ impl Executor {
     /// `check_sat_guarded` and the unrewritten fallback
     /// (#simplifier-sat-fallback), which repeats exactly this sequence.
     pub(in crate::executor) fn solve_and_emit_primary(&mut self) -> Result<SolveResult> {
-        let result = self.cegar_refine_solve_with_finite_model_last_chance()?;
+        let mut result = self.cegar_refine_solve_with_finite_model_last_chance()?;
         self.trace_unknown_funnel("primary-cegar-return", None, Some(&result), false);
+        let periodic_completion =
+            result == SolveResult::Unknown && self.try_periodic_array_model_completion();
+        if periodic_completion {
+            result = SolveResult::Sat;
+        }
         if result.is_unsat() && self.produce_proofs_enabled() && self.last_proof.is_none() {
             self.build_unsat_proof();
         }
@@ -3289,6 +3372,11 @@ impl Executor {
         // can no longer bypass the soundness kernel via those paths.
         self.trace_unknown_funnel("primary-emit-enter", None, Some(&result), false);
         let emitted = self.emit_sat_verdict(result, &[]);
+        if periodic_completion && matches!(&emitted, Ok(SolveResult::Sat)) {
+            self.last_unknown_reason = None;
+            self.last_statistics
+                .set_int("model_completion.periodic_checked_proposal", 2);
+        }
         self.trace_unknown_funnel(
             "primary-emit-return",
             None,
@@ -3487,6 +3575,31 @@ impl Executor {
         policy: super::QuantifierDeadlinePolicy,
     ) {
         self.quantifier_deadline_policy = policy;
+    }
+
+    /// Honour the caller's deadline exactly (`true`), or allow AY's defaults
+    /// around it (`false`, the default).
+    ///
+    /// By default an untimed check-sat gets a 5-minute safety deadline
+    /// (`install_timeout_deadline_for_call`), so that a library embedding
+    /// that never sets one cannot spin forever, and a quantified solve may
+    /// relax a nominal deadline into the opted-in backstop. A caller that
+    /// supervises the run itself, such as `ay flatzinc solve` under a
+    /// MiniZinc time limit, sets this so that no deadline means no time
+    /// limit of AY's own and a deadline is never extended. Interrupts, work
+    /// grants and memory stops still apply. [`Self::reset`] clears it.
+    pub fn set_exact_deadline(&mut self, exact: bool) {
+        self.quantifier_deadline_policy = if exact {
+            super::QuantifierDeadlinePolicy::Exact
+        } else {
+            super::QuantifierDeadlinePolicy::RelaxToBackstop
+        };
+    }
+
+    /// Whether [`Self::set_exact_deadline`] is in force.
+    #[must_use]
+    pub fn exact_deadline(&self) -> bool {
+        self.quantifier_deadline_policy == super::QuantifierDeadlinePolicy::Exact
     }
 
     /// Opt in to (or back out of) the quantified wall-clock BACKSTOP.
@@ -6014,6 +6127,37 @@ mod quantifier_determinism_tests {
         assert_eq!(exec.solve_deadline.get(), None);
     }
 
+    /// An untimed call gets AY's 5-minute safety deadline unless the caller
+    /// asked for its deadline to be honoured exactly; then no deadline means
+    /// none. `ay flatzinc solve` without -t ended UNKNOWN at about 300 s
+    /// (official-20261114, mznc fd/free/par/open) because of the default.
+    #[test]
+    fn exact_deadline_leaves_an_untimed_call_unbounded() {
+        let mut exec = Executor::new();
+        assert!(!exec.exact_deadline());
+        let before = Instant::now();
+        let scope = exec.install_timeout_deadline_for_call();
+        let default_deadline = exec
+            .solve_deadline
+            .get()
+            .expect("an untimed call gets the default safety deadline");
+        assert!(default_deadline >= before + Duration::from_secs(299));
+        exec.restore_timeout_deadline_after_call(scope);
+
+        let mut exec = Executor::new();
+        exec.set_exact_deadline(true);
+        assert!(exec.exact_deadline());
+        let scope = exec.install_timeout_deadline_for_call();
+        assert_eq!(exec.solve_deadline.get(), None);
+        exec.restore_timeout_deadline_after_call(scope);
+
+        exec.set_exact_deadline(false);
+        assert!(!exec.exact_deadline());
+        exec.set_exact_deadline(true);
+        exec.reset();
+        assert!(!exec.exact_deadline(), "reset clears the per-call controls");
+    }
+
     include!("check_sat/command_deadline_tests.rs");
     include!("check_sat/backstop_envelope_tests.rs");
     include!("check_sat/quantified_trace_retry_tests.rs");
@@ -6361,3 +6505,81 @@ mod quantifier_determinism_tests {
 }
 
 include!("check_sat/conflict_semantic_memo_tests.rs");
+
+thread_local! {
+    /// How many solver dispatches are open on this thread
+    /// (#nia-persist-until-deadline); see [`NiaPersistWindow`].
+    static NIA_PERSIST_WINDOWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// One solver dispatch, from `route_to_solver`'s call to its return. A
+/// dispatch that opens while another is open on the same thread belongs to a
+/// nested solve (a probe, a re-solve, a component), whose `unknown` its
+/// caller reads; only the outermost one may let a NIA solve persist to its
+/// deadline.
+struct NiaPersistWindow {
+    /// No other dispatch was open on this thread when this one opened.
+    outermost: bool,
+}
+
+impl NiaPersistWindow {
+    fn open() -> Self {
+        let open_before = NIA_PERSIST_WINDOWS.with(|open| {
+            let before = open.get();
+            open.set(before + 1);
+            before
+        });
+        Self {
+            outermost: open_before == 0,
+        }
+    }
+}
+
+impl Drop for NiaPersistWindow {
+    fn drop(&mut self) {
+        NIA_PERSIST_WINDOWS.with(|open| open.set(open.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(test)]
+mod nia_persist_window_tests {
+    use super::{Executor, NiaPersistWindow};
+
+    #[test]
+    fn an_inherited_absolute_deadline_can_admit_a_nonlinear_box() {
+        let commands = ay_frontend::parse(
+            "(set-logic QF_NIA)
+             (declare-const x Int) (declare-const y Int)
+             (assert (= (* x y) 6)) (assert (>= x 2)) (assert (>= y 2)) (check-sat)",
+        )
+        .unwrap();
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        exec.set_solve_controls(
+            None,
+            Some(ay_core::time::Instant::now() + std::time::Duration::from_secs(5)),
+        );
+        let outputs = exec.execute_all(&commands).unwrap();
+        assert!(outputs.iter().any(|answer| answer == "sat"));
+        assert_eq!(
+            exec.statistics().get_string("nia.box_blast"),
+            Some("sat r=1")
+        );
+    }
+
+    /// Only the first open dispatch of a thread is the outermost; closing it
+    /// makes the next one outermost again.
+    #[test]
+    fn only_the_first_open_window_is_outermost() {
+        let first = NiaPersistWindow::open();
+        assert!(first.outermost);
+        let nested = NiaPersistWindow::open();
+        assert!(!nested.outermost);
+        drop(nested);
+        let sibling = NiaPersistWindow::open();
+        assert!(!sibling.outermost, "the first window is still open");
+        drop(sibling);
+        drop(first);
+        assert!(NiaPersistWindow::open().outermost);
+    }
+}

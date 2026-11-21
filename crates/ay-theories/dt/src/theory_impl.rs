@@ -33,6 +33,8 @@ impl TheorySolver for DtSolver<'_> {
             (literal, value)
         };
 
+        self.record_seq_owned_guard(term, val);
+
         // Check if this is an equality
         if let Some((lhs, rhs)) = self.decode_eq(term) {
             self.process_equality(term, lhs, rhs, val);
@@ -155,6 +157,17 @@ impl TheorySolver for DtSolver<'_> {
             return TheoryResult::Unsat(conflict);
         }
 
+        // Mixed owned structure is checked from exact scoped guard assignments.
+        // Its explanation is independently reconstructed before publication.
+        match self.check_seq_owned_cycle() {
+            Ok(Some(conflict)) => {
+                self.conflict_count = self.conflict_count.saturating_add(1);
+                return TheoryResult::Unsat(conflict);
+            }
+            Ok(None) => {}
+            Err(_) => return TheoryResult::Unknown,
+        }
+
         // Dynamic case splitting for recursive datatypes (#8539).
         //
         // After all conflict checks pass, scan for DT terms whose equivalence
@@ -214,6 +227,7 @@ impl TheorySolver for DtSolver<'_> {
 
     fn push(&mut self) {
         self.current_scope.asserted_eq_lits_len = self.asserted_eq_lits.len();
+        self.current_scope.seq_owned_guards_len = self.seq_owned_guards.len();
         self.current_scope.asserted_diseqs_len = self.asserted_diseqs.len();
         // Save union trail mark for efficient pop (#8627).
         // Since find() does NOT use path compression (it takes &self),
@@ -249,6 +263,7 @@ impl TheorySolver for DtSolver<'_> {
             }
             // Undo equality assertions
             self.asserted_eq_lits.truncate(scope.asserted_eq_lits_len);
+            self.seq_owned_guards.truncate(scope.seq_owned_guards_len);
             self.asserted_diseqs.truncate(scope.asserted_diseqs_len);
             // Clear propagated pairs, pending propagations, and pending
             // injectivity equalities since the assertions that derived them
@@ -279,6 +294,8 @@ impl TheorySolver for DtSolver<'_> {
         self.current_scope = DtScope::default();
         self.tester_results.clear();
         self.asserted_eq_lits.clear();
+        self.seq_owned_guards.clear();
+        self.seq_owned_possible = false;
         self.pending_injectivity_eqs.clear();
         self.propagated_eq_pairs.clear();
         self.asserted_diseqs.clear();

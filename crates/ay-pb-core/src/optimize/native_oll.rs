@@ -124,12 +124,50 @@ enum CoreOutcome {
 /// its `ub` at iteration boundaries as `external_ub_cutoff: Option<i128>` and
 /// consumes it ONLY to prune (see the module docs); it never writes the bus.
 /// Sequential callers pass `None` (identical pre-bus behavior).
+///
+/// No LP-floor cap; production callers go through [`solve_with_floor_budget`].
+#[cfg(test)]
 pub(crate) fn solve<F>(
     instance: &PbInstance,
     objective: &PbObjective,
     should_stop: F,
     on_improve: Option<&mut dyn FnMut(i128, &[bool])>,
     external_bounds: Option<&SharedBounds>,
+) -> Option<OptResult>
+where
+    F: FnMut() -> bool,
+{
+    solve_with_floor_budget(
+        instance,
+        objective,
+        should_stop,
+        on_improve,
+        external_bounds,
+        None,
+    )
+}
+
+/// The native OLL engine with a deadline for the root LP-relaxation floor (see
+/// [`lp_relaxation_floor`]).
+///
+/// The size-scaled LP-floor budget reaches 35 s from about 4,400 variables, and
+/// the floor runs BEFORE the first core is extracted. A caller that gives the
+/// whole engine a short slice passes a deadline here so the floor cannot use up
+/// the slice and leave the core-guided descent no time at all (AY-SAT-8: on
+/// the all-soft WBO instance `elf.rf7` the exact-rational LP floor used the
+/// whole native-OLL pre-pass slice and returned 0, while the descent alone
+/// proves the optimum, 1, in 0.3 s). The deadline is absolute, so the solver
+/// construction, the first model and the floor's own preprocessing all count
+/// against it. It only shortens the LP's budget; a shorter budget yields a
+/// weaker or no floor, never an unsound one. `None` keeps the size-scaled
+/// budget unchanged.
+pub(crate) fn solve_with_floor_budget<F>(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    should_stop: F,
+    on_improve: Option<&mut dyn FnMut(i128, &[bool])>,
+    external_bounds: Option<&SharedBounds>,
+    floor_deadline: Option<std::time::Instant>,
 ) -> Option<OptResult>
 where
     F: FnMut() -> bool,
@@ -141,6 +179,7 @@ where
         on_improve,
         MAX_DISJOINT_CORES_PER_ROUND,
         external_bounds,
+        floor_deadline,
     )
 }
 
@@ -158,6 +197,7 @@ fn solve_with_round_core_cap<F>(
     mut on_improve: Option<&mut dyn FnMut(i128, &[bool])>,
     round_core_cap: usize,
     external_bounds: Option<&SharedBounds>,
+    floor_deadline: Option<std::time::Instant>,
 ) -> Option<OptResult>
 where
     F: FnMut() -> bool,
@@ -287,7 +327,8 @@ where
     // cannot double-count) used only for the terminal `best_value <= floor`
     // short-circuit and as a clamp in `finish_optimum`; the optimum witness is
     // always re-verified against the ORIGINAL constraints by `verify_native_optimum`.
-    let lp_floor = lp_relaxation_floor(instance, objective, &mut should_stop).unwrap_or(i128::MIN);
+    let lp_floor = lp_relaxation_floor(instance, objective, &mut should_stop, floor_deadline)
+        .unwrap_or(i128::MIN);
 
     // LP REDUCED-COST VARIABLE FIXING (RoundingSat/Exact's general-OPT edge,
     // OPT-IN via AY_PB_REDUCED_COST). Build the fixer once (GCD-strengthening the
@@ -1666,10 +1707,14 @@ fn lp_relaxation_floor<F>(
     instance: &PbInstance,
     objective: &PbObjective,
     should_stop: &mut F,
+    floor_deadline: Option<std::time::Instant>,
 ) -> Option<i128>
 where
     F: FnMut() -> bool,
 {
+    // The floor's clock starts here, before its preprocessing, so the
+    // strengthening pass counts against the budget too.
+    let floor_started = std::time::Instant::now();
     // Budget. An explicit `AY_PB_LP_FLOOR_MS` override pins a fixed budget (and `0`
     // disables the floor entirely). Otherwise the budget SCALES WITH INSTANCE SIZE:
     // the exact-rational simplex cost grows with the variable count, and so does the
@@ -1677,15 +1722,20 @@ where
     // weighted instances are closed by the core-guided descent alone). Scaling keeps
     // tiny instances from ever spending a large fixed slice on a doomed LP while
     // still granting big pebbling instances the seconds their (tight) LP needs to
-    // complete. Clamped to `[LP_FLOOR_BUDGET_MIN_MS, LP_FLOOR_BUDGET_MS]`.
+    // complete. Clamped to `[LP_FLOOR_BUDGET_MIN_MS, LP_FLOOR_BUDGET_MS]`, and
+    // then to the time left before the caller's `floor_deadline` (the part of
+    // its own slice it can spare before the core-guided descent; see
+    // [`solve_with_floor_budget`]). The explicit override is a diagnostic knob
+    // and is not capped.
     let budget_ms = match std::env::var(LP_FLOOR_BUDGET_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
         Some(fixed) => fixed,
-        None => u64::from(instance.num_vars)
-            .saturating_mul(LP_FLOOR_BUDGET_MS_PER_VAR)
-            .clamp(LP_FLOOR_BUDGET_MIN_MS, LP_FLOOR_BUDGET_MS),
+        None => capped_lp_floor_budget_ms(
+            instance.num_vars,
+            floor_deadline.map(|deadline| deadline.saturating_duration_since(floor_started)),
+        ),
     };
     if budget_ms == 0 || should_stop() {
         return None;
@@ -1710,7 +1760,7 @@ where
             _ => return None,
         };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+    let deadline = floor_started + std::time::Duration::from_millis(budget_ms);
     // `lp_lower_bound` wants a `&dyn Fn()`; the caller's `should_stop` is `FnMut`.
     // Wrap it in a `RefCell` so the inner `Fn` closure can poll it (the OLL stop
     // closures are cheap idempotent deadline/term-flag checks). The LP's own
@@ -1761,7 +1811,9 @@ where
     // will otherwise consume the entire LP-floor budget and leave it with an
     // already-expired stop closure — measured: it exited at iteration 0 and
     // returned nothing at all.
-    let sub_deadline = std::time::Instant::now() + SUBGRADIENT_FLOOR_BUDGET;
+    // Never past the LP floor's own deadline: under a `floor_deadline` the
+    // subgradient slice must not outlast the capped budget.
+    let sub_deadline = (std::time::Instant::now() + SUBGRADIENT_FLOOR_BUDGET).min(deadline);
     let sub_should_stop =
         || std::time::Instant::now() >= sub_deadline || (should_stop_cell.borrow_mut())();
     let subgradient_floor = crate::optimize::lp_bound::lagrangian_dual_floor(
@@ -1782,6 +1834,20 @@ where
         .into_iter()
         .flatten()
         .max()
+}
+
+/// Size-scaled LP-floor budget in milliseconds, clamped to
+/// `[LP_FLOOR_BUDGET_MIN_MS, LP_FLOOR_BUDGET_MS]` and then to `cap` when one is
+/// given. A cap below the minimum wins (the caller's slice is the hard limit);
+/// a zero cap disables the floor.
+fn capped_lp_floor_budget_ms(num_vars: u32, cap: Option<std::time::Duration>) -> u64 {
+    let scaled = u64::from(num_vars)
+        .saturating_mul(LP_FLOOR_BUDGET_MS_PER_VAR)
+        .clamp(LP_FLOOR_BUDGET_MIN_MS, LP_FLOOR_BUDGET_MS);
+    match cap {
+        Some(cap) => scaled.min(u64::try_from(cap.as_millis()).unwrap_or(u64::MAX)),
+        None => scaled,
+    }
 }
 
 /// Sound structural lower bound on the objective, computed over the original
@@ -2291,6 +2357,71 @@ mod tests {
         assert_eq!(optimum_value(&result), Some(3), "got {result:?}");
     }
 
+    // AY-SAT-8: the caller's cap bounds the size-scaled LP-floor budget, even
+    // below the usual minimum; without a cap the budget is unchanged.
+    #[test]
+    fn lp_floor_budget_is_capped_by_the_callers_slice() {
+        use std::time::Duration;
+        // elf.rf7 after the WBO projection: 4,677 variables reach the ceiling.
+        assert_eq!(capped_lp_floor_budget_ms(4_677, None), LP_FLOOR_BUDGET_MS);
+        assert_eq!(
+            capped_lp_floor_budget_ms(4_677, Some(Duration::from_secs(12))),
+            12_000
+        );
+        assert_eq!(
+            capped_lp_floor_budget_ms(4_677, Some(Duration::from_secs(3_600))),
+            LP_FLOOR_BUDGET_MS
+        );
+        assert_eq!(capped_lp_floor_budget_ms(100, None), LP_FLOOR_BUDGET_MIN_MS);
+        assert_eq!(
+            capped_lp_floor_budget_ms(100, Some(Duration::from_millis(500))),
+            500
+        );
+        assert_eq!(capped_lp_floor_budget_ms(100, Some(Duration::ZERO)), 0);
+    }
+
+    // AY-SAT-8: a floor deadline that has already passed disables the LP floor
+    // (observable: `lp_relaxation_floor` returns `None`), while the same
+    // instance without a deadline has a positive floor, so the `None` is the
+    // deadline's doing. The engine still proves the optimum with the floor off.
+    #[test]
+    fn native_oll_expired_floor_deadline_disables_the_lp_floor() {
+        // The explicit override bypasses the deadline by design, so it is
+        // removed (under the process-wide env lock) for the whole test.
+        ay_test_support::env::with_serialized_env_vars_removed(
+            &[LP_FLOOR_BUDGET_ENV],
+            expired_floor_deadline_disables_the_lp_floor_body,
+        );
+    }
+
+    fn expired_floor_deadline_disables_the_lp_floor_body() {
+        let instance = parse_opb(concat!(
+            "* #variable= 3 #constraint= 2\n",
+            "min: +1 x1 +2 x2 +3 x3 ;\n",
+            "+1 x1 +1 x2 >= 1 ;\n",
+            "+1 x2 +1 x3 >= 1 ;\n",
+        ))
+        .expect("fixture should parse");
+        let objective = instance.objective.clone().expect("objective");
+
+        // LP optimum 2 (x2 = 1); every sound floor lies in 1..=2 here.
+        let uncapped = lp_relaxation_floor(&instance, &objective, &mut || false, None);
+        assert!(
+            matches!(uncapped, Some(floor) if (1..=2).contains(&floor)),
+            "the fixture must have a positive LP floor: {uncapped:?}"
+        );
+        let expired = Some(std::time::Instant::now());
+        assert_eq!(
+            lp_relaxation_floor(&instance, &objective, &mut || false, expired),
+            None,
+            "an expired floor deadline must skip the LP floor"
+        );
+
+        let result = solve_with_floor_budget(&instance, &objective, || false, None, None, expired)
+            .expect("native OLL applies");
+        assert_eq!(optimum_value(&result), Some(2));
+    }
+
     #[test]
     fn native_oll_lp_floor_proves_gcd_strengthened_cardinality_optimum() {
         // Two disjoint groups, each `2a+2b+2c+2d >= 3`. GCD strengthening rewrites
@@ -2761,7 +2892,8 @@ mod tests {
 
             // End-to-end: cap=1 (the old single-core loop) and the default
             // batched cap must both prove the brute-force optimum.
-            let single = solve_with_round_core_cap(&instance, &objective, || false, None, 1, None);
+            let single =
+                solve_with_round_core_cap(&instance, &objective, || false, None, 1, None, None);
             let batched = solve(&instance, &objective, || false, None, None);
             let Some(opt) = bf else {
                 assert_eq!(single, Some(OptResult::Infeasible), "cap=1: {single:?}");

@@ -411,7 +411,7 @@ fn incomplete_trace_only_level0_chain_drops_ghost_lrat_owner() {
     let conflict_offset = solver.arena.len();
     assert!(solver.add_clause(vec![b.negated(), c.negated()]));
     assert_ne!(solver.cold.clause_ids[conflict_offset], 0);
-    solver.cold.clause_ids[conflict_offset] = 0;
+    solver.cold.clause_ids.set(conflict_offset, 0);
 
     assert!(matches!(solver.solve().into_inner(), SatResult::Unsat(_)));
     assert!(solver

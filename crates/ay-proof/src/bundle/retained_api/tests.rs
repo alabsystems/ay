@@ -9,6 +9,7 @@ use std::time::Duration;
 
 mod control;
 mod diagnostics;
+mod source_view;
 mod transport;
 
 fn end() -> Instant {

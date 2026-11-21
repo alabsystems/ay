@@ -10,8 +10,15 @@ use super::{Constant, Sort, TermData, TermEntry, TermEntryStamp, TermId, TermSto
 
 pub(super) mod counted;
 mod fresh;
+mod function_names;
+mod native_proof;
+mod owned_choice;
+mod owned_var;
+mod rational;
 mod reserve;
+mod sequence;
 mod shape;
+mod symbolic;
 #[cfg(test)]
 mod tests;
 
@@ -64,9 +71,14 @@ impl Admission<'_> {
 impl TermStore {
     /// Intern a borrowed, bounded term in this SAME producer arena.
     ///
-    /// Admits Bool/BV1..128 constants, named applications with at most three
+    /// Admits Bool/Int/BV1..128 constants, named applications with at most three
     /// live children and a name of at most 64 bytes, Not, and Ite. Output sorts
-    /// are Bool/BV1..128 or flat BV64-index arrays of those cells. Variables,
+    /// are Bool/Int/BV1..128, flat BV64-index Bool/BV arrays, or flat Int-index
+    /// Bool/Int arrays. Integer magnitude is admitted before hash, comparison
+    /// and copy under the original caller's ledger.
+    /// Exact nullary `seq.empty` also admits recursively metered Seq/Array
+    /// sorts over Bool/Int/Real/String/RegLan/Char/BV/FP and Uninterpreted
+    /// leaves. This is not general Seq-operator admission. Variables,
     /// binders, indexed symbols and other payloads refuse; freshness/name-table
     /// construction is a separate operation, not silently fabricated here.
     ///
@@ -110,31 +122,73 @@ impl TermStore {
         if self.store_role != StoreRole::Producer {
             return Err(ControlledTermInternError::ReadOnlySnapshot);
         }
-        shape::validate(self, term, sort, admission)?;
-        self.intern_controlled_validated(term, sort, admission)
+        let sequence = shape::validate(self, term, sort, admission)?;
+        self.intern_controlled_validated(term, sort, sequence.as_ref(), admission)
     }
 
-    // Only the public checked fragment or the fixed-purpose fresh-name factory
+    // Only the public checked fragment or a controlled fresh-Var factory
     // reaches this private entry. No caller may graft an arbitrary Var identity.
     fn intern_controlled_validated(
         &mut self,
         term: &TermData,
         sort: &Sort,
+        sequence: Option<&shape::SortCost>,
         admission: &mut Admission<'_>,
     ) -> Result<TermId> {
         // Complete bounded hash payload and scalar/sort comparison work.
-        admission.pay(512, 0)?;
+        let payload = shape::owned_payload_bytes(term)?;
+        admission.pay(
+            payload
+                .checked_add(512)
+                .ok_or(ControlledTermInternError::ResourceLimit)?,
+            0,
+        )?;
         let hash = Self::compute_hash(term);
-        let plan = self.controlled_bucket_plan(hash, term, sort, admission)?;
+        let comparison_work = sequence
+            .map_or(Ok(256), |cost| {
+                cost.work
+                    .checked_add(256)
+                    .ok_or(ControlledTermInternError::ResourceLimit)
+            })?
+            .checked_add(payload)
+            .ok_or(ControlledTermInternError::ResourceLimit)?;
+        let plan = self.controlled_bucket_plan(hash, term, sort, comparison_work, admission)?;
         if let Some(id) = plan.existing {
             return Ok(id);
         }
         let id = checked_term_id(self.terms.len())?;
         admission.pay(512, 0)?;
-        let credit = self.controlled_credit(plan.bucket_bytes)?;
+        let credit = self.controlled_credit(
+            payload
+                .checked_add(4096)
+                .ok_or(ControlledTermInternError::ResourceLimit)?,
+            plan.bucket_bytes,
+        )?;
         let prepared = self.controlled_reserve(hash, &plan, admission)?;
-        // The fixed payload envelope precedes every bounded clone.
-        admission.pay(512, 8192)?;
+        // Prepay the complete sort copy and bounded scratch disposal as well
+        // as the existing fixed term payload envelope, before the first clone.
+        let copy_work = sequence
+            .map_or(Ok(512), |cost| {
+                cost.work
+                    .checked_mul(4)
+                    .and_then(|work| work.checked_add(512))
+                    .ok_or(ControlledTermInternError::ResourceLimit)
+            })?
+            .checked_add(payload)
+            .ok_or(ControlledTermInternError::ResourceLimit)?;
+        let copy_bytes = sequence
+            .map_or(Ok(8192), |cost| {
+                cost.bytes
+                    .checked_add(8192)
+                    .ok_or(ControlledTermInternError::ResourceLimit)
+            })?
+            .checked_add(
+                payload
+                    .checked_mul(2)
+                    .ok_or(ControlledTermInternError::ResourceLimit)?,
+            )
+            .ok_or(ControlledTermInternError::ResourceLimit)?;
+        admission.pay(copy_work, copy_bytes)?;
         let owned = shape::copy(term)?;
         let owned_sort = sort.clone();
         admission.pay(512, 0)?;
@@ -145,7 +199,11 @@ impl TermStore {
         admission.pay(0, 0)?;
         // All vectors/table slots are reserved, and u64 hashing cannot call
         // caller code. No fallible allocation or callback occurs during commit.
-        let field_presence = self.entry_field_presence(&owned, &owned_sort);
+        // Every validated output AND binder sort is field-free. The native
+        // proof grammar admits every physical binder sort before this point.
+        // Do not repeat the legacy allocating sort census during commit;
+        // actual body/trigger child flags are still unioned, including None.
+        let field_presence = self.entry_field_presence_for_controlled(&owned);
         self.controlled_commit_bucket(
             hash,
             id,

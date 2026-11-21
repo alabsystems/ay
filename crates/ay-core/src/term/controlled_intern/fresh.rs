@@ -1,14 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixed-purpose, producer-owned fresh BV64 identities; no solver authority.
+//! Producer-owned fresh scalar binder identities; no solver authority.
 
 use super::{Admission, ControlledTermInternError, Result, StoreRole};
 use crate::term::{Sort, TermData, TermId, TermStore};
 use std::mem::size_of;
 
 mod names;
-mod registry;
+pub(super) mod registry;
 #[cfg(test)]
 mod tests;
 
@@ -32,12 +32,30 @@ impl TermStore {
         &mut self,
         progress: &mut dyn FnMut(usize, usize) -> bool,
     ) -> std::result::Result<TermId, ControlledTermInternError> {
+        self.try_fresh_model_binder_with_progress(Sort::bitvec(64), progress)
+    }
+
+    /// Mint a fresh integer binder under the same producer-owned admission and
+    /// complete namespace scan as the BV64 constructor. No source identity or
+    /// model authority accompanies this data handle.
+    pub fn try_fresh_int_binder_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> std::result::Result<TermId, ControlledTermInternError> {
+        self.try_fresh_model_binder_with_progress(Sort::Int, progress)
+    }
+
+    fn try_fresh_model_binder_with_progress(
+        &mut self,
+        sort: Sort,
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> std::result::Result<TermId, ControlledTermInternError> {
         let mut admission = Admission {
             progress,
             refused: false,
         };
         admission.pay(0, 0)?;
-        let result = self.fresh_bv64_controlled(&mut admission);
+        let result = self.fresh_binder_controlled(sort, &mut admission);
         let final_poll = admission.pay(0, 0);
         match (result, final_poll) {
             (Ok(id), Ok(())) => Ok(id),
@@ -45,7 +63,11 @@ impl TermStore {
         }
     }
 
-    fn fresh_bv64_controlled(&mut self, admission: &mut Admission<'_>) -> Result<TermId> {
+    fn fresh_binder_controlled(
+        &mut self,
+        sort: Sort,
+        admission: &mut Admission<'_>,
+    ) -> Result<TermId> {
         if self.store_role != StoreRole::Producer {
             return Err(ControlledTermInternError::ReadOnlySnapshot);
         }
@@ -72,9 +94,8 @@ impl TermStore {
         // A reserved identity is never rewound after any later refusal/drop.
         self.var_counter = next;
         let term = TermData::Var(name, plan.candidate);
-        let sort = Sort::bitvec(64);
-        let id = self.intern_controlled_validated(&term, &sort, admission)?;
-        registry::probe(self, admission)?;
+        let id = self.intern_controlled_validated(&term, &sort, None, admission)?;
+        registry::insert_probe(self, &key, admission)?;
         admission.pay(512, 0)?;
         // reserve(1) and the complete freshness scan ensure no allocation or
         // replacement. No callback occurs between this insert and return.

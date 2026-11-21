@@ -1256,6 +1256,85 @@ fn declared_zero_based_circuit_uses_its_array_index_set() {
     assert!(matches!(parse_and_solve(fzn), CpSolveResult::Sat(_)));
 }
 
+/// Reduced from the MiniZinc Challenge 2026 job atp-stage2 instance6 (AY-N3).
+/// The model's `circuit` is over `array[0..1] of var 0..1`; FlatZinc arrays
+/// are 1-based, so the node base must travel as `ay_circuit`'s second
+/// argument. Reading the successors as 1-based nodes made the only circuit,
+/// `[1, 0]`, a pair of self-loops, and AY printed =====UNSATISFIABLE=====
+/// where the optimum is 726404.
+#[test]
+fn zero_based_circuit_from_mznlib_keeps_its_node_base() {
+    let fzn = "\
+        var 0..1: X_INTRODUCED_1_;\n\
+        var 0..1: X_INTRODUCED_2_;\n\
+        var 726404..726404: X_INTRODUCED_35_;\n\
+        array [1..2] of var int: X_INTRODUCED_0_:: output_array([1..2]) = [X_INTRODUCED_1_,X_INTRODUCED_2_];\n\
+        array [1..1] of var int: job_end:: output_array([1..1]) = [6120];\n\
+        constraint ay_circuit([X_INTRODUCED_1_,X_INTRODUCED_2_],0);\n\
+        constraint int_ne(X_INTRODUCED_2_,1);\n\
+        solve :: int_search(job_end,smallest,indomain_min,complete) minimize X_INTRODUCED_35_;\n";
+    let output = solve_cp_output(fzn, false);
+    assert!(!output.contains("UNSATISFIABLE"), "output: {output}");
+    assert!(
+        output.contains("X_INTRODUCED_0_ = array1d(1..2, [1, 0]);"),
+        "output: {output}"
+    );
+    assert!(output.contains("=========="), "output: {output}");
+}
+
+/// `ay_circuit(x, base)` accepts exactly the Hamiltonian cycles over the nodes
+/// `base..base+n-1`, checked against brute-force enumeration.
+#[test]
+fn based_circuit_solutions_match_brute_force() {
+    fn is_circuit(succ: &[i64], base: i64) -> bool {
+        let n = succ.len();
+        let mut node = 0usize;
+        for step in 1..=n {
+            let next = succ[node] - base;
+            if next < 0 || next as usize >= n {
+                return false;
+            }
+            node = next as usize;
+            if node == 0 {
+                return step == n;
+            }
+        }
+        false
+    }
+    for (base, n) in [(0i64, 3usize), (1, 3), (-2, 3), (5, 4), (0, 1)] {
+        let hi = base + n as i64 - 1;
+        let mut expected = 0usize;
+        let total = n.pow(n as u32);
+        for code in 0..total {
+            let mut c = code;
+            let succ: Vec<i64> = (0..n)
+                .map(|_| {
+                    let v = base + (c % n) as i64;
+                    c /= n;
+                    v
+                })
+                .collect();
+            if is_circuit(&succ, base) {
+                expected += 1;
+            }
+        }
+        let decls: String = (0..n)
+            .map(|i| format!("var {base}..{hi}: s{i} :: output_var;\n"))
+            .collect();
+        let names: Vec<String> = (0..n).map(|i| format!("s{i}")).collect();
+        let fzn = format!(
+            "{decls}constraint ay_circuit([{}], {base});\nsolve satisfy;\n",
+            names.join(", ")
+        );
+        let output = solve_cp_output(&fzn, true);
+        assert_eq!(
+            output.matches("----------").count(),
+            expected,
+            "base {base}, n {n}: {output}"
+        );
+    }
+}
+
 #[test]
 fn inline_circuit_does_not_infer_node_ids_from_shifted_domains() {
     let fzn = "\

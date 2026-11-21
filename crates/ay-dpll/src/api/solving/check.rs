@@ -653,9 +653,37 @@ impl Solver {
         authority_origin: NativeCheckAuthorityOrigin,
         boundary: NativeQueryBoundary,
     ) -> VerifiedSolveResult {
+        self.check_sat_with_authority_origin_observed(authority_origin, boundary, None)
+    }
+
+    pub(in crate::api) fn check_sat_with_native_query_observer(
+        &mut self,
+        observer: &mut dyn crate::api::proofs::NativeQueryObservation,
+    ) -> VerifiedSolveResult {
+        self.check_sat_with_authority_origin_observed(
+            NativeCheckAuthorityOrigin::AuthoredPlain,
+            NativeQueryBoundary::External,
+            Some(observer),
+        )
+    }
+
+    fn check_sat_with_authority_origin_observed(
+        &mut self,
+        authority_origin: NativeCheckAuthorityOrigin,
+        boundary: NativeQueryBoundary,
+        mut observer: Option<&mut dyn crate::api::proofs::NativeQueryObservation>,
+    ) -> VerifiedSolveResult {
+        // Optional diagnostic input capture consumes this same transaction's
+        // original wall clock; it cannot start a fresh solve timeout afterward.
+        let observed_origin = observer
+            .as_ref()
+            .map(|observer| (Instant::now(), observer.deadline()));
         self.clear_last_solve_state_at_boundary(true, false, boundary);
         self.executor.bind_unsat_query_assumptions(&[]);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
+        if let Some(observer) = observer.as_mut() {
+            observer.input(self);
+        }
         if let Some(rejected) = self.reject_native_array_ext_witness_capture(&[]) {
             return rejected;
         }
@@ -664,7 +692,13 @@ impl Solver {
             return rejected;
         }
 
-        let controls = self.native_publication_controls();
+        let controls = if let Some((origin, deadline)) = observed_origin {
+            let mut controls = self.native_publication_controls_at(origin);
+            controls.deadline = Self::earliest_optional(controls.deadline, Some(deadline));
+            controls
+        } else {
+            self.native_publication_controls()
+        };
         if let Some(early) = self.preflight_check(&controls) {
             return early;
         }
@@ -686,7 +720,30 @@ impl Solver {
         self.executor
             .trace_unknown_funnel("native-exec-enter", None, None, false);
         let exec_result = if authority_origin == NativeCheckAuthorityOrigin::AuthoredPlain {
-            self.executor.solve_authored_plain_hard_query(&native_softs)
+            if let Some(observer) = observer {
+                self.executor
+                    .solve_authored_plain_hard_query_observed(&native_softs, &mut |executor| {
+                        observer.proof(executor)
+                    })
+            } else if native_softs.is_empty()
+                && self.is_producing_proofs()
+                && self.executor.context().has_parsed_definition_retry()
+            {
+                // Parsed definitions can rewrite the assertion that should be
+                // a proof premise. Run the authored command's bounded attempts
+                // over the expanded and original stacks under the installed
+                // public solve deadline.
+                self.executor
+                    .execute_authored(&ay_frontend::Command::CheckSat)
+                    .map(|_| {
+                        self.executor
+                            .last_result()
+                            .cloned()
+                            .unwrap_or(SolveResult::Unknown)
+                    })
+            } else {
+                self.executor.solve_authored_plain_hard_query(&native_softs)
+            }
         } else {
             self.executor.check_sat()
         };

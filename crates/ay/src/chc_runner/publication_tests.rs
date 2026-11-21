@@ -14,6 +14,7 @@ fn proof_config(path: &Path) -> ProofConfig {
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: false,
+        label: None,
     }
 }
 

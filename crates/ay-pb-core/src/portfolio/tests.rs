@@ -6783,3 +6783,24 @@ fn widen_candidate_ignores_unverifiable_cache_and_keeps_ties() {
     assert_eq!(kept.assignment, portfolio_solution.assignment);
     assert_eq!(kept.objective, Some(5));
 }
+
+// AY-SAT-8: the LP-floor deadline is a third of the remaining slice only when
+// the caller asks for a cap (the sequential pre-pass); every other native-OLL
+// caller passes `None` and keeps the size-scaled floor budget.
+#[test]
+fn native_oll_floor_deadline_only_when_the_caller_caps_it() {
+    let now = Instant::now();
+    let deadline = Some(now + Duration::from_secs(36));
+    assert_eq!(
+        floor_deadline_for_slice(deadline, now, Some(NATIVE_OLL_LP_FLOOR_SLICE_DEN)),
+        Some(now + Duration::from_secs(12))
+    );
+    assert_eq!(floor_deadline_for_slice(deadline, now, None), None);
+    assert_eq!(floor_deadline_for_slice(None, now, Some(3)), None);
+    assert_eq!(floor_deadline_for_slice(deadline, now, Some(0)), None);
+    // A slice already spent gives a deadline of `now`: no floor.
+    assert_eq!(
+        floor_deadline_for_slice(Some(now), now + Duration::from_secs(1), Some(3)),
+        Some(now + Duration::from_secs(1))
+    );
+}

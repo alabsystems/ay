@@ -1219,6 +1219,11 @@ fn publish_chc_certificate_payloads(
 ) -> io::Result<ChcCliReplayArtifacts> {
     let resolved_proof = crate::run::resolve_artifact_target(Path::new(&proof.path))?;
     let publication_lock = ChcPublicationLock::acquire(&resolved_proof)?;
+    // The lock stays beside the certificate for the next publication: it says
+    // what it belongs to, as the certificate does (DC-77).
+    if let Some(subject) = proof.label.as_ref() {
+        ay::proof_store::label_companion(&publication_lock.file, subject)?;
+    }
     let result = (|| {
         let mut replay_obligations = Vec::with_capacity(obligations.len());
         let mut retained_files = Vec::with_capacity(obligations.len() + 1);
@@ -1234,11 +1239,21 @@ fn publish_chc_certificate_payloads(
                     use std::os::unix::fs::OpenOptionsExt as _;
                     options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
                 }
-                let mut file = options.open(&path)?;
-                file.write_all(&payload.bytes)?;
+                let file = options.open(&path)?;
+                if let Some(subject) = proof.label.as_ref() {
+                    ay::proof_store::label_at_creation(&file, subject)?;
+                }
+                // Under the same free-space reserve as the certificate.
+                let mut writer = crate::dimacs::ReservedProofWriter::for_proof(file, &proof.path);
+                writer.write_all(&payload.bytes)?;
+                writer.flush()?;
+                let file = writer.into_inner();
+                let digest = sha256_bytes(&payload.bytes);
+                if proof.label.is_some() {
+                    ay::proof_store::seal_label(&file, &digest)?;
+                }
                 file.sync_all()?;
                 drop(file);
-                let digest = sha256_bytes(&payload.bytes);
                 retained_files.push(seal_chc_published_file(&path, &digest)?);
                 let query = ChcProofArtifactDigest::from_sha256(
                     payload.role,
@@ -1255,9 +1270,13 @@ fn publish_chc_certificate_payloads(
             fs::File::open(&obligations_dir)?.sync_all()?;
         }
 
-        crate::run::write_artifact_atomically(&resolved_proof, |file| {
-            file.write_all(certificate.as_bytes())
-        })?;
+        // Labelled at creation, written under the free-space reserve and
+        // sealed with its sha256 before it is renamed into place (DC-77).
+        crate::run::write_labelled_proof_atomically(
+            &resolved_proof,
+            proof,
+            certificate.as_bytes(),
+        )?;
         let proof_digest = sha256_bytes(certificate.as_bytes());
         retained_files.push(seal_chc_published_file(&resolved_proof, &proof_digest)?);
         let proof_artifact = ChcProofArtifactDigest::from_sha256(

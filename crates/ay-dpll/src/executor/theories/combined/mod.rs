@@ -856,13 +856,17 @@ fn extract_uflia_theory_models(
     // uninterpreted pairs. SOUND/fail-closed: only repairs the materialized
     // model; validation re-checks every assertion, so it can never admit a
     // false `sat`. Fixes verification-consumer bug/682 + final_borrows.
-    super::lia::recover_uninterpreted_equalities_from_assertions(terms, &model_roots, &mut euf);
+    super::lia::recover_uninterpreted_equalities_from_assertions(
+        terms,
+        &model_roots,
+        &mut euf,
+        lia.as_ref(),
+    );
     // Restore current/root applications omitted by row-key deduplication. All
     // candidate writes are staged; failure leaves the previous model intact.
     // The existing original-root completion/validation/publication gates remain
     // mandatory. Model-only congruence never enters the live proof e-graph.
     restored_uf::recover(exec, theory, &model_roots, &mut euf, &mut lia);
-
     TheoryModels {
         euf: Some(euf),
         lia,
@@ -8020,7 +8024,12 @@ impl Executor {
                     let (euf, arr, lia) = theory.extract_all_models_auflia_with_lia_fixup(
                         &model_roots,
                         |terms, euf_model, lia| {
-                            let Some(model) = lia.as_mut() else { return };
+                            let Some(model) = lia.as_mut() else {
+                                super::lia::recover_uninterpreted_equalities_from_assertions(
+                                    terms, &original_model_equalities, euf_model, None,
+                                );
+                                return;
+                            };
                             let dbg_fix = ay_core::misc_cli_flags().debug_fixup;
                             let dump = |model: &LiaModel, tag: &str| {
                                 if dbg_fix {
@@ -8069,6 +8078,13 @@ impl Executor {
                                 }
                             }
                             dump(model, "final");
+                            // Named assertions route UFLIA through this
+                            // assumption lane. Restore carrier components
+                            // using the final numeric row values, before
+                            // array extraction uses their elements as keys.
+                            super::lia::recover_uninterpreted_equalities_from_assertions(
+                                terms, &original_model_equalities, euf_model, Some(model),
+                            );
                         },
                     );
                     theory.clear_euf_model_scope();

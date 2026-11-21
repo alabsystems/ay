@@ -366,3 +366,27 @@ fn repro_proof_itp_replay() {
         "replayed interpolant must satisfy the Craig properties: {itp:?}"
     );
 }
+
+/// AY-SMT-9: the first QF_LIA proof-interpolation script IMC builds on
+/// kind2 `DRAGON_13_000.smt2` (captured with `--chc-proof-itp-dump`; z3 4.12.5
+/// and `ay solve` both answer unsat). Under the exported-artifact proof demand
+/// its exported proof keeps a `trust` step, the mandatory strict certification
+/// refused the UNSAT ("step t152 uses unverified trust rule") and the lane
+/// served nothing. The scoped proof solve must decide it UNSAT, still through
+/// the mandatory certification of the verdict.
+#[test]
+fn proof_solve_of_dragon13_lia_script_is_not_refused_for_its_artifact() {
+    const SCRIPT: &str =
+        include_str!("../../tests/fixtures/proof_itp_dragon13_lia_trust_step.smt2");
+    let (logic, script) =
+        crate::smt::executor_adapter::split_leading_set_logic(SCRIPT, Logic::QfLia);
+    let mut solver = Solver::try_new(logic).expect("solver");
+    configure_proof_solver(&mut solver, Duration::from_secs(60));
+    let asserts = solver.parse_smtlib2(&script).expect("parseable fixture");
+    assert_eq!(asserts.len(), 96, "fixture is the a=95, b=1 split");
+    let result = solver.check_sat_internal_query();
+    assert!(
+        result.is_unsat(),
+        "the scoped proof solve must certify this UNSAT, got {result:?}"
+    );
+}

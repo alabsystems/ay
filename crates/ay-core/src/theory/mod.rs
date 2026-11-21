@@ -178,6 +178,23 @@ pub trait TheorySolver {
         false
     }
 
+    /// Whether the split loop should keep branching when its split-drift
+    /// guard (#1836) would end the search `unknown` for this theory's
+    /// monotone integer split walk (AY-SMT-5, #nia-persist-until-deadline).
+    ///
+    /// The split itself is the tautology `x <= floor OR x >= ceil`, so
+    /// continuing is sound whatever this returns; the guard only exists to
+    /// stop a walk that may never converge. A theory may return `true` only
+    /// while a wall deadline that WILL end the walk is in force and no
+    /// outer strategy is waiting for this solve's `unknown`. The default
+    /// keeps the guard. Only the LAZY shared split-loop dispatch
+    /// (`pipeline_incremental_split_lazy_shared_macros.rs`, the arm
+    /// `solve_nia` takes) consults this hook; the eager arms keep their
+    /// guard whatever it returns.
+    fn continue_split_walk_until_deadline(&self) -> bool {
+        false
+    }
+
     /// A last SAT-ONLY attempt before the split loop accepts a round as `Sat`
     /// on a STALE request — a model equality or expression split with nothing
     /// new to encode (#1771, #stale-expr-split) — and leaves the verdict to

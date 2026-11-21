@@ -12,7 +12,7 @@ use ay_flatzinc_parser::ast::Expr;
 use crate::builtins::check_args;
 use crate::error::TranslateError;
 use crate::set_constraints::{
-    resolve_set_domain, set_lex_condition, set_membership_term, SetLexOrder,
+    resolve_set_domain, set_lex_condition, set_membership_term, set_operand, SetLexOrder,
 };
 use crate::translate::Context;
 
@@ -35,8 +35,8 @@ fn disjunction(terms: &[String]) -> String {
 /// `set_eq_reif(S1, S2, r)` → r <=> (for all i: S1_bit_i = S2_bit_i)
 pub(crate) fn set_eq_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_eq_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_eq_reif")?;
@@ -58,8 +58,8 @@ pub(crate) fn set_eq_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), Transl
 /// `set_ne_reif(S1, S2, r)` → r <=> (exists i: S1_bit_i ≠ S2_bit_i)
 pub(crate) fn set_ne_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_ne_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_ne_reif")?;
@@ -81,8 +81,8 @@ pub(crate) fn set_ne_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), Transl
 /// `set_subset_reif(S1, S2, r)` → r <=> (for all i: S1_bit_i => S2_bit_i)
 pub(crate) fn set_subset_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_subset_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_subset_reif")?;
@@ -105,8 +105,8 @@ pub(crate) fn set_subset_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), Tr
 /// lexicographically less than or equal to that of S2.
 pub(crate) fn set_le_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_le_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
     let condition = set_lex_condition(ctx, &s1, &s2, SetLexOrder::LessEqual, "set_le_reif")?;
     ctx.emit_fmt(format_args!("(assert (= {r} {condition}))"));
@@ -117,8 +117,8 @@ pub(crate) fn set_le_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), Transl
 /// lexicographically less than that of S2.
 pub(crate) fn set_lt_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_lt_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
     let condition = set_lex_condition(ctx, &s1, &s2, SetLexOrder::Less, "set_lt_reif")?;
     ctx.emit_fmt(format_args!("(assert (= {r} {condition}))"));
@@ -128,8 +128,8 @@ pub(crate) fn set_lt_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), Transl
 /// `set_superset_reif(S1, S2, r)` → r <=> S1 ⊇ S2.
 pub(crate) fn set_superset_reif(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
     check_args("set_superset_reif", args, 3)?;
-    let s1 = ctx.expr_to_smt(&args[0])?;
-    let s2 = ctx.expr_to_smt(&args[1])?;
+    let s1 = set_operand(ctx, &args[0])?;
+    let s2 = set_operand(ctx, &args[1])?;
     let r = ctx.expr_to_smt(&args[2])?;
 
     let (lo, hi) = resolve_set_domain(ctx, &s1, &s2, "set_superset_reif")?;

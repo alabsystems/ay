@@ -359,6 +359,36 @@ fn qnt_neg_exists_accepts_the_exact_dual() {
 }
 
 #[test]
+fn qnt_neg_exists_wire_screen_requires_the_printed_dual_and_remaining_work() {
+    let f = neg_exists_fixture();
+    let clause = [f.exists, f.forall];
+    let mut remaining = 64 * 1024;
+    assert!(crate::qnt_neg_exists_step_lowering_supported(
+        &f.terms,
+        &clause,
+        None,
+        &mut remaining
+    ));
+    assert!(remaining < 64 * 1024);
+    let mut overrides = ay_core::kani_compat::det_hash_map_new();
+    overrides.insert(f.forall, "(forall ((qx U) (qy U)) true)".to_owned());
+    assert!(!crate::qnt_neg_exists_step_lowering_supported(
+        &f.terms,
+        &clause,
+        Some(&overrides),
+        &mut remaining
+    ));
+    let mut depleted = 1;
+    assert!(!crate::qnt_neg_exists_step_lowering_supported(
+        &f.terms,
+        &clause,
+        None,
+        &mut depleted
+    ));
+    assert_eq!(depleted, 0);
+}
+
+#[test]
 fn qnt_neg_exists_rejects_premises_or_args() {
     let f = neg_exists_fixture();
     assert!(

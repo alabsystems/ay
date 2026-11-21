@@ -66,12 +66,18 @@ fn status_transaction_error(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
-    reserve_dimacs_proof_status_body(proof_path)
+fn reserve_dimacs_proof_status(
+    proof_path: &str,
+    label: Option<&ay::proof_store::ProofSubject>,
+) -> io::Result<DimacsProofStatusReservation> {
+    reserve_dimacs_proof_status_body(proof_path, label)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
+fn reserve_dimacs_proof_status(
+    _proof_path: &str,
+    _label: Option<&ay::proof_store::ProofSubject>,
+) -> io::Result<DimacsProofStatusReservation> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "transactional DIMACS proof status publication is unavailable on this platform",
@@ -220,7 +226,7 @@ fn mark_synthesized_default_dimacs_proof_stale(proof: &ProofConfig) {
         take_owned_dimacs_proof_status_reservation(&proof.path).and_then(|reservation| {
             match reservation {
                 Some(reservation) => Ok(reservation),
-                None => reserve_dimacs_proof_status(&proof.path),
+                None => reserve_dimacs_proof_status(&proof.path, proof.label.as_ref()),
             }
         });
     match reservation.and_then(|reservation| {

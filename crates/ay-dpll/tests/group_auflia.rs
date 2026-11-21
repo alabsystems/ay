@@ -67,6 +67,8 @@ mod auflira_bridged_conflict_verifier_6853;
 mod auflira_cross_sort_soundness;
 #[path = "group_auflia/auflira_root_congruence.rs"]
 mod auflira_root_congruence;
+#[path = "group_auflia/ay_smt_2_shared_interface.rs"]
+mod ay_smt_2_shared_interface;
 #[path = "group_auflia/const_array_definition_validation_sat.rs"]
 mod const_array_definition_validation_sat;
 #[path = "group_auflia/dt_uflia_array_free_routing_chc25.rs"]

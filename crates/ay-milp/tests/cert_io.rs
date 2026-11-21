@@ -121,6 +121,8 @@ COLUMNS
 RHS
     RHS       R1       -1
 BOUNDS
+ PL BND       Y0
+ PL BND       Y1
  BV BND       X
 ENDATA
 ";
@@ -195,6 +197,7 @@ RHS
     RHS       ROPEN     2          RLOW      1
     RHS       RUP       0
 BOUNDS
+ PL BND       OPEN
  BV BND       X
 ENDATA
 ";
@@ -259,6 +262,7 @@ RHS
     RHS       ROPEN      2         RLOW       1
     RHS       RUP        0
 BOUNDS
+ PL BND       OPEN
  BV BND       X
  FR BND       Y
 ENDATA
@@ -286,6 +290,7 @@ RHS
     RHS       ROPEN      2         RLOW       1
     RHS       RUP        0
 BOUNDS
+ PL BND       OPEN
  UP BND       X           2
  FR BND       Y
 ENDATA

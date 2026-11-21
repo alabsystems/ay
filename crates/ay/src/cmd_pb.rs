@@ -348,11 +348,10 @@ fn run_solve<W: Write>(
         }
     }
 
-    let termination_requested = term_flag.load(Ordering::SeqCst);
     let final_status = write_result_or_best_known(
         &mut out,
         &result.solution,
-        termination_requested,
+        &|assignment: &[bool]| instance.admits_recovered_incumbent(assignment),
         &best_solution,
     )?;
 
@@ -798,10 +797,11 @@ fn solve_opb<W: Write>(
         // The bar advances only from a VERIFIED construction (the helper
         // fails closed to `objective: None` on an infeasible model above).
         best_obj = Some(exact_obj_value);
-        if wbo_projection.is_none() {
-            let _ = out.write_objective_exact(exact_obj_value);
-            streamed_best_obj = Some(exact_obj_value);
-        }
+        // WBO included (AY-SAT-8): a WBO incumbent was re-projected and
+        // re-scored against the ORIGINAL WBO above (`wbo_admissible_cost`), so
+        // its `o` value is the true cost of a checked model.
+        let _ = out.write_objective_exact(exact_obj_value);
+        streamed_best_obj = Some(exact_obj_value);
         cache_exact_solution(best_solution, exact_solution);
     };
     // PARALLEL OPTIMIZATION TRACK (batteries-included default; design §2.3):
@@ -822,8 +822,8 @@ fn solve_opb<W: Write>(
     // REDUCED PBO (`try_wbo_to_pbo` output, including its top-cost budget
     // row); incumbents flow through this SAME `on_improve` closure (which
     // re-projects + re-scores against the ORIGINAL WBO via
-    // `exact_incumbent_from_model` and suppresses intermediate `o` lines
-    // under `wbo_projection.is_some()`), and the final result takes the
+    // `exact_incumbent_from_model` and streams the `o` line of every strict
+    // improvement in true WBO cost), and the final result takes the
     // identical `project_wbo_solution` /
     // `prefer_cheaper_cached_wbo_incumbent` /
     // `exact_wbo_solution_from_assignment` top-cost fail-closed gates below.
@@ -2357,25 +2357,48 @@ fn cache_exact_solution(best_solution: &Mutex<Option<PbExactSolution>>, solution
 fn write_result_or_best_known<W: Write>(
     out: &mut PbOutputWriter<W>,
     result: &PbSolution,
-    termination_requested: bool,
+    admits: &dyn Fn(&[bool]) -> bool,
     best_solution: &Mutex<Option<PbExactSolution>>,
 ) -> io::Result<PbStatus> {
-    // A late SIGTERM after solving should not override a completed result.
-    let emitted = select_result_or_best_known(result, termination_requested, best_solution);
+    // A late SIGTERM after solving does not override a completed result; an
+    // UNKNOWN result (SIGTERM or plain timeout) flushes the best checked model.
+    let emitted = select_result_or_best_known(result, admits, best_solution);
     let status = emitted.status;
     out.write_full_result_exact(&emitted)?;
     Ok(status)
 }
 
+/// The final answer: a completed result as is; for an UNKNOWN result, the best
+/// cached incumbent as `SATISFIABLE` when `admits` accepts it against the
+/// ORIGINAL instance (OPB: every constraint; WBO: `wbo_admissible_cost`), else
+/// `UNKNOWN`. Never OPTIMUM, and no objective: the incumbent's `o` line was
+/// streamed when it was found.
+///
+/// AY-SAT-8: this used to flush the incumbent only when SIGTERM had been
+/// requested, so a plain timeout printed the streamed `o` lines followed by
+/// `s UNKNOWN` and no model. `ay-pb`'s `write_result_or_best_known` flushes on
+/// every UNKNOWN; the CLI now does the same, behind the same boundary gate.
 fn select_result_or_best_known(
     result: &PbSolution,
-    termination_requested: bool,
+    admits: &dyn Fn(&[bool]) -> bool,
     best_solution: &Mutex<Option<PbExactSolution>>,
 ) -> PbExactSolution {
-    let selected = if termination_requested && result.status == PbStatus::Unknown {
-        let mut best_known = best_known_or_unknown(best_solution);
-        best_known.objective = None;
-        best_known
+    let selected = if result.status == PbStatus::Unknown {
+        let best_known = best_known_or_unknown(best_solution);
+        match best_known.status {
+            PbStatus::Satisfiable | PbStatus::OptimumFound if admits(&best_known.assignment) => {
+                PbExactSolution {
+                    status: PbStatus::Satisfiable,
+                    assignment: best_known.assignment,
+                    objective: None,
+                }
+            }
+            _ => PbExactSolution {
+                status: PbStatus::Unknown,
+                assignment: Vec::new(),
+                objective: None,
+            },
+        }
     } else {
         result.to_exact_solution()
     };
@@ -3047,6 +3070,21 @@ impl ParsedPbInstance {
         match self {
             Self::Opb(instance) => instance.objective.is_some(),
             Self::Wbo(_) => true,
+        }
+    }
+
+    /// Emission-boundary gate for a cached incumbent flushed on an UNKNOWN
+    /// result (AY-SAT-8; the same gate as `ay-pb`'s). OPB: every ORIGINAL
+    /// constraint holds. WBO: exactly one value per WBO variable (a longer
+    /// assignment would be a projected-PBO model) and `wbo_admissible_cost`
+    /// accepts it (hard rows hold, checked cost strictly below `top`).
+    fn admits_recovered_incumbent(&self, assignment: &[bool]) -> bool {
+        match self {
+            Self::Opb(instance) => ay_pb::verify_all_constraints(&instance.constraints, assignment),
+            Self::Wbo(wbo) => {
+                usize::try_from(wbo.num_vars).ok() == Some(assignment.len())
+                    && ay_pb::wbo_admissible_cost(wbo, assignment).is_some()
+            }
         }
     }
 }

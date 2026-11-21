@@ -1449,7 +1449,7 @@ impl Solver {
                 .solution_witness
                 .as_ref()
                 .map_or(0, |witness| witness.capacity() * size_of::<Option<bool>>());
-        let clause_ids = self.cold.clause_ids.capacity() * size_of::<u64>()
+        let clause_ids = self.cold.clause_ids.heap_bytes()
             + self.cold.bcp_learned_clause_birth_conflicts.capacity() * size_of::<u64>()
             + self.unit_proof_id.capacity() * size_of::<u64>()
             + self.unit_proof_sign.capacity() * size_of::<i8>()

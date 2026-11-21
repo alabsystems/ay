@@ -182,6 +182,40 @@ fn format_newest_first_store_chain(mut base: String, stores: &[(String, String)]
 }
 
 impl Executor {
+    /// Pick a simple SMT-LIB symbol for a generated model parameter. Each
+    /// slot has its own base and fallback family, so names are also distinct
+    /// within the definition. The frontend decodes quoted source symbols.
+    pub(in crate::executor) fn model_formal_name(
+        &self,
+        prefix: &str,
+        index: usize,
+        owner: ay_core::render_admission::Owner<'_>,
+    ) -> String {
+        use ay_core::render_admission as output;
+        let mut candidate = output::format(owner, format_args!("{prefix}{index}"));
+        let mut suffix = 0usize;
+        while !candidate.is_empty() && self.ctx.has_symbol_binding(&candidate) {
+            candidate = output::format(owner, format_args!("{prefix}{index}!{suffix}"));
+            suffix += 1;
+        }
+        candidate
+    }
+
+    pub(super) fn model_formal_names(&self, prefix: &str, arity: usize) -> Vec<String> {
+        (0..arity)
+            .map(|index| self.model_formal_name(prefix, index, None))
+            .collect()
+    }
+
+    pub(super) fn format_model_parameters(&self, names: &[String], sorts: &[Sort]) -> String {
+        names
+            .iter()
+            .zip(sorts)
+            .map(|(name, sort)| format!("({name} {})", format_sort_surface(&self.ctx, sort)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Format an exact total projection as an SMT-LIB `define-fun`.
     pub(super) fn format_projection_function(
         &self,
@@ -203,21 +237,8 @@ impl Executor {
                 format_sort_surface(&self.ctx, result_sort)
             ));
         }
-        let parameter_names: Vec<String> = (0..argument_sorts.len())
-            .map(|index| format!("__ay_projection_arg_{index}"))
-            .collect();
-        let parameters = parameter_names
-            .iter()
-            .zip(argument_sorts)
-            .map(|(parameter, sort)| {
-                format!(
-                    "({} {})",
-                    quote_symbol(parameter),
-                    format_sort_surface(&self.ctx, sort)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let parameter_names = self.model_formal_names("__ay_projection_arg_", argument_sorts.len());
+        let parameters = self.format_model_parameters(&parameter_names, argument_sorts);
         Ok(format!(
             "  (define-fun {} ({}) {}\n    {})",
             quote_symbol(name),
@@ -331,14 +352,8 @@ impl Executor {
         model: &Model,
         overloaded: &super::overloaded_ctor_surface::OverloadedCtors,
     ) -> Result<String, String> {
-        // Generate parameter names: x0, x1, ...
-        let params: Vec<String> = arg_sorts
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("(x{} {})", i, format_sort_surface(&self.ctx, s)))
-            .collect();
-
-        let params_str = params.join(" ");
+        let names = self.model_formal_names("x", arg_sorts.len());
+        let params_str = self.format_model_parameters(&names, arg_sorts);
         let result_sort_str = format_sort_surface(&self.ctx, result_sort);
 
         let mut resolved_table = self
@@ -348,6 +363,12 @@ impl Executor {
         // any, and then goes through `Self::ascribe_overloaded_ctors` with its
         // column's sort (#overloaded-nil-surface), as z3 ascribes a table cell.
         for (args, value) in &mut resolved_table {
+            if args.len() != names.len() {
+                return Err(format!(
+                    "function {} has a row with mismatched arity",
+                    quote_symbol(name)
+                ));
+            }
             let cells = args
                 .iter_mut()
                 .zip(arg_sorts)
@@ -375,7 +396,7 @@ impl Executor {
                 overloaded,
             )
         } else {
-            self.format_function_body(arg_sorts, result_sort, &resolved_table)
+            self.format_function_body(&names, result_sort, &resolved_table)
         };
 
         Ok(format!(
@@ -412,7 +433,11 @@ impl Executor {
                 return Err("retained function output refused".to_owned());
             }
             let sort = crate::executor_format::format_sort_surface_owned(&self.ctx, sort, owner);
-            if !text.format(format_args!("(x{index} ")) || !text.push(&sort) || !text.character(')')
+            let formal = self.model_formal_name("x", index, owner);
+            if formal.is_empty()
+                || !text.format(format_args!("({formal} "))
+                || !text.push(&sort)
+                || !text.character(')')
             {
                 return Err("retained function output refused".to_owned());
             }
@@ -829,11 +854,8 @@ impl Executor {
         rows: &[(Vec<String>, String)],
         default: &str,
     ) -> Result<String, String> {
-        let params: Vec<String> = arg_sorts
-            .iter()
-            .enumerate()
-            .map(|(i, sort)| format!("(x{} {})", i, format_sort_surface(&self.ctx, sort)))
-            .collect();
+        let names = self.model_formal_names("x", arg_sorts.len());
+        let parameters = self.format_model_parameters(&names, arg_sorts);
         let mut seen: HashMap<Vec<String>, String> = HashMap::new();
         let mut deduped: Vec<(Vec<String>, String)> = Vec::with_capacity(rows.len());
         for (args, value) in rows {
@@ -864,11 +886,13 @@ impl Executor {
         }
 
         let mut body = default.to_string();
-        for (args, value) in deduped.iter().rev() {
+        // A row equal to the default adds no branch to the printed function.
+        // Validate every row above so an inconsistent key still fails.
+        for (args, value) in deduped.iter().rev().filter(|(_, value)| value != default) {
             let conditions: Vec<String> = args
                 .iter()
-                .enumerate()
-                .map(|(i, arg)| format!("(= x{i} {arg})"))
+                .zip(&names)
+                .map(|(arg, name)| format!("(= {name} {arg})"))
                 .collect();
             let condition = if conditions.len() == 1 {
                 conditions[0].clone()
@@ -880,7 +904,7 @@ impl Executor {
         Ok(format!(
             "  (define-fun {} ({}) {}\n    {})",
             quote_symbol(name),
-            params.join(" "),
+            parameters,
             format_sort_surface(&self.ctx, result_sort),
             body
         ))
@@ -1155,7 +1179,7 @@ impl Executor {
     /// Build nested ite expression for function table.
     fn format_function_body(
         &self,
-        _arg_sorts: &[Sort],
+        names: &[String],
         result_sort: &Sort,
         table: &[(Vec<String>, String)],
     ) -> String {
@@ -1180,8 +1204,8 @@ impl Executor {
             // Build condition: (and (= x0 arg0) (= x1 arg1) ...).
             let conditions: Vec<String> = args
                 .iter()
-                .enumerate()
-                .map(|(i, arg)| format!("(= x{i} {arg})"))
+                .zip(names)
+                .map(|(arg, name)| format!("(= {name} {arg})"))
                 .collect();
 
             let condition = if conditions.len() == 1 {

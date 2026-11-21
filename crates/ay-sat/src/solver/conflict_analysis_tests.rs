@@ -4223,7 +4223,7 @@ fn test_collect_probe_conflict_lrat_hints_uses_cached_conflict_clause_id() {
     // In production this cache is populated by propagate_bcp::conflict_finalize
     // before LRAT hint collection runs.
     let internal_conflict_idx = solver.add_clause_db(&[probe.negated()], false);
-    solver.cold.clause_ids[internal_conflict_idx] = 0;
+    solver.cold.clause_ids.set(internal_conflict_idx, 0);
     let conflict_ref = ClauseRef(internal_conflict_idx as u32);
     solver.last_conflict_clause_ref = Some(conflict_ref);
     solver.last_conflict_clause_id = real_conflict_id;

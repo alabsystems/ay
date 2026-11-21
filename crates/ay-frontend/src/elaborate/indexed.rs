@@ -906,6 +906,7 @@ impl Context {
         // `__ay_`-prefixed symbol by table lookup; only *declaring* such a name
         // from user input is rejected, so using one here is safe.
         let pred = self.terms.mk_internal_symbol("order");
+        self.advance_source_revision();
         self.track_scoped_symbol(&pred);
         self.symbols.insert(
             pred.clone(),
@@ -922,7 +923,6 @@ impl Context {
                 super::DeclarationKind::SolverInternal,
             ),
         );
-        self.advance_source_revision();
         // Assert the property axioms through the surface path so `assertions` and
         // `assertions_parsed` stay aligned and the axioms are push/pop-scoped
         // exactly like the predicate symbol.

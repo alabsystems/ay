@@ -599,6 +599,30 @@ fn units_refute(
 // Proof solve + extraction
 // ---------------------------------------------------------------------------
 
+/// Configure the scoped proof-producing solver of the QF_LIA route.
+fn configure_proof_solver(solver: &mut Solver, remaining: Duration) {
+    // Proof mode is scoped to THIS solver instance / THIS query only, and is
+    // the best-effort artifact mode the QF_LIA proof-groups lane already uses
+    // (`proof_groups::enable_proofs`), not an exported-artifact demand
+    // (`set_produce_proofs(true)`). That demand made the strict Alethe
+    // presentation verdict-relevant: a refutation whose exported proof kept
+    // one `trust` step was refused ("computed UNSAT rejected by mandatory
+    // strict certification ... uses unverified trust rule", AY-SMT-9) and the
+    // lane served nothing, on DRAGON_13 / DRAGON_all / MESI_i4 / metros_2.
+    // Best effort keeps the mandatory certification of the UNSAT verdict
+    // (independently certified or refused exactly as before); it only stops a
+    // missing translated artifact from changing that verdict. The proof
+    // itself is never published: every interpolant extracted from it is
+    // re-checked by the Craig validation (A |= I, I & B unsat,
+    // locality), and the CHC verdict is re-verified before it is printed.
+    solver.set_best_effort_produce_proofs(super::proof_groups::PROOF_STEP_BUDGET);
+    // Preprocessing variable substitution detaches proof leaves from the
+    // original assertions (everything collapses to Trust steps); disable it
+    // for this solver only — same knob as the interpolation spike.
+    solver.set_option(":ay-proof-no-varsubst", "true");
+    solver.set_timeout(Some(remaining));
+}
+
 /// Run the scoped proof-producing solve and return UNVALIDATED interpolant
 /// candidates (one per strength variant that extracted + converted cleanly).
 ///
@@ -639,13 +663,7 @@ fn proof_solve_and_extract(
     let Ok(mut solver) = Solver::try_new(logic) else {
         return Vec::new();
     };
-    // Proof mode is scoped to THIS solver instance / THIS query only.
-    solver.set_produce_proofs(true);
-    // Preprocessing variable substitution detaches proof leaves from the
-    // original assertions (everything collapses to Trust steps); disable it
-    // for this solver only — same knob as the interpolation spike.
-    solver.set_option(":ay-proof-no-varsubst", "true");
-    solver.set_timeout(Some(remaining));
+    configure_proof_solver(&mut solver, remaining);
 
     let stats = proof_itp_stats_enabled();
     let Ok(asserts) = solver.parse_smtlib2(&script) else {

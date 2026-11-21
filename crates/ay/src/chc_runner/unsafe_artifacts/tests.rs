@@ -51,6 +51,7 @@ fn ground_publication_without_stats_preserves_source_and_descriptor_authority() 
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: false,
+        label: None,
     };
     let publication = write_chc_unsafe_certificate_artifacts(
         Some(&config),

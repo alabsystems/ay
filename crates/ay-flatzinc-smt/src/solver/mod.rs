@@ -22,7 +22,7 @@ mod tests;
 pub use error::SolverError;
 pub use parse::{parse_get_value, parse_smt_int};
 
-pub(crate) use execution::{extract_reason_unknown, parse_ay_output, run_ay};
+pub(crate) use execution::{call_timeout_ms, extract_reason_unknown, parse_ay_output, run_ay};
 pub(crate) use incremental::IncrementalSolver;
 #[cfg(test)]
 use satisfaction::build_output_get_value;

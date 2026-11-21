@@ -103,7 +103,18 @@ fn query(body: &str) -> String {
 #[test]
 fn ground_core_is_unsat_under_proof_production() {
     let input = query(&format!("{GROUND_CORE}{GOAL_NEGATED}"));
-    assert_eq!(verdict(&input), vec!["unsat"]);
+    let mut exec = Executor::new();
+    exec.set_best_effort_produce_proofs(1_000_000);
+    exec.set_timeout(Some(std::time::Duration::from_secs(60)));
+    let out = run_authored(&mut exec, &input);
+    if out != vec!["unsat"] {
+        eprintln!("actual={out:?}");
+        eprintln!(
+            "reason={:?}",
+            run_authored(&mut exec, "(get-info :reason-unknown)")
+        );
+    }
+    assert_eq!(out, vec!["unsat"]);
 }
 
 /// The shed (`--no-proof`) twin, unchanged by the fold: the outer dense pass

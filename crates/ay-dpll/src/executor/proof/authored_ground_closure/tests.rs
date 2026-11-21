@@ -10,6 +10,7 @@ use ay_frontend::parse;
 mod boolean_coverage;
 mod checked_intrinsics;
 mod consumer_whole;
+mod native_clauses;
 mod offset;
 mod operators;
 mod outside_range;

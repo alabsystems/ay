@@ -42,6 +42,7 @@ mod extension;
 mod finder;
 mod gaussian;
 pub(crate) mod packed_row;
+mod parity_space;
 mod pcgf2;
 mod preprocess;
 
@@ -69,6 +70,12 @@ pub use finder::XorFinder;
 // Polynomial Calculus / GF(2) certificate export
 pub use pcgf2::{
     pc_gf2_certificate_json, write_pc_gf2_certificate, PcGf2CertificateError, PcGf2CertificateStats,
+};
+
+// Parity-space walk (AY-SAT-2)
+pub use parity_space::{
+    solve_parity_space, ParitySpaceDecline, ParitySpaceOutcome, ParitySpaceStats,
+    FILTERED_SCAN_MAX_DIMENSION, FULL_SCAN_MAX_DIMENSION,
 };
 
 // Preprocessing functions and types

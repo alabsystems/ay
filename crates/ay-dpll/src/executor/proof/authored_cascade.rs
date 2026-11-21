@@ -206,6 +206,14 @@ impl Executor {
         {
             return false;
         }
+        // This existing classification already established a complete proof
+        // with an external wire gap. Try the shared native source producer
+        // before the historical raw-root fallbacks and early return below.
+        if self.replace_with_native_source_quantifier_refutation(proof)
+            && !self.proof_has_known_wire_gap(proof)
+        {
+            return true;
+        }
         self.replace_with_exact_authored_conjunct_refutation(
             proof,
             RepairEntry::NativeStrictWireGap,
@@ -293,6 +301,7 @@ impl Executor {
                 }
             }};
         }
+        strict_gated_cascade_member!(replace_with_native_source_quantifier_refutation);
         strict_gated_cascade_member!(
             replace_with_exact_authored_conjunct_refutation,
             RepairEntry::Check

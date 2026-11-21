@@ -67,6 +67,8 @@ impl<'a> DatatypeOutputNames<'a> {
     }
 }
 
+mod native_batch_admission;
+
 /// Mangle a parametric-datatype instantiation `(Name A1 .. An)` into a unique,
 /// deterministic sort name used as `Sort::Uninterpreted(<mangled>)`.
 ///
@@ -297,6 +299,7 @@ impl Context {
         instance: Option<&str>,
     ) -> Vec<String> {
         debug_assert_eq!(constructors.len(), selector_sorts.len());
+        self.advance_source_revision();
         let mut registered_constructor_names = Vec::with_capacity(constructors.len());
         // An instance's constructors do not have their names as identities
         // (`mangle_member`), so none is given a private one here.
@@ -786,6 +789,7 @@ impl Context {
         // Reject re-declaring an existing sort name (#reserved-ops reverse
         // gate; see `check_datatype_sort_redeclaration`).
         self.check_datatype_sort_redeclaration(name)?;
+        self.advance_source_revision();
 
         // Parametric datatype: store the template and defer monomorphization.
         if !datatype_dec.type_params.is_empty() {
@@ -939,6 +943,7 @@ impl Context {
         // Parametric templates must be visible while the live context
         // elaborates monomorphic members that reference them. Preflight above
         // guarantees this phase cannot fail for user-controlled input.
+        self.advance_source_revision();
         let parametric_names: Vec<String> = sort_decs
             .iter()
             .filter(|sort_dec| sort_dec.arity != 0)
@@ -1041,6 +1046,12 @@ impl Context {
 
             self.track_scoped_datatype(sort_identity.clone(), sort_dec.name.clone());
 
+            // Keep the exact source declaration just as the single-declaration
+            // path does. Membership/source codecs and identical redeclaration
+            // checks must retain the whole group member's original schema.
+            self.monomorphic_datatype_decs
+                .insert(sort_dec.name.clone(), datatype_dec.clone());
+
             let ctor_names = self.register_elaborated_datatype_constructors(
                 sort_identity,
                 sort,
@@ -1124,6 +1135,7 @@ impl Context {
             .collect();
 
         let preferred_instance_name = mangle_datatype_instance(name, args);
+        self.advance_source_revision();
         let instance_identity =
             self.allocate_nominal_sort_identity(&preferred_instance_name, &preferred_instance_name);
         self.record_parametric_sort_surface(

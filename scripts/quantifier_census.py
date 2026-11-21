@@ -70,6 +70,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 VERDICTS = ("sat", "unsat", "unknown")
@@ -248,9 +249,13 @@ def scan_debug_cert(stderr):
 
 
 def run_one(job):
-    ay, posture, timeout, division, rel_path, abs_path, z3 = job
+    ay, posture, timeout, division, rel_path, abs_path, z3, proof_store = job
     cmd = [ay, "--quiet", "--stats-full", "--debug-cert", f"-T:{timeout}"]
     cmd += POSTURES[posture]
+    # The default posture keeps its proof cycle, so the census measures what
+    # a plain solve does; the proof it writes goes to a proof store, never
+    # beside the corpus file (DC-77).
+    cmd += ["--proof-store", proof_store]
     cmd.append(abs_path)
     start = time.time()
     killed = False
@@ -321,6 +326,9 @@ def cmd_run(args):
                 except Exception:
                     pass
 
+    if args.proof_store is None:
+        args.proof_store = tempfile.mkdtemp(prefix="ay-proof-store-")
+        print(f"proof store: {args.proof_store}", file=sys.stderr)
     jobs = []
     missing = 0
     for rec in bucket:
@@ -340,6 +348,7 @@ def cmd_run(args):
                 rel,
                 abs_path,
                 rec.get("scan_z3", rec.get("z3", "")),
+                args.proof_store,
             )
         )
     print(
@@ -764,6 +773,13 @@ def main():
     r.add_argument("--ay", default=os.path.expanduser(os.environ.get("AY", "target/release/ay")))
     r.add_argument("--timeout", type=int, default=10)
     r.add_argument("--jobs", type=int, default=2)
+    r.add_argument(
+        "--proof-store",
+        help="where ay writes default proofs (ay --proof-store); never beside "
+        "the corpus. Default: a new, empty store under $TMPDIR, since a proof a "
+        "store already holds counts and ay then writes none, which would shed "
+        "the proof cycle the census measures",
+    )
     r.add_argument("--resume", action="store_true")
     r.set_defaults(func=cmd_run)
 

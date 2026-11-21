@@ -15,6 +15,7 @@ mod ground_substitution_projection;
 mod intrinsic_array_clause_authority;
 mod intrinsic_datatype_clause_authority;
 mod intrinsic_euf_clause_authority;
+mod intrinsic_integer_clause_authority;
 mod propagation_unit_authority;
 mod refutation_tail;
 mod unjustified_rederivation_scope;

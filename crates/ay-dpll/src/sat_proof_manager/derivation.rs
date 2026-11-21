@@ -2000,11 +2000,10 @@ impl SatProofManager<'_> {
     /// clause (#probe-ite-lift-promoter): the search runs under the
     /// assumptions `¬target` and the clause it returns is exactly `target`.
     ///
-    /// Same closer, same fail-closed contract, one difference: the derived
-    /// SAT clause must be `target` as a SET — a strict subclause (the search
-    /// refuted the database without some assumption) is declined rather than
-    /// weakened, so the caller receives exactly the clause it asked for or
-    /// nothing. An empty target is the plain refutation above.
+    /// The returned SAT clause must be `target` as a set. For a unit target,
+    /// an already-derived empty clause can be explicitly weakened to that
+    /// exact unit. Other strict subclauses decline. An empty target is the
+    /// plain refutation above.
     pub(super) fn derive_target_via_bounded_dpll_theory(
         &mut self,
         clause_versions: &[SatClauseVersion],
@@ -2110,6 +2109,33 @@ impl SatProofManager<'_> {
                     "bounded DPLL(T) closed the target clause with certified theory leaves"
                 );
                 Some(proof_id)
+            }
+            Some((empty, derived_sat))
+                if derived_sat.is_empty()
+                    && target_sat.len() == 1
+                    && self.step_budget != Some(0)
+                    && matches!(
+                        proof.get_step(empty),
+                        Some(
+                            ProofStep::Resolution { clause, .. }
+                            | ProofStep::Step { clause, .. }
+                            | ProofStep::TheoryLemma { clause, .. }
+                        ) if clause.is_empty()
+                    ) =>
+            {
+                if let Some(unit) = self.lit_to_term(target_sat[0]) {
+                    if let Some(remaining) = self.step_budget.as_mut() {
+                        *remaining -= 1;
+                    }
+                    return Some(proof.add_rule_step(
+                        AletheRule::Weakening,
+                        vec![unit],
+                        vec![empty],
+                        Vec::new(),
+                    ));
+                }
+                proof.steps.truncate(steps_snapshot);
+                None
             }
             _ => {
                 // Fail closed: drop every step the search added.

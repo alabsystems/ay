@@ -127,7 +127,7 @@ fn test_congruence_equivalence_binaries_leave_disabled_clause_ids_unallocated() 
         "the fixture must make congruence add equivalence binaries"
     );
     assert_eq!(
-        solver.cold.clause_ids.capacity(),
+        solver.cold.clause_ids.heap_bytes(),
         0,
         "the disabled table stays unallocated"
     );

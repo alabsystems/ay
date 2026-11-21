@@ -34,4 +34,6 @@ default = []
 ay-flatzinc-parser.workspace = true
 ay-flatzinc-smt.workspace = true
 ay-cp.workspace = true
+ay-core.workspace = true
+ay-sys.workspace = true
 thiserror.workspace = true

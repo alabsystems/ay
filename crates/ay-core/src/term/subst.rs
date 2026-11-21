@@ -6,8 +6,8 @@
 //! hash-consed term DAG.
 //!
 //! This backs the Z3-compat `Z3_substitute` FFI entry point. Unlike
-//! [`TermStore::substitute_var`] (which replaces a single `Var` by name and is
-//! used for lambda beta-reduction), this performs *simultaneous* replacement of
+//! [`TermStore::substitute_var`] (which replaces one exact `Var` with lexical
+//! binder handling for lambda beta-reduction), this performs *simultaneous* replacement of
 //! arbitrary subterms matched by hash-consed [`TermId`] identity. The common
 //! consumer use (KLEE/SeaHorn/angr-style symbolic execution) is replacing
 //! uninterpreted constants with concrete terms.
@@ -715,7 +715,8 @@ mod tests {
 
         assert_ne!(rebuilt, quantifier, "substitution must rebuild the forall");
         assert!(matches!(s.get(rebuilt), TermData::Forall(_, body, _) if *body == replacement));
-        assert_quantifier_metadata(&s, rebuilt, outer, true);
+        assert_quantifier_metadata(&s, rebuilt, replacement, true);
+        assert_quantifier_metadata(&s, quantifier, outer, true);
     }
 
     #[test]

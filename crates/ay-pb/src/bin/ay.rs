@@ -96,9 +96,13 @@ static GLOBAL: ay_sys::CountingAllocator<std::alloc::System> =
 /// the handler can re-run the Verified Incumbent Gate (VIG) and flush the model
 /// as `SATISFIABLE`. The boundary VIG means a stored model is emitted only if it
 /// still satisfies every constraint, so this NEVER prints a wrong answer and
-/// NEVER claims OPTIMUM. Armed only for OPB (where the incumbent assignment lives
-/// in the original variable space); left disarmed for WBO, preserving the
-/// fail-closed `s UNKNOWN` there.
+/// NEVER claims OPTIMUM. Armed for OPB and for uncertified WBO solves, where every
+/// recorded assignment lives in the original variable space (WBO incumbents are
+/// projected before they are cached); for WBO the boundary gate is
+/// `wbo_admissible_cost` (hard rows hold, cost strictly below `top`), see
+/// [`ParsedPbInstance::admits_recovered_incumbent`]. A certified WBO solve
+/// (`--proof`) searches the projected PBO, whose models carry relaxation
+/// variables, so it stays disarmed (fail-closed `s UNKNOWN`).
 struct EmergencyIncumbent {
     /// The parsed instance, shared by refcount. The store must own the rows
     /// (the solve stack that parsed them unwinds before the panic handler
@@ -109,15 +113,6 @@ struct EmergencyIncumbent {
     /// handler re-checks against is byte-identical to the original.
     instance: Arc<ParsedPbInstance>,
     assignment: Option<Vec<bool>>,
-}
-
-impl EmergencyIncumbent {
-    /// The ORIGINAL constraints for the VIG re-check (`None` only if a WBO
-    /// instance were ever armed, which `run_solve` never does; fail-closed to
-    /// UNKNOWN in that case).
-    fn vig_constraints(&self) -> Option<&[ay_pb::PbConstraint]> {
-        self.instance.vig_constraints()
-    }
 }
 
 static EMERGENCY_INCUMBENT: Mutex<Option<EmergencyIncumbent>> = Mutex::new(None);
@@ -157,20 +152,20 @@ static EMERGENCY_INCUMBENT_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Pure core of the emergency flush: emit a stored incumbent as `SATISFIABLE`
-/// only if it passes the boundary VIG against the original constraints; otherwise
-/// fail closed to `UNKNOWN`. Kept side-effect-free for direct unit testing.
+/// only if it passes the boundary gate against the ORIGINAL instance (OPB: every
+/// constraint; WBO: `wbo_admissible_cost`); otherwise fail closed to `UNKNOWN`.
+/// No objective is attached: the incumbent's `o` line was streamed when it was
+/// recorded. Kept side-effect-free for direct unit testing.
 fn emergency_emit_solution(
-    constraints: &[ay_pb::PbConstraint],
+    instance: &ParsedPbInstance,
     assignment: Option<&[bool]>,
 ) -> PbExactSolution {
     match assignment {
-        Some(assignment) if ay_pb::verify_all_constraints(constraints, assignment) => {
-            PbExactSolution {
-                status: PbStatus::Satisfiable,
-                assignment: assignment.to_vec(),
-                objective: None,
-            }
-        }
+        Some(assignment) if instance.admits_recovered_incumbent(assignment) => PbExactSolution {
+            status: PbStatus::Satisfiable,
+            assignment: assignment.to_vec(),
+            objective: None,
+        },
         _ => unknown_exact_solution(),
     }
     .normalized_for_competition()
@@ -180,11 +175,8 @@ fn emergency_emit_solution(
 fn flush_emergency_incumbent_or_unknown<W: Write>(out: &mut PbOutputWriter<W>) -> PbStatus {
     let emitted = {
         let guard = lock_emergency_incumbent();
-        match guard.as_ref().and_then(|slot| {
-            slot.vig_constraints()
-                .map(|constraints| (constraints, slot.assignment.as_deref()))
-        }) {
-            Some((constraints, assignment)) => emergency_emit_solution(constraints, assignment),
+        match guard.as_ref() {
+            Some(slot) => emergency_emit_solution(&slot.instance, slot.assignment.as_deref()),
             None => unknown_exact_solution(),
         }
     };
@@ -408,12 +400,8 @@ fn render_emergency_flush() -> (Vec<u8>, PbStatus) {
             .as_ref()
             .map(|slot| (Arc::clone(&slot.instance), slot.assignment.clone()))
     };
-    let emitted = match snapshot.as_ref().and_then(|(instance, assignment)| {
-        instance
-            .vig_constraints()
-            .map(|constraints| (constraints, assignment.as_deref()))
-    }) {
-        Some((constraints, assignment)) => emergency_emit_solution(constraints, assignment),
+    let emitted = match snapshot.as_ref() {
+        Some((instance, assignment)) => emergency_emit_solution(instance, assignment.as_deref()),
         None => unknown_exact_solution(),
     };
     let mut rendered: Vec<u8> = Vec::with_capacity(4096);
@@ -744,12 +732,17 @@ fn run_solve_with_writer<W: Write>(cmd: &SolveArgs, writer: W) -> Result<PbStatu
     // ownership without duplicating millions of rows on the pre-search path.
     let instance = Arc::new(instance);
 
-    // Arm the panic-time emergency incumbent flush for OPB solves (the incumbent
-    // assignment lives in the original variable space; WBO is left disarmed).
-    if instance.vig_constraints().is_some() {
-        arm_emergency_incumbent(Arc::clone(&instance));
-    } else {
+    // Arm the panic-time / SIGTERM emergency incumbent flush. OPB and
+    // uncertified WBO incumbents are cached in the ORIGINAL variable space, so
+    // the boundary gate (`admits_recovered_incumbent`) can re-check them there.
+    // A certified WBO solve searches the projected PBO (its models carry
+    // relaxation variables and its `o` values are projected-PBO objectives), so
+    // it stays disarmed and falls closed to `s UNKNOWN` (AY-SAT-8).
+    let wbo_with_proof = cmd.proof.is_some() && matches!(*instance, ParsedPbInstance::Wbo(_));
+    if wbo_with_proof {
         disarm_emergency_incumbent();
+    } else {
+        arm_emergency_incumbent(Arc::clone(&instance));
     }
 
     let best_solution = Mutex::new(None);
@@ -805,9 +798,25 @@ fn run_solve_with_writer<W: Write>(cmd: &SolveArgs, writer: W) -> Result<PbStatu
             result.solution = decision_sat_self_checked(result.solution, pb);
         }
     }
-    // The normal output path now owns emission; the panic handler must not also
-    // print a result, so disarm the emergency-flush store.
-    disarm_emergency_incumbent();
+    // The emergency-flush store stays armed until the cooperative path claims
+    // the emission slot inside `write_result_or_best_known`, which disarms it
+    // there. Up to that claim a stalled final write is what the SIGTERM
+    // watchdog exists for, and it can only flush what the store holds: hand
+    // it the final answer, so that a forced flush prints the answer this path
+    // was about to print (the flush re-gates it against the ORIGINAL instance
+    // and prints SATISFIABLE, never OPTIMUM).
+    //
+    // The store used to be disarmed HERE, before the final write began. A
+    // stall between this point and the claim left the watchdog an empty
+    // store: `s UNKNOWN` after a solve that had finished with a checked model
+    // (first compiled run of the WBO watchdog test, 20 November 2026;
+    // AY-SAT-8).
+    if matches!(
+        result.solution.status,
+        PbStatus::Satisfiable | PbStatus::OptimumFound
+    ) {
+        record_emergency_incumbent(&result.solution.assignment);
+    }
     let final_status = write_result_or_best_known(
         &mut out,
         &result.solution,
@@ -1461,30 +1470,22 @@ fn solve_opb<W: Write>(
 
     let mut best_obj: Option<i128> = None;
     let mut streamed_best_obj: Option<i128> = None;
+    // Every strictly improving VERIFIED incumbent streams its `o` line at once,
+    // WBO included (AY-SAT-8): a WBO incumbent is re-projected and re-scored
+    // against the ORIGINAL WBO (`wbo_admissible_cost`), so its `o` value is the
+    // true cost of a checked model, exactly what the final answer would print.
     let mut on_improve = |obj_value: i128, model: &[bool]| {
-        let exact_solution = exact_incumbent_from_model(
+        let _ = stream_anytime_incumbent(
             instance,
             objective,
             wbo_projection,
-            PbStatus::Satisfiable,
+            out,
+            best_solution,
+            &mut best_obj,
+            &mut streamed_best_obj,
             obj_value,
-            best_obj,
             model,
         );
-        let Some(exact_obj_value) = exact_solution.objective else {
-            return;
-        };
-        if best_obj.is_some_and(|prev| exact_obj_value >= prev) {
-            return;
-        }
-        // The bar advances only from a VERIFIED construction (the helper
-        // fails closed to `objective: None` on an infeasible model above).
-        best_obj = Some(exact_obj_value);
-        if wbo_projection.is_none() {
-            let _ = out.write_objective_exact(exact_obj_value);
-            streamed_best_obj = Some(exact_obj_value);
-        }
-        cache_exact_solution(best_solution, exact_solution);
     };
     // PARALLEL OPTIMIZATION TRACK (batteries-included default; design §2.3):
     // when the memory-clamped core budget is >= 2 (`the --pb-parallel policy` unset
@@ -1510,8 +1511,8 @@ fn solve_opb<W: Write>(
     //   (`try_wbo_to_pbo` output, including its top-cost budget row). The
     //   projection-before-gate order is untouched: incumbents flow through
     //   this SAME `on_improve` closure (which re-projects + re-scores against
-    //   the ORIGINAL WBO via `exact_incumbent_from_model` and suppresses
-    //   intermediate `o` lines under `wbo_projection.is_some()`), and the
+    //   the ORIGINAL WBO via `exact_incumbent_from_model` and streams the `o`
+    //   line of every strict improvement in true WBO cost), and the
     //   final result takes the identical `project_wbo_solution` /
     //   `prefer_cheaper_cached_wbo_incumbent` /
     //   `exact_wbo_solution_from_assignment` top-cost fail-closed gates
@@ -1613,18 +1614,24 @@ fn solve_opb<W: Write>(
         result
     };
     if result.status == PbStatus::OptimumFound || result.status == PbStatus::Satisfiable {
-        let mut guard = best_solution
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(match wbo_projection {
-            Some(wbo) => exact_wbo_solution_from_assignment(
-                wbo,
-                result.status,
-                &result.assignment,
-                result.objective,
-            ),
-            None => exact_solution_from_result(&result, objective),
-        });
+        // Through `cache_exact_solution`, so the final model also reaches the
+        // emergency store (AY-SAT-8): a run that found its answer without an
+        // anytime callback and then stalls in its wind-down still has a model
+        // for the SIGTERM watchdog to flush (re-gated there against the
+        // ORIGINAL instance). A model that fails its gate here is cached as
+        // UNKNOWN and recorded nowhere, as before.
+        cache_exact_solution(
+            best_solution,
+            match wbo_projection {
+                Some(wbo) => exact_wbo_solution_from_assignment(
+                    wbo,
+                    result.status,
+                    &result.assignment,
+                    result.objective,
+                ),
+                None => exact_solution_from_result(&result, objective),
+            },
+        );
     }
     Ok(PbSolveOutcome {
         solution: final_optimization_result_after_anytime_stream(result, streamed_best_obj),
@@ -2617,8 +2624,10 @@ fn cpu_budget_spent() -> bool {
 /// pipeline so the improvement bar is monotone across phase handoffs. Returns
 /// `true` iff the bar advanced (a VERIFIED construction — the incumbent helper
 /// fails closed to `objective: None` on an infeasible or dominated model).
-/// This path never sees WBO (refused before dispatch), so the exact objective
-/// needs no projection.
+/// No WBO projection is applied here: a certified (`--proof`) WBO solve is
+/// dispatched as its projected PBO, so its `o` values are projected-PBO
+/// objectives over the relaxation variables (pre-existing behaviour; the
+/// emergency store stays disarmed for it, see `run_solve_with_writer`).
 #[allow(clippy::too_many_arguments)]
 fn stream_verified_improvement<W: Write>(
     instance: &PbInstance,
@@ -2630,10 +2639,45 @@ fn stream_verified_improvement<W: Write>(
     obj_value: i128,
     model: &[bool],
 ) -> bool {
-    let exact_solution = exact_incumbent_from_model(
+    stream_anytime_incumbent(
         instance,
         objective,
         None,
+        out,
+        best_solution,
+        best_obj,
+        streamed_best_obj,
+        obj_value,
+        model,
+    )
+}
+
+/// One anytime incumbent: re-score it exactly, and when it strictly beats
+/// `best_obj`, print its `o` line (flushed at once) and cache it.
+///
+/// OPB (`wbo_projection: None`): the objective is recomputed exactly and the
+/// model is re-checked against the ORIGINAL constraints. WBO: the model is
+/// projected to the WBO variables and its cost is recomputed by
+/// `wbo_admissible_cost` (every hard row holds, cost in checked arithmetic,
+/// cost strictly below `top`). Either gate failing leaves `objective: None`,
+/// and nothing is printed or cached. Returns whether the incumbent was
+/// streamed.
+#[allow(clippy::too_many_arguments)]
+fn stream_anytime_incumbent<W: Write>(
+    instance: &PbInstance,
+    objective: &ay_pb::PbObjective,
+    wbo_projection: Option<&WboInstance>,
+    out: &mut PbOutputWriter<W>,
+    best_solution: &Mutex<Option<PbExactSolution>>,
+    best_obj: &mut Option<i128>,
+    streamed_best_obj: &mut Option<i128>,
+    obj_value: i128,
+    model: &[bool],
+) -> bool {
+    let exact_solution = exact_incumbent_from_model(
+        instance,
+        objective,
+        wbo_projection,
         PbStatus::Satisfiable,
         obj_value,
         *best_obj,
@@ -2645,6 +2689,8 @@ fn stream_verified_improvement<W: Write>(
     if best_obj.is_some_and(|prev| exact_obj_value >= prev) {
         return false;
     }
+    // The bar advances only from a VERIFIED construction (the helper fails
+    // closed to `objective: None` on an infeasible model above).
     *best_obj = Some(exact_obj_value);
     let _ = out.write_objective_exact(exact_obj_value);
     *streamed_best_obj = Some(exact_obj_value);
@@ -3604,11 +3650,13 @@ fn projected_assignment_vec(model: &[bool], num_pb_vars: u32) -> Option<Vec<bool
 }
 
 fn cache_exact_solution(best_solution: &Mutex<Option<PbExactSolution>>, solution: PbExactSolution) {
-    // Mirror every streamed feasible incumbent into the process-global
-    // emergency-flush store so a later panic can still emit it (see
-    // `EmergencyIncumbent`). The store is armed only for OPB, so this is a no-op
-    // for WBO; the assignment is in the original variable space at every call
-    // site, matching the constraints recorded at arm time.
+    // Mirror every feasible incumbent into the process-global emergency-flush
+    // store so a later panic or stalled SIGTERM wind-down can still emit it
+    // (see `EmergencyIncumbent`). The store is armed for OPB and uncertified
+    // WBO (a no-op while disarmed); a WBO incumbent is cached in the WBO
+    // variable space, and the flush re-gates every record against the ORIGINAL
+    // instance (`admits_recovered_incumbent`), so a record in any other space
+    // falls closed to `s UNKNOWN`.
     if matches!(
         solution.status,
         PbStatus::Satisfiable | PbStatus::OptimumFound
@@ -3703,6 +3751,11 @@ fn write_result_or_best_known<W: Write>(
             std::thread::park();
         }
     }
+    // The cooperative path owns emission from here on: neither the panic
+    // handler nor the watchdog may print a second result, so the
+    // emergency-flush store is disarmed now, with the claim, and not before
+    // the write began (see `run_solve_with_writer`).
+    disarm_emergency_incumbent();
     out.write_full_result_exact(&emitted)?;
     Ok(status)
 }
@@ -3963,6 +4016,24 @@ impl ParsedPbInstance {
         match self {
             Self::Opb(instance) => Some(&instance.constraints),
             Self::Wbo(_) => None,
+        }
+    }
+
+    /// Emission-boundary gate for an incumbent recovered by the emergency
+    /// flush (panic or SIGTERM). OPB: every ORIGINAL constraint holds (the
+    /// pre-existing VIG). WBO: the assignment has exactly one value per WBO
+    /// variable (a longer one would be a projected-PBO model and would print
+    /// variables the instance does not have) and `wbo_admissible_cost` accepts
+    /// it (every hard row holds, cost computed with checked arithmetic,
+    /// strictly below `top`), the same single chokepoint every WBO emission
+    /// uses.
+    fn admits_recovered_incumbent(&self, assignment: &[bool]) -> bool {
+        match self {
+            Self::Opb(instance) => ay_pb::verify_all_constraints(&instance.constraints, assignment),
+            Self::Wbo(wbo) => {
+                usize::try_from(wbo.num_vars).ok() == Some(assignment.len())
+                    && ay_pb::wbo_admissible_cost(wbo, assignment).is_some()
+            }
         }
     }
 }
@@ -5137,7 +5208,7 @@ mod tests {
             "+1 x1 +1 x2 +1 x3 >= 1 ;\n",
         ))
         .expect("fixture should parse");
-        let c = &instance.constraints;
+        let c = &ParsedPbInstance::Opb(Arc::new(instance));
 
         // Feasible witness -> SATISFIABLE, no objective re-emitted.
         let sat = emergency_emit_solution(c, Some(&[true, false, false]));
@@ -5199,7 +5270,161 @@ mod tests {
             String::from_utf8(output).expect("utf-8"),
             "s SATISFIABLE\nv x1 -x2\n"
         );
+
+        // AY-SAT-8: a WBO solve is armed too. Before, the WBO store had no
+        // boundary gate and every WBO flush printed `s UNKNOWN`, discarding
+        // the incumbent whose `o` line had been printed.
+        let wbo = ay_pb::parse_wbo("soft: 5 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+            .expect("WBO fixture should parse");
+        arm_emergency_incumbent(Arc::new(ParsedPbInstance::Wbo(wbo)));
+        record_emergency_incumbent(&[false, true]);
+        let mut output = Vec::new();
+        {
+            let mut out = PbOutputWriter::new(&mut output);
+            assert_eq!(
+                flush_emergency_incumbent_or_unknown(&mut out),
+                PbStatus::Satisfiable
+            );
+        }
+        assert_eq!(
+            String::from_utf8(output).expect("utf-8"),
+            "s SATISFIABLE\nv -x1 x2\n"
+        );
         disarm_emergency_incumbent();
+    }
+
+    // AY-SAT-8: the WBO emergency gate admits exactly the WBO models in the
+    // original variable space: hard rows hold and the cost is below `top`.
+    #[test]
+    fn emergency_emit_solution_gates_wbo_models() {
+        let wbo = ay_pb::parse_wbo("soft: 5 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+            .expect("WBO fixture should parse");
+        let parsed = ParsedPbInstance::Wbo(wbo);
+
+        // Cost 0 and cost 3 (< top 5) are models.
+        let cheap = emergency_emit_solution(&parsed, Some(&[true, false]));
+        assert_eq!(cheap.status, PbStatus::Satisfiable);
+        assert_eq!(cheap.assignment, vec![true, false]);
+        assert!(cheap.objective.is_none());
+        let paid = emergency_emit_solution(&parsed, Some(&[false, true]));
+        assert_eq!(paid.status, PbStatus::Satisfiable);
+
+        // A violated hard row is not a model.
+        let hard_violated = emergency_emit_solution(&parsed, Some(&[false, false]));
+        assert_eq!(hard_violated.status, PbStatus::Unknown);
+
+        // An assignment longer than the WBO variables (a projected-PBO model
+        // with relaxation variables) is refused rather than printed.
+        let projected = emergency_emit_solution(&parsed, Some(&[true, false, true]));
+        assert_eq!(projected.status, PbStatus::Unknown);
+
+        // No incumbent recorded.
+        assert_eq!(
+            emergency_emit_solution(&parsed, None).status,
+            PbStatus::Unknown
+        );
+
+        // Cost reaching `top` is not a model (official WBO semantics).
+        let at_top = ay_pb::parse_wbo("soft: 3 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+            .expect("WBO fixture should parse");
+        let at_top = ParsedPbInstance::Wbo(at_top);
+        assert_eq!(
+            emergency_emit_solution(&at_top, Some(&[false, true])).status,
+            PbStatus::Unknown
+        );
+        assert_eq!(
+            emergency_emit_solution(&at_top, Some(&[true, false])).status,
+            PbStatus::Satisfiable
+        );
+    }
+
+    // AY-SAT-8: a WBO anytime incumbent streams its `o` line (true WBO cost)
+    // at once and is cached in the WBO variable space; a worse or an
+    // infeasible one prints nothing. Before, the WBO arm printed no `o` line
+    // until the final answer.
+    #[test]
+    fn wbo_anytime_incumbent_streams_its_true_cost() {
+        let wbo = ay_pb::parse_wbo("soft: 5 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+            .expect("WBO fixture should parse");
+        let pbo = try_wbo_to_pbo(&wbo).expect("WBO fixture should project");
+        let objective = pbo
+            .objective
+            .clone()
+            .expect("projected PBO has an objective");
+        let num_pbo_vars = usize::try_from(pbo.num_vars).expect("fits usize");
+        assert!(num_pbo_vars >= 2);
+        let best_solution = Mutex::new(None);
+        let mut best_obj = None;
+        let mut streamed_best_obj = None;
+        let mut output = Vec::new();
+        let mut out = PbOutputWriter::new(&mut output);
+
+        // A projected-PBO model paying the soft (x1 = 0, x2 = 1, every
+        // relaxation variable set): true WBO cost 3.
+        let mut paying = vec![true; num_pbo_vars];
+        paying[0] = false;
+        assert!(stream_anytime_incumbent(
+            &pbo,
+            &objective,
+            Some(&wbo),
+            &mut out,
+            &best_solution,
+            &mut best_obj,
+            &mut streamed_best_obj,
+            i128::MAX,
+            &paying,
+        ));
+        // The same cost again is not a strict improvement.
+        assert!(!stream_anytime_incumbent(
+            &pbo,
+            &objective,
+            Some(&wbo),
+            &mut out,
+            &best_solution,
+            &mut best_obj,
+            &mut streamed_best_obj,
+            i128::MAX,
+            &paying,
+        ));
+        // A model violating the hard row prints nothing.
+        let infeasible = vec![false; num_pbo_vars];
+        assert!(!stream_anytime_incumbent(
+            &pbo,
+            &objective,
+            Some(&wbo),
+            &mut out,
+            &best_solution,
+            &mut best_obj,
+            &mut streamed_best_obj,
+            i128::MAX,
+            &infeasible,
+        ));
+        // x1 = 1 satisfies the soft: true cost 0, whatever the relaxation
+        // variables say (the projected-PBO objective would overstate it).
+        let free = vec![true; num_pbo_vars];
+        assert!(stream_anytime_incumbent(
+            &pbo,
+            &objective,
+            Some(&wbo),
+            &mut out,
+            &best_solution,
+            &mut best_obj,
+            &mut streamed_best_obj,
+            i128::MAX,
+            &free,
+        ));
+        drop(out);
+        assert_eq!(String::from_utf8(output).expect("utf-8"), "o 3\no 0\n");
+        assert_eq!(best_obj, Some(0));
+        assert_eq!(streamed_best_obj, Some(0));
+        let cached = best_solution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the improvement is cached");
+        assert_eq!(cached.status, PbStatus::Satisfiable);
+        assert_eq!(cached.assignment, vec![true, true]);
+        assert_eq!(cached.objective, Some(0));
     }
 
     #[test]
@@ -5706,6 +5931,44 @@ mod tests {
         .solution
     }
 
+    /// Like `solve_wbo_text`, with what the solve wrote. Since 2026-11-19 a
+    /// WBO incumbent's cost is written as an `o` line when it is found, as
+    /// for OPB, and the returned objective is then cleared so that the cost
+    /// is not written a second time with the final answer.
+    fn solve_wbo_text_and_output(input: &str) -> (PbSolution, String) {
+        let instance = parse_instance_interruptible(PbInputFormat::Wbo, input, || false)
+            .expect("WBO text should parse");
+        let term_flag = AtomicBool::new(false);
+        let best_solution = Mutex::new(None);
+        let mut output = Vec::new();
+        let solution = {
+            let mut out = PbOutputWriter::new(&mut output);
+            solve_pb(
+                &instance,
+                None,
+                Some(Duration::from_secs(10)),
+                Instant::now(),
+                false,
+                false,
+                &term_flag,
+                &mut out,
+                &best_solution,
+                None,
+            )
+            .expect("WBO solve should succeed")
+            .solution
+        };
+        (
+            solution,
+            String::from_utf8(output).expect("solver output is UTF-8"),
+        )
+    }
+
+    /// The optimum of a WBO solve as it reaches the output: the last `o` line.
+    fn last_cost_line(output: &str) -> Option<&str> {
+        output.lines().rev().find(|line| line.starts_with("o "))
+    }
+
     #[test]
     fn test_decision_sat_solution_proof_text_shape() {
         let instance = ay_pb::parse_opb(
@@ -5834,7 +6097,7 @@ mod tests {
     #[test]
     fn test_wbo_top_cost_above_optimum_answers_optimum() {
         // Same instance with top cost 3: the optimum 2 is admissible.
-        let solution = solve_wbo_text(
+        let (solution, output) = solve_wbo_text_and_output(
             "* #variable= 2 #constraint= 3\n\
              soft: 3 ;\n\
              -1 x1 -1 x2 >= -1 ;\n\
@@ -5842,7 +6105,8 @@ mod tests {
              [2] +1 x2 >= 1 ;\n",
         );
         assert_eq!(solution.status, PbStatus::OptimumFound);
-        assert_eq!(solution.objective, Some(2));
+        assert_eq!(last_cost_line(&output), Some("o 2"), "{output}");
+        assert_eq!(solution.objective, None, "the cost is written once");
     }
 
     #[test]
@@ -5968,14 +6232,15 @@ mod tests {
     fn test_wbo_omitted_top_cost_solves_unbounded() {
         // "soft: ;" (no integer) is legal and means no cost bound; previously
         // this failed to parse and produced no `s` line at all.
-        let solution = solve_wbo_text(
+        let (solution, output) = solve_wbo_text_and_output(
             "soft: ;\n\
              -1 x1 -1 x2 >= -1 ;\n\
              [2] +1 x1 >= 1 ;\n\
              [2] +1 x2 >= 1 ;\n",
         );
         assert_eq!(solution.status, PbStatus::OptimumFound);
-        assert_eq!(solution.objective, Some(2));
+        assert_eq!(last_cost_line(&output), Some("o 2"), "{output}");
+        assert_eq!(solution.objective, None, "the cost is written once");
     }
 
     /// Review finding (ce368aefb): the search routes after the proof slice

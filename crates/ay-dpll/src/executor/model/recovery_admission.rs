@@ -8,7 +8,7 @@
 //! original query controls. Neither retries nor rollback refund consumed work.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use ay_core::resource::Guard;
 
@@ -20,35 +20,113 @@ thread_local! {
 }
 
 #[derive(Clone)]
-pub(super) struct RecoveryAdmission(Rc<Owner>);
+pub(super) struct RecoveryAdmission(Arc<Owner>);
 
 struct Owner {
-    ledger: RefCell<Ledger>,
+    ledger: Mutex<Ledger>,
     guard: Option<Guard>,
-    stopped: Box<dyn Fn() -> bool>,
+    stopped: Box<dyn Fn() -> bool + Send + Sync>,
     source: Option<ay_core::term::TermStoreSnapshotStamp>,
+    append_source: Option<(
+        ay_frontend::SourceContextStamp,
+        crate::executor::QueryAuthorityEpoch,
+    )>,
+    work_owner: Option<Box<dyn Fn(usize, usize) -> bool + Send + Sync>>,
 }
 
 struct Ledger {
     work_left: usize,
     bytes_left: usize,
     refused: bool,
+    first_refusal: Option<RecoveryRefusal>,
+}
+
+/// Fixed-size first failure data. Formatting is only done on a refused path;
+/// no source term, model payload or spelling is copied to diagnose admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum RecoveryRefusal {
+    Work { requested: usize, remaining: usize },
+    Storage { requested: usize, remaining: usize },
+    OriginalWorkOwner,
+    OriginalResourceGuard,
+    OriginalStop,
+    Source,
+    ForeignActiveOwner,
+    ReadStop,
+    Poisoned,
+    Unwind,
+    Explicit,
+}
+
+impl Ledger {
+    fn refuse(&mut self, reason: RecoveryRefusal) {
+        self.refused = true;
+        self.first_refusal.get_or_insert(reason);
+    }
 }
 
 pub(super) struct RecoveryScope {
     admission: RecoveryAdmission,
+    // Dropping the installation edits ACTIVE on this thread. Retained model
+    // admissions are shared, but the installing RAII frame must not migrate.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl RecoveryScope {
     /// A nested transaction cannot install a fresh allowance over its caller.
     pub(super) fn enter(exec: &Executor, work: usize, bytes: usize) -> Option<Self> {
+        Self::enter_inner(exec, work, bytes, None, None)
+    }
+
+    /// Borrow an existing aggregate work owner for every pre-copy debit. The
+    /// local recovery allowance and original stop retain their usual behavior.
+    pub(super) fn enter_with_work_owner(
+        exec: &Executor,
+        work: usize,
+        bytes: usize,
+        work_owner: Box<dyn Fn(usize, usize) -> bool + Send + Sync>,
+    ) -> Option<Self> {
+        Self::enter_inner(exec, work, bytes, Some(work_owner), None)
+    }
+
+    /// The symbolic proposal appends body/instance terms while retaining the
+    /// same exact authored context and original immutable arena prefix. This
+    /// accessor changes no allowance, stop or source/model authority.
+    pub(super) fn enter_append_only_with_work_owner(
+        exec: &Executor,
+        work: usize,
+        bytes: usize,
+        work_owner: Box<dyn Fn(usize, usize) -> bool + Send + Sync>,
+    ) -> Option<Self> {
+        Self::enter_inner(
+            exec,
+            work,
+            bytes,
+            Some(work_owner),
+            Some((
+                exec.ctx.source_context_stamp(),
+                exec.query_authority_epoch.clone(),
+            )),
+        )
+    }
+
+    fn enter_inner(
+        exec: &Executor,
+        work: usize,
+        bytes: usize,
+        work_owner: Option<Box<dyn Fn(usize, usize) -> bool + Send + Sync>>,
+        append_source: Option<(
+            ay_frontend::SourceContextStamp,
+            crate::executor::QueryAuthorityEpoch,
+        )>,
+    ) -> Option<Self> {
         if RecoveryAdmission::current().is_some() {
             return None;
         }
-        let stop = FpStop::from_executor_for_term_construction(exec);
+        let stop = Mutex::new(FpStop::from_executor_for_term_construction(exec));
         let attempt = exec.evaluation_attempt();
         let original_stop = ay_core::resource::current_check_stop().ok()?;
-        let admission = RecoveryAdmission::with_source(
+        let admission = RecoveryAdmission::with_source_and_work_owner(
             work,
             bytes,
             ay_core::resource::current_guard(),
@@ -57,10 +135,20 @@ impl RecoveryScope {
                     attempt.record_stop(origin);
                     return true;
                 }
+                let stop = match stop.lock() {
+                    Ok(stop) => stop,
+                    Err(_) => {
+                        attempt.record_stop(
+                            crate::executor_types::UnknownOrigin::IncompleteSolverLane,
+                        );
+                        return true;
+                    }
+                };
                 if let Err(origin) = stop.check() {
                     attempt.record_stop(origin);
                     return true;
                 }
+                drop(stop);
                 if ay_core::resource::process_cancelled()
                     || original_stop.as_ref().is_some_and(|stop| stop())
                 {
@@ -70,9 +158,14 @@ impl RecoveryScope {
                 false
             }),
             Some(exec.ctx.terms.snapshot_stamp()),
+            work_owner,
+            append_source,
         );
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
-        let scope = Self { admission };
+        let scope = Self {
+            admission,
+            _thread: std::marker::PhantomData,
+        };
         // Install the scope before polling the original callback: reentrant
         // recovery must already see this owner and cannot open a fresh meter.
         if !scope.admission.pay(0, 0) {
@@ -92,7 +185,7 @@ impl Drop for RecoveryScope {
             let mut active = active.borrow_mut();
             if active
                 .as_ref()
-                .is_some_and(|value| Rc::ptr_eq(&value.0, &self.admission.0))
+                .is_some_and(|value| Arc::ptr_eq(&value.0, &self.admission.0))
             {
                 *active = None;
             }
@@ -101,32 +194,61 @@ impl Drop for RecoveryScope {
 }
 
 impl RecoveryAdmission {
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        match self.0.ledger.lock() {
+            Ok(ledger) => ledger,
+            Err(poisoned) => {
+                let mut ledger = poisoned.into_inner();
+                ledger.refuse(RecoveryRefusal::Poisoned);
+                ledger
+            }
+        }
+    }
     #[cfg(test)]
     fn new(
         work: usize,
         bytes: usize,
         guard: Option<Guard>,
-        stopped: Box<dyn Fn() -> bool>,
+        stopped: Box<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         Self::with_source(work, bytes, guard, stopped, None)
     }
 
+    #[cfg(test)]
     fn with_source(
         work: usize,
         bytes: usize,
         guard: Option<Guard>,
-        stopped: Box<dyn Fn() -> bool>,
+        stopped: Box<dyn Fn() -> bool + Send + Sync>,
         source: Option<ay_core::term::TermStoreSnapshotStamp>,
     ) -> Self {
-        Self(Rc::new(Owner {
-            ledger: RefCell::new(Ledger {
+        Self::with_source_and_work_owner(work, bytes, guard, stopped, source, None, None)
+    }
+
+    fn with_source_and_work_owner(
+        work: usize,
+        bytes: usize,
+        guard: Option<Guard>,
+        stopped: Box<dyn Fn() -> bool + Send + Sync>,
+        source: Option<ay_core::term::TermStoreSnapshotStamp>,
+        work_owner: Option<Box<dyn Fn(usize, usize) -> bool + Send + Sync>>,
+        append_source: Option<(
+            ay_frontend::SourceContextStamp,
+            crate::executor::QueryAuthorityEpoch,
+        )>,
+    ) -> Self {
+        Self(Arc::new(Owner {
+            ledger: Mutex::new(Ledger {
                 work_left: work,
                 bytes_left: bytes,
                 refused: false,
+                first_refusal: None,
             }),
             guard,
             stopped,
             source,
+            work_owner,
+            append_source,
         }))
     }
 
@@ -146,18 +268,64 @@ impl RecoveryAdmission {
         })
     }
 
+    /// Narrow opt-in for the same live context after append-only term growth.
+    /// Foreign/cloned/reset arenas, rollback/compaction and source scope changes
+    /// retire it. Legacy exact-snapshot transactions retain their old API.
+    pub(super) fn current_for_append_only(exec: &Executor) -> Option<Self> {
+        Self::current().filter(|admission| admission.matches_append_only_source(exec))
+    }
+
+    /// Resource currency for a retained capsule after its TLS frame ends.
+    /// Possession admits no source, model or assertion. No allowance is made.
+    pub(super) fn matches_append_only_source(&self, exec: &Executor) -> bool {
+        self.0
+            .append_source
+            .as_ref()
+            .is_some_and(|(context, epoch)| {
+                *context == exec.ctx.source_context_stamp()
+                    && epoch.is_same_epoch(&exec.query_authority_epoch)
+                    && self
+                        .0
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.is_append_only_prefix_of(&exec.ctx.terms))
+            })
+    }
+
+    pub(super) fn shares_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(super) fn refusal(&self) -> Option<RecoveryRefusal> {
+        self.ledger().first_refusal
+    }
+
+    #[cfg(test)]
+    pub(super) fn remaining(&self) -> (usize, usize) {
+        let ledger = self.ledger();
+        (ledger.work_left, ledger.bytes_left)
+    }
+
     pub(super) fn pay(&self, work: usize, bytes: usize) -> bool {
         {
-            let mut ledger = self.0.ledger.borrow_mut();
+            let mut ledger = self.ledger();
             if ledger.refused {
                 return false;
             }
             let Some(work_left) = ledger.work_left.checked_sub(work) else {
-                ledger.refused = true;
+                let remaining = ledger.work_left;
+                ledger.refuse(RecoveryRefusal::Work {
+                    requested: work,
+                    remaining,
+                });
                 return false;
             };
             let Some(bytes_left) = ledger.bytes_left.checked_sub(bytes) else {
-                ledger.refused = true;
+                let remaining = ledger.bytes_left;
+                ledger.refuse(RecoveryRefusal::Storage {
+                    requested: bytes,
+                    remaining,
+                });
                 return false;
             };
             // Debit BEFORE calling user controls. A finite reentrant read
@@ -172,7 +340,7 @@ impl RecoveryAdmission {
         impl Drop for RefuseOnUnwind<'_> {
             fn drop(&mut self) {
                 if self.armed {
-                    self.owner.refuse();
+                    self.owner.refuse_with(RecoveryRefusal::Unwind);
                 }
             }
         }
@@ -180,23 +348,40 @@ impl RecoveryAdmission {
             owner: self,
             armed: true,
         };
+        let shared = self
+            .0
+            .work_owner
+            .as_ref()
+            .is_none_or(|owner| owner(work, bytes));
         let guarded = u64::try_from(work).is_ok_and(|work| {
             self.0
                 .guard
                 .as_ref()
                 .is_none_or(|guard| guard.tick(work).is_ok())
         });
-        let stopped = !guarded || (self.0.stopped)();
-        let mut ledger = self.0.ledger.borrow_mut();
-        if stopped {
-            ledger.refused = true;
+        let reason = if !shared {
+            Some(RecoveryRefusal::OriginalWorkOwner)
+        } else if !guarded {
+            Some(RecoveryRefusal::OriginalResourceGuard)
+        } else if (self.0.stopped)() {
+            Some(RecoveryRefusal::OriginalStop)
+        } else {
+            None
+        };
+        let mut ledger = self.ledger();
+        if let Some(reason) = reason {
+            ledger.refuse(reason);
         }
         poll.armed = false;
         !ledger.refused
     }
 
     pub(super) fn refuse(&self) {
-        self.0.ledger.borrow_mut().refused = true;
+        self.refuse_with(RecoveryRefusal::Explicit);
+    }
+
+    pub(super) fn refuse_with(&self, reason: RecoveryRefusal) {
+        self.ledger().refuse(reason);
     }
 }
 
@@ -210,7 +395,9 @@ pub(super) fn pay_current(work: usize, bytes: usize) -> bool {
 pub(super) fn pay_for(exec: &Executor, work: usize, bytes: usize) -> bool {
     super::evaluation_copies::validate(exec)
         && super::evaluation_copies::pay(work, bytes)
-        && RecoveryAdmission::current_for(exec).is_none_or(|admission| admission.pay(work, bytes))
+        && RecoveryAdmission::current_for(exec)
+            .or_else(|| RecoveryAdmission::current_for_append_only(exec))
+            .is_none_or(|admission| admission.pay(work, bytes))
         && super::evaluation_copies::validate(exec)
 }
 
@@ -542,7 +729,106 @@ fn fp_view(value: &ay_fp::FpModelValue) -> Option<FpView<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn symbolic_append_scope_remains_bound_to_its_installing_thread() {
+        // Exactly one implementation is inferable only while the TLS scope
+        // lacks Send. Retained admissions/models have separate positive Send
+        // and actual cross-thread move controls.
+        trait NotSendCheck<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSendCheck<()> for T {}
+        struct IfSend;
+        impl<T: ?Sized + Send> NotSendCheck<IfSend> for T {}
+        let _ = <RecoveryScope as NotSendCheck<_>>::check;
+        let _ = <crate::executor::model::SymbolicRecoveryScope as NotSendCheck<_>>::check;
+    }
+
+    #[test]
+    fn symbolic_append_owner_clones_debit_one_ledger_across_threads() {
+        let admission = RecoveryAdmission::new(32, 16, None, Box::new(|| false));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let owner = admission.clone();
+            workers.push(std::thread::spawn(move || owner.pay(8, 4)));
+        }
+        for worker in workers {
+            assert!(worker.join().unwrap());
+        }
+        assert_eq!(admission.remaining(), (0, 0));
+        assert!(!admission.pay(1, 0));
+        assert!(!admission.clone().pay(0, 0));
+    }
+
+    #[test]
+    fn symbolic_append_owner_poison_cannot_reopen_an_allowance() {
+        let admission = RecoveryAdmission::new(32, 16, None, Box::new(|| false));
+        let owner = admission.clone();
+        assert!(std::thread::spawn(move || {
+            let _ledger = owner.ledger();
+            panic!("interrupted ledger owner");
+        })
+        .join()
+        .is_err());
+        assert!(!admission.pay(0, 0));
+        assert!(!admission.clone().pay(0, 0));
+    }
+
+    #[test]
+    fn symbolic_append_owner_keeps_one_ledger_and_authenticates_arena_source_and_attempt() {
+        assert!(RecoveryAdmission::current().is_none());
+        let mut exec = Executor::new();
+        let scope = RecoveryScope::enter_append_only_with_work_owner(
+            &exec,
+            10000,
+            10000,
+            Box::new(|_, _| true),
+        )
+        .unwrap();
+        assert!(RecoveryAdmission::current_for(&exec).is_some());
+        exec.ctx.terms.mk_int(934.into());
+        assert!(RecoveryAdmission::current_for(&exec).is_none());
+        let owner = RecoveryAdmission::current_for_append_only(&exec).unwrap();
+        assert!(owner.pay(9999, 0));
+        assert!(!RecoveryAdmission::current_for_append_only(&exec)
+            .unwrap()
+            .pay(2, 0));
+        assert!(!scope.admission().pay(0, 0));
+        assert!(RecoveryAdmission::current_for_append_only(&Executor::new()).is_none());
+        exec.advance_query_authority_epoch();
+        assert!(RecoveryAdmission::current_for_append_only(&exec).is_none());
+    }
+
+    #[test]
+    fn symbolic_append_owner_refuses_reset_arena_and_scope_pop_without_renewal() {
+        for reset in [false, true] {
+            let mut exec = Executor::new();
+            let scope = RecoveryScope::enter_append_only_with_work_owner(
+                &exec,
+                10000,
+                10000,
+                Box::new(|_, _| true),
+            )
+            .unwrap();
+            if reset {
+                exec.ctx.terms = ay_core::TermStore::new();
+            } else {
+                exec.execute_all(&ay_frontend::parse("(push 1)(pop 1)").unwrap())
+                    .unwrap();
+            }
+            assert!(RecoveryAdmission::current_for_append_only(&exec).is_none());
+            assert!(RecoveryScope::enter_append_only_with_work_owner(
+                &exec,
+                10000,
+                10000,
+                Box::new(|_, _| true)
+            )
+            .is_none());
+            drop(scope);
+        }
+    }
 
     #[test]
     fn model_value_copy_uses_original_evaluation_owner_without_recovery_scope() {
@@ -709,7 +995,10 @@ mod tests {
             let admission = RecoveryAdmission::new(100, bytes, None, Box::new(|| false));
             let retained = admission.clone();
             ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
-            let scope = RecoveryScope { admission };
+            let scope = RecoveryScope {
+                admission,
+                _thread: std::marker::PhantomData,
+            };
             assert_eq!(pay_eval_value_copy(&value), expected);
             assert!(!pay_eval_value_copy(&value));
             assert!(!retained.pay(0, 0));
@@ -719,7 +1008,10 @@ mod tests {
         }
         let admission = RecoveryAdmission::new(100, 1000, None, Box::new(|| true));
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
-        let _scope = RecoveryScope { admission };
+        let _scope = RecoveryScope {
+            admission,
+            _thread: std::marker::PhantomData,
+        };
         assert!(!pay_eval_value_copy(&value));
         assert!(!RecoveryAdmission::current().unwrap().pay(0, 0));
     }
@@ -734,10 +1026,51 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_aggregate_work_owner_pays_each_retry_and_latches_refusal() {
+        let remaining = Arc::new(AtomicUsize::new(7usize));
+        let owner = Arc::clone(&remaining);
+        let admission = RecoveryAdmission::with_source_and_work_owner(
+            100,
+            100,
+            None,
+            Box::new(|| false),
+            None,
+            Some(Box::new(move |work, bytes| {
+                let Some(amount) = work.checked_add(bytes) else {
+                    owner.store(0, Ordering::SeqCst);
+                    return false;
+                };
+                if owner
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(amount)
+                    })
+                    .is_err()
+                {
+                    owner.store(0, Ordering::SeqCst);
+                    return false;
+                }
+                true
+            })),
+            None,
+        );
+        assert!(admission.pay(2, 3));
+        assert_eq!(remaining.load(Ordering::SeqCst), 2);
+        assert!(!admission.clone().pay(2, 1));
+        assert_eq!(remaining.load(Ordering::SeqCst), 0);
+        assert!(!admission.pay(0, 0));
+        assert_eq!(admission.ledger().work_left, 96);
+        assert_eq!(admission.ledger().bytes_left, 96);
+    }
+
+    #[test]
     fn a_stop_observed_once_stays_refused() {
-        let stopped = Cell::new(true);
-        let admission =
-            RecoveryAdmission::new(30, 70, None, Box::new(move || stopped.replace(false)));
+        let stopped = AtomicBool::new(true);
+        let admission = RecoveryAdmission::new(
+            30,
+            70,
+            None,
+            Box::new(move || stopped.swap(false, Ordering::SeqCst)),
+        );
         assert!(!admission.pay(0, 0));
         assert!(!admission.clone().pay(0, 0));
     }
@@ -749,7 +1082,10 @@ mod tests {
         let retained = admission.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
-            let _scope = RecoveryScope { admission };
+            let _scope = RecoveryScope {
+                admission,
+                _thread: std::marker::PhantomData,
+            };
             assert!(retained.pay(2, 6));
             panic!("private candidate unwind");
         }));
@@ -764,7 +1100,10 @@ mod tests {
         assert!(RecoveryAdmission::current().is_none());
         let admission = RecoveryAdmission::new(100, 5, None, Box::new(|| false));
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
-        let scope = RecoveryScope { admission };
+        let scope = RecoveryScope {
+            admission,
+            _thread: std::marker::PhantomData,
+        };
         let mut first = SchemaSourceBudget::new();
         assert!(first.charge_name(3));
         let mut retry = SchemaSourceBudget::new();
@@ -777,13 +1116,13 @@ mod tests {
     #[test]
     fn a_finite_reentrant_stop_callback_debits_without_borrowing_the_ledger() {
         assert!(RecoveryAdmission::current().is_none());
-        let entered = Cell::new(false);
+        let entered = AtomicBool::new(false);
         let admission = RecoveryAdmission::new(
             10,
             20,
             None,
             Box::new(move || {
-                if !entered.replace(true) {
+                if !entered.swap(true, Ordering::SeqCst) {
                     assert!(RecoveryAdmission::current().unwrap().pay(2, 1));
                 }
                 false
@@ -791,10 +1130,11 @@ mod tests {
         );
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
         let _scope = RecoveryScope {
+            _thread: std::marker::PhantomData,
             admission: admission.clone(),
         };
         assert!(admission.pay(3, 4));
-        let ledger = admission.0.ledger.borrow();
+        let ledger = admission.ledger();
         assert_eq!(ledger.work_left, 5);
         assert_eq!(ledger.bytes_left, 15);
         assert!(!ledger.refused);
@@ -810,7 +1150,7 @@ mod tests {
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| admission.pay(3, 4)));
         assert!(result.is_err());
-        let ledger = admission.0.ledger.borrow();
+        let ledger = admission.ledger();
         assert_eq!(ledger.work_left, 7);
         assert_eq!(ledger.bytes_left, 16);
         assert!(ledger.refused);
@@ -826,8 +1166,8 @@ mod tests {
         let mut unrelated = Executor::new();
         let other_root = unrelated.ctx.terms.mk_bool(false);
         unrelated.ctx.assertions.push(other_root);
-        let unrelated = Rc::new(unrelated);
-        let observed = Rc::new(RefCell::new(Vec::new()));
+        let unrelated = Arc::new(Mutex::new(unrelated));
+        let observed = Arc::new(Mutex::new(Vec::new()));
         let captured_other = unrelated.clone();
         let captured_observed = observed.clone();
         let admission = RecoveryAdmission::with_source(
@@ -838,20 +1178,28 @@ mod tests {
                 // Exhaust the SAME owner through a genuine finite callback. The
                 // different executor must still retain its complete false root.
                 assert!(!RecoveryAdmission::current().unwrap().pay(1, 0));
-                *captured_observed.borrow_mut() =
-                    captured_other.independent_gate_query_roots().unwrap();
+                *captured_observed.lock().unwrap() = captured_other
+                    .lock()
+                    .unwrap()
+                    .independent_gate_query_roots()
+                    .unwrap();
                 false
             }),
             Some(owner.ctx.terms.snapshot_stamp()),
         );
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
         let _scope = RecoveryScope {
+            _thread: std::marker::PhantomData,
             admission: admission.clone(),
         };
         assert!(!admission.pay(1, 0));
-        assert_eq!(*observed.borrow(), [other_root]);
+        assert_eq!(*observed.lock().unwrap(), [other_root]);
         assert_eq!(
-            unrelated.independent_gate_query_roots().unwrap(),
+            unrelated
+                .lock()
+                .unwrap()
+                .independent_gate_query_roots()
+                .unwrap(),
             [other_root]
         );
         assert!(RecoveryAdmission::current_for(&owner).is_some());
@@ -884,6 +1232,7 @@ mod tests {
         );
         ACTIVE.with(|active| *active.borrow_mut() = Some(admission.clone()));
         let _scope = RecoveryScope {
+            _thread: std::marker::PhantomData,
             admission: admission.clone(),
         };
         assert!(exec.independent_gate_query_roots().is_err());

@@ -48,17 +48,22 @@ const MAX_TABLES: usize = 64;
 ///
 /// Keys and values are literal terms or pinned representatives, so the
 /// substituted `ite` chain denotes one function in every model of the pins.
+#[derive(Clone)]
 pub(super) struct UfTable {
     pub(super) symbol: Symbol,
     pub(super) arg_sorts: Vec<Sort>,
     pub(super) result_sort: Sort,
+    /// Every observed point, including values equal to the present default.
+    /// Alternative defaults must retain those points as observations.
     pub(super) rows: Vec<(Vec<TermId>, TermId)>,
     pub(super) default: TermId,
 }
 
 /// The fixed part of the candidate model one certificate pass works under.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Interpretation {
+    pub(super) symbolic: crate::executor::model::SymbolicUfModel,
+    pub(super) symbolic_owner: Option<crate::executor::model::SymbolicAdmission>,
     /// Ground equalities (and representative disequalities) true in the
     /// candidate model.
     pub(super) pins: Vec<TermId>,
@@ -71,6 +76,84 @@ pub(super) struct Interpretation {
 }
 
 impl Interpretation {
+    /// A total-model proposal for numeric functions with finitely many
+    /// exceptional values. Using the first observed value as the else value
+    /// can keep adding zero-valued rows forever. Retain every observed row
+    /// and propose zero outside them; the ordinary authored and residual
+    /// checks must still certify this exact interpretation before publishing.
+    pub(super) fn with_zero_numeric_defaults(&self, terms: &mut TermStore) -> Option<Self> {
+        fn zero(terms: &mut TermStore, sort: &Sort) -> Option<TermId> {
+            match sort {
+                Sort::Int => Some(terms.mk_int(0.into())),
+                Sort::Real => {
+                    Some(terms.mk_rational(num_rational::BigRational::from_integer(0.into())))
+                }
+                _ => None,
+            }
+        }
+
+        if !self
+            .tables
+            .iter()
+            .any(|table| zero(terms, &table.result_sort).is_some_and(|zero| table.default != zero))
+        {
+            return None;
+        }
+        let mut candidate = self.clone();
+        for table in &mut candidate.tables {
+            if let Some(zero) = zero(terms, &table.result_sort) {
+                table.default = zero;
+            }
+        }
+        Some(candidate)
+    }
+
+    /// One additional total-model candidate for quantified relations. Ground
+    /// search often leaves an unobserved relation false, which cannot satisfy
+    /// a reflexivity law on fresh carrier elements. A constant true function
+    /// is only a proposal: every original quantified and residual obligation
+    /// must still pass the ordinary checks before it can be published.
+    pub(super) fn with_true_boolean_tables(&self, terms: &mut TermStore) -> Option<Self> {
+        let truth = terms.mk_bool(true);
+        if !self.tables.iter().any(|table| {
+            table.result_sort == Sort::Bool
+                && (table.default != truth || table.rows.iter().any(|(_, value)| *value != truth))
+        }) {
+            return None;
+        }
+        let mut candidate = self.clone();
+        for table in &mut candidate.tables {
+            if table.result_sort == Sort::Bool {
+                table.rows.clear();
+                table.default = truth;
+            }
+        }
+        Some(candidate)
+    }
+
+    /// Preserve the existing scalar-table candidate before attempting the
+    /// additional closed-array candidate. These are term data, not authority.
+    pub(super) fn without_array_defaults(&self) -> Option<Self> {
+        if !self
+            .tables
+            .iter()
+            .any(|table| matches!(table.result_sort, Sort::Array(_)))
+        {
+            return None;
+        }
+        let mut original = self.clone();
+        original
+            .tables
+            .retain(|table| !matches!(table.result_sort, Sort::Array(_)));
+        original.index = original
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(idx, table)| (table.symbol.clone(), idx))
+            .collect();
+        Some(original)
+    }
+
     /// The pinned representatives of `sort` (empty for other sorts).
     pub(super) fn representatives(&self, sort: &Sort) -> &[TermId] {
         self.reps.get(sort).map_or(&[], Vec::as_slice)
@@ -105,6 +188,18 @@ impl Interpretation {
                         table_application(terms, table, &new_args)
                     }
                     _ if new_args == args => term,
+                    // Replacing an array-valued UF can expose a closed array.
+                    // Rebuild the typed read through the ordinary constructor,
+                    // whose read-over-const/store reductions preserve exactly
+                    // the same array semantics as frontend elaboration.
+                    _ if matches!(&sym, Symbol::Named(name) if name == "select")
+                        && new_args.len() == 2
+                        && terms.sort(new_args[0]).array_index()
+                            == Some(terms.sort(new_args[1]))
+                        && terms.sort(new_args[0]).array_element() == Some(terms.sort(term)) =>
+                    {
+                        terms.mk_select(new_args[0], new_args[1])
+                    }
                     _ => {
                         let sort = terms.sort(term).clone();
                         terms.mk_app(sym, new_args, sort)
@@ -143,7 +238,12 @@ impl Interpretation {
 /// `ite(args = k̄₁, v₁, ite(…, default))` for one table.
 fn table_application(terms: &mut TermStore, table: &UfTable, args: &[TermId]) -> TermId {
     let mut body = table.default;
-    for (keys, value) in table.rows.iter().rev() {
+    for (keys, value) in table
+        .rows
+        .iter()
+        .rev()
+        .filter(|(_, value)| *value != table.default)
+    {
         let conjuncts: Vec<TermId> = args
             .iter()
             .zip(keys)

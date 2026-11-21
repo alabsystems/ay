@@ -646,9 +646,6 @@ fn random_obligation(seed: u64) -> (TermStore, Vec<TermId>, Vec<TermId>) {
     (terms, vars, assertions)
 }
 
-/// The compiled region reproduces the interpreter exactly: status, trail
-/// entry for entry, and final state, including runs cut short by the round
-/// limit.
 /// Every node's value under `env`, computed from the region's own semantics
 /// (leaves from their source terms), so a test can tell a wrong derivation
 /// from a wrong cone.

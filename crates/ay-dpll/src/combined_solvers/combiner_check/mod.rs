@@ -1149,6 +1149,23 @@ impl TheoryCombiner<'_> {
             } else if let Some(repair) = self.discover_congruence_repair_eqs(debug) {
                 return Some(repair);
             }
+        } else if self.label == "AUFLIA" {
+            // AY-SMT-2 (2026-11-19): the AUFLIA lane has no reactive re-solve
+            // (`uflia_congruence_lane` marks only the UFLIA lane, and the
+            // quantifier rounds run this combiner directly), so without this
+            // scan it accepted candidates whose arithmetic model makes two UF
+            // arguments equal while the applications keep different values
+            // (AUFLIA 498486a2: `x2 = sk!x12 = 6` with no arithmetic reason,
+            // `sk(x2) = 6`, `sk(sk!x12) = 4`). Model reunification then moved
+            // `x2` to satisfy congruence, which falsified the ground
+            // assertion `(>= x2 x9)`, and the strict gate degraded the round
+            // to `unknown`. Here only VISIBLE divergences are split (both
+            // application values known and different): that is a certain
+            // function-graph violation of this candidate, never a latent one.
+            let repair = self.discover_congruence_repair_eqs(debug);
+            if repair.is_some() {
+                return repair;
+            }
         }
         if let Some(arrays) = &mut self.arrays {
             if let Some(result) = forward_non_sat(arrays.final_check()) {
@@ -1445,13 +1462,22 @@ impl TheoryCombiner<'_> {
     /// unproposable violation (all pairs pinned) falls through to Sat and the
     /// independent gate still fail-closes, exactly as before this scan.
     ///
-    /// Scoped to the UFLIA lane: array-carrying combiners own their index
-    /// coincidences via the array rescue machinery (#6367/#7956), and the
-    /// LRA lanes have no observed instances of this failure class.
+    /// Scoped to the UFLIA and AUFLIA lanes. Array-carrying combiners own
+    /// their SELECT index coincidences via the array rescue machinery
+    /// (#6367/#7956), which is why `select`/`store` are skipped below; UF
+    /// argument coincidences in the AUFLIA lane had no owner (AY-SMT-2,
+    /// AUFLIA 498486a2), so that lane runs the scan for visible divergences.
+    /// The LRA lanes have no observed instances of this failure class.
     fn discover_congruence_repair_eqs(&mut self, debug: bool) -> Option<TheoryResult> {
-        if self.label != "UFLIA" {
-            return None;
-        }
+        // UFLIA runs the scan armed (after a gate refutation) and splits
+        // every possible violation; AUFLIA runs it at every accept point
+        // (AY-SMT-2) and splits only visible divergences, so a latent
+        // collision (an invisible application value) costs it no split.
+        let visible_divergence_only = match self.label {
+            "UFLIA" => false,
+            "AUFLIA" => true,
+            _ => return None,
+        };
         let lia = self.lia.as_ref()?;
         // Cap the per-round batch: each pair is one SAT-visible atom; a giant
         // batch on a dense-collision model floods the split loop's round
@@ -1578,6 +1604,8 @@ impl TheoryCombiner<'_> {
                         if av == bv {
                             continue;
                         }
+                    } else if visible_divergence_only {
+                        continue;
                     }
                     if self.euf.are_equal(*a_app, *b_app) {
                         // EUF already merged them; the value divergence is a

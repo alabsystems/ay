@@ -49,11 +49,12 @@ pub use elaborate::{
     DatatypeOutputNames, DeclarationId, DeclarationKind, DefinitionalAdoptionSnapshot,
     ElaborateError, FiniteSetOp, FiniteSetTermMetadata, FiniteSetTypingMode, InternalLogicBorrow,
     InternalNamespace, InternalNamespaceMinter, InternalNamespaceScope, IntroKind, LabelFailure,
-    NativeAssertionSurfaces, Objective, ObjectiveDirection, ObjectiveStep, OptionValue,
-    ParsedRetention, ProjectionBindingRejection, ProjectionBindingRequest, PublicAssertionMetadata,
-    PublicSort, PublicSymbolSignature, PublicTermMetadata, SharedSurfaceElaboration,
-    SharedSurfaceLimits, SoftAssertion, SourceContextStamp, SymbolInfo,
-    CHECK_SAT_ADOPTION_MAX_RETAINED_NODES, INTERNAL_NAMESPACES,
+    NativeAssertionSurfaces, NativeOwnedConstantError, Objective, ObjectiveDirection,
+    ObjectiveStep, OptionValue, ParsedRetention, ProjectionBindingRejection,
+    ProjectionBindingRequest, ProjectionLookupFootprint, PublicAssertionMetadata, PublicSort,
+    PublicSymbolSignature, PublicTermMetadata, SharedSurfaceElaboration, SharedSurfaceLimits,
+    SoftAssertion, SourceContextStamp, SymbolInfo, CHECK_SAT_ADOPTION_MAX_RETAINED_NODES,
+    INTERNAL_NAMESPACES,
 };
 pub use parser::{
     parse, CommandStream, CommandStreamItem, RawCommandCursor, RawCommandError, RawCommandFrame,

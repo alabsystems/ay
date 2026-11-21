@@ -10,12 +10,14 @@ fn fixture() -> Context {
     ctx.authored_assertions = vec![
         AuthoredAssertion::Concrete {
             term: false_term,
+            origin: super::super::AuthoredAssertionOrigin::Text,
             parsed_index: None,
             source_is_literal_false: false,
         },
         AuthoredAssertion::Schematic(Term::Const(Constant::False)),
         AuthoredAssertion::Concrete {
             term: false_term,
+            origin: super::super::AuthoredAssertionOrigin::Text,
             parsed_index: None,
             source_is_literal_false: true,
         },

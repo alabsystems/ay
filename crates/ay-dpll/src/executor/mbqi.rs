@@ -11747,6 +11747,30 @@ impl Executor {
         }
     }
 
+    /// A fixed interpretation satisfying a body for every value also supplies
+    /// an existential witness when its binder is a live, inhabited unit type.
+    fn const_interp_unit_binder(&self, vars: &[(String, Sort)]) -> bool {
+        let [(_, sort @ Sort::Uninterpreted(name))] = vars else {
+            return false;
+        };
+        if name.len() > 4096 || !self.ctx.is_live_datatype_carrier(name) {
+            return false;
+        }
+        let Some([ctor]) = self.ctx.datatype_constructors(name) else {
+            return false;
+        };
+        if ctor.len() > 4096 {
+            return false;
+        }
+        self.ctx
+            .constructor_metadata(ctor)
+            .is_some_and(|(owner, _)| owner == name)
+            && self
+                .ctx
+                .exact_datatype_member_info(ctor)
+                .is_some_and(|info| info.arg_sorts.is_empty() && &info.sort == sort && info.term.is_some_and(|term| self.ctx.terms.entry_stamp(term).is_some() && self.ctx.terms.sort(term) == sort && matches!(self.ctx.terms.get(term), TermData::Var(actual, _) if actual == ctor)))
+    }
+
     /// Body of [`Self::try_const_interp_sat_certificate`], split out so the
     /// caller owns the single deadline save/restore.
     fn const_interp_cert_inner(
@@ -11876,29 +11900,36 @@ impl Executor {
             // and had been answering `unknown` for want of this line. Both
             // directions are pinned in
             // `crates/ay-dpll/tests/no_mbqi_const_interp_certificate.rs`.
-            let TermData::Forall(vars, body, _triggers) = self.ctx.terms.get(q) else {
-                // GROUND CONJUNCT. Admitted only when it is `Bool`-sorted and
-                // quantifier-free; an `exists` (or a `forall` nested below the
-                // top level) is out of class and declines, exactly as it does
-                // inside an axiom body.
-                if *self.ctx.terms.sort(q) != Sort::Bool || contains_quantifier(&self.ctx.terms, q)
-                {
-                    const_interp_note(
-                        mode,
-                        "decline: snapshot contains a non-forall, non-ground-Bool assertion",
-                    );
-                    return None;
+            let (vars, body) = match self.ctx.terms.get(q) {
+                TermData::Forall(vars, body, _) => (vars, body),
+                // Check this existential's body with the same universal
+                // obligation. The original, registered unit constructor is
+                // a witness for that stronger, independently checked claim.
+                TermData::Exists(vars, body, _) if self.const_interp_unit_binder(vars) => {
+                    (vars, body)
                 }
-                // Scanned with an EMPTY binder set — a ground conjunct has no
-                // binders, so any `Var` it mentions is a free constant. This is
-                // load-bearing for soundness, not bookkeeping: it is what makes
-                // a head occurring ONLY in a ground conjunct join `head_map`,
-                // so `I` pins it too and the sort/arity agreement check covers
-                // it. Without it such a head would stay unpinned and its ground
-                // conjunct would be discharged against an arbitrary reading.
-                self.const_interp_scan_body(q, &HashSet::default(), &mut head_map, &mut work)?;
-                grounds.push(q);
-                continue;
+                _ => {
+                    // Ground conjuncts must be Bool-sorted and quantifier-free.
+                    if *self.ctx.terms.sort(q) != Sort::Bool
+                        || contains_quantifier(&self.ctx.terms, q)
+                    {
+                        const_interp_note(
+                            mode,
+                            "decline: snapshot contains a non-forall, non-ground-Bool assertion",
+                        );
+                        return None;
+                    }
+                    // Scanned with an EMPTY binder set — a ground conjunct has no
+                    // binders, so any `Var` it mentions is a free constant. This is
+                    // load-bearing for soundness, not bookkeeping: it is what makes
+                    // a head occurring ONLY in a ground conjunct join `head_map`,
+                    // so `I` pins it too and the sort/arity agreement check covers
+                    // it. Without it such a head would stay unpinned and its ground
+                    // conjunct would be discharged against an arbitrary reading.
+                    self.const_interp_scan_body(q, &HashSet::default(), &mut head_map, &mut work)?;
+                    grounds.push(q);
+                    continue;
+                }
             };
             let binders: Vec<(String, Sort)> = vars.clone();
             let body = *body;

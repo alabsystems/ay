@@ -8381,6 +8381,45 @@ fn create_artifact_temp_file(
     Ok((resolved_target, reservation, file))
 }
 
+/// Reserve a proof's temporary file and label it at creation
+/// (`ay::proof_store`), before a byte is written: a run killed at any point
+/// leaves a file that says what it is. A label that cannot be written drops
+/// the reservation, which unlinks the file.
+fn create_labelled_proof_temp_file(
+    target: &std::path::Path,
+    proof_config: &ProofConfig,
+) -> io::Result<(std::path::PathBuf, ArtifactTempReservation, std::fs::File)> {
+    let (resolved_target, reservation, file) = create_artifact_temp_file(target)?;
+    if let Some(subject) = proof_config.label.as_ref() {
+        ay::proof_store::label_at_creation(&file, subject)?;
+    }
+    Ok((resolved_target, reservation, file))
+}
+
+/// Write and publish a whole proof: labelled when its temporary file is
+/// created (`ay::proof_store`), written under the free-space reserve, sealed
+/// with its bytes' sha256, then renamed onto `target`, replacing it as
+/// [`write_artifact_atomically`] does.
+pub(crate) fn write_labelled_proof_atomically(
+    target: &std::path::Path,
+    proof_config: &ProofConfig,
+    bytes: &[u8],
+) -> io::Result<()> {
+    write_artifact_atomically(target, |file| {
+        if let Some(subject) = proof_config.label.as_ref() {
+            ay::proof_store::label_at_creation(file, subject)?;
+        }
+        let mut writer = dimacs::ReservedProofWriter::for_proof(&mut *file, &proof_config.path);
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        if proof_config.label.is_none() {
+            return Ok(());
+        }
+        let digest: DigestBytes = Sha256::digest(bytes).into();
+        ay::proof_store::seal_label(file, &ay::proof_store::hex(&digest))
+    })
+}
+
 pub(crate) fn write_artifact_atomically(
     target: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
@@ -8915,10 +8954,16 @@ fn write_alethe_proof(
     };
     let mut self_check_verdict = None;
     let mut carcara_surface = None;
-    let stream_result = match create_artifact_temp_file(target_path) {
+    let stream_result = match create_labelled_proof_temp_file(target_path, proof_config) {
         Ok((resolved_target, mut reservation, file)) => {
+            // The free-space reserve the DRAT writer keeps covers the Alethe
+            // writer too (DC-77): a 785 MB certificate stops before the disk
+            // fills, as a write error the posture below already handles.
             let mut writer = ProofDigestWriter::for_executor(
-                BufWriter::with_capacity(1 << 20, file),
+                BufWriter::with_capacity(
+                    1 << 20,
+                    dimacs::ReservedProofWriter::for_proof(file, &proof_config.path),
+                ),
                 self_check_scope,
                 executor,
             );
@@ -8945,7 +8990,7 @@ fn write_alethe_proof(
                     use std::io::Write as _;
                     let flush_result = writer
                         .flush()
-                        .and_then(|()| writer.inner().get_ref().sync_all())
+                        .and_then(|()| writer.inner().get_ref().get_ref().sync_all())
                         .map_err(ay_proof::AletheStreamError::Io);
                     let proof_digest = writer.digest();
                     self_check_verdict = writer.take_self_check_verdict();
@@ -8970,10 +9015,23 @@ fn write_alethe_proof(
                     match flush_result {
                         Ok(()) => match writer.into_inner().into_inner() {
                             Ok(file) => {
-                                match publish_artifact_temp_noreplace(
-                                    reservation.path(),
-                                    &resolved_target,
-                                ) {
+                                let file = file.into_inner();
+                                // The label records the published bytes'
+                                // sha256 before the name appears.
+                                let sealed = if proof_config.label.is_some() {
+                                    ay::proof_store::seal_label(
+                                        &file,
+                                        &ay::proof_store::hex(&proof_digest),
+                                    )
+                                } else {
+                                    Ok(())
+                                };
+                                match sealed.and_then(|()| {
+                                    publish_artifact_temp_noreplace(
+                                        reservation.path(),
+                                        &resolved_target,
+                                    )
+                                }) {
                                     Ok(()) => {
                                         // Published: the temp name is gone, so
                                         // the reservation must not unlink it.
@@ -8995,7 +9053,7 @@ fn write_alethe_proof(
                                 let (file, _discarded) = error.into_inner().into_parts();
                                 Err(alethe_error_after_invalidation(
                                     ay_proof::AletheStreamError::Io(primary),
-                                    &file,
+                                    file.get_ref(),
                                 ))
                             }
                         },
@@ -9274,12 +9332,12 @@ fn write_alethe_proof(
 /// discarded proof text (996 KB of real blocks). The caller's
 /// [`ArtifactTempReservation`] then unlinks the path; this makes the inode
 /// itself empty even for anyone still holding it open.
-fn alethe_error_after_abandoning_buffer(
+fn alethe_error_after_abandoning_buffer<F: Write + std::borrow::Borrow<std::fs::File>>(
     primary: ay_proof::AletheStreamError,
-    writer: ProofDigestWriter<BufWriter<std::fs::File>>,
+    writer: ProofDigestWriter<BufWriter<F>>,
 ) -> ay_proof::AletheStreamError {
     let (file, _discarded) = writer.into_inner().into_parts();
-    alethe_error_after_invalidation(primary, &file)
+    alethe_error_after_invalidation(primary, file.borrow())
 }
 
 fn alethe_error_after_invalidation(

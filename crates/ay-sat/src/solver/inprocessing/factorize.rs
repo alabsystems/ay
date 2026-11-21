@@ -1056,6 +1056,11 @@ impl Solver {
     }
 
     fn build_factor_occ(&mut self) -> crate::occ_list::OccList {
+        // The engine's literal-indexed arrays are allocated on first use
+        // (AY-SAT-1). The factoring driver sizes them before it calls this,
+        // but this function reads them itself, so it does not rely on that:
+        // three tests that call it directly found the arrays empty.
+        self.inproc.factor_engine.ensure_num_vars(self.num_vars);
         // CaDiCaL factor.cpp:factor_mode() keeps all binary clauses but filters
         // larger candidates before building the hot occurrence lists. Clauses
         // containing a literal that appears only once across the remaining

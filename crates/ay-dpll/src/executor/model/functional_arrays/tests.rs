@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use ay_core::TermStore;
+use ay_core::{Symbol, TermStore};
 use ay_frontend::parse;
 use ay_model_check::{confirm_completed_model, GateVerdict};
 
@@ -399,3 +399,35 @@ mod named_values;
 mod fill;
 
 mod finite_pins;
+
+#[test]
+fn qmc_array_default_preserves_an_existing_functional_owner() {
+    let mut exec = prepared("(declare-fun data (Int) (Array Int Int))");
+    let mut owned = installed(&exec);
+    let before = exec
+        .functional_array_render(&owned, variable(&exec, "w"))
+        .unwrap();
+    let zero = exec.ctx.terms.mk_int(0.into());
+    let value = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+    let row = (
+        Symbol::named("data"),
+        vec![Sort::Int],
+        Sort::array(Sort::Int, Sort::Int),
+        value,
+    );
+    let mut fresh = Model::empty();
+    assert!(exec
+        .install_model_check_array_defaults(&mut fresh, vec![row.clone()])
+        .is_some());
+    assert!(exec
+        .install_model_check_array_defaults(&mut owned, vec![row])
+        .is_none());
+    assert_eq!(
+        exec.functional_array_render(&owned, variable(&exec, "w"))
+            .unwrap(),
+        before
+    );
+    assert!(owned.certified_const_interp_entries().is_empty());
+}
+
+mod periodic;

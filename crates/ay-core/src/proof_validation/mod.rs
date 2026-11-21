@@ -16,6 +16,11 @@ mod lia_cut_chain;
 mod lia_cut_lattice;
 mod lia_equality_lattice;
 mod lia_guarded_split;
+mod owned_subvalue;
+pub use owned_subvalue::{
+    owned_subvalue_cycle_with_progress, OwnedSubvalueBudget, OwnedSubvalueConstructor,
+    OwnedSubvalueCycle, OwnedSubvalueEdge, OwnedSubvalueEdgeKind, OwnedSubvalueRefusal,
+};
 
 pub use divmod_def::{recognize_divmod_def, DivModDefShape, DivModDefShapeError};
 pub use farkas::{
@@ -36,11 +41,15 @@ pub use fresh_def_bound::{
 pub use fresh_def_eq::{recognize_fresh_def_eq, FreshDefEqShape, FreshDefEqShapeError};
 pub use lia::{
     arith_disequality_split_guard_multiplier, arith_disequality_split_has_primitive_guard,
-    arith_disequality_split_primitive_guard_is_reversed, lia_divisibility_equality_witness,
-    recognize_arith_disequality_split, recognize_int_bounds_tautology, recognize_lia_bounds_gap,
-    recognize_lia_divisibility, recognize_lia_linear_identity, recognize_lia_mod_range,
-    validate_lia_mod_range, validate_lia_theory_lemma, LiaDivisibilityEqualityWitness,
-    LiaValidationError,
+    arith_disequality_split_lowering_witness, arith_disequality_split_primitive_guard_is_reversed,
+    arith_inconsistent_equality_subset_witness,
+    arith_inconsistent_equality_subset_witness_with_progress, arith_proportional_equality_witness,
+    lia_divisibility_equality_witness, recognize_arith_disequality_split,
+    recognize_int_bounds_tautology, recognize_lia_bounds_gap, recognize_lia_divisibility,
+    recognize_lia_linear_identity, recognize_lia_mod_range, validate_lia_mod_range,
+    validate_lia_theory_lemma, ArithDisequalitySplitLoweringWitness,
+    ArithInconsistentEqualitySubsetWitness, ArithProportionalEqualityWitness,
+    LiaDivisibilityEqualityWitness, LiaValidationError,
 };
 pub use lia_bound_lattice::{
     int_bound_lattice_gap_core, recognize_int_bound_lattice_gap, IntBoundLatticeGap,
@@ -71,6 +80,9 @@ mod fresh_def_eq_tests;
 
 #[cfg(test)]
 mod lia_tests;
+#[cfg(test)]
+#[path = "lia/proportional_equality_tests.rs"]
+mod proportional_equality_tests;
 
 #[cfg(test)]
 mod lia_bound_lattice_tests;

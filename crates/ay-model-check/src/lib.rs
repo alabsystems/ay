@@ -62,8 +62,9 @@ pub use functional_array::topology::{
     SnapshotKind, SnapshotNode, SnapshotTermError, SnapshotTopology,
 };
 pub use functional_array::{
-    recognize_fill_lambda, recognize_identity_lambda, recognize_range_lambda, ArraySnapshot,
-    FillInterval, FillLambda, FunctionalArrayError, IdentityLambda, RangeLambda,
+    recognize_fill_lambda, recognize_identity_lambda, recognize_int_scalar_lambda,
+    recognize_range_lambda, ArraySnapshot, FillInterval, FillLambda, FunctionalArrayError,
+    IdentityLambda, IntScalarLambda, RangeLambda,
 };
 pub mod fp;
 mod fp_exact;
@@ -389,6 +390,22 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 // The model view the gate reads
 // ===========================================================================
 
+/// Borrowed data describing one total symbolic function interpretation.
+///
+/// This is model data, not a proof, source declaration or SAT permission. The
+/// evaluator independently checks the exact head, signature, closed formal
+/// identities and body, then evaluates it under its actual argument values.
+/// Parameters are fresh exact variable IDs, rather than names whose lexical
+/// scope could be inherited from another function or an ambient quantifier.
+pub struct SymbolicFunctionView<'a> {
+    /// Exact core application head owned by this interpretation.
+    pub symbol: &'a ay_core::Symbol,
+    /// Distinct exact variable terms, in declared argument order.
+    pub parameters: &'a [TermId],
+    /// Quantifier-free body closed over `parameters` and function applications.
+    pub body: TermId,
+}
+
 /// Read-only access to a model, as seen by the gate.
 ///
 /// The gate does **all** compositional evaluation itself; it only asks the model
@@ -408,6 +425,19 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 /// owner, even when it supplies replacement leaves. Default hooks are for
 /// standalone views, not permission to replace a wrapped owner's ledger.
 pub trait ModelView {
+    /// Optional total symbolic interpretation for the exact application `t`.
+    ///
+    /// Default absence preserves existing views. An error is an ownership or
+    /// identity refusal and cannot fall through to an ambient application pin.
+    /// The borrowed data must remain immutable for this evaluator's lifetime;
+    /// the evaluator also records each observed head/body/formal tuple and
+    /// rejects a changed interpretation. No value or evidence is returned by
+    /// this hook: the evaluator computes the body itself, in its own scoped
+    /// binding frame, before consulting per-application UF commitments.
+    fn symbolic_function(&self, _t: TermId) -> Result<Option<SymbolicFunctionView<'_>>, String> {
+        Ok(None)
+    }
+
     /// Whether a shared evaluator resource ledger is active for this view.
     /// This grants no array/value interpretation or model publication authority.
     /// Default-absent views keep their existing evaluation and copying behavior.
@@ -574,8 +604,9 @@ pub trait ModelView {
     /// ONLY after the evaluator proves the typed unconstrained-input condition.
     ///
     /// The admitted cases are enumerated by [`ProvenUnconstrainedKind`]:
-    /// non-finite `fp.to_real`, Real division by zero, and integer `div`/`mod`
-    /// by zero. In each case the theory permits every value of the result sort.
+    /// non-finite `fp.to_real`, Real division by zero, integer `div`/`mod`
+    /// by zero, and `seq.nth` outside independently evaluated finite bounds.
+    /// In each case the theory permits every value of the result sort.
     /// A solver may therefore have no ordinary per-application commitment even
     /// though an asserted definition selects a legal value.
     ///

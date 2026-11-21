@@ -177,11 +177,32 @@ pub enum Constraint {
         capacity: i64,
     },
 
-    /// Circuit constraint (Hamiltonian cycle)
-    Circuit(Vec<IntVarId>),
+    /// Circuit constraint (Hamiltonian cycle): `succ[i]` is the successor
+    /// of node `base + i`; the nodes are `base..base + n` (FlatZinc: the
+    /// array's index set, usually `base = 1`), and every other value is
+    /// excluded. A numbering past `i64::MAX` makes the constraint
+    /// unsatisfiable. [`CpSatEngine::circuit_numbered_by_domains`] builds
+    /// one numbered by the rule this variant had before 2026-11-19.
+    ///
+    /// [`CpSatEngine::circuit_numbered_by_domains`]: crate::CpSatEngine::circuit_numbered_by_domains
+    Circuit { succ: Vec<IntVarId>, base: i64 },
 
-    /// Inverse constraint: `x[y[i]] = i` for all i
-    Inverse { x: Vec<IntVarId>, y: Vec<IntVarId> },
+    /// Inverse constraint: `x[i] = base_x + j` exactly when
+    /// `y[j] = base_y + i`, with `x` taking values in `base_x..base_x + n`
+    /// and `y` in `base_y..base_y + n` (FlatZinc: each array's values are
+    /// indices of the other, so `base_x` is `y`'s index base and `base_y`
+    /// is `x`'s). Arrays of different lengths, or a numbering past
+    /// `i64::MAX`, make the constraint unsatisfiable.
+    /// [`CpSatEngine::inverse_numbered_by_domains`] builds one numbered by
+    /// the rule this variant had before 2026-11-19.
+    ///
+    /// [`CpSatEngine::inverse_numbered_by_domains`]: crate::CpSatEngine::inverse_numbered_by_domains
+    Inverse {
+        x: Vec<IntVarId>,
+        y: Vec<IntVarId>,
+        base_x: i64,
+        base_y: i64,
+    },
 
     /// Boolean clause: disjunction of literals
     BoolClause {
@@ -191,6 +212,21 @@ pub enum Constraint {
 
     /// x = abs(y)
     Abs { result: IntVarId, arg: IntVarId },
+
+    /// `result = x * y` (bounds propagation, any domain size)
+    Times {
+        x: IntVarId,
+        y: IntVarId,
+        result: IntVarId,
+    },
+
+    /// `result = x div y`, rounding towards zero, `y != 0` (FlatZinc
+    /// `int_div`; bounds propagation, any domain size)
+    Div {
+        x: IntVarId,
+        y: IntVarId,
+        result: IntVarId,
+    },
 
     /// x = max(y1, y2, ..., yn)
     Maximum {

@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod native_batch;
+
 #[allow(clippy::panic, deprecated)]
 impl Solver {
     /// Declare a datatype (algebraic data type).

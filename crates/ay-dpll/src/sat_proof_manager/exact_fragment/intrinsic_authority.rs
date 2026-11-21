@@ -123,7 +123,27 @@ impl SatProofManager<'_> {
                 kind,
             )));
         }
-        Ok(None)
+        use crate::theory_inference::intrinsic_integer::IntrinsicIntegerClause;
+
+        let mut refusal = None;
+        let mut charge = |work, bytes| {
+            if refusal.is_some() {
+                return false;
+            }
+            match progress(work, bytes) {
+                Ok(()) => true,
+                Err(error) => {
+                    refusal = Some(error);
+                    false
+                }
+            }
+        };
+        let step = IntrinsicIntegerClause::admit(self.terms, clause, &mut charge)
+            .and_then(|integer| integer.emit(self.terms, proof, &mut charge));
+        match refusal {
+            Some(error) => Err(error.into()),
+            None => Ok(step),
+        }
     }
 
     /// The pre-existing direct-EUF arm, lifted verbatim so the array arm below

@@ -321,12 +321,35 @@ fn clone_owned_dimacs_proof_descriptors(file: &File) -> io::Result<(File, File)>
 /// Unsupported platforms fail before reserving any proof/status pathname. The
 /// registry retains a descriptor for every later seal, verification, artifact
 /// scan, and cleanup.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn create_owned_dimacs_proof_file_with_status(
     path: &str,
     status_reservation: &mut Option<DimacsProofStatusReservation>,
     invalidation: DimacsPublicationInvalidation,
     fast_publication: bool,
+) -> io::Result<File> {
+    create_labelled_dimacs_proof_file_with_status(
+        path,
+        status_reservation,
+        invalidation,
+        fast_publication,
+        None,
+    )
+}
+
+/// As [`create_owned_dimacs_proof_file_with_status`], labelling the staged
+/// file at its creation with what the proof is derived from
+/// (`ay::proof_store`), before it is registered: a label that cannot be
+/// written fails the creation, and the unregistered stage is cleaned up the
+/// way an identity failure is. The label stays on the inode through the
+/// rename or link that publishes it, and a run killed mid-write leaves a stage
+/// that says what it is.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn create_labelled_dimacs_proof_file_with_status(
+    path: &str,
+    status_reservation: &mut Option<DimacsProofStatusReservation>,
+    invalidation: DimacsPublicationInvalidation,
+    fast_publication: bool,
+    label: Option<&ay::proof_store::ProofSubject>,
 ) -> io::Result<File> {
     let resolved = match status_reservation.as_ref() {
         Some(reservation) => reservation.proof_path.clone(),
@@ -375,6 +398,10 @@ fn create_owned_dimacs_proof_file_with_status(
         OwnedDimacsProofLocation::Anonymous => regular_file_identity(&file, staging_label),
         _ => regular_single_link_identity(&file, staging_label),
     };
+    let identity_result = identity_result.and_then(|identity| match label {
+        Some(subject) => ay::proof_store::label_at_creation(&file, subject).map(|()| identity),
+        None => Ok(identity),
+    });
     let identity = match identity_result {
         Ok(identity) => identity,
         Err(error) => {
@@ -424,11 +451,12 @@ fn create_owned_dimacs_proof_file_with_status(
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn create_owned_dimacs_proof_file_with_status(
+fn create_labelled_dimacs_proof_file_with_status(
     _path: &str,
     _status_reservation: &mut Option<DimacsProofStatusReservation>,
     _invalidation: DimacsPublicationInvalidation,
     _fast_publication: bool,
+    _label: Option<&ay::proof_store::ProofSubject>,
 ) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -450,24 +478,29 @@ fn create_owned_dimacs_proof_file(path: &str) -> io::Result<File> {
 fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> {
     if !proof.synthesized_default {
         let mut status_reservation = None;
-        return create_owned_dimacs_proof_file_with_status(
+        return create_labelled_dimacs_proof_file_with_status(
             &proof.path,
             &mut status_reservation,
             DimacsPublicationInvalidation::Proof {
                 binary: proof.binary,
             },
             dimacs_fast_publication(proof),
+            proof.label.as_ref(),
         );
     }
 
-    let mut status_reservation = Some(reserve_dimacs_proof_status(&proof.path)?);
-    match create_owned_dimacs_proof_file_with_status(
+    let mut status_reservation = Some(reserve_dimacs_proof_status(
+        &proof.path,
+        proof.label.as_ref(),
+    )?);
+    match create_labelled_dimacs_proof_file_with_status(
         &proof.path,
         &mut status_reservation,
         DimacsPublicationInvalidation::Proof {
             binary: proof.binary,
         },
         false,
+        proof.label.as_ref(),
     ) {
         Ok(file) => Ok(file),
         Err(proof_error) => {

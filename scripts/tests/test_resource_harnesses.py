@@ -7,6 +7,7 @@ import io
 import json
 import lzma
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -87,7 +88,7 @@ class MiniZincResourceTest(unittest.TestCase):
             solver = Path(td, "minizinc")
             solver.write_text(
                 "#!/bin/sh\n"
-                f"exec {sys.executable} -c 'import time; "
+                f"exec {shlex.quote(sys.executable)} -c 'import time; "
                 "b=bytearray(128*1024*1024); time.sleep(60)'\n"
             )
             solver.chmod(0o755)
@@ -428,7 +429,7 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
             solver = Path(td, "solver")
             solver.write_text(
                 "#!/bin/sh\n"
-                f"exec {sys.executable} -c 'import time; "
+                f"exec {shlex.quote(sys.executable)} -c 'import time; "
                 "b=bytearray(128*1024*1024); time.sleep(60)'\n"
             )
             solver.chmod(0o755)

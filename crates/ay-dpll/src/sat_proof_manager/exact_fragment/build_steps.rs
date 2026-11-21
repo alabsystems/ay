@@ -283,7 +283,9 @@ impl SatProofManager<'_> {
                 }
             }
         }
-        if let Some(step) = self.emit_intrinsic_original_clause(proof, clause, progress)? {
+        let intrinsic = self.emit_intrinsic_original_clause(proof, clause, progress)?;
+        self.reconcile_term_store_growth(term_store_baseline, charged_term_store_growth, progress)?;
+        if let Some(step) = intrinsic {
             return Ok(step);
         }
         // #dt-context-derivation: sealed premise-carrying authentication for

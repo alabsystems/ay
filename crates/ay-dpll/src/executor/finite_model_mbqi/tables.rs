@@ -11,8 +11,8 @@
 //! share one row and a candidate that is not a function declines the table.
 //! The else value is the first row's value (the model-based "projection"
 //! heuristic: an unlisted point behaves like a listed one), or the default of
-//! the result sort when there is no row. Rows equal to the else value are
-//! dropped, which keeps the substituted `ite` chains short.
+//! the result sort when there is no row. Keep every observed row until the
+//! default is chosen; only substitution omits rows equal to that default.
 
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Sort, Symbol, TermData, TermId};
@@ -86,6 +86,27 @@ impl Executor {
         let Some((arg_sorts, result_sort)) = self.model_check_signature(symbol, universals) else {
             return;
         };
+        // Array-valued UFs cannot pass through EvalValue, which deliberately
+        // has no array variant. Propose a closed constant-array interpretation
+        // instead. This is only a candidate: the ordinary QMC refutations,
+        // residual check and independent model gate must all validate it.
+        if matches!(result_sort, Sort::Array(_)) {
+            if !arg_sorts.iter().all(|sort| is_fixable_sort(self, sort)) {
+                return;
+            }
+            let Some(default) = self.model_check_closed_array_default(&result_sort, 0) else {
+                return;
+            };
+            interp.index.insert(symbol.clone(), interp.tables.len());
+            interp.tables.push(UfTable {
+                symbol: symbol.clone(),
+                arg_sorts,
+                result_sort,
+                rows: Vec::new(),
+                default,
+            });
+            return;
+        }
         if !arg_sorts
             .iter()
             .chain([&result_sort])
@@ -112,10 +133,12 @@ impl Executor {
                 None => return,
             },
         };
-        let default_value = rows.first().map(|row| row.value.clone());
+        // Retain every observed point. A later candidate may change ELSE;
+        // dropping points equal to today's default would silently change
+        // those observations along with it. Compact only against the default
+        // of the interpretation actually being substituted.
         let rows: Vec<(Vec<TermId>, TermId)> = rows
             .into_iter()
-            .filter(|row| Some(&row.value) != default_value.as_ref())
             .map(|row| (row.key_terms, row.value_term))
             .collect();
         interp.index.insert(symbol.clone(), interp.tables.len());
@@ -126,6 +149,25 @@ impl Executor {
             rows,
             default,
         });
+    }
+
+    /// Closed scalar leaves and recursively nested constant arrays only.
+    /// Uninterpreted elements have no closed literal, so they decline rather
+    /// than inventing an unpinned representative.
+    fn model_check_closed_array_default(&mut self, sort: &Sort, depth: usize) -> Option<TermId> {
+        if depth > 32 {
+            return None;
+        }
+        if let Sort::Array(array) = sort {
+            let element = self.model_check_closed_array_default(&array.element_sort, depth + 1)?;
+            return Some(
+                self.ctx
+                    .terms
+                    .mk_const_array(array.index_sort.clone(), element),
+            );
+        }
+        let value = self.unconstrained_default_value(sort)?;
+        scalar_value_term(&mut self.ctx.terms, sort, &value)
     }
 
     /// One candidate row: the model's value at one ground application.

@@ -34,12 +34,14 @@ use ay_core::{time::Instant, TermId};
 mod control;
 mod diagnostics;
 mod finish;
+mod source_view;
 mod transport;
 use control::Control;
 pub use diagnostics::{
     RetainedReadDiagnostics, RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal,
     RetainedReadStage, RetainedReadTerminal,
 };
+pub use source_view::RetainedProofSourceView;
 pub use transport::{
     re_check_retained_bundle_strict_with_resource_control,
     read_retained_proof_bundle_with_resource_control,

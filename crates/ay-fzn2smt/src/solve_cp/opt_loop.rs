@@ -82,6 +82,7 @@ pub(super) fn solve_optimization(
     );
 
     let mut ctx = CpContext::new();
+    ctx.engine.set_memory_budget(super::engine_memory_share(1));
     ctx.build_model(model)?;
     if super::reject_unsupported_constraints(&ctx.unsupported, out, err)? {
         return Ok(());
@@ -143,9 +144,19 @@ pub(super) fn solve_optimization(
     // the models whose full encodings these bounded shortcuts avoid.
     // Generic optimization still capacity-checks before any bound helper asks
     // for order literals.
-    if ctx.engine.try_pre_compile().is_err() {
-        writeln!(out, "=====UNKNOWN=====")?;
-        return Ok(());
+    if let Err(capacity) = ctx.engine.try_pre_compile() {
+        if found_any {
+            // A structurally matched incumbent is already printed; it stays
+            // the answer. Never follow a solution with =====UNKNOWN=====.
+            let _ = writeln!(
+                err,
+                "info: direct-CP encoding exceeds its capacity ({capacity}); keeping the incumbent"
+            );
+            return Ok(());
+        }
+        // Nothing printed yet: decline, so the caller can use another backend
+        // with the time that remains instead of giving up at once.
+        return Err(Fzn2smtError::CpEncodingCapacity(capacity.to_string()));
     }
 
     // Use set_deadline so the timer starts AFTER encoding inside each

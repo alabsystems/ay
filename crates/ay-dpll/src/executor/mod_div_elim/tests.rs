@@ -797,3 +797,39 @@ fn test_general_symbolic_division_gets_no_exact_lemma() {
     let result = eliminate_int_mod_div(&mut terms, &[div_expr]);
     assert_eq!(result.constraints.len(), 1);
 }
+
+#[test]
+fn lambda_mod_div_purification_respects_binders_and_ground_uses() {
+    let mut terms = setup_term_store();
+    let index = terms.mk_var("bound_index", Sort::Int);
+    let other = terms.mk_var("outer_index", Sort::Int);
+    let two = terms.mk_int(2.into());
+    let zero = terms.mk_int(0.into());
+    let remainder = terms.mk_mod(index, two);
+    let quotient = terms.mk_intdiv(other, index);
+    let body = terms.mk_add(vec![remainder, quotient]);
+    let lambda = terms.mk_lambda_array(index, body);
+    let nested_lambda = terms.mk_lambda_array(other, lambda);
+    let predicate = terms.mk_eq(body, zero);
+    let forall = terms.mk_forall(vec![("bound_index".to_owned(), Sort::Int)], predicate);
+    let exists = terms.mk_exists(vec![("bound_index".to_owned(), Sort::Int)], predicate);
+    let let_binding = terms.mk_let(vec![("bound_index".to_owned(), two)], body);
+    let binders = [lambda, nested_lambda, forall, exists, let_binding];
+
+    for eliminate in [eliminate_int_mod_div_by_constant, eliminate_int_mod_div] {
+        let kept = eliminate(&mut terms, &binders);
+        assert_eq!(kept.rewritten, binders);
+        assert!(kept.constraints.is_empty());
+        assert!(!kept.introduced_unconstrained_div_mod);
+
+        // A DAG node shared by an opaque binder and a ground occurrence
+        // can still be purified at the latter occurrence.
+        for inputs in [[lambda, remainder], [remainder, lambda]] {
+            let rewritten = eliminate(&mut terms, &inputs);
+            let lambda_index = usize::from(inputs[0] != lambda);
+            assert_eq!(rewritten.rewritten[lambda_index], lambda);
+            assert_ne!(rewritten.rewritten[1 - lambda_index], remainder);
+            assert_eq!(rewritten.constraints.len(), 3);
+        }
+    }
+}

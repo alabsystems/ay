@@ -135,7 +135,6 @@ impl LraSolver {
         let normalized_expr = expr.normalize();
 
         for row in &self.rows {
-            let row_constant_big = row.constant.to_big();
             // Tableau rows are constructed and pivot-maintained
             // normalized, so the common case compares slices in place;
             // the clone+normalize fallback covers any row that is not.
@@ -160,8 +159,13 @@ impl LraSolver {
             let (required_basic_value, ratio_positive) =
                 if same_coeff_slices(&normalized_expr.coeffs, row_coeffs) {
                     // expr = row_expr + (expr_constant - row_constant).
+                    // The row constant is widened to a BigRational only for a
+                    // MATCHING row: converting it for every row before the
+                    // comparison was the allocation hot spot of this scan
+                    // (AY-SMT-2 sampling: UFLIA 21ea7d7d spent most of its
+                    // samples in `to_big`/drop of this value).
                     (
-                        target_value - expr.constant.to_big() + &row_constant_big,
+                        target_value - expr.constant.to_big() + row.constant.to_big(),
                         true,
                     )
                 } else if let Some(k) =
@@ -169,6 +173,7 @@ impl LraSolver {
                 {
                     // expr = k * basic_var + (expr_constant - k * row_constant).
                     let positive = k.is_positive();
+                    let row_constant_big = row.constant.to_big();
                     (
                         (target_value - expr.constant.to_big() + &k * &row_constant_big) / &k,
                         positive,

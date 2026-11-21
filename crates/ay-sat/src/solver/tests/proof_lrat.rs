@@ -994,7 +994,7 @@ fn clause_trace_level0_conflict_missing_id_fails_closed() {
     let conflict_offset = solver.arena.len();
     assert!(solver.add_clause(vec![b.negated(), c.negated()]));
     assert_ne!(solver.cold.clause_ids[conflict_offset], 0);
-    solver.cold.clause_ids[conflict_offset] = 0;
+    solver.cold.clause_ids.set(conflict_offset, 0);
 
     assert!(solver.solve().into_inner().is_unsat());
     let trace = solver.take_clause_trace().expect("clause trace enabled");
@@ -1723,7 +1723,7 @@ fn test_bve_lrat_missing_parent_id_skips_before_mutation() {
 
     let parent0 = solver.arena.literals(pos_ante).to_vec();
     let parent1 = solver.arena.literals(neg_ante).to_vec();
-    solver.cold.clause_ids[pos_ante] = 0;
+    solver.cold.clause_ids.set(pos_ante, 0);
     let clause_ids_before = solver.cold.clause_ids.clone();
     let reconstruction_before = solver.inproc.reconstruction.len();
     let proof_added_before = solver.proof_manager.as_ref().unwrap().added_count();

@@ -3007,6 +3007,7 @@ fn test_dimacs_timeout_exit_discards_buffered_proof_output_2971() {
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: true,
+        label: None,
     };
     #[cfg(target_os = "linux")]
     inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
@@ -3121,6 +3122,7 @@ fn test_synthesized_default_dimacs_non_unsat_cleanup_removes_private_staging() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let file = create_configured_dimacs_proof_file(&proof).expect("create owned proof fixture");
     let proof_output = ProofOutput::lrat_text(BufWriter::new(file), 1);
@@ -3185,6 +3187,7 @@ fn test_dense_clique_php_route_rejection_cleanup_removes_proof_sidecar() {
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: false,
+        label: None,
     };
 
     let telemetry = cleanup_dense_clique_php_route_rejection_proof(&mut solver, &proof)
@@ -4180,6 +4183,7 @@ fn synthesized_default_preexisting_proof_gets_explicit_stale_status() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
 
     let error = create_configured_dimacs_proof_file(&proof)
@@ -4210,6 +4214,7 @@ fn synthesized_default_never_overwrites_preexisting_status_output() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let status_path = dimacs_proof_status_path(&proof.path);
     std::fs::write(&status_path, b"unrelated status bytes\n").expect("seed status replacement");
@@ -4238,6 +4243,7 @@ fn status_lock_post_create_identity_failure_cleans_exact_owned_path() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let status_path = dimacs_proof_status_path(&proof.path);
     let lock_path = dimacs_proof_status_lock_path(&status_path);
@@ -4273,6 +4279,7 @@ fn concurrent_synthesized_default_loser_cannot_replace_winner_status() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut winner =
         create_configured_dimacs_proof_file(&proof).expect("winner reserves transaction");
@@ -4320,6 +4327,7 @@ fn late_status_collision_removes_only_the_owned_proof_generation() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4360,6 +4368,7 @@ fn current_status_remains_absent_until_required_artifact_is_published() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4398,6 +4407,7 @@ fn status_failure_cleans_retained_artifact_without_touching_replacement() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4462,6 +4472,7 @@ fn status_lock_cleanup_preserves_a_raced_replacement() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"partial\n").expect("write staged proof");
@@ -4511,6 +4522,7 @@ fn retained_proof_replacement_invalidates_exact_inode_for_both_policies() {
             is_temp: false,
             synthesized_default: requirement.is_optional(),
             format_was_explicit: false,
+            label: None,
         };
         let mut output = match requirement {
             DimacsProofRequirement::Optional => {
@@ -4567,6 +4579,7 @@ fn retained_status_replacement_invalidates_proof_and_exact_marker() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4621,6 +4634,7 @@ fn retained_artifact_replacement_invalidates_proof_and_exact_artifact() {
         is_temp: false,
         synthesized_default: false,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4694,6 +4708,7 @@ fn temporary_proof_stays_valid_until_verdict_then_preserves_replacement() {
         is_temp: true,
         synthesized_default: false,
         format_was_explicit: false,
+        label: None,
     };
     let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve temp proof");
     output.write_all(b"0\n").expect("write proof");
@@ -4794,6 +4809,7 @@ fn unsupported_platform_proof_gate_mutates_no_paths() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let error = create_configured_dimacs_proof_file(&proof)
         .expect_err("unsupported platform must fail before mutation");
@@ -5075,6 +5091,7 @@ fn allocator_ceiling_discards_a_byte_bearing_proof_generation() {
             is_temp: false,
             synthesized_default: false,
             format_was_explicit: true,
+            label: None,
         };
         #[cfg(target_os = "linux")]
         inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);

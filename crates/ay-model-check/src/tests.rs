@@ -1461,6 +1461,7 @@ impl ModelView for UfStubModel {
 }
 
 include!("tests/uf_congruence_and_projection.rs");
+include!("tests/sequence_unconstrained.rs");
 
 // ===========================================================================
 // (e) Array-`select` reads via the model — value-keyed select graph

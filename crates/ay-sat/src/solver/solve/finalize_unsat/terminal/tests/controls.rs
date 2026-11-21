@@ -123,7 +123,7 @@ fn owned_post_proof_operation_unwind_poison_is_sticky_and_never_flushes_pending_
 #[test]
 fn missing_actual_conflict_id_cannot_mint_a_substitute_terminal_proof() {
     let (mut s, conflict, _) = fixture();
-    s.cold.clause_ids[conflict.0 as usize] = 0;
+    s.cold.clause_ids.set(conflict.0 as usize, 0);
     let before = rows(&s);
     let next = s.cold.next_clause_id;
     let owner = test_owner(1_000_000, 1_000_000);

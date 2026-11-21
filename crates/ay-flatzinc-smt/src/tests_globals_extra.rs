@@ -33,6 +33,81 @@ fn solve_fzn_verdict(input: &str) -> String {
     panic!("translated model produced no solver verdict")
 }
 
+// --- Global: ay_circuit (circuit with an explicit node base) ---
+
+/// `ay_circuit(x, base)` is what AY's mznlib emits for `circuit`, because a
+/// FlatZinc array has lost the MiniZinc index set (AY-N3: a 0-based circuit
+/// read as 1-based gave a false UNSATISFIABLE). Every fixed successor
+/// assignment must be sat exactly when it is a Hamiltonian cycle over
+/// `base..base+n-1`, checked by brute force.
+#[test]
+fn test_ay_circuit_fixed_assignments_match_brute_force() {
+    fn is_circuit(succ: &[i64], base: i64) -> bool {
+        let n = succ.len();
+        let mut node = 0usize;
+        for step in 1..=n {
+            let next = succ[node] - base;
+            if next < 0 || next as usize >= n {
+                return false;
+            }
+            node = next as usize;
+            if node == 0 {
+                return step == n;
+            }
+        }
+        false
+    }
+    for (base, n) in [(0i64, 3usize), (1, 2), (-1, 3), (0, 1)] {
+        // One value outside the node range on each side as well.
+        let lo = base - 1;
+        let width = n + 2;
+        for code in 0..width.pow(n as u32) {
+            let mut c = code;
+            let succ: Vec<i64> = (0..n)
+                .map(|_| {
+                    let v = lo + (c % width) as i64;
+                    c /= width;
+                    v
+                })
+                .collect();
+            let decls: String = (0..n).map(|i| format!("var int: s{i};\n")).collect();
+            let fixes: String = succ
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("constraint int_eq(s{i}, {v});\n"))
+                .collect();
+            let names: Vec<String> = (0..n).map(|i| format!("s{i}")).collect();
+            let fzn = format!(
+                "{decls}constraint ay_circuit([{}], {base});\n{fixes}solve satisfy;\n",
+                names.join(", ")
+            );
+            let expected = if is_circuit(&succ, base) {
+                "sat"
+            } else {
+                "unsat"
+            };
+            assert_eq!(
+                solve_fzn_verdict(&fzn),
+                expected,
+                "base {base}, succ {succ:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_ay_circuit_zero_based_two_nodes_is_satisfiable() {
+    // atp-stage2 instance6, reduced: the only circuit over {0, 1} is [1, 0].
+    assert_eq!(
+        solve_fzn_verdict(
+            "var 0..1: a;\nvar 0..1: b;\n\
+             constraint ay_circuit([a, b], 0);\n\
+             constraint int_ne(b, 1);\nsolve satisfy;\n"
+        ),
+        "sat"
+    );
+}
+
 // --- Global: global_cardinality ---
 
 #[test]

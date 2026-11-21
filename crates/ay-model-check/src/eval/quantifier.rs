@@ -289,6 +289,20 @@ impl Evaluator<'_> {
         let count = crate::residual::term_child_count(data)
             .ok_or_else(|| "unsupported binding-scan term".to_string())?;
         self.charge_quantifier_work(count)?;
+        if self.functional_capture_depth.get() != 0 || self.model.has_functional_arrays() {
+            let bytes = stack
+                .len()
+                .checked_add(count)
+                .and_then(|capacity| capacity.checked_add(stack.len()))
+                .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<TermId>()))
+                .ok_or_else(|| EvalError::from("functional binding scan allocation overflow"))?;
+            self.charge_functional_work(
+                count
+                    .checked_add(bytes)
+                    .ok_or_else(|| EvalError::from("functional binding scan work overflow"))?,
+            )?;
+            self.admit_evaluation(count, bytes)?;
+        }
         stack
             .try_reserve(count)
             .map_err(|_| EvalError::from(QuantifierRejection::EvaluationBudget))?;

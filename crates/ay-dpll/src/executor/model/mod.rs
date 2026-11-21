@@ -82,6 +82,11 @@ mod output_format;
 mod output_objectives;
 mod overloaded_ctor_surface;
 mod projection_uf;
+mod symbolic_uf;
+pub(in crate::executor) use symbolic_uf::{
+    symbolic_source_inventory_work, SymbolicAdmission, SymbolicRecoveryScope, SymbolicUfDefinition,
+    SymbolicUfModel,
+};
 mod public_uf_observation;
 mod recovery_admission;
 mod rendered_dt_guard;
@@ -751,6 +756,16 @@ impl Executor {
         // partial atom sweep masquerade as a complete score.
         if self.w4_budget_exhausted() {
             return EvalValue::Unknown;
+        }
+        // A symbolic total body owns its application ahead of all completion
+        // channels and old per-term pins. Body argument values still use the
+        // ordinary independent array/completion semantics.
+        match self.symbolic_function_value(model, term_id) {
+            Ok(Some(value)) => {
+                return self.completed_scalar_value(&value, self.ctx.terms.sort(term_id))
+            }
+            Ok(None) => {}
+            Err(_) => return EvalValue::Unknown,
         }
         // Typed residual completions precede every old scalar pin/cache. Their
         // independent evaluator computes fresh reads from the retained array,

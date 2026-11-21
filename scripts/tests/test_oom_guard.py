@@ -19,6 +19,7 @@ import lzma
 import os
 import queue
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -37,6 +38,9 @@ import _oom_guard as og  # noqa: E402
 import smtcomp_harness  # noqa: E402
 import pbcomp_harness  # noqa: E402
 import wind_tunnel  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _python_fixture import python_header  # noqa: E402
 
 _missing_posix_apis = [
     name for name in ("getuid", "getpgid") if not hasattr(os, name)
@@ -1522,7 +1526,7 @@ class WindTunnelMemoutTest(unittest.TestCase):
             with open(hog, "w") as fh:
                 fh.write("#!/bin/sh\nexec %s -c 'import time; "
                          "b = bytearray(400*1024*1024); time.sleep(60)'\n"
-                         % sys.executable)
+                         % shlex.quote(sys.executable))
             os.chmod(hog, 0o755)
             workdir = os.path.join(td, "work")
             os.makedirs(workdir)
@@ -2615,7 +2619,7 @@ class LegacyGuardedCallerTest(unittest.TestCase):
                     "time.sleep(30)"
                 )
                 script.write_text(
-                    f"#!{sys.executable}\n"
+                    python_header() +
                     "import pathlib,subprocess,sys,time\n"
                     f"p = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
                     f"pathlib.Path({str(pidfile)!r}).write_text(str(p.pid))\n"

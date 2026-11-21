@@ -59,7 +59,8 @@ pub(super) fn validate_constraint_arity(c: &ConstraintItem) -> Result<()> {
         | "fzn_lex_less_int"
         | "lex_less_int"
         | "fzn_nvalue"
-        | "nvalue" => &[2],
+        | "nvalue"
+        | "ay_circuit" => &[2],
 
         "bool_and" | "bool_or" | "bool_xor" => &[2, 3],
 

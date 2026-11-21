@@ -36,7 +36,12 @@
 //!  * structural ACYCLICITY (a directed cycle in the class graph whose edges
 //!    go from a class through a registered constructor-application member to
 //!    its argument classes refutes: a constructor value is a finite tree, so
-//!    no value properly contains itself).
+//!    no value properly contains itself);
+//!  * native sequence ELEMENT CONTAINMENT: `seq.unit` contains its element;
+//!    `seq.nth` contains an element only under exact asserted integer bounds
+//!    `0 <= i < seq.len(s)`. These edges are weak, and a reported mixed cycle
+//!    must include an actual strict datatype field edge. Sequence concatenation
+//!    is never treated as strict owned descent.
 //!
 //! Contradiction is reached when TRUE and FALSE merge, a recorded
 //! disequality's sides merge, or a clash/exclusivity/acyclicity rule fires.
@@ -58,6 +63,7 @@ use super::ProofCheckError;
 
 mod cycle;
 mod refuter;
+mod resources;
 
 use refuter::GroundRefuter;
 
@@ -78,6 +84,28 @@ pub(crate) fn validate_datatype_ground_conflict(
     dt_decls: DatatypeDecls<'_>,
     ctor_selectors: SelectorDecls<'_>,
 ) -> Result<(), ProofCheckError> {
+    validate_datatype_ground_conflict_with_progress(
+        terms,
+        step_id,
+        clause,
+        dt_decls,
+        ctor_selectors,
+        &mut |work, _| {
+            ay_core::resource::current_guard()
+                .is_none_or(|guard| guard.tick(u64::try_from(work).unwrap_or(u64::MAX)).is_ok())
+                && !ay_core::resource::check_stop_requested()
+        },
+    )
+}
+
+pub(crate) fn validate_datatype_ground_conflict_with_progress(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+    ctor_selectors: SelectorDecls<'_>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
     let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
         step: step_id,
         reason,
@@ -87,6 +115,10 @@ pub(crate) fn validate_datatype_ground_conflict(
             "datatype ground-conflict clause must be non-empty".to_string(),
         ));
     }
+    let mut control = resources::Control::new(progress);
+    control
+        .source(terms, clause, dt_decls, ctor_selectors)
+        .map_err(|_| ProofCheckError::ResourceLimit)?;
     let literals = flatten_clause_literals(terms, clause);
 
     let mut refuter = GroundRefuter::new(terms, dt_decls, ctor_selectors);
@@ -95,6 +127,9 @@ pub(crate) fn validate_datatype_ground_conflict(
     let mut atoms: Vec<TermId> = Vec::new();
     let mut polarities: Vec<(TermId, bool)> = Vec::new();
     for &literal in &literals {
+        if !control.poll() {
+            return Err(ProofCheckError::ResourceLimit);
+        }
         match terms.get(literal) {
             TermData::Not(inner) => {
                 atoms.push(*inner);
@@ -106,24 +141,40 @@ pub(crate) fn validate_datatype_ground_conflict(
             }
         }
     }
-    if refuter.collect_universe(&atoms).is_err() {
+    if refuter.collect_universe(&atoms, &mut control).is_err() {
+        if control.stopped() {
+            return Err(ProofCheckError::ResourceLimit);
+        }
         return Err(invalid(
             "datatype ground-conflict refuter: non-ground construct or node budget exceeded"
                 .to_string(),
         ));
     }
     for (atom, polarity) in polarities {
+        if !control.poll() {
+            return Err(ProofCheckError::ResourceLimit);
+        }
         refuter.assume(atom, polarity);
     }
 
     for _ in 0..MAX_GROUND_ROUNDS {
         let mut changed = false;
-        if refuter.round(&mut changed) {
+        if !control.round() {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        let conflict = refuter.round(&mut changed, &mut control);
+        if control.stopped() || !control.poll() {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        if conflict {
             return Ok(());
         }
         if !changed {
             break;
         }
+    }
+    if refuter.has_sequence_owned_cycle(&mut control.budget, control.progress)? {
+        return Ok(());
     }
     Err(invalid(
         "datatype ground-conflict refuter reached saturation without contradiction; \
@@ -420,3 +471,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod owned_sequence_tests;

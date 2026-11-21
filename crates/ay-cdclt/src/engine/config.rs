@@ -6,7 +6,7 @@
 //! bounds one check ([`Guard`], design R1).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use ay_core::resource::{self, ResourceGuard};
@@ -145,7 +145,10 @@ impl Exhausted {
     }
 }
 
-/// A caller's live stop question.
+/// A caller's live stop question for one check. Clones share its first
+/// observed stop; clearing a flag or changing a deadline cannot revive that
+/// check. A later caller-owned check must create its control view explicitly,
+/// retaining any cumulative ResourceGuard it is required to share.
 type StopPredicate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// The resources of one check (design R1): a deadline, a cancel flag, a
@@ -162,6 +165,9 @@ pub struct Guard {
     cancel: Option<Arc<AtomicBool>>,
     stop: Option<StopPredicate>,
     resource: ResourceGuard,
+    /// First observed stop for this caller-owned check. Guard clones share
+    /// this reason; clearing a live flag cannot renew an ended callback.
+    refusal: Arc<OnceLock<Exhausted>>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -219,26 +225,44 @@ impl Guard {
         self.deadline
     }
 
-    /// Why the check must stop now, if it must (the deadline is read first).
+    /// Debit the same caller's resource owner. Statistics never debit it again.
+    /// Caller-level deadline/stop polling remains the context's periodic job.
+    pub(crate) fn charge_ticks(&self, cost: u64) -> Result<(), Exhausted> {
+        // Offer every charge to the original owner, even after this adapter
+        // has observed an external stop. Its own sticky semantics decide what
+        // is counted/refused; do not create a replacement owner or refund.
+        let charged = self.resource.tick(cost).map_err(resource_stop);
+        if let Some(&why) = self.refusal.get() {
+            return Err(why);
+        }
+        charged.map_err(|why| self.latch(why))
+    }
+
+    fn latch(&self, why: Exhausted) -> Exhausted {
+        *self.refusal.get_or_init(|| why)
+    }
+
+    /// Why the check must stop now. Preserve deadline/cancel/resource ordering
+    /// on its first observation; later polls keep that exact typed reason.
     #[must_use]
     pub fn exhausted(&self) -> Option<Exhausted> {
+        if let Some(&why) = self.refusal.get() {
+            return Some(why);
+        }
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return Some(Exhausted::Deadline);
+            return Some(self.latch(Exhausted::Deadline));
         }
         let cancelled = self
             .cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed));
         if cancelled || self.stop.as_ref().is_some_and(|stop| stop()) {
-            return Some(Exhausted::Interrupted);
+            return Some(self.latch(Exhausted::Interrupted));
         }
-        self.resource.exhausted().map(|why| match why {
-            resource::Exhausted::Cancelled => Exhausted::Interrupted,
-            // A spent CPU slice is spelled `timeout`, like the deadline.
-            resource::Exhausted::Deadline | resource::Exhausted::Cpu => Exhausted::Deadline,
-            resource::Exhausted::Rlimit => Exhausted::Rlimit,
-            resource::Exhausted::Memory => Exhausted::Memory,
-        })
+        self.resource
+            .exhausted()
+            .map(resource_stop)
+            .map(|why| self.latch(why))
     }
 
     /// The search's stop question.
@@ -246,4 +270,36 @@ impl Guard {
     pub fn should_stop(&self) -> bool {
         self.exhausted().is_some()
     }
+}
+
+/// Retain the exact existing resource-stop mapping, including CPU slices.
+fn resource_stop(why: resource::Exhausted) -> Exhausted {
+    match why {
+        resource::Exhausted::Cancelled => Exhausted::Interrupted,
+        resource::Exhausted::Deadline | resource::Exhausted::Cpu => Exhausted::Deadline,
+        resource::Exhausted::Rlimit => Exhausted::Rlimit,
+        resource::Exhausted::Memory => Exhausted::Memory,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn kernel_plugin_tick_resource_reason_mapping_is_unchanged() {
+    assert_eq!(
+        resource_stop(resource::Exhausted::Cancelled),
+        Exhausted::Interrupted
+    );
+    assert_eq!(
+        resource_stop(resource::Exhausted::Deadline),
+        Exhausted::Deadline
+    );
+    assert_eq!(resource_stop(resource::Exhausted::Cpu), Exhausted::Deadline);
+    assert_eq!(
+        resource_stop(resource::Exhausted::Rlimit),
+        Exhausted::Rlimit
+    );
+    assert_eq!(
+        resource_stop(resource::Exhausted::Memory),
+        Exhausted::Memory
+    );
 }

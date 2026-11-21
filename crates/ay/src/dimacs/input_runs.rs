@@ -6,6 +6,175 @@ fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
     Sha256::digest(bytes).into()
 }
 
+/// Inputs at least this long that the XOR route would refuse are parsed
+/// straight from the file (AY-SAT-1).
+const STREAM_DIMACS_MIN_BYTES: u64 = 64 << 20;
+
+/// Longest leading comment block the pre-scan reads to find the header.
+const STREAM_DIMACS_HEADER_PREFIX_MAX: usize = 1 << 20;
+
+/// What [`prescan_large_dimacs`] decided.
+enum LargeDimacsPrescan {
+    /// Read the whole file into memory, as for every small input.
+    InMemory,
+    /// Parse from the file; the whole-buffer facts were gathered line by line.
+    Stream {
+        sha256: Sha256Digest,
+        max_var: usize,
+    },
+}
+
+enum LargeDimacsPrescanError {
+    Io(io::Error),
+    Utf8(std::str::Utf8Error),
+}
+
+/// Decide whether `path` is parsed from the file, and if so gather, in one
+/// pass, the SHA-256 of its bytes, their UTF-8 validity and the largest
+/// variable [`scan_max_variable`] would report on the whole buffer.
+///
+/// Streams only when the file is at least [`STREAM_DIMACS_MIN_BYTES`] long and
+/// its header declares more clauses than the XOR route accepts (the route
+/// needs the whole text); `--xor-allow-large`, a header not found within
+/// [`STREAM_DIMACS_HEADER_PREFIX_MAX`] bytes, or a small header keep the
+/// in-memory path. Lines are split at `\n`, which no multi-byte UTF-8
+/// sequence contains, and `scan_max_variable` restarts its state at every
+/// newline, so checking and scanning each line equals doing it on the whole.
+///
+/// `min_bytes` is [`STREAM_DIMACS_MIN_BYTES`] in production; tests pass a
+/// smaller one to drive the route on a small file.
+fn prescan_large_dimacs(
+    path: &Path,
+    min_bytes: u64,
+) -> Result<LargeDimacsPrescan, LargeDimacsPrescanError> {
+    let file = open_dimacs_regular_file(path).map_err(LargeDimacsPrescanError::Io)?;
+    let len = file.metadata().map_err(LargeDimacsPrescanError::Io)?.len();
+    if len < min_bytes || ay_core::misc_cli_flags().xor_allow_large {
+        return Ok(LargeDimacsPrescan::InMemory);
+    }
+    let reader = io::BufReader::with_capacity(1 << 20, file);
+    Ok(match prescan_dimacs_lines(reader)? {
+        Some((sha256, max_var)) => LargeDimacsPrescan::Stream { sha256, max_var },
+        None => LargeDimacsPrescan::InMemory,
+    })
+}
+
+/// The pass of [`prescan_large_dimacs`] over `reader`: `None` when the
+/// header keeps the input in memory, else its SHA-256 and maximum variable.
+fn prescan_dimacs_lines<B: io::BufRead>(
+    mut reader: B,
+) -> Result<Option<(Sha256Digest, usize)>, LargeDimacsPrescanError> {
+    let mut hasher = Sha256::new();
+    let mut line = Vec::new();
+    let mut header_prefix = Vec::new();
+    let mut header_decided = false;
+    let mut max_var = 0usize;
+    let mut max_var_done = false;
+    loop {
+        line.clear();
+        let n = reader
+            .read_until(b'\n', &mut line)
+            .map_err(LargeDimacsPrescanError::Io)?;
+        if n == 0 {
+            break;
+        }
+        std::str::from_utf8(&line).map_err(LargeDimacsPrescanError::Utf8)?;
+        hasher.update(&line);
+        if !header_decided {
+            header_prefix.extend_from_slice(&line);
+            let trimmed = String::from_utf8_lossy(&line);
+            let trimmed = trimmed.trim();
+            let comment = trimmed.is_empty() || trimmed.starts_with('c');
+            if !comment || header_prefix.len() > STREAM_DIMACS_HEADER_PREFIX_MAX {
+                header_decided = true;
+                let header = std::str::from_utf8(&header_prefix)
+                    .ok()
+                    .and_then(scan_dimacs_header);
+                match header {
+                    Some((_, clauses)) if clauses > XOR_EXTENSION_MAX_CLAUSES => {
+                        header_prefix = Vec::new();
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+        if !max_var_done {
+            let first = line
+                .iter()
+                .find(|&&byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
+            if first == Some(&b'%') {
+                max_var_done = true;
+            } else {
+                max_var = max_var.max(scan_max_variable(&line));
+            }
+        }
+    }
+    if !header_decided {
+        return Ok(None);
+    }
+    Ok(Some((hasher.finalize().into(), max_var)))
+}
+
+/// A reader that hashes what it passes on and, at end of input, fails with
+/// `InvalidData` unless the bytes match the pre-scan's SHA-256: a file that
+/// changed between the pre-scan and the parse ends the run with a parse
+/// error (`s UNKNOWN`), never a solve of different bytes (AY-SAT-1).
+struct Sha256CheckingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    expected: Sha256Digest,
+    checked: bool,
+}
+
+impl<R> Sha256CheckingReader<R> {
+    fn new(inner: R, expected: Sha256Digest) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            expected,
+            checked: false,
+        }
+    }
+}
+
+impl<R: Read> Read for Sha256CheckingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        } else if !buf.is_empty() && !self.checked {
+            self.checked = true;
+            let digest: Sha256Digest = std::mem::take(&mut self.hasher).finalize().into();
+            if digest != self.expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DIMACS input changed between its pre-scan and its parse",
+                ));
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// The large-file route's reader: the file again, through the check that its
+/// bytes are the pre-scanned ones.
+fn open_streamed_dimacs(
+    path: &Path,
+    sha256: Sha256Digest,
+) -> io::Result<io::BufReader<Sha256CheckingReader<File>>> {
+    let file = open_dimacs_regular_file(path)?;
+    Ok(io::BufReader::with_capacity(
+        1 << 20,
+        Sha256CheckingReader::new(file, sha256),
+    ))
+}
+
+/// Read what the parser left (it stops at a `%` line) through the SHA-256
+/// check, so every byte of the file is checked before anything is solved.
+fn drain_streamed_dimacs<R: Read>(mut reader: R) -> io::Result<()> {
+    io::copy(&mut reader, &mut io::sink()).map(drop)
+}
+
 fn read_authenticated_dimacs_source(
     path: &str,
     expected_sha256: Sha256Digest,
@@ -226,6 +395,45 @@ pub(crate) fn run_dimacs_proof_from_file(
         }
     };
     let canonical_input_text = canonical_input.to_string_lossy().into_owned();
+    // AY-SAT-1: a large input that the XOR route's header gate refuses is
+    // parsed straight from the file, so its bytes are not held in memory
+    // while the solver is built and loaded (1.76 GB of the 14400 MiB budget
+    // on e85fb114). The pre-scan gathers what the in-memory path computes
+    // from the whole buffer (SHA-256, UTF-8 validity, maximum variable).
+    match prescan_large_dimacs(&canonical_input, STREAM_DIMACS_MIN_BYTES) {
+        Ok(LargeDimacsPrescan::InMemory) => {}
+        Ok(LargeDimacsPrescan::Stream { sha256, max_var }) => {
+            let reader = match open_streamed_dimacs(&canonical_input, sha256) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    safe_eprintln!("Error reading file '{path}': {error}");
+                    std::process::exit(1);
+                }
+            };
+            run_proof_streaming_reader_body_then(
+                reader,
+                stats_cfg,
+                selected_sat_variant(),
+                proof,
+                DimacsInputSource::FilePath {
+                    path: &canonical_input_text,
+                    sha256,
+                },
+                Some(max_var),
+                drain_streamed_dimacs,
+            );
+            return;
+        }
+        Err(LargeDimacsPrescanError::Utf8(error)) => {
+            safe_eprintln!("c Parse error: DIMACS input is not valid UTF-8/ASCII: {error}");
+            safe_println!("s UNKNOWN");
+            std::process::exit(1);
+        }
+        Err(LargeDimacsPrescanError::Io(error)) => {
+            safe_eprintln!("Error reading file '{path}': {error}");
+            std::process::exit(1);
+        }
+    }
     let bytes = match open_dimacs_regular_file(&canonical_input).and_then(|mut file| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -254,6 +462,10 @@ pub(crate) fn run_dimacs_proof_from_file(
     // built two near-copies of the formula.) The UTF-8 check above makes the
     // str conversion infallible.
     if let Ok(content_str) = std::str::from_utf8(&bytes) {
+        // AY-SAT-2: a near-pure XOR CNF is answered SAT from the affine
+        // solution space of its XOR system, with a checked model and no
+        // proof, before the XOR proof route (which declines such CNFs).
+        exit_if_parity_space_model_in_content(content_str, stats_cfg, proof);
         if try_run_xor_proof_route(content_str, stats_cfg, selected_sat_variant(), proof) {
             return;
         }

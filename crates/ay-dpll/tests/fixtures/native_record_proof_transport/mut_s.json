@@ -1,0 +1,4145 @@
+{
+  "assertions": [
+    {
+      "index": 0,
+      "name": null,
+      "scope_depth": 0,
+      "term": 11
+    },
+    {
+      "index": 1,
+      "name": "__verification_consumer_precondition_0",
+      "scope_depth": 0,
+      "term": 13
+    },
+    {
+      "index": 2,
+      "name": "__verification_consumer_precondition_1",
+      "scope_depth": 0,
+      "term": 14
+    },
+    {
+      "index": 3,
+      "name": "__verification_consumer_precondition_2",
+      "scope_depth": 0,
+      "term": 16
+    },
+    {
+      "index": 4,
+      "name": null,
+      "scope_depth": 0,
+      "term": 19
+    },
+    {
+      "index": 5,
+      "name": null,
+      "scope_depth": 0,
+      "term": 25
+    },
+    {
+      "index": 6,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 7,
+      "name": null,
+      "scope_depth": 0,
+      "term": 29
+    },
+    {
+      "index": 8,
+      "name": null,
+      "scope_depth": 0,
+      "term": 31
+    },
+    {
+      "index": 9,
+      "name": null,
+      "scope_depth": 0,
+      "term": 34
+    },
+    {
+      "index": 10,
+      "name": null,
+      "scope_depth": 0,
+      "term": 36
+    },
+    {
+      "index": 11,
+      "name": null,
+      "scope_depth": 0,
+      "term": 38
+    },
+    {
+      "index": 12,
+      "name": null,
+      "scope_depth": 0,
+      "term": 40
+    },
+    {
+      "index": 13,
+      "name": null,
+      "scope_depth": 0,
+      "term": 42
+    },
+    {
+      "index": 14,
+      "name": null,
+      "scope_depth": 0,
+      "term": 48
+    },
+    {
+      "index": 15,
+      "name": null,
+      "scope_depth": 0,
+      "term": 54
+    },
+    {
+      "index": 16,
+      "name": null,
+      "scope_depth": 0,
+      "term": 55
+    },
+    {
+      "index": 17,
+      "name": null,
+      "scope_depth": 0,
+      "term": 56
+    },
+    {
+      "index": 18,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 19,
+      "name": null,
+      "scope_depth": 0,
+      "term": 57
+    },
+    {
+      "index": 20,
+      "name": null,
+      "scope_depth": 0,
+      "term": 63
+    },
+    {
+      "index": 21,
+      "name": null,
+      "scope_depth": 0,
+      "term": 64
+    },
+    {
+      "index": 22,
+      "name": null,
+      "scope_depth": 0,
+      "term": 70
+    },
+    {
+      "index": 23,
+      "name": null,
+      "scope_depth": 0,
+      "term": 76
+    },
+    {
+      "index": 24,
+      "name": null,
+      "scope_depth": 0,
+      "term": 77
+    },
+    {
+      "index": 25,
+      "name": null,
+      "scope_depth": 0,
+      "term": 83
+    },
+    {
+      "index": 26,
+      "name": null,
+      "scope_depth": 0,
+      "term": 84
+    },
+    {
+      "index": 27,
+      "name": null,
+      "scope_depth": 0,
+      "term": 90
+    },
+    {
+      "index": 28,
+      "name": null,
+      "scope_depth": 0,
+      "term": 91
+    },
+    {
+      "index": 29,
+      "name": null,
+      "scope_depth": 0,
+      "term": 94
+    },
+    {
+      "index": 30,
+      "name": null,
+      "scope_depth": 2,
+      "term": 23
+    },
+    {
+      "index": 31,
+      "name": null,
+      "scope_depth": 2,
+      "term": 562
+    },
+    {
+      "index": 32,
+      "name": null,
+      "scope_depth": 2,
+      "term": 585
+    }
+  ],
+  "ay_revision": "19cd4fa7243474fc1acc10c0f2a1b9c7aa56a537",
+  "ay_version": "0.27.0",
+  "checked_replay": null,
+  "created_unix_ms": "0",
+  "declarations": [
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s",
+      "name": "__verification_consumer_source_var_v1_b_s",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 5
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_current",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 15
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_final",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_final",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 17
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current",
+      "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 18
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s_current",
+      "name": "__verification_consumer_source_var_v1_b_s_current",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 20
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current_final",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_current_final",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 30
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current_view",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_current_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 32
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 33
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_old_s~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 35
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view",
+      "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 37
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_final_view",
+      "name": "__verification_consumer_source_var_v1_b_s~2e0_final_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 39
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_final_s~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_final_s~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 41
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s_final",
+      "name": "__verification_consumer_source_var_v1_b_s_final",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 43
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_current",
+      "name": "__verification_consumer_source_var_v1_b_old_s_current",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 49
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s_current_final",
+      "name": "__verification_consumer_source_var_v1_b_s_current_final",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 58
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s_current_view",
+      "name": "__verification_consumer_source_var_v1_b_s_current_view",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 65
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_s_view",
+      "name": "__verification_consumer_source_var_v1_b_s_view",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 71
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_view",
+      "name": "__verification_consumer_source_var_v1_b_old_s_view",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 78
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_current_view",
+      "name": "__verification_consumer_source_var_v1_b_old_s_current_view",
+      "sort": "S",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "term": 85
+    },
+    {
+      "core_name": "__verification_consumer_unit",
+      "name": "__verification_consumer_unit",
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "term": 92
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_result",
+      "name": "__verification_consumer_source_var_v1_b_result",
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "term": 93
+    }
+  ],
+  "events": [
+    {
+      "index": 0,
+      "kind": {
+        "event": "set_logic",
+        "logic": "ALL"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 1,
+      "kind": {
+        "event": "declare_const",
+        "name": "heap",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 2
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 2,
+      "kind": {
+        "event": "declare_const",
+        "name": "domain",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 3
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 3,
+      "kind": {
+        "event": "declare_const",
+        "name": "perms",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 4
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 4,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 5,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 5
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 6,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 11
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 7,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_0",
+        "term": 13
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 8,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "domain_data": [
+          {
+            "kind": "int"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "logic_inv__placeholder_i__ret_b",
+        "range": "Bool",
+        "range_data": {
+          "kind": "bool"
+        }
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 9,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_1",
+        "term": 14
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 10,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 15
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 11,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_2",
+        "term": 16
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 12,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_final",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 17
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 13,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 18
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 14,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 19
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 15,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s_current",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 20
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 16,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 25
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 17,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 18,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 29
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 19,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current_final",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 30
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 20,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 31
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 21,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 32
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 22,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 33
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 23,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 34
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 24,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 35
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 25,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 36
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 26,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 37
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 27,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 38
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 28,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_final_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 39
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 29,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 40
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 30,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_final_s~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 41
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 31,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 42
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 32,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s_final",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 43
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 33,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 48
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 34,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s_current",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 49
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 35,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 54
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 36,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 55
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 37,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 56
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 38,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 39,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 57
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 40,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s_current_final",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 58
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 41,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 63
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 42,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 64
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 43,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s_current_view",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 65
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 44,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 70
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 45,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_s_view",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 71
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 46,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 76
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 47,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 77
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 48,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s_view",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 78
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 49,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 83
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 50,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 84
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 51,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_s_current_view",
+        "sort": "S",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "S"
+        },
+        "term": 85
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 52,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 90
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 53,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 91
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 54,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_unit",
+        "sort": "Unit",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        },
+        "term": 92
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 55,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_result",
+        "sort": "Unit",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        },
+        "term": 93
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 56,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 94
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 57,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 58,
+      "kind": {
+        "domain": [
+          "S"
+        ],
+        "domain_data": [
+          {
+            "datatype": {
+              "constructors": [
+                {
+                  "fields": [
+                    {
+                      "name": "s_0",
+                      "sort": "Int",
+                      "sort_data": {
+                        "kind": "int"
+                      }
+                    }
+                  ],
+                  "name": "S"
+                }
+              ],
+              "name": "S"
+            },
+            "kind": "datatype"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "logic_____VERIFICATION_CONSUMER__tuple__get__0__placeholder_d53__ret_i",
+        "range": "Int",
+        "range_data": {
+          "kind": "int"
+        }
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 59,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 60,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 99
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 61,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 106
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 62,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 117
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 63,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 118
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 64,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 119
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 65,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 120
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 66,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 121
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 67,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 122
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 68,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 123
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 69,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 124
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 70,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 125
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 71,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 72,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 73,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 74,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 75,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 76,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 77,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 78,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 347
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 79,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 349
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 80,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 81,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 82,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 83,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 84,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 85,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 86,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 87,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 23
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 88,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 562
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 89,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 564
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 90,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 91,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 92,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 93,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 94,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "s_0",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "S"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "S"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 95,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 96,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 97,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 23
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 98,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 562
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 99,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 585
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 100,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    }
+  ],
+  "function_declarations": [
+    {
+      "core_name": "logic_inv__placeholder_i__ret_b",
+      "domain": [
+        "Int"
+      ],
+      "domain_data": [
+        {
+          "kind": "int"
+        }
+      ],
+      "name": "logic_inv__placeholder_i__ret_b",
+      "range": "Bool",
+      "range_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "logic": "ALL",
+  "metadata": {
+    "consumer": null,
+    "consumer_revision": null,
+    "fixture_path": null,
+    "function_path": null,
+    "notes": null,
+    "obligation_kind": null,
+    "source_span": null
+  },
+  "panic_payload": null,
+  "replay_gaps": [],
+  "schema": "ay.native-replay.v1",
+  "scope_depth": 2,
+  "selected_route": "native-api:ALL",
+  "solve": null,
+  "symbol_identities": [
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "S",
+      "datatype_core": "S",
+      "datatype_surface": "S",
+      "engine_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "datatype_constructor",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "S"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_final_s~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_final_s~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_s~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_s~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_result",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_result"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s_current_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s_current_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "s_0",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "S"
+            }
+          ],
+          "name": "S"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "S"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_current_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_final_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_final_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_s~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_s~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "core_name": "__verification_consumer_unit",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        }
+      },
+      "surface_name": "__verification_consumer_unit"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "s_0",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "S"
+              }
+            ],
+            "name": "S"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "is-S",
+      "datatype_core": "S",
+      "datatype_surface": "S",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "datatype_tester",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "S"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "is-S"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "logic_inv__placeholder_i__ret_b",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "logic_inv__placeholder_i__ret_b"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "s_0",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "S"
+              }
+            ],
+            "name": "S"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "s_0",
+      "datatype_core": "S",
+      "datatype_surface": "S",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "S"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "S"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "s_0"
+    }
+  ],
+  "terms": [
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "0"
+        }
+      },
+      "id": 8,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s",
+        "var_id": 3
+      },
+      "id": 5,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 7,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          7
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 9,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 6,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 6,
+        "kind": "not"
+      },
+      "id": 10,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          9,
+          10
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 11,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "100"
+        }
+      },
+      "id": 12,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          7,
+          12
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 13,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          7
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "logic_inv__placeholder_i__ret_b"
+        }
+      },
+      "id": 14,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current",
+        "var_id": 4
+      },
+      "id": 15,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "logic_inv__placeholder_i__ret_b"
+        }
+      },
+      "id": 16,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current",
+        "var_id": 6
+      },
+      "id": 18,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15,
+          18
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 19,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s_current",
+        "var_id": 7
+      },
+      "id": 20,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 22,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          22
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 23,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 21,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 21,
+        "kind": "not"
+      },
+      "id": 24,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          24
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 25,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "bool",
+          "value": true
+        }
+      },
+      "id": 0,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_final",
+        "var_id": 5
+      },
+      "id": 17,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "1"
+        }
+      },
+      "id": 26,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          22,
+          26
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 27,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          17,
+          27
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 29,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current_final",
+        "var_id": 8
+      },
+      "id": 30,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27,
+          30
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 31,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_current_view",
+        "var_id": 9
+      },
+      "id": 32,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_view",
+        "var_id": 10
+      },
+      "id": 33,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          32,
+          33
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 34,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_view",
+        "var_id": 11
+      },
+      "id": 35,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          35
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 36,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s~2e0_current_view",
+        "var_id": 12
+      },
+      "id": 37,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          32,
+          37
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 38,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s~2e0_final_view",
+        "var_id": 13
+      },
+      "id": 39,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27,
+          39
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 40,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_final_s~2e0_view",
+        "var_id": 14
+      },
+      "id": 41,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27,
+          41
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 42,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s_final",
+        "var_id": 15
+      },
+      "id": 43,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          43
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 45,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          45
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 46,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          43
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 44,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 44,
+        "kind": "not"
+      },
+      "id": 47,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          47
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 48,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s_current",
+        "var_id": 16
+      },
+      "id": 49,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 51,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          51
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 52,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 50,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 50,
+        "kind": "not"
+      },
+      "id": 53,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          52,
+          53
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 54,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          20,
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 55,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5,
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 56,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "S"
+        }
+      },
+      "id": 28,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          28,
+          43
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 57,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s_current_final",
+        "var_id": 17
+      },
+      "id": 58,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 60,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          60
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 61,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 59,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 59,
+        "kind": "not"
+      },
+      "id": 62,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          61,
+          62
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 63,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          28,
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 64,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s_current_view",
+        "var_id": 18
+      },
+      "id": 65,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          65
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 67,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          67
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 68,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          65
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 66,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 66,
+        "kind": "not"
+      },
+      "id": 69,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          68,
+          69
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 70,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_s_view",
+        "var_id": 19
+      },
+      "id": 71,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          71
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 73,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          73
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 74,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          71
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 72,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 72,
+        "kind": "not"
+      },
+      "id": 75,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          74,
+          75
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 76,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          65,
+          71
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 77,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s_view",
+        "var_id": 20
+      },
+      "id": 78,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          78
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 80,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          80
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 81,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          78
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 79,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 79,
+        "kind": "not"
+      },
+      "id": 82,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          81,
+          82
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 83,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          71,
+          78
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 84,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_s_current_view",
+        "var_id": 21
+      },
+      "id": 85,
+      "is_datatype_constructor": false,
+      "sort": "S",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "S"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          85
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "s_0"
+        }
+      },
+      "id": 87,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          87
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 88,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          85
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-S"
+        }
+      },
+      "id": 86,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 86,
+        "kind": "not"
+      },
+      "id": 89,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          88,
+          89
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 90,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          65,
+          85
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 91,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_unit",
+        "var_id": 22
+      },
+      "id": 92,
+      "is_datatype_constructor": false,
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_result",
+        "var_id": 23
+      },
+      "id": 93,
+      "is_datatype_constructor": false,
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          92,
+          93
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 94,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "18446744073709551615"
+        }
+      },
+      "id": 98,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          22,
+          98
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 562,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27,
+          98
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 584,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 584,
+        "kind": "not"
+      },
+      "id": 585,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "timeout_ms": "2640",
+  "unsupported_atoms": []
+}

@@ -83,12 +83,12 @@ impl Context {
             DeclarationKind::Uninterpreted,
             binding_origin,
         );
+        self.advance_source_revision();
         if self.global_declarations_enabled() {
             self.propagate_global_symbol_replacement_to_snapshots(&name, &info);
         } else {
             self.track_scoped_symbol(&name);
         }
         self.symbols.insert(name, info);
-        self.advance_source_revision();
     }
 }

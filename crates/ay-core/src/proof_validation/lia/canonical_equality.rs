@@ -46,11 +46,33 @@ pub fn arith_disequality_split_primitive_guard_is_reversed(
     terms: &TermStore,
     clause: &[TermId],
 ) -> Option<bool> {
+    use num_traits::One;
+    let witness = arith_disequality_split_lowering_witness(terms, clause)?;
+    (witness.guard_multiplier == num_bigint::BigInt::one()).then_some(witness.guard_is_reversed)
+}
+
+/// Checked data for lowering one exact arithmetic disequality split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithDisequalitySplitLoweringWitness {
+    /// Positive integer scaling the guard's canonical linear form relative
+    /// to the branches. The two Alethe bound steps use weights `(1, k)`.
+    pub guard_multiplier: num_bigint::BigInt,
+    /// Whether the guard's raw forward order excludes the first branch
+    /// rather than the second branch.
+    pub guard_is_reversed: bool,
+}
+
+/// Recheck the full integer sort, polarity, one-value gap, uniform positive
+/// scale and affine target conditions, then recover the raw guard orientation.
+/// Real splits retain their exact unscaled, forward-only schema.
+#[must_use]
+pub fn arith_disequality_split_lowering_witness(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<ArithDisequalitySplitLoweringWitness> {
     use crate::term::{Symbol, TermData};
     use crate::Sort;
-    if !arith_disequality_split_has_primitive_guard(terms, clause) {
-        return None;
-    }
+    let multiplier = arith_disequality_split_guard_multiplier(terms, clause)?;
     let [first, _, guard] = clause else {
         return None;
     };
@@ -64,14 +86,29 @@ pub fn arith_disequality_split_primitive_guard_is_reversed(
         return None;
     }
     if matches!(terms.sort(*lhs), Sort::Real) {
-        return Some(false);
+        return Some(ArithDisequalitySplitLoweringWitness {
+            guard_multiplier: multiplier,
+            guard_is_reversed: false,
+        });
     }
     let (raw, _) = int_linear_diff(terms, *lhs, *rhs)?;
-    let (branch, _, _) = parse_int_comparison(terms, *first, true)?;
-    if raw == branch {
-        return Some(false);
-    }
-    let negated: std::collections::BTreeMap<TermId, num_bigint::BigInt> =
-        branch.into_iter().map(|(var, c)| (var, -c)).collect();
-    (raw == negated).then_some(true)
+    let (branch, _, _) = parse_asserted_int_literal(terms, *first)?;
+    let scaled: std::collections::BTreeMap<TermId, num_bigint::BigInt> = branch
+        .into_iter()
+        .map(|(var, coefficient)| (var, coefficient * &multiplier))
+        .collect();
+    let guard_is_reversed = if raw == scaled {
+        false
+    } else {
+        let negated: std::collections::BTreeMap<TermId, num_bigint::BigInt> =
+            scaled.into_iter().map(|(var, c)| (var, -c)).collect();
+        if raw != negated {
+            return None;
+        }
+        true
+    };
+    Some(ArithDisequalitySplitLoweringWitness {
+        guard_multiplier: multiplier,
+        guard_is_reversed,
+    })
 }

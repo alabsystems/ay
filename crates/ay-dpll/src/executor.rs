@@ -99,6 +99,8 @@ pub(crate) mod optimization;
 mod partition_rescue;
 mod premise_surface;
 mod proof;
+pub(crate) use proof::native_source_scope::{NativeProofSourceScope, MAX_NATIVE_SOURCE_ROOTS};
+pub(crate) type NativeProofObserver<'a> = &'a mut dyn FnMut(&Executor);
 mod proof_array_ext;
 pub use premise_surface::{normalize_premise_surface, premise_int_let_binding};
 mod proof_authored_assume_spelling;
@@ -205,6 +207,15 @@ pub struct Executor {
     /// Rotated by `begin_public_solve` before preflight/elaboration so a permit
     /// from an earlier, textually identical query can never become current.
     pub(in crate::executor) query_authority_epoch: QueryAuthorityEpoch,
+    /// Complete native input captured before solve-time rewrites. The later
+    /// proof-support checker must still authenticate and check its subset.
+    pub(crate) native_proof_source_scope:
+        Option<std::sync::Arc<proof::native_source_scope::NativeProofSourceScope>>,
+    pub(in crate::executor) native_universal_budget:
+        std::cell::RefCell<proof::native_universal_lineage::NativeUniversalBudget>,
+    pub(crate) checked_external_proof_support: std::cell::RefCell<
+        Option<std::sync::Arc<proof::external_support::CheckedExternalProofSupport>>,
+    >,
     /// Origin canary for query-authority unit tests.
     #[cfg(test)]
     pub(in crate::executor) last_authored_query_authority_seen: bool,
@@ -1704,6 +1715,23 @@ pub struct Executor {
     /// nested calls must fail closed instead of repeatedly selecting the same
     /// branch.
     mod_div_or_branch_rescue_depth: u8,
+    /// #nia-persist-until-deadline (AY-SMT-5): `true` only for the duration
+    /// of the PRIMARY dispatch of a `check-sat` whose assertions form ONE
+    /// symbol-connected component, i.e. when the post-dispatch partition
+    /// rescue (`partition_rescue.rs`) cannot fire. A NIA solve may then keep
+    /// searching to its deadline instead of ending `unknown` early, because
+    /// no outer strategy is waiting for its `unknown`. `false` everywhere
+    /// else (component solves, probes, every other dispatch): fail-closed.
+    nia_persist_allowed: bool,
+    /// Allow small-model search in this outer, originally quantifier-free dispatch.
+    nia_box_allowed: bool,
+    /// #nia-persist-until-deadline: this executor is a probe or a re-solve
+    /// whose `unknown` an outer strategy reads, so its NIA solves never
+    /// persist. Set by the constructors of such executors
+    /// (`qpf_probe_executor_within`, `new_derived_query_executor`); the
+    /// dispatch window in `check_sat.rs` covers the nested executors that are
+    /// built in other ways.
+    pub(in crate::executor) nia_persist_forbidden: bool,
     /// #6812 sound relaxation: re-entry guard / mode flag for verify-before-accept.
     /// When > 0, the UF+LIA eager arm is running as the FRESH re-derivation of a
     /// post-split UNSAT core (no stale learned clauses, isolated incremental

@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::counted_storage::{checked_double, try_vec_with, Result};
+use crate::counted_storage::Result;
 use ay_core::original_query::CountedAdmission;
 
 impl Prober {
     /// Construct the normal initial state under the invocation's original owner.
     pub(crate) fn try_new_counted(num_vars: usize, owner: &CountedAdmission) -> Result<Self> {
         owner.admit(1, size_of::<Self>())?;
-        let num_lits = checked_double(owner, num_vars)?;
+        // The per-literal arrays wait for first use, as in `Prober::new`.
         Ok(Self {
             num_vars,
             probes: Vec::new(),
-            bin_occs: try_vec_with(owner, num_lits, |_| 0)?,
-            propfixed: try_vec_with(owner, num_lits, |_| -1)?,
-            uip_seen: try_vec_with(owner, num_vars, |_| false)?,
+            bin_occs: Vec::new(),
+            propfixed: Vec::new(),
+            uip_seen: Vec::new(),
             stats: ProbeStats::default(),
             last_search_ticks: 0,
         })

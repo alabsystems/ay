@@ -6,6 +6,8 @@
 
 mod adoption_support;
 mod native_power;
+#[cfg(test)]
+mod source_origin_tests;
 
 use ay_core::term::Symbol;
 use ay_core::{Sort, TermData, TermId};
@@ -85,7 +87,7 @@ impl Solver {
         // Keep assertions_parsed aligned with assertions for proof-rewrite
         // invariants when assertions are added via the native API path.
         let ctx = self.executor.context_mut_internal();
-        ctx.add_assertion_with_parsed(asserted_term, source);
+        ctx.add_native_assertion_with_parsed(asserted_term, source);
         self.record_native_replay_event(NativeReplayEventKind::Assert {
             term: term_id,
             name: None,
@@ -158,7 +160,7 @@ impl Solver {
         // syntax.  Reuse the anonymous native sentinel so strict proof
         // reconstruction derives from the exact asserted term instead of
         // trying to elaborate a fabricated `__ay_named_*` variable.
-        ctx.add_assertion_with_parsed(
+        ctx.add_native_assertion_with_parsed(
             asserted_term,
             ParsedTerm::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
         );
@@ -263,12 +265,21 @@ impl Solver {
     /// Return the current set of asserted terms.
     #[must_use]
     pub fn assertions(&self) -> Vec<Term> {
+        self.assertions_iter().collect()
+    }
+
+    /// Borrow the current asserted terms without allocating a vector.
+    ///
+    /// Order, duplicates and active scopes match [`Self::assertions`]. Each
+    /// item carries the same current arena/entry authentication as other native
+    /// term handles. The exact length can be checked before reserving storage.
+    #[must_use]
+    pub fn assertions_iter(&self) -> impl ExactSizeIterator<Item = Term> + '_ {
         self.executor
             .context()
             .assertions
             .iter()
             .map(|&id| self.wrap_term(id))
-            .collect()
     }
 
     /// Reset the solver, clearing all assertions

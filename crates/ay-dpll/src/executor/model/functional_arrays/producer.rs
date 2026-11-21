@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ay_core::term::TermData;
 use ay_model_check::{
-    recognize_fill_lambda, recognize_identity_lambda, recognize_range_lambda, ArrayValue, ModelView,
+    recognize_fill_lambda, recognize_identity_lambda, recognize_int_scalar_lambda,
+    recognize_range_lambda, ArrayValue, ModelView,
 };
 
 use super::*;
@@ -86,6 +87,46 @@ fn spend(exec: &Executor, work: &mut Work, amount: usize) -> Option<()> {
     Some(())
 }
 
+fn push_children(
+    exec: &Executor,
+    term: TermId,
+    stack: &mut Vec<TermId>,
+    work: &mut Work,
+) -> Option<()> {
+    let data = exec.ctx.terms.get(term);
+    let count = match data {
+        TermData::Const(_) | TermData::Var(..) => 0,
+        TermData::App(_, arguments) => arguments.len(),
+        TermData::Let(bindings, _) => bindings.len().checked_add(1)?,
+        TermData::Not(_) | TermData::Forall(..) | TermData::Exists(..) => 1,
+        TermData::Ite(..) => 3,
+        _ => return None,
+    };
+    let bytes = stack
+        .len()
+        .checked_add(count)?
+        .checked_add(stack.len())?
+        .checked_mul(std::mem::size_of::<TermId>())?;
+    spend(exec, work, count.checked_add(bytes)?)?;
+    stack.try_reserve_exact(count).ok()?;
+    match data {
+        TermData::Const(_) | TermData::Var(..) => {}
+        TermData::App(_, arguments) => stack.extend_from_slice(arguments),
+        TermData::Let(bindings, body) => {
+            stack.extend(bindings.iter().map(|(_, value)| *value));
+            stack.push(*body);
+        }
+        TermData::Not(inner) | TermData::Forall(_, inner, _) | TermData::Exists(_, inner, _) => {
+            stack.push(*inner);
+        }
+        TermData::Ite(condition, positive, negative) => {
+            stack.extend_from_slice(&[*condition, *positive, *negative]);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 fn array_variables(exec: &Executor, root: TermId, work: &mut Work) -> Option<Vec<TermId>> {
     let mut stack = vec![root];
     let mut seen = BTreeSet::new();
@@ -103,10 +144,7 @@ fn array_variables(exec: &Executor, root: TermId, work: &mut Work) -> Option<Vec
         {
             variables.insert(term);
         }
-        let children = exec.ctx.terms.children(term);
-        spend(exec, work, children.len())?;
-        stack.try_reserve(children.len()).ok()?;
-        stack.extend(children);
+        push_children(exec, term, &mut stack, work)?;
     }
     Some(variables.into_iter().collect())
 }
@@ -185,10 +223,7 @@ impl Builder<'_> {
             {
                 return None;
             }
-            let children = self.exec.ctx.terms.children(term);
-            spend(self.exec, &mut self.work, children.len())?;
-            pending.try_reserve(children.len()).ok()?;
-            pending.extend(children);
+            push_children(self.exec, term, &mut pending, &mut self.work)?;
         }
         Some(())
     }
@@ -205,15 +240,14 @@ impl Builder<'_> {
                 if !seen.insert(term) {
                     continue;
                 }
-                let children = self.exec.ctx.terms.children(term);
-                spend(self.exec, &mut self.work, children.len())?;
-                pending.try_reserve(children.len()).ok()?;
-                pending.extend(children);
+                push_children(self.exec, term, &mut pending, &mut self.work)?;
             }
             return Some(Some(recipe.array));
         }
         // Scalar fill captures remain checked even for empty/reversed ranges.
-        if recognize_fill_lambda(&self.exec.ctx.terms, rhs).is_some() {
+        if recognize_fill_lambda(&self.exec.ctx.terms, rhs).is_some()
+            || recognize_int_scalar_lambda(&self.exec.ctx.terms, rhs).is_some()
+        {
             return Some(None);
         }
         let Some(recipe) = recognize_range_lambda(&self.exec.ctx.terms, rhs) else {
@@ -382,6 +416,7 @@ pub(super) fn capture(
     if !binding.validate(exec) {
         return None;
     }
+    let epoch = exec.query_authority_epoch.clone();
     let used = Arc::clone(&binding.used);
     let mut work = Work {
         left: MAX_FUNCTIONAL_WORK.saturating_sub(used.load(Ordering::Acquire)),
@@ -400,7 +435,8 @@ pub(super) fn capture(
         builder.build(canonical, 0)?;
     }
     spend(exec, &mut builder.work, 1)?;
-    if source != exec.ctx.source_context_stamp()
+    if !epoch.is_same_epoch(&exec.query_authority_epoch)
+        || source != exec.ctx.source_context_stamp()
         || plan.roots != exec.independent_gate_query_roots().ok()?
     {
         return None;
@@ -421,6 +457,7 @@ pub(super) fn capture(
     Some((
         FunctionalArrayModel {
             source,
+            epoch,
             roots: plan.roots.clone(),
             stamps: plan.stamps.clone(),
             entries: builder.entries.into_iter().collect(),

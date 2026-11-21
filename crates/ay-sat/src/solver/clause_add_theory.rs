@@ -28,7 +28,8 @@ impl Solver {
         origin: crate::ClauseEventOrigin,
     ) -> usize {
         let idx = self.add_clause_db_checked(literals, true, false, &[]);
-        let id = self.cold.clause_ids[idx];
+        // Absent when the clause-ID table is disabled (no proof, no trace).
+        let id = self.cold.clause_ids.get(idx).copied().unwrap_or(0);
         if let Some(trace) = self.live_clause_trace_mut() {
             trace.set_inserted_origin(id, origin);
         }

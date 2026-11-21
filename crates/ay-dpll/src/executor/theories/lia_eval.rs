@@ -819,9 +819,11 @@ pub(in crate::executor) fn recover_lia_equalities_from_assertions(
 /// array path happens to avoid the split; the plain UFLIA path did not repair
 /// it, and `reunify_lia_values_across_euf_classes` only touches Int classes.)
 ///
-/// Repair: for each top-level asserted-equal uninterpreted-sort pair, propagate
-/// one representative element to both sides of `euf_model.term_values`
-/// (fill-only when one side is unvalued; overwrite the RHS when they disagree).
+/// Repair connected components of top-level same-sort equalities, retaining
+/// existing same-element peers. Directional RHS overwrites cannot close a
+/// branching alias graph whose anchors initially have different values. Keep
+/// the function tables synchronized with the repaired carrier values and
+/// decline the repair if it would make a function row inconsistent.
 ///
 /// SOUND / fail-closed: the two sides MUST agree in any satisfying model, so
 /// adopting one element for both never makes a correct model wrong; and the
@@ -833,48 +835,314 @@ pub(in crate::executor) fn recover_uninterpreted_equalities_from_assertions(
     terms: &ay_core::TermStore,
     assertions: &[TermId],
     euf_model: &mut EufModel,
+    lia_model: Option<&LiaModel>,
 ) {
     use ay_core::term::TermData;
     use ay_core::Sort;
 
-    let max_passes = assertions.len().max(1);
-    for _ in 0..max_passes {
-        let mut progress = false;
-        for &assertion in assertions {
+    fn integer_atom(raw: &str) -> Option<num_bigint::BigInt> {
+        if let Ok(value) = raw.parse() {
+            return Some(value);
+        }
+        let magnitude: num_bigint::BigInt = raw
+            .strip_prefix("(- ")?
+            .strip_suffix(')')?
+            .trim()
+            .parse()
+            .ok()?;
+        (magnitude.sign() != num_bigint::Sign::Minus).then(|| -magnitude)
+    }
+    fn committed_integer(
+        terms: &ay_core::TermStore,
+        euf: &EufModel,
+        lia: Option<&LiaModel>,
+        term: TermId,
+    ) -> Option<num_bigint::BigInt> {
+        lia.and_then(|model| model.values.get(&term))
+            .cloned()
+            .or_else(|| {
+                euf.func_app_const_terms.get(&term).and_then(|&value| {
+                    terms.entry_stamp(value)?;
+                    match terms.get(value) {
+                        TermData::Const(ay_core::Constant::Int(value)) => Some(value.clone()),
+                        _ => None,
+                    }
+                })
+            })
+            .or_else(|| {
+                if euf.speculative_int_terms.contains(&term) {
+                    None
+                } else {
+                    euf.int_values.get(&term).cloned().or_else(|| {
+                        euf.term_values
+                            .get(&term)
+                            .and_then(|value| integer_atom(value))
+                    })
+                }
+            })
+    }
+    fn integer_placeholder(terms: &ay_core::TermStore, raw: &str) -> Option<TermId> {
+        let term = TermId(raw.strip_prefix("@?")?.parse().ok()?);
+        (terms.entry_stamp(term).is_some() && terms.sort(term) == &Sort::Int).then_some(term)
+    }
+
+    let equalities: Vec<(TermId, TermId)> = assertions
+        .iter()
+        .filter_map(|&assertion| {
             let TermData::App(sym, args) = terms.get(assertion) else {
-                continue;
+                return None;
             };
             if sym.name() != "=" || args.len() != 2 {
-                continue;
+                return None;
             }
             let (lhs, rhs) = (args[0], args[1]);
-            // Only uninterpreted-sort equalities: Int/Bool/etc. have their own
-            // dedicated model recovery.
-            if !matches!(terms.sort(lhs), Sort::Uninterpreted(_)) {
-                continue;
-            }
-            match (
-                euf_model.term_values.get(&lhs).cloned(),
-                euf_model.term_values.get(&rhs).cloned(),
-            ) {
-                (Some(lv), Some(rv)) if lv != rv => {
-                    euf_model.term_values.insert(rhs, lv);
-                    progress = true;
-                }
-                (Some(lv), None) => {
-                    euf_model.term_values.insert(rhs, lv);
-                    progress = true;
-                }
-                (None, Some(rv)) => {
-                    euf_model.term_values.insert(lhs, rv);
-                    progress = true;
-                }
-                _ => {}
+            (matches!(terms.sort(lhs), Sort::Uninterpreted(_))
+                && terms.sort(lhs) == terms.sort(rhs))
+            .then_some((lhs, rhs))
+        })
+        .collect();
+    if equalities.is_empty() {
+        return;
+    }
+    let mut members: Vec<TermId> = equalities.iter().flat_map(|&(a, b)| [a, b]).collect();
+    members.sort_unstable();
+    members.dedup();
+    let indices: HashMap<TermId, usize> = members
+        .iter()
+        .enumerate()
+        .map(|(index, &term)| (term, index))
+        .collect();
+    let mut parent: Vec<usize> = (0..members.len()).collect();
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    fn unite(parent: &mut [usize], a: usize, b: usize) {
+        let a = find(parent, a);
+        let b = find(parent, b);
+        if a != b {
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+    let mut original_classes: HashMap<(Sort, String), usize> = HashMap::default();
+    for (index, &term) in members.iter().enumerate() {
+        if let Some(value) = euf_model.term_values.get(&term) {
+            let key = (terms.sort(term).clone(), value.clone());
+            if let Some(&other) = original_classes.get(&key) {
+                unite(&mut parent, index, other);
+            } else {
+                original_classes.insert(key, index);
             }
         }
-        if !progress {
-            break;
+    }
+    for (a, b) in equalities {
+        unite(&mut parent, indices[&a], indices[&b]);
+    }
+    // Sorted source terms make representative choice independent of assertion
+    // order. Components with no existing element stay unresolved.
+    let mut representatives: HashMap<usize, String> = HashMap::default();
+    for (index, &term) in members.iter().enumerate() {
+        let root = find(&mut parent, index);
+        if let Some(value) = euf_model.term_values.get(&term) {
+            representatives.entry(root).or_insert_with(|| value.clone());
         }
+    }
+    let mut recovered: HashMap<TermId, String> = HashMap::default();
+    let mut remap: HashMap<(Sort, String), String> = HashMap::default();
+    for (index, &term) in members.iter().enumerate() {
+        let Some(value) = representatives.get(&find(&mut parent, index)) else {
+            continue;
+        };
+        recovered.insert(term, value.clone());
+        if let Some(old) = euf_model.term_values.get(&term) {
+            remap.insert((terms.sort(term).clone(), old.clone()), value.clone());
+        }
+    }
+    if recovered
+        .iter()
+        .all(|(term, value)| euf_model.term_values.get(term) == Some(value))
+    {
+        return;
+    }
+    let final_value = |term: TermId| {
+        recovered.get(&term).cloned().or_else(|| {
+            let old = euf_model.term_values.get(&term)?;
+            Some(
+                remap
+                    .get(&(terms.sort(term).clone(), old.clone()))
+                    .unwrap_or(old)
+                    .clone(),
+            )
+        })
+    };
+    // Tables contain concrete element strings, not live references to the
+    // source terms. Rebuild affected typed positions before committing either
+    // view. Retain row provenance in exactly the same positional order.
+    let mut repaired_tables = Vec::new();
+    let mut integer_updates: HashMap<TermId, num_bigint::BigInt> = HashMap::default();
+    for (name, table) in &euf_model.function_tables {
+        let Some(sources) = euf_model.function_table_terms.get(name) else {
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "MODEL/alias-recovery refused table {name}: missing row provenance"
+                );
+            }
+            return;
+        };
+        if sources.len() != table.len() {
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "MODEL/alias-recovery refused table {name}: row provenance length mismatch"
+                );
+            }
+            return;
+        }
+        let mut repaired = Vec::with_capacity(table.len());
+        let mut affected = false;
+        let mut signature = None;
+        for ((args, result), &source) in table.iter().zip(sources) {
+            let TermData::App(symbol, source_args) = terms.get(source) else {
+                return;
+            };
+            if symbol.to_string() != *name || source_args.len() != args.len() {
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "MODEL/alias-recovery refused table {name}: source signature mismatch"
+                    );
+                }
+                return;
+            }
+            let source_signature = (
+                source_args
+                    .iter()
+                    .map(|&term| terms.sort(term).clone())
+                    .collect::<Vec<_>>(),
+                terms.sort(source).clone(),
+            );
+            if signature
+                .as_ref()
+                .is_some_and(|expected| expected != &source_signature)
+            {
+                return;
+            }
+            signature = Some(source_signature);
+            let repaired_args: Vec<String> = source_args
+                .iter()
+                .zip(args)
+                .map(|(&term, old)| {
+                    if matches!(terms.sort(term), Sort::Uninterpreted(_)) {
+                        final_value(term).unwrap_or_else(|| old.clone())
+                    } else {
+                        old.clone()
+                    }
+                })
+                .collect();
+            let repaired_result = if matches!(terms.sort(source), Sort::Uninterpreted(_)) {
+                final_value(source).unwrap_or_else(|| result.clone())
+            } else {
+                result.clone()
+            };
+            affected |= &repaired_args != args || &repaired_result != result;
+            repaired.push((repaired_args, repaired_result));
+        }
+        if !affected {
+            continue;
+        }
+        let mut seen: HashMap<Vec<String>, String> = HashMap::default();
+        let mut unresolved = Vec::new();
+        for (row, ((args, result), &source)) in repaired.iter_mut().zip(sources).enumerate() {
+            if matches!(terms.sort(source), Sort::Int) {
+                let placeholder = integer_placeholder(terms, result);
+                if result.starts_with("@?") && placeholder.is_none() {
+                    return;
+                }
+                let value = committed_integer(terms, euf_model, lia_model, source)
+                    .or_else(|| {
+                        placeholder
+                            .and_then(|term| committed_integer(terms, euf_model, lia_model, term))
+                    })
+                    .or_else(|| integer_atom(result));
+                let Some(value) = value else {
+                    let Some(placeholder) = placeholder else {
+                        return;
+                    };
+                    unresolved.push((row, source, placeholder));
+                    continue;
+                };
+                *result = crate::executor_format::format_bigint(&value);
+                if integer_updates
+                    .insert(source, value.clone())
+                    .is_some_and(|old| old != value)
+                {
+                    return;
+                }
+            }
+            if seen.get(&*args).is_some_and(|old| old != &*result) {
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "MODEL/alias-recovery refused table {name}: point {args:?} has {:?} and {result:?}; source={source:?}",
+                        seen.get(&*args)
+                    );
+                }
+                // A carrier choice cannot erase distinct function results.
+                // Leave the complete incoming candidate untouched; the usual
+                // strict model validation will withhold it if inconsistent.
+                return;
+            }
+            seen.insert(args.clone(), result.clone());
+        }
+        // A placeholder is an absent model value, not contradictory evidence.
+        // A concrete row at the identical typed function point supplies one
+        // candidate value for every congruent observation. Two different
+        // concrete values were refused above; wholly unknown points decline.
+        for (row, source, placeholder) in unresolved {
+            let (args, result) = &mut repaired[row];
+            let Some(value) = seen.get(&*args).and_then(|value| integer_atom(value)) else {
+                return;
+            };
+            *result = crate::executor_format::format_bigint(&value);
+            for term in [source, placeholder] {
+                if integer_updates
+                    .insert(term, value.clone())
+                    .is_some_and(|old| old != value)
+                {
+                    return;
+                }
+            }
+        }
+        repaired_tables.push((name.clone(), repaired));
+    }
+    // Commit the same renaming to all existing peers of an affected element,
+    // not just the equality endpoints, so a previously shared class is intact.
+    for (&term, value) in &mut euf_model.term_values {
+        if let Some(replacement) = remap.get(&(terms.sort(term).clone(), value.clone())) {
+            *value = replacement.clone();
+        }
+    }
+    euf_model.term_values.extend(recovered);
+    for (term, value) in integer_updates {
+        euf_model
+            .term_values
+            .insert(term, crate::executor_format::format_bigint(&value));
+        euf_model.int_values.insert(term, value);
+        euf_model.speculative_int_terms.remove(&term);
+    }
+    for (sort, elements) in &mut euf_model.sort_elements {
+        let mut seen = HashSet::default();
+        elements.retain_mut(|value| {
+            if let Some(replacement) =
+                remap.get(&(Sort::Uninterpreted(sort.clone()), value.clone()))
+            {
+                *value = replacement.clone();
+            }
+            seen.insert(value.clone())
+        });
+    }
+    for (name, table) in repaired_tables {
+        euf_model.function_tables.insert(name, table);
     }
 }
 
@@ -1584,6 +1852,240 @@ pub(in crate::executor) fn recover_substituted_bool_values(
 mod tests {
     use super::*;
     use ay_core::{Sort, TermStore};
+
+    #[test]
+    fn uninterpreted_alias_components_rekey_rows_and_preserve_existing_peers() {
+        let mut terms = TermStore::new();
+        let sort = Sort::Uninterpreted("U".into());
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort.clone());
+        let c = terms.mk_var("c", sort.clone());
+        let peer = terms.mk_var("peer", sort);
+        let ab = terms.mk_eq(a, b);
+        let cb = terms.mk_eq(c, b);
+        let fb = terms.mk_app(ay_core::Symbol::named("f"), vec![b], Sort::Int);
+        let fc = terms.mk_app(ay_core::Symbol::named("f"), vec![c], Sort::Int);
+        for roots in [[ab, cb], [cb, ab]] {
+            let mut model = EufModel::default();
+            for (term, value) in [
+                (a, "A"),
+                (b, "B"),
+                (c, "C"),
+                (peer, "B"),
+                (fb, "7"),
+                (fc, "7"),
+            ] {
+                model.term_values.insert(term, value.into());
+            }
+            model
+                .sort_elements
+                .insert("U".into(), vec!["A".into(), "B".into(), "C".into()]);
+            model.function_tables.insert(
+                "f".into(),
+                vec![
+                    (vec!["B".into()], "7".into()),
+                    (vec!["C".into()], "7".into()),
+                ],
+            );
+            model.function_table_terms.insert("f".into(), vec![fb, fc]);
+            recover_uninterpreted_equalities_from_assertions(&terms, &roots, &mut model, None);
+            for term in [a, b, c, peer] {
+                assert_eq!(model.term_values[&term], "A");
+            }
+            assert_eq!(model.sort_elements["U"], vec!["A"]);
+            assert_eq!(
+                model.function_tables["f"],
+                vec![
+                    (vec!["A".to_string()], "7".to_string()),
+                    (vec!["A".to_string()], "7".to_string())
+                ]
+            );
+            assert_eq!(model.function_table_terms["f"], vec![fb, fc]);
+        }
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_refuse_conflicting_rows_atomically() {
+        let mut terms = TermStore::new();
+        let sort = Sort::Uninterpreted("U".into());
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort);
+        let alias = terms.mk_eq(a, b);
+        let fa = terms.mk_app(ay_core::Symbol::named("f"), vec![a], Sort::Int);
+        let fb = terms.mk_app(ay_core::Symbol::named("f"), vec![b], Sort::Int);
+        let mut model = EufModel::default();
+        model.term_values.insert(a, "A".into());
+        model.term_values.insert(b, "B".into());
+        model.function_tables.insert(
+            "f".into(),
+            vec![
+                (vec!["A".into()], "1".into()),
+                (vec!["B".into()], "2".into()),
+            ],
+        );
+        model.function_table_terms.insert("f".into(), vec![fa, fb]);
+        let original = model.clone();
+        recover_uninterpreted_equalities_from_assertions(&terms, &[alias], &mut model, None);
+        assert_eq!(model.term_values, original.term_values);
+        assert_eq!(model.function_tables, original.function_tables);
+        assert_eq!(model.function_table_terms, original.function_table_terms);
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_complete_congruent_integer_placeholders() {
+        for value in [0, -7] {
+            for reverse in [false, true] {
+                let mut terms = TermStore::new();
+                let sort = Sort::Uninterpreted("U".into());
+                let a = terms.mk_var("a", sort.clone());
+                let b = terms.mk_var("b", sort);
+                let alias = terms.mk_eq(a, b);
+                let fa = terms.mk_app(ay_core::Symbol::named("f"), vec![a], Sort::Int);
+                let fb = terms.mk_app(ay_core::Symbol::named("f"), vec![b], Sort::Int);
+                let value = num_bigint::BigInt::from(value);
+                let rendered = crate::executor_format::format_bigint(&value);
+                let mut model = EufModel::default();
+                model.term_values.insert(a, "A".into());
+                model.term_values.insert(b, "B".into());
+                model.term_values.insert(fa, "99".into());
+                model.int_values.insert(fa, 99.into());
+                model.speculative_int_terms.insert(fa);
+                let mut rows = vec![
+                    (vec!["A".to_string()], format!("@?{}", fa.0)),
+                    (vec!["B".to_string()], rendered.clone()),
+                ];
+                let mut sources = vec![fa, fb];
+                if reverse {
+                    rows.reverse();
+                    sources.reverse();
+                }
+                model.function_tables.insert("f".into(), rows);
+                model
+                    .function_table_terms
+                    .insert("f".into(), sources.clone());
+                let mut lia = LiaModel {
+                    values: HashMap::default(),
+                };
+                lia.values.insert(fb, value.clone());
+                recover_uninterpreted_equalities_from_assertions(
+                    &terms,
+                    &[alias],
+                    &mut model,
+                    Some(&lia),
+                );
+                assert_eq!(model.term_values[&a], model.term_values[&b]);
+                assert_eq!(model.term_values[&fa], rendered);
+                assert_eq!(model.int_values[&fa], value);
+                assert!(!model.speculative_int_terms.contains(&fa));
+                assert!(model.function_tables["f"]
+                    .iter()
+                    .all(|(args, result)| args == &["A".to_string()] && result == &rendered));
+                assert_eq!(model.function_table_terms["f"], sources);
+            }
+        }
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_refuse_invalid_or_wholly_unknown_placeholders() {
+        let mut terms = TermStore::new();
+        let sort = Sort::Uninterpreted("U".into());
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort);
+        let alias = terms.mk_eq(a, b);
+        let fa = terms.mk_app(ay_core::Symbol::named("f"), vec![a], Sort::Int);
+        for target in [a.0, u32::MAX, fa.0] {
+            let mut model = EufModel::default();
+            model.term_values.insert(a, "A".into());
+            model.term_values.insert(b, "B".into());
+            model
+                .function_tables
+                .insert("f".into(), vec![(vec!["B".into()], format!("@?{target}"))]);
+            model.function_table_terms.insert("f".into(), vec![fa]);
+            let original = model.clone();
+            recover_uninterpreted_equalities_from_assertions(&terms, &[alias], &mut model, None);
+            assert_eq!(model.term_values, original.term_values);
+            assert_eq!(model.function_tables, original.function_tables);
+            assert_eq!(model.int_values, original.int_values);
+        }
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_refuse_inconsistent_row_signatures() {
+        let mut terms = TermStore::new();
+        let u = Sort::Uninterpreted("U".into());
+        let a = terms.mk_var("a", u.clone());
+        let b = terms.mk_var("b", u);
+        let other = terms.mk_var("other", Sort::Uninterpreted("V".into()));
+        let alias = terms.mk_eq(a, b);
+        let fa = terms.mk_app(ay_core::Symbol::named("f"), vec![a], Sort::Int);
+        let malformed = terms.mk_app(ay_core::Symbol::named("f"), vec![other], Sort::Int);
+        let mut model = EufModel::default();
+        model.term_values.insert(a, "A".into());
+        model.term_values.insert(b, "B".into());
+        model.term_values.insert(other, "B".into());
+        model.function_tables.insert(
+            "f".into(),
+            vec![
+                (vec!["A".into()], "0".into()),
+                (vec!["B".into()], "0".into()),
+            ],
+        );
+        model
+            .function_table_terms
+            .insert("f".into(), vec![fa, malformed]);
+        let original = model.clone();
+        recover_uninterpreted_equalities_from_assertions(&terms, &[alias], &mut model, None);
+        assert_eq!(model.term_values, original.term_values);
+        assert_eq!(model.function_tables, original.function_tables);
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_keep_sorts_separate_and_do_not_invent_elements() {
+        let mut terms = TermStore::new();
+        let u = Sort::Uninterpreted("U".into());
+        let v = Sort::Uninterpreted("V".into());
+        let a = terms.mk_var("a", u.clone());
+        let b = terms.mk_var("b", u.clone());
+        let missing = terms.mk_var("missing", u.clone());
+        let unknown = terms.mk_var("unknown", u);
+        let other = terms.mk_var("other", v);
+        let ab = terms.mk_eq(a, b);
+        let unknown_pair = terms.mk_eq(missing, unknown);
+        let malformed = terms.mk_app(ay_core::Symbol::named("="), vec![a, other], Sort::Bool);
+        let mut model = EufModel::default();
+        model.term_values.insert(a, "A".into());
+        model.term_values.insert(b, "B".into());
+        model.term_values.insert(other, "B".into());
+        recover_uninterpreted_equalities_from_assertions(
+            &terms,
+            &[ab, unknown_pair, malformed],
+            &mut model,
+            None,
+        );
+        assert_eq!(model.term_values[&a], model.term_values[&b]);
+        assert_eq!(model.term_values[&other], "B");
+        assert!(!model.term_values.contains_key(&missing));
+        assert!(!model.term_values.contains_key(&unknown));
+    }
+
+    #[test]
+    fn uninterpreted_alias_components_refuse_a_table_without_row_provenance() {
+        let mut terms = TermStore::new();
+        let sort = Sort::Uninterpreted("U".into());
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort);
+        let alias = terms.mk_eq(a, b);
+        let mut model = EufModel::default();
+        model.term_values.insert(a, "A".into());
+        model.term_values.insert(b, "B".into());
+        model
+            .function_tables
+            .insert("f".into(), vec![(vec!["B".into()], "1".into())]);
+        let original = model.clone();
+        recover_uninterpreted_equalities_from_assertions(&terms, &[alias], &mut model, None);
+        assert_eq!(model.term_values, original.term_values);
+        assert_eq!(model.function_tables, original.function_tables);
+    }
 
     #[test]
     fn substituted_int_array_default_seeds_one_shared_value() {

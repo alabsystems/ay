@@ -9,6 +9,8 @@ use crate::ModelValue;
 pub(super) fn scalar_cost(value: &ModelValue) -> Result<usize, FunctionalArrayError> {
     match value {
         ModelValue::Bool(_) => Ok(1),
+        ModelValue::Int(value) => usize::try_from(value.bits().max(1).div_ceil(8))
+            .map_err(|_| FunctionalArrayError::Resource),
         ModelValue::BitVec { value, width } => {
             usize::try_from(value.bits().max(u64::from(*width)).div_ceil(8))
                 .map_err(|_| FunctionalArrayError::Resource)
@@ -18,6 +20,21 @@ pub(super) fn scalar_cost(value: &ModelValue) -> Result<usize, FunctionalArrayEr
 }
 
 pub(super) fn scalar(value: &ModelValue, work: &mut usize) -> Result<String, FunctionalArrayError> {
+    if let ModelValue::Int(value) = value {
+        let bits =
+            usize::try_from(value.bits().max(1)).map_err(|_| FunctionalArrayError::Resource)?;
+        charge(
+            work,
+            bits.checked_mul(bits)
+                .and_then(|n| n.checked_add(64))
+                .ok_or(FunctionalArrayError::Resource)?,
+        )?;
+        let printed = value.to_string();
+        return Ok(match printed.strip_prefix('-') {
+            Some(magnitude) => format!("(- {magnitude})"),
+            None => printed,
+        });
+    }
     // Decimal conversion and the subsequent allocation are bounded BEFORE it.
     charge(
         work,

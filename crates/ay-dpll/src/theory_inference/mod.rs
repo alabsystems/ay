@@ -22,6 +22,7 @@ mod funnel;
 #[cfg(test)]
 mod funnel_tests;
 pub(crate) mod intrinsic;
+pub(crate) mod intrinsic_integer;
 mod recording_dt;
 
 use std::borrow::Cow;

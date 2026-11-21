@@ -44,6 +44,26 @@ mod consumer_subset_tests;
 mod exact_query;
 pub use exact_query::ExactSmtlibQueryBinding;
 
+mod native_query;
+pub(in crate::api) use native_query::NativeQueryObservation;
+pub use native_query::{
+    NativeDiagnosticSolve, NativeQueryBinding, NativeQueryDiagnosticDocument,
+    NativeQueryProofEnvelope,
+};
+
+mod external_support;
+pub use external_support::{ExternalProofAssumption, ExternalProofSupport};
+
+#[cfg(test)]
+pub(crate) fn native_support_test_executor(solver: &super::Solver) -> &crate::Executor {
+    &solver.executor
+}
+
+#[cfg(test)]
+pub(crate) fn native_support_test_executor_mut(solver: &mut super::Solver) -> &mut crate::Executor {
+    &mut solver.executor
+}
+
 mod bv_lia_source_replay;
 use bv_lia_source_replay::discharge_source_bv_lia;
 
@@ -185,8 +205,9 @@ pub struct UnsatProofArtifact {
     /// AND the document is printed in that problem's own spelling. A document
     /// the canonical-spelling rescue produced is checkable only against the
     /// canonical problem, so it always carries it, whatever the caller asked
-    /// for; `Some` from the session export means exactly that. It does not
-    /// weaken the independent native [`Self::strict_verdict`].
+    /// for. An authenticated native support projection likewise always carries
+    /// its paired problem, as disclosed by [`Self::external_support`]. Neither
+    /// changes the independent native [`Self::strict_verdict`].
     pub alethe_problem_smt2: Option<String>,
     /// Partial check result from the internal checker.
     pub partial_check: Option<PartialProofCheck>,
@@ -231,6 +252,9 @@ pub struct UnsatProofArtifact {
     /// strict-checker class and never promotes it past it. The type is
     /// `#[non_exhaustive]`: treat a variant you do not know as unsupported.
     pub carcara_surface: CarcaraSurface,
+    /// A native support export's full-query binding and exact emitted inputs.
+    /// Only the live checked support workflow can populate this description.
+    pub(crate) external_support: Option<ExternalProofSupport>,
 }
 
 /// Whether an exported artifact carries its own problem transport.
@@ -997,6 +1021,13 @@ fn extract_farkas_certificates(proof: &ay_core::Proof) -> Vec<FarkasCertificate>
 }
 
 impl UnsatProofArtifact {
+    /// Describe an authenticated supported-premise transport, when one was
+    /// required. Such an artifact always carries its paired SMT-LIB problem.
+    #[must_use]
+    pub fn external_support(&self) -> Option<&ExternalProofSupport> {
+        self.external_support.as_ref()
+    }
+
     /// Accept this proof artifact at a consumer-facing boundary.
     ///
     /// `Strict` requires the strict checker to have accepted the proof.
@@ -1080,8 +1111,9 @@ impl super::Solver {
     /// the problem: `alethe_problem_smt2` is not rendered and is `None` —
     /// unless the document had to be re-printed in the canonical spelling,
     /// which the caller's transcript does not match; then the canonical
-    /// problem it does match is rendered (that path alone, so the cost is
-    /// paid only where the caller's own problem cannot serve).
+    /// problem it does match is rendered. An authenticated native support
+    /// projection also always carries its paired problem: the caller's full
+    /// query is not the projected checker input.
     ///
     /// A push/pop session asserts every fact once and checks many queries
     /// against its live stack. Rendering the whole live stack again for every
@@ -1105,20 +1137,45 @@ impl super::Solver {
         let proof = self.executor.last_proof()?;
         let finite_enum = self.executor.last_proof_has_finite_enum_sidecar();
         let strict_quality = self.executor.check_proof_strict_with_datatypes(proof);
-        let (alethe, alethe_problem_smt2, canonical_rescue, dialect) =
-            self.render_artifact_surface(transport, strict_quality.is_ok())?;
-        // D7: the surface verdict is read on the SAME proof and override table
-        // the document above was rendered with, so the disclosure describes
-        // the artifact's own bytes — the canonical document after a rescue,
-        // the authored one otherwise. A parseable document that kept a
+        let support = strict_quality.as_ref().ok().and_then(|_| {
+            self.executor
+                .checked_external_proof_support_for_current_proof()
+        });
+        // A datatype presentation retains the full authenticated scope. Its
+        // standard tester spellings belong to one paired render; ordinary
+        // omitted-problem exports keep their historical source presentation.
+        let datatype_pair = if transport == ProblemTransport::Rendered && strict_quality.is_ok() {
+            self.executor.try_export_last_unsat_datatype_pair()
+        } else {
+            None
+        };
+        // D7: a support seal supplies one checked proof/problem/surface pair.
+        // Other exports read the SAME proof and override table used by their
+        // render, so the disclosure describes their own bytes — the canonical
+        // document after a rescue, the authored one otherwise. A document that kept a
         // spelling only Clean's vendored Carcara accepts is `CleanDialect`,
         // as the CLI's certificate line says `clean-dialect` for it, and one
         // that eliminated a problem `let` with `:rule let` is
         // `WithoutLetExpansion` (`without-let-expansion`).
-        let carcara_surface = self
-            .executor
-            .carcara_surface_for_last_export(canonical_rescue)?
-            .with_dialect_report(&dialect);
+        let (alethe, alethe_problem_smt2, canonical_rescue, carcara_surface) =
+            if let Some(support) = support.as_ref() {
+                (
+                    support.proof_text().to_owned(),
+                    Some(support.problem_text().to_owned()),
+                    false,
+                    support.surface().clone(),
+                )
+            } else if let Some((proof, problem, surface)) = datatype_pair {
+                (proof, Some(problem), false, surface)
+            } else {
+                let (alethe, problem, canonical_rescue, dialect) =
+                    self.render_artifact_surface(transport, strict_quality.is_ok())?;
+                let surface = self
+                    .executor
+                    .carcara_surface_for_last_export(canonical_rescue)?
+                    .with_dialect_report(&dialect);
+                (alethe, problem, canonical_rescue, surface)
+            };
         let terms = self.executor.terms();
         let evaluation = evaluate_proof_artifact_boundary(proof, terms, strict_quality)?;
 
@@ -1156,6 +1213,7 @@ impl super::Solver {
             lrat_certificate: self.executor.last_lrat_certificate().map(<[u8]>::to_vec),
             farkas_certificates,
             carcara_surface,
+            external_support: support.as_ref().map(|support| support.disclosure().clone()),
         })
     }
 

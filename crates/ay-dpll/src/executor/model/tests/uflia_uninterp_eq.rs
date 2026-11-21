@@ -213,3 +213,128 @@ fn uninterpreted_universe_elements_are_ascribed_values_not_declared() {
         );
     }
 }
+
+fn solve_checked_alias_fixture(body: &str, named_goal: &str, cores: bool) -> (Executor, String) {
+    let goal = if cores {
+        format!("(assert (! {named_goal} :named observed_goal))")
+    } else {
+        format!("(assert {named_goal})")
+    };
+    let input = format!(
+        "(set-logic UFLIA) (set-option :produce-unsat-cores {cores}) \
+         (declare-sort Carrier 0) \
+         (declare-fun field0 (Carrier) Int) \
+         (declare-fun field1 (Carrier) Int) \
+         {body} {goal} (check-sat)"
+    );
+    let mut exec = Executor::new();
+    exec.set_self_check(true);
+    let outputs = exec.execute_all(&parse(&input).unwrap()).unwrap();
+    (exec, outputs.into_iter().next().unwrap())
+}
+
+fn assert_checked_alias_sat(exec: &Executor, verdict: &str) {
+    assert_eq!(verdict, "sat");
+    assert!(
+        exec.last_model_validated,
+        "the original query needs a validated model"
+    );
+    let model = exec.last_model.as_ref().unwrap();
+    eval_memo_clear();
+    for root in exec.independent_gate_query_roots().unwrap() {
+        assert_eq!(
+            exec.evaluate_term(model, root),
+            EvalValue::Bool(true),
+            "original assertion must hold in the emitted model: {}",
+            ay_proof::render_term_canonical(&exec.ctx.terms, root)
+        );
+    }
+}
+
+#[test]
+fn uflia_named_core_invariant_countermodel_preserves_carrier_alias() {
+    // The original verification-consumer Sum10 negative: an unconstrained construction
+    // need not satisfy field0(result)+field1(result)=10. The return-value
+    // alias must survive the named-goal assumption route too.
+    let body = "(declare-const result Carrier) (declare-const returned Carrier) \
+                (declare-fun invariant (Carrier) Bool) \
+                (assert (= result returned)) \
+                (assert (= (invariant result) (= (+ (field0 result) (field1 result)) 10)))";
+    for cores in [false, true] {
+        let (exec, verdict) = solve_checked_alias_fixture(
+            body,
+            "(not (= (+ (field0 result) (field1 result)) 10))",
+            cores,
+        );
+        assert_checked_alias_sat(&exec, &verdict);
+    }
+}
+
+#[test]
+fn uflia_named_core_wrong_field_countermodel_preserves_carrier_aliases() {
+    let body = "(declare-const root Carrier) (declare-const current Carrier) \
+                (declare-const old_current Carrier) (declare-const final Carrier) \
+                (assert (= current old_current)) (assert (= root current)) \
+                (assert (= final current)) (assert (= (field0 current) 5)) \
+                (assert (= (field0 final) 5))";
+    for cores in [false, true] {
+        let (exec, verdict) =
+            solve_checked_alias_fixture(body, "(not (= (field1 final) 5))", cores);
+        assert_checked_alias_sat(&exec, &verdict);
+    }
+}
+
+#[test]
+fn uflia_named_core_repeated_wrong_field_countermodel_keeps_one_function_value() {
+    for cores in [false, true] {
+        let input = format!(
+            "(set-logic UFLIA) (set-option :produce-unsat-cores {cores}) \
+             (declare-sort Carrier 0) \
+             (declare-const root Carrier) (declare-const current Carrier) \
+             (declare-const old_current Carrier) (declare-const final Carrier) \
+             (declare-fun field0 (Carrier) Int) (declare-fun field1 (Carrier) Int) \
+             (assert (= current old_current)) (assert (= root current)) \
+             (assert (= final current)) (assert (= (field0 current) 5)) \
+             (assert (= (field0 final) 5)) \
+             (push 1) (assert (not (= (field1 final) 5))) (check-sat) (pop 1) \
+             (push 1) (push 1) \
+             (assert (! (not (= (field1 final) 5)) :named negated_goal)) \
+             (check-sat)"
+        );
+        let mut exec = Executor::new();
+        exec.set_self_check(true);
+        let outputs = exec.execute_all(&parse(&input).unwrap()).unwrap();
+        assert_eq!(outputs, vec!["sat", "sat"]);
+        assert_checked_alias_sat(&exec, &outputs[1]);
+    }
+}
+
+#[test]
+fn uflia_named_core_distinct_concrete_projection_results_stay_unsatisfiable() {
+    let body = "(declare-const a Carrier) (declare-const b Carrier) \
+                (assert (= a b)) (assert (= (field0 a) 1))";
+    for cores in [false, true] {
+        let (_, verdict) = solve_checked_alias_fixture(body, "(= (field0 b) 2)", cores);
+        assert_eq!(verdict, "unsat");
+    }
+}
+
+#[test]
+fn uflia_named_core_carrier_alias_conflict_stays_unsatisfiable() {
+    let body = "(declare-const a Carrier) (declare-const b Carrier) (assert (= a b))";
+    for cores in [false, true] {
+        let (_, verdict) = solve_checked_alias_fixture(body, "(not (= a b))", cores);
+        assert_eq!(verdict, "unsat");
+    }
+}
+
+#[test]
+fn uflia_named_core_inactive_carrier_equality_does_not_merge_values() {
+    let body = "(declare-const a Carrier) (declare-const b Carrier) \
+                (declare-const selected Bool) (assert (not selected)) \
+                (assert (=> selected (= a b)))";
+    for cores in [false, true] {
+        let (exec, verdict) = solve_checked_alias_fixture(body, "(distinct a b)", cores);
+        assert_checked_alias_sat(&exec, &verdict);
+    }
+}

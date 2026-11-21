@@ -26,7 +26,7 @@ impl Solver {
             mib(self.watches.heap_bytes()),
             mib(self.cold.original_ledger.heap_bytes()),
             mib(self.reason_clause_marks.capacity() * size_of::<u32>()),
-            mib(self.cold.clause_ids.capacity() * size_of::<u64>()),
+            mib(self.cold.clause_ids.heap_bytes()),
             self.cold.clause_ids_disabled,
             mib(var_arrays),
             mib(self.trail.capacity() * size_of::<Literal>()),

@@ -6,6 +6,7 @@ use crate::{ArraySnapshot, Evaluator, ModelView, SnapshotNode};
 use num_traits::One;
 use std::sync::Arc;
 
+mod integer;
 mod resources;
 
 struct Empty;

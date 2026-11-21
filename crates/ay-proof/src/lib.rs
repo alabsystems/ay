@@ -92,20 +92,24 @@ pub use alethe_printer::dialect::{
 };
 pub use alethe_printer::refused_surface_hole::with_refused_surface_steps_declined_to_hole;
 pub use alethe_printer::{
-    arith_equality_chain_lowering_supported, carcara_declaration_gap, carcara_proof_surface,
+    arith_disequality_split_lowering_supported, arith_equality_chain_lowering_supported,
+    arith_proportional_equality_lowering_supported, carcara_declaration_gap, carcara_proof_surface,
     carcara_proof_surface_is_supported, certified_let_assume_bridge_is_supported,
-    checked_array_read_lowering_supported, checked_bv_bitblast_lowering_supported,
-    checked_bv_bitblast_lowering_supported_asking,
+    checked_affine_equality_cycle_lowering_supported, checked_array_read_lowering_supported,
+    checked_bv_bitblast_lowering_supported, checked_bv_bitblast_lowering_supported_asking,
     checked_bv_bitblast_lowering_supported_within_solve, checked_euf_transitive_lowering_supported,
     checked_ground_substitution_lowering_supported,
     checked_guarded_row_expansion_lowering_supported,
-    checked_ite_branch_projection_lowering_supported, checked_shadowed_stores_lowering_supported,
-    checked_urem_bound_lowering_supported, dt_project_lowering_supported,
-    effective_wire_term_overrides_for_proof, lia_lattice_lowering_supported,
-    mul_overflow_division_lowering_supported, negation_shell_assume_surface_pairs,
-    nra_sos_lowering_supported, recognize_mul_overflow_division, split_alethe_application_bounded,
-    theory_lemma_bv_arithmetic_lowering_supported_within_solve, trans_step_surface_is_supported,
-    AlethePrintError, AletheSurfaceParseError, BvSupportDeclines, CarcaraSurface, CompleteBlastAsk,
+    checked_ite_branch_projection_lowering_supported,
+    checked_lia_equality_chain_lowering_supported, checked_shadowed_stores_lowering_supported,
+    checked_unary_congruence_lowering_supported, checked_urem_bound_lowering_supported,
+    dt_project_lowering_supported, effective_wire_term_overrides_for_proof,
+    lia_lattice_lowering_supported, mul_overflow_division_lowering_supported,
+    negation_shell_assume_surface_pairs, nra_sos_lowering_supported,
+    qnt_neg_exists_step_lowering_supported, recognize_mul_overflow_division,
+    split_alethe_application_bounded, theory_lemma_bv_arithmetic_lowering_supported_within_solve,
+    trans_step_surface_is_supported, AlethePrintError, AletheSurfaceParseError, BvSupportDeclines,
+    CarcaraSurface, CompleteBlastAsk,
 };
 pub use array_row_axiom::{mint_row1_axiom, plan_row1_axiom_instances};
 pub use array_store_overwrite::{mint_store_overwrite_axiom, plan_store_overwrite_instances};
@@ -118,7 +122,8 @@ pub use authored_surfaces::{
     nullary_definition_assume_bridge_is_supported, term_overrides_outside_confined_let_assumes,
     try_export_alethe_with_authored_surfaces, try_export_alethe_with_authored_surfaces_until,
     try_export_alethe_with_authored_surfaces_with_progress,
-    try_export_alethe_with_authored_surfaces_within_solve, AletheAuthoredSurfaces, AskingSolve,
+    try_export_alethe_with_authored_surfaces_within_solve,
+    try_export_alethe_with_paired_datatype_constructors, AletheAuthoredSurfaces, AskingSolve,
 };
 pub use bundle::{
     capture_strict_retained_bundle_with_resource_control, re_check_bundle_strict,
@@ -126,10 +131,10 @@ pub use bundle::{
     re_check_retained_bundle_strict_with_resource_control,
     read_retained_proof_bundle_with_resource_control,
     read_retained_proof_bundle_with_resource_control_and_diagnostics, render_term_canonical,
-    BundleReCheck, RetainedProofBundle, RetainedProofCapture, RetainedProofTransportLimits,
-    RetainedReadDiagnostics, RetainedReadErrorClass, RetainedReadFailure, RetainedReadRefusal,
-    RetainedReadStage, RetainedReadTerminal, SerializableProofBundle, PROOF_BUNDLE_SCHEMA,
-    RETAINED_PROOF_BUNDLE_SCHEMA,
+    BundleReCheck, RetainedProofBundle, RetainedProofCapture, RetainedProofSourceView,
+    RetainedProofTransportLimits, RetainedReadDiagnostics, RetainedReadErrorClass,
+    RetainedReadFailure, RetainedReadRefusal, RetainedReadStage, RetainedReadTerminal,
+    SerializableProofBundle, PROOF_BUNDLE_SCHEMA, RETAINED_PROOF_BUNDLE_SCHEMA,
 };
 pub use bv_blast_export::{
     export_bv_blast_proof, BitLemma, BitLemmaKind, BvBlastExportError, BvBlastProof,
@@ -764,7 +769,7 @@ pub fn try_export_alethe_with_authored_surfaces_to_with_progress<W: std::io::Wri
         .with_assembled_rendering(alethe_printer::AssembledRendering::CachedWithinBudget)
         .with_emission_progress(keep_going)
         .with_authored_surfaces(surfaces);
-    export_alethe_with_printer_to(out, proof, terms, problem_assertions, &printer)
+    export_alethe_with_printer_to(out, proof, terms, problem_assertions, &printer, None)
 }
 
 /// Stream through the configured printer, retaining its original progress owner.
@@ -774,6 +779,7 @@ pub(crate) fn export_alethe_with_printer_to<W: std::io::Write>(
     terms: &TermStore,
     problem_assertions: &[TermId],
     printer: &AlethePrinter<'_>,
+    constructors: Option<&std::collections::BTreeMap<&str, TermId>>,
 ) -> Result<(), AletheStreamError> {
     printer
         .check_emission_progress(0)
@@ -784,7 +790,8 @@ pub(crate) fn export_alethe_with_printer_to<W: std::io::Write>(
         .prepare_proof(proof)
         .map_err(AletheStreamError::Print)?;
 
-    let definitions = prepare_alethe_definitions(printer, proof, terms, problem_assertions)?;
+    let definitions =
+        prepare_alethe_definitions(printer, proof, terms, problem_assertions, constructors)?;
     // The same obligation for APPLICATION heads and SORT names, which the
     // definitions walk never sees (`application_heads.rs`): judged on the
     // shipped bytes of each definition and step.
@@ -828,6 +835,7 @@ fn prepare_alethe_definitions(
     proof: &Proof,
     terms: &TermStore,
     problem_assertions: &[TermId],
+    constructors: Option<&std::collections::BTreeMap<&str, TermId>>,
 ) -> Result<Vec<String>, AletheStreamError> {
     // An Alethe PROOF document has no declaration command (see
     // `AlethePrintError::UndeclarableProofSymbols` for the carcara
@@ -841,6 +849,14 @@ fn prepare_alethe_definitions(
     // the printed document at all, so it needs nothing in the preamble.
     let pending: Vec<String> = auxiliary_declarations
         .into_iter()
+        .filter(|(name, sort)| {
+            !constructors.and_then(|decls| decls.get(name.as_str())).is_some_and(|&term| {
+                terms.entry_stamp(term).is_some()
+                    && terms.sort(term) == sort
+                    && terms.constructor_field_names(name).is_some_and(|fields| fields.is_empty())
+                    && matches!(terms.get(term), ay_core::TermData::Var(identity, _) if identity == name)
+            })
+        })
         .map(|(name, _sort)| name)
         .filter(|name| !printer.is_skolem_witness_name(name))
         .collect();

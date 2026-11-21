@@ -407,6 +407,10 @@ pub(crate) struct ProofConfig {
     /// the DIMACS/SMT `--proof-format` enum. The CHC preflight uses this marker
     /// to reject an explicit, incompatible format before solving.
     pub(crate) format_was_explicit: bool,
+    /// What the proof is derived from, for the label written on it at
+    /// creation (`ay::proof_store`); `None` for a proof of standard input and
+    /// for a temporary checker proof.
+    pub(crate) label: Option<ay::proof_store::ProofSubject>,
 }
 
 impl ProofConfig {
@@ -420,6 +424,7 @@ impl ProofConfig {
             is_temp: false,
             synthesized_default: false,
             format_was_explicit: false,
+            label: None,
         }
     }
 
@@ -432,6 +437,7 @@ impl ProofConfig {
             is_temp: false,
             synthesized_default: false,
             format_was_explicit: true,
+            label: None,
         }
     }
 
@@ -447,6 +453,7 @@ impl ProofConfig {
             is_temp: true,
             synthesized_default: false,
             format_was_explicit: false,
+            label: None,
         }
     }
 
@@ -462,11 +469,17 @@ impl ProofConfig {
             is_temp: false,
             synthesized_default: true,
             format_was_explicit: false,
+            label: None,
         }
     }
 
     fn with_artifact_path(mut self, artifact_path: Option<String>) -> Self {
         self.artifact_path = artifact_path;
+        self
+    }
+
+    fn with_label(mut self, label: Option<ay::proof_store::ProofSubject>) -> Self {
+        self.label = label;
         self
     }
 }
@@ -755,6 +768,9 @@ enum Command {
     ModelCount(cmd_model_count::ModelCountArgs),
     /// Triage a suspected wrong answer against a reference solver
     Diagnose(cmd_diagnose::DiagnoseCommand),
+    /// Where ay's proofs go: the names it writes beside an input
+    #[command(subcommand)]
+    Proof(ProofCommand),
     /// Release evidence generation and verification
     #[command(subcommand, hide = true)]
     Release(cmd_release::ReleaseCommand),
@@ -786,6 +802,23 @@ enum Command {
         #[arg(value_name = "TOPIC")]
         topic: Option<String>,
     },
+}
+
+/// `ay proof ...`: what ay's proofs are and where they go.
+#[derive(clap::Subcommand)]
+enum ProofCommand {
+    /// Print every name ay writes beside an input: its default proof pairs
+    /// (`<B>.cnf` -> `<B>.cnf.drat`, ...), the companions a published proof
+    /// keeps, the transaction files a killed run leaves, the label attribute
+    /// and the proof store's tag.
+    ///
+    /// One tab-separated record per line: `pair <input ext> <proof ext>
+    /// <format>`, `companion <pattern> <file|dir> <what>`, `leftover <pattern>
+    /// <file|dir> <what>` (`{P}` is the proof's name, `{pid}` the writing
+    /// process, `{n}` a nonce), `label <attribute> <schema>` and `store <tag>
+    /// <signature>`. A disk cleaner reads the list from here rather than
+    /// keeping a copy.
+    Sidecars,
 }
 
 include!("main/sat_exit_codes.rs");
@@ -1350,6 +1383,34 @@ struct SolveArgs {
         hide_short_help = true
     )]
     no_proof: bool,
+
+    /// Write the default proof into a proof store instead of beside the input.
+    ///
+    /// For ay's own runners, which solve corpora they must leave untouched.
+    /// The proof goes to `DIR/<input sha256>-<ay build>/<input>.<proof>`, and
+    /// every file the proof's transaction makes stays in that folder, so a run
+    /// killed at any point leaves nothing beside the input. DIR must be new,
+    /// empty, or a store ay made: ay tags it with `CACHEDIR.TAG` and refuses
+    /// any other folder. Every proof there carries a label (the
+    /// `com.alab.made` extended attribute) naming the input's sha256 and ay's
+    /// build; a store on a filesystem that keeps no extended attributes is
+    /// refused.
+    ///
+    /// A proof already in the store counts for a later run only after it is
+    /// checked again: its label must name this input's sha256 and this build,
+    /// sit on the file's own inode, and record the sha256 the file's bytes
+    /// still hash to. A proof that counts is the input's proof: the run still
+    /// solves, but writes no second copy. A stored proof that fails, and a
+    /// status file a killed run left, is set aside in its folder and the run
+    /// writes a fresh proof. An explicit `--proof FILE` still wins.
+    #[arg(
+        long,
+        value_name = "DIR",
+        help_heading = "Proof verification",
+        conflicts_with = "no_proof",
+        hide_short_help = true
+    )]
+    proof_store: Option<PathBuf>,
 
     /// Re-check the emitted proof after UNSAT (on by default)
     ///
@@ -3271,6 +3332,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "allsat",
     "model-count",
     "diagnose",
+    "proof",
     "launch-packet",
     "launch-gate",
     "release",
@@ -5312,7 +5374,8 @@ fn solve_artifact_path_collision(
     if !has_explicit_proof
         && !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args))
     {
-        if let Some((path, format)) = default_proof_path(args.file.as_deref()) {
+        let slot = proof_store_slot(args)?;
+        if let Some((path, format)) = default_proof_path(args.file.as_deref(), slot.as_ref()) {
             output_paths.push(("default proof", comparable_output_path(FsPath::new(&path))?));
             if format == ProofFormat::Drat {
                 let status_path = dimacs::dimacs_proof_status_path(&path);
@@ -5577,7 +5640,8 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
     if !has_explicit_proof
         && !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args))
     {
-        if let Some((default_path, _)) = default_proof_path(args.file.as_deref()) {
+        let slot = proof_store_slot(args)?;
+        if let Some((default_path, _)) = default_proof_path(args.file.as_deref(), slot.as_ref()) {
             let default_path = comparable_output_path(FsPath::new(&default_path))?;
             for (certificate_label, requested, comparable) in &certificate_paths {
                 if certificate_paths_may_alias(&default_path, comparable)? {
@@ -6678,30 +6742,40 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
         .proof_artifact
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+    // A proof a person named is labelled too: it is derived from the input
+    // and made again by the same command, and it is the person's file.
+    let explicit_label = args
+        .file
+        .as_deref()
+        .map(ay::proof_store::ProofSubject::named);
 
     // Legacy explicit flags take precedence
     if let Some(ref path) = args.drat {
         return Some(
             ProofConfig::new(path.to_string_lossy().to_string(), ProofFormat::Drat, false)
-                .with_artifact_path(artifact_path),
+                .with_artifact_path(artifact_path)
+                .with_label(explicit_label),
         );
     }
     if let Some(ref path) = args.drat_binary {
         return Some(
             ProofConfig::new(path.to_string_lossy().to_string(), ProofFormat::Drat, true)
-                .with_artifact_path(artifact_path),
+                .with_artifact_path(artifact_path)
+                .with_label(explicit_label),
         );
     }
     if let Some(ref path) = args.lrat {
         return Some(
             ProofConfig::new(path.to_string_lossy().to_string(), ProofFormat::Lrat, false)
-                .with_artifact_path(artifact_path),
+                .with_artifact_path(artifact_path)
+                .with_label(explicit_label),
         );
     }
     if let Some(ref path) = args.lrat_binary {
         return Some(
             ProofConfig::new(path.to_string_lossy().to_string(), ProofFormat::Lrat, true)
-                .with_artifact_path(artifact_path),
+                .with_artifact_path(artifact_path)
+                .with_label(explicit_label),
         );
     }
 
@@ -6717,7 +6791,11 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
             }
             config
         };
-        return Some(config.with_artifact_path(artifact_path));
+        return Some(
+            config
+                .with_artifact_path(artifact_path)
+                .with_label(explicit_label),
+        );
     }
 
     // No explicit --proof. For a file whose extension maps to a supported
@@ -6740,7 +6818,26 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
     // plain solve honours it — batteries on — so the announcement always names
     // a file the run will actually write on `unsat`.
     if !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args)) {
-        if let Some((path, format)) = default_proof_path(args.file.as_deref()) {
+        let slot = match proof_store_slot(args) {
+            Ok(slot) => slot,
+            Err(error) => {
+                safe_eprintln!("Error: --proof-store: {error}");
+                std::process::exit(1);
+            }
+        };
+        let stored = match slot.as_ref() {
+            Some(slot) => check_stored_proofs_again(slot, args),
+            None => StoredDefault::Write,
+        };
+        let path = default_proof_path(args.file.as_deref(), slot.as_ref());
+        if let (Some((path, format)), StoredDefault::Write) = (path, stored) {
+            let label = match slot.as_ref() {
+                Some(slot) => Some(slot.subject()),
+                None => args
+                    .file
+                    .as_deref()
+                    .map(ay::proof_store::ProofSubject::beside),
+            };
             if !args.stats_json && !quiet_enabled() {
                 // "on unsat": this is announced before solving, and the
                 // certificate is only actually written for an UNSAT verdict —
@@ -6752,7 +6849,11 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
                     default_proof_kind(format)
                 );
             }
-            return Some(ProofConfig::new_default(path, format).with_artifact_path(artifact_path));
+            return Some(
+                ProofConfig::new_default(path, format)
+                    .with_artifact_path(artifact_path)
+                    .with_label(label),
+            );
         }
     }
 
@@ -6868,23 +6969,150 @@ fn default_proof_kind(format: ProofFormat) -> &'static str {
 ///                          retargets this to `<input>.chccert` at write time
 ///                          when the problem turns out to be Horn)
 ///
+/// With `--proof-store`, the same name goes in the input's store slot
+/// instead of beside the input (`<slot>/<input>.drat`, ...).
+///
 /// Returns `None` for stdin input (no file), unknown extensions, or anything
 /// without an obvious on-disk home for the artifact. This is a pure function
 /// extracted for unit testing; `build_proof_config` wraps the result in a
 /// `ProofConfig::new_default`.
-fn default_proof_path(file: Option<&std::path::Path>) -> Option<(String, ProofFormat)> {
+fn default_proof_path(
+    file: Option<&std::path::Path>,
+    slot: Option<&ay::proof_store::ProofSlot>,
+) -> Option<(String, ProofFormat)> {
     let file = file?;
-    let ext = file
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    let (proof_ext, format) = match ext.as_str() {
-        "cnf" | "dimacs" => ("drat", ProofFormat::Drat),
-        "smt2" | "smt" => ("alethe", ProofFormat::Alethe),
+    // The pairs `ay proof sidecars` declares are the ones written here.
+    let proof_ext = ay::proof_store::default_proof_extension(file)?;
+    let format = match proof_ext {
+        "drat" => ProofFormat::Drat,
+        "alethe" => ProofFormat::Alethe,
         _ => return None,
     };
-    Some((sibling_proof_path(file, proof_ext), format))
+    let path = match slot {
+        Some(slot) => slot.proof_path(proof_ext).to_string_lossy().into_owned(),
+        None => sibling_proof_path(file, proof_ext),
+    };
+    Some((path, format))
+}
+
+/// The `--proof-store` slot of this run's input, opened (store and slot
+/// created when missing) once per store and input: the input is hashed once
+/// however many checks ask for the default proof's path.
+fn proof_store_slot(args: &SolveArgs) -> io::Result<Option<ay::proof_store::ProofSlot>> {
+    type Opened = ((PathBuf, PathBuf), ay::proof_store::ProofSlot);
+    static OPENED: std::sync::Mutex<Vec<Opened>> = std::sync::Mutex::new(Vec::new());
+    let Some(store) = args.proof_store.as_deref() else {
+        return Ok(None);
+    };
+    let Some(file) = args.file.as_deref() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a proof store holds proofs of input files; standard input has none",
+        ));
+    };
+    let key = (store.to_path_buf(), file.to_path_buf());
+    let mut opened = OPENED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, slot)) = opened.iter().find(|(seen, _)| *seen == key) {
+        return Ok(Some(slot.clone()));
+    }
+    let slot = ay::proof_store::ProofStore::open(store)?.slot(file)?;
+    opened.push((key, slot.clone()));
+    Ok(Some(slot))
+}
+
+/// What the proof store says about this run's default proof.
+enum StoredDefault {
+    /// Write it into the slot.
+    Write,
+    /// The slot already holds this input's proof from this build, checked
+    /// again, or a live run is writing it: this run writes no second copy.
+    NoSecondCopy,
+}
+
+/// What asks for this run's own proof, beyond a proof of its input: a
+/// stored proof does not answer it.
+fn run_needs_its_own_proof(args: &SolveArgs) -> Option<&'static str> {
+    if args.proof_artifact.is_some() {
+        Some("--proof-artifact asks for this run's own proof")
+    } else if args.emit_firewall_lean.is_some() {
+        Some("--emit-firewall-lean asks for this run's own proof")
+    } else if args.verify_proof {
+        Some("--verify-proof asks to check this run's own proof")
+    } else {
+        None
+    }
+}
+
+/// Check again each proof already in this input's store slot, before it
+/// counts (`ay::proof_store::ProofSlot::check_stored`).
+///
+/// A proof that passes is this input's proof from this build: the run still
+/// solves, but writes no second copy, and says which file is the proof. So
+/// does a run that finds a live run writing that proof. A run that asks for
+/// its own proof (`run_needs_its_own_proof`) sets a passing proof aside
+/// instead. Whatever fails its check, and a status lock or marker a dead run
+/// left with no proof, is set aside in the slot, never removed, so this run
+/// can publish a fresh proof.
+fn check_stored_proofs_again(slot: &ay::proof_store::ProofSlot, args: &SolveArgs) -> StoredDefault {
+    use ay::proof_store::StoredProof;
+    let Some(file) = args.file.as_deref() else {
+        return StoredDefault::Write;
+    };
+    let announce = !args.stats_json && !quiet_enabled();
+    let own = run_needs_its_own_proof(args);
+    let report_aside = |aside: &ay::proof_store::SetAside| {
+        safe_eprintln!(
+            "c proof store: {} does not count ({}); set aside as {}",
+            aside.name.display(),
+            aside.why,
+            aside.aside.display()
+        );
+    };
+    for extension in ay::proof_store::proof_extensions(file) {
+        let check = match slot.check_stored(extension) {
+            Ok(check) => check,
+            Err(error) => {
+                safe_eprintln!(
+                    "c warning: proof store: could not check {} again: {error}",
+                    slot.proof_path(extension).display()
+                );
+                continue;
+            }
+        };
+        check.set_aside.iter().for_each(report_aside);
+        match (check.proof, own) {
+            (StoredProof::Absent, _) | (StoredProof::Busy(_), Some(_)) => {}
+            (StoredProof::Busy(why), None) => {
+                if announce {
+                    safe_eprintln!(
+                        "c proof store: {why}; this run writes no second copy of {}",
+                        slot.proof_path(extension).display()
+                    );
+                }
+                return StoredDefault::NoSecondCopy;
+            }
+            (StoredProof::Reused(path), None) => {
+                if announce {
+                    safe_eprintln!(
+                        "c proof store: {} is this input's proof from this build (checked again: its label names this input's sha256 and this build, and its bytes hash to the sha256 it records); this run writes no second copy",
+                        path.display()
+                    );
+                }
+                return StoredDefault::NoSecondCopy;
+            }
+            (StoredProof::Reused(_), Some(why)) => match slot.supersede(extension, why.to_string())
+            {
+                Ok(aside) => report_aside(&aside),
+                Err(error) => safe_eprintln!(
+                    "c warning: proof store: could not set {} aside: {error}",
+                    slot.proof_path(extension).display()
+                ),
+            },
+        }
+    }
+    StoredDefault::Write
 }
 
 /// Compute the default DRAT proof path for a DIMACS input file (#8864).
@@ -6894,7 +7122,7 @@ fn default_proof_path(file: Option<&std::path::Path>) -> Option<(String, ProofFo
 /// for the DIMACS-default unit tests.
 #[cfg(test)]
 fn default_drat_proof_path(file: Option<&std::path::Path>) -> Option<String> {
-    match default_proof_path(file) {
+    match default_proof_path(file, None) {
         Some((path, ProofFormat::Drat)) => Some(path),
         _ => None,
     }
@@ -7185,6 +7413,10 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some(Command::Proof(ProofCommand::Sidecars)) => {
+            safe_print!("{}", ay::proof_store::sidecars_report());
+            let _ = io::stdout().flush();
+        }
         Some(Command::Commands) => {
             help_topics::print_commands();
             let _ = io::stdout().flush();

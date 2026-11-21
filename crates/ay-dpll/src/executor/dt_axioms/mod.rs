@@ -278,6 +278,17 @@ impl Executor {
                 let _ = args;
                 out.push(DisjunctOption::Facts(vec![t]));
             }
+            // Actual integer guard assignments remain source premises for
+            // guarded Seq element containment. They add no arithmetic result.
+            TermData::App(Symbol::Named(name), args)
+                if matches!(name.as_str(), "<" | "<=" | ">" | ">=")
+                    && args.len() == 2
+                    && args
+                        .iter()
+                        .all(|&arg| self.ctx.terms.sort(arg) == &Sort::Int) =>
+            {
+                out.push(DisjunctOption::Facts(vec![t]));
+            }
             // Disjunction: each arg is a disjunct (#dt-embedded-cycle false-SAT).
             // This is EXACT (not a weakening): `(or e1 .. en)` asserts that every
             // model satisfies at least one `e_i`, which is precisely the
@@ -341,6 +352,16 @@ impl Executor {
             // ENTAILED true makes its negation a dead disjunct (dropped, exact).
             TermData::Not(inner) => match self.ctx.terms.get(inner).clone() {
                 TermData::Not(e) => self.collect_dt_fact_disjuncts(e, out, units, depth + 1, gmemo),
+                TermData::App(Symbol::Named(name), args)
+                    if matches!(name.as_str(), "<" | "<=" | ">" | ">=")
+                        && args.len() == 2
+                        && args
+                            .iter()
+                            .all(|&arg| self.ctx.terms.sort(arg) == &Sort::Int) =>
+                {
+                    out.push(DisjunctOption::Facts(vec![t]));
+                }
+
                 TermData::App(Symbol::Named(name), conj_args) if name == "and" => {
                     for &c in &conj_args {
                         match self.ctx.terms.get(c) {

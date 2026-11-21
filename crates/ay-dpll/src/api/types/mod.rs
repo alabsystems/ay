@@ -26,6 +26,7 @@ mod model_blocking;
 mod model_provenance;
 mod model_value;
 mod model_value_display;
+mod native_datatypes;
 mod native_replay;
 mod objective;
 mod results;
@@ -41,6 +42,19 @@ pub use complete_value::CompleteModelValue;
 pub use finite_enumeration::{
     FiniteEnumerationOutcome, FiniteEnumerationReport, FiniteEnumerationRow,
     FiniteEnumerationStatistics, FiniteEnumerationValue,
+};
+pub use native_datatypes::{
+    NativeDatatypeBatchBudget, NativeDatatypeBatchError, NativeDatatypeBatchLimits,
+    NativeDatatypeBatchRefusal, NativeDatatypeBatchUsage,
+};
+
+/// Shared native declaration admission owner; datatype-batch spellings remain compatible.
+pub use native_datatypes::{
+    NativeDatatypeBatchBudget as NativeDeclarationBudget,
+    NativeDatatypeBatchError as NativeDeclarationError,
+    NativeDatatypeBatchLimits as NativeDeclarationLimits,
+    NativeDatatypeBatchRefusal as NativeDeclarationRefusal,
+    NativeDatatypeBatchUsage as NativeDeclarationUsage,
 };
 
 // Re-export all public types to preserve the existing `types::*` surface.
@@ -212,9 +226,11 @@ pub(crate) use native_replay::NativeReplayAdmissionToken;
 pub use native_replay::{
     NativeReplayArtifact, NativeReplayAssertion, NativeReplayCheckedReplaySummary,
     NativeReplayDeclaration, NativeReplayEvent, NativeReplayEventKind,
-    NativeReplayEvidenceManifest, NativeReplayFunctionDeclaration, NativeReplayMetadata,
-    NativeReplayModelSummary, NativeReplayProofSummary, NativeReplayResourceUsage,
-    NativeReplaySolveSummary, NativeReplaySolverIdentity, NativeReplayStatistics,
+    NativeReplayEvidenceManifest, NativeReplayExportBudget, NativeReplayExportError,
+    NativeReplayExportLimits, NativeReplayExportResource, NativeReplayExportUsage,
+    NativeReplayFunctionDeclaration, NativeReplayMetadata, NativeReplayModelSummary,
+    NativeReplayProofSummary, NativeReplayResourceUsage, NativeReplaySolveSummary,
+    NativeReplaySolverIdentity, NativeReplaySortDeclaration, NativeReplayStatistics,
     NativeReplaySymbolIdentity, NativeReplaySymbolKind, NativeReplayTermNode,
     NativeReplayUnknownProgress, NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA, NATIVE_REPLAY_SCHEMA,
 };

@@ -159,6 +159,9 @@ impl Executor {
     /// Start a caller-visible decision query and replenish resource envelopes
     /// that must remain cumulative across every nested solve/restart it owns.
     pub(crate) fn begin_external_decision_query(&mut self, preserve_pareto_enumeration: bool) {
+        self.native_universal_budget
+            .get_mut()
+            .begin_external_query();
         self.begin_evaluation_decision();
         self.begin_external_proof_checkpoint_budget();
         // The consequence-replay lane's WALL envelope re-arms HERE and nowhere

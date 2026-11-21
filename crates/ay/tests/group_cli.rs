@@ -16,6 +16,9 @@ mod spawn_timeout_selftest;
 #[path = "group_cli/competition_mode_b1.rs"]
 mod competition_mode_b1;
 
+#[path = "group_cli/parity_space_route_cli.rs"]
+mod parity_space_route_cli;
+
 #[path = "group_cli/orbitope_detection_honors_the_deadline.rs"]
 mod orbitope_detection_honors_the_deadline;
 
@@ -37,6 +40,8 @@ mod dimacs_sat_exit_codes;
 mod kernel_route_cli;
 #[path = "group_cli/proof_staging_abnormal_exit.rs"]
 mod proof_staging_abnormal_exit;
+#[path = "group_cli/proof_store_sweep.rs"]
+mod proof_store_sweep;
 #[path = "group_cli/qbf_solve_cli.rs"]
 mod qbf_solve_cli;
 #[path = "group_cli/reexec_supervisor_gate.rs"]

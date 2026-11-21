@@ -29,6 +29,35 @@ pub struct IdentityLambda {
     pub read: TermId,
 }
 
+/// A well-typed integer-index scalar lambda header. This is eligibility data;
+/// the independent evaluator must still establish the entire periodic grammar.
+#[derive(Clone, Copy, Debug)]
+pub struct IntScalarLambda {
+    pub bound: TermId,
+    pub body: TermId,
+}
+
+pub fn recognize_int_scalar_lambda(terms: &TermStore, term: TermId) -> Option<IntScalarLambda> {
+    if terms.entry_stamp(term).is_none() {
+        return None;
+    }
+    let Sort::Array(sort) = terms.sort(term) else {
+        return None;
+    };
+    if sort.index_sort != Sort::Int || !matches!(&sort.element_sort, Sort::Bool | Sort::Int) {
+        return None;
+    }
+    let lambda = app(terms, term, "lambda-array", 2)?;
+    let (bound, body) = (lambda[0], lambda[1]);
+    if !matches!(terms.get(bound), TermData::Var(..))
+        || terms.sort(bound) != &Sort::Int
+        || terms.sort(body) != &sort.element_sort
+    {
+        return None;
+    }
+    Some(IntScalarLambda { bound, body })
+}
+
 fn app<'a>(terms: &'a TermStore, term: TermId, name: &str, count: usize) -> Option<&'a [TermId]> {
     if (term.0 as usize) >= terms.len() {
         return None;

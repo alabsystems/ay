@@ -8,6 +8,8 @@ use ay_core::{ProofId, TermId};
 
 use super::Executor;
 
+mod rejected_step;
+
 const CERT_REJECT_PROBE_MAX_TERMS: usize = 32;
 
 /// Print a certification-rejection diagnostic when `--probe-cert-reject` is set.
@@ -49,6 +51,14 @@ fn emit_probe_cert_reject(format: ProbeFormat, message: impl FnOnce() -> String)
 }
 
 impl Executor {
+    pub(super) fn rejected_step_probe_message(
+        &self,
+        proof: &ay_core::Proof,
+        error: &ay_proof::ProofCheckError,
+    ) -> String {
+        rejected_step::render(proof, &self.ctx.terms, error)
+    }
+
     /// Identity-only diagnostics must not invoke the solver's term renderer:
     /// finite-field formatting can record an evaluation stop, and truncating
     /// afterwards does not bound traversal of the term graph.

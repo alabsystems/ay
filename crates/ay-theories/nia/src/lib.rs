@@ -502,6 +502,22 @@ pub struct NiaSolver<'a> {
     /// split is about to enumerate. Shared by every theory instance the split
     /// loop creates, like `local_search_deadline`; `None` disables it.
     split_probe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+
+    /// The enclosing solve is the top-level QF_NIA search under a wall
+    /// deadline and nothing waits for its `unknown` (AY-SMT-5,
+    /// #nia-persist-until-deadline): not a mod/div rescue sub-solve, not a
+    /// quantifier round, and the assertions form one symbol-connected
+    /// component, so the executor's post-dispatch partition rescue cannot
+    /// follow it. An `unknown` before the deadline then forfeits the rest of
+    /// the budget. When set, the solver (1) offers geometric box splits on
+    /// half-bounded monomial factors at the refinement-stall exit and (2)
+    /// asks the split loop to keep branching past its split-drift guard
+    /// until the deadline (`TheorySolver::continue_split_walk_until_deadline`).
+    /// Both are tautological case splits or search order: neither can change
+    /// a `sat` or an `unsat`. Off by default (sub-solves, quantifier rounds,
+    /// the combined UF lanes and solves without a deadline keep the
+    /// historical behaviour).
+    persist_until_deadline: bool,
 }
 
 impl<'a> NiaSolver<'a> {
@@ -578,7 +594,23 @@ impl<'a> NiaSolver<'a> {
             local_search_first_offer: None,
             local_search_deadline: None,
             split_probe: None,
+            persist_until_deadline: false,
         }
+    }
+
+    /// Mark the enclosing solve as the top-level QF_NIA search
+    /// (#nia-persist-until-deadline); see the `persist_until_deadline` field.
+    /// Has no effect unless a deadline is also installed (`set_deadline`):
+    /// without one, the split-drift guard is the only thing that ends an
+    /// unbounded split walk, so it must keep doing so.
+    pub fn set_persist_until_deadline(&mut self, persist: bool) {
+        self.persist_until_deadline = persist;
+    }
+
+    /// Whether the persistence policy is in force right now: requested,
+    /// a deadline is installed, and it has not passed.
+    pub(crate) fn persisting_until_deadline(&self) -> bool {
+        self.persist_until_deadline && self.deadline.is_some() && !self.should_timeout()
     }
 
     /// Install the solve's original assertion formulas (#nia-clausal-sls).
@@ -727,6 +759,9 @@ mod stale_accept_tests;
 
 #[cfg(test)]
 mod split_probe_tests;
+
+#[cfg(test)]
+mod persist_until_deadline_tests;
 
 #[cfg(test)]
 mod factor_split_precision_tests;

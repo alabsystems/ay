@@ -1279,7 +1279,7 @@ impl Solver {
                     // Update clause_ids so deduplication/later deletions use the
                     // new proof ID, not the stale original that Phase 2 will delete.
                     if new_id != 0 && *clause_idx < self.cold.clause_ids.len() {
-                        self.cold.clause_ids[*clause_idx] = new_id;
+                        self.cold.clause_ids.set(*clause_idx, new_id);
                     }
                 }
                 crate::decompose::ClauseMutation::Unit { unit, old, .. } => {

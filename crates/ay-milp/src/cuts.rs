@@ -36,6 +36,7 @@ use num_rational::BigRational;
 use num_traits::Zero;
 
 use crate::model::{exact, Col, ColKind, Model, Row};
+use crate::BoundSide;
 
 /// A cut must be violated by at least this much to be worth its row.
 ///
@@ -8674,6 +8675,30 @@ const MAX_CLIQUE_ROW_SUPPORT: usize = 128;
 /// strength it could not have kept anyway. Held under the pool's `MAX_CUT_NNZ` (200) on purpose.
 const MAX_CLIQUE_MEMBERS: usize = 96;
 
+/// Whether an actual authoritative upper row makes every pair a conflict.
+/// Uniformity is exact and unchanged as a structural criterion; stored f64
+/// values may be only rounded advice for the model's exact row side store.
+fn is_conflict_packing_row(model: &Model, row: Row) -> bool {
+    let (coeffs, _lb, ub) = model.row(row);
+    if coeffs.len() < 2 {
+        return false;
+    }
+    let index = row.index();
+    let Some(upper) = model.row_ub_exact_cow(index, ub) else {
+        return false;
+    };
+    let (first_column, first_advice) = coeffs[0];
+    let value = model.row_coeff_exact_cow(index, first_column, first_advice);
+    if !value.is_positive() || value.as_ref() + value.as_ref() <= *upper.as_ref() {
+        return false;
+    }
+    coeffs.iter().all(|&(column, advice)| {
+        model.row_coeff_exact_cow(index, column, advice).as_ref() == value.as_ref()
+            && matches!(model.col_kind(Col(column)), ColKind::Binary)
+            && model.col_bounds(Col(column)).0 >= 0.0
+    })
+}
+
 /// Separate CLIQUE cuts from the conflict graph implied by the model's rows.
 ///
 /// # Why this family, and why nothing already here can do its job
@@ -8701,9 +8726,9 @@ const MAX_CLIQUE_MEMBERS: usize = 96;
 ///   with `2v > ub` (a set-packing `Σ x <= 1` or partitioning `Σ x = 1` row is `v = ub = 1`) makes
 ///   every pair of its columns an edge: forcing two on already contributes `2v > ub`, and every
 ///   other term's least contribution is `>= 0` (`v > 0`, binary `lb >= 0`). The comparisons are
-///   f64-EXACT (`a == v`, `2v > ub` -- a power-of-two product), and the adjacency test is "do the
-///   two columns share a packing row", a bitset intersection over row indices; no per-row pair
-///   enumeration, which matters when one row has 3,861 columns.
+///   against the model's authoritative exact coefficients and upper side, and the adjacency test
+///   is "do the two columns share a packing row", a bitset intersection over row indices; no per-row
+///   pair enumeration, which matters when one row has 3,861 columns.
 /// * **Lane B -- knapsack-implied edges.** For any other row-side `Σ a_j x_j <= b` (a `>=` side is
 ///   the negated `<=` side), pay every column its LEAST possible contribution over its box (exact
 ///   rationals; a side with an unbounded column pays ∞ and is skipped) and write
@@ -8743,22 +8768,10 @@ pub(crate) fn separate_clique(model: &Model, x: &[f64], n_rows: usize) -> Vec<Cu
         .map(|(i, &j)| (j as u32, i))
         .collect();
 
-    // LANE A: the packing rows, found by exact f64 comparison.
+    // LANE A: uniform packing rows, using the model's authoritative exact data.
     let mut pack: Vec<usize> = Vec::new();
     for r in 0..n_rows {
-        let (coeffs, _lb, ub) = model.row(Row(r as u32));
-        if coeffs.len() < 2 || !ub.is_finite() {
-            continue;
-        }
-        let v = coeffs[0].1;
-        // `2.0 * v` is exact (a power-of-two product), so the overshoot test never rounds.
-        if v <= 0.0 || 2.0 * v <= ub {
-            continue;
-        }
-        if coeffs
-            .iter()
-            .all(|&(c, a)| a == v && is_binary(c) && model.col_bounds(Col(c)).0 >= 0.0)
-        {
+        if is_conflict_packing_row(model, Row(r as u32)) {
             pack.push(r);
         }
     }
@@ -8783,21 +8796,27 @@ pub(crate) fn separate_clique(model: &Model, x: &[f64], n_rows: usize) -> Vec<Cu
         if coeffs.len() < 2 {
             continue;
         }
-        for (sign, rhs) in [(1.0f64, ub), (-1.0, lb)] {
-            if !rhs.is_finite() {
+        for side in [BoundSide::Upper, BoundSide::Lower] {
+            let bound = match side {
+                BoundSide::Upper => model.row_ub_exact_cow(r, ub),
+                BoundSide::Lower => model.row_lb_exact_cow(r, lb),
+            };
+            let Some(bound) = bound else {
                 continue;
-            }
-            let Some(rhs) = exact(sign * rhs) else {
-                continue;
+            };
+            let rhs = match side {
+                BoundSide::Upper => bound.into_owned(),
+                BoundSide::Lower => -bound.into_owned(),
             };
             // Pay every column its least contribution; collect each support binary's surplus.
             let mut minact = BigRational::zero();
             let mut surplus: Vec<(usize, BigRational)> = Vec::new();
             let mut ok = true;
             for &(c, raw) in coeffs {
-                let Some(a) = exact(sign * raw) else {
-                    ok = false;
-                    break;
+                let coefficient = model.row_coeff_exact_cow(r, c, raw);
+                let a = match side {
+                    BoundSide::Upper => coefficient.into_owned(),
+                    BoundSide::Lower => -coefficient.into_owned(),
                 };
                 if a.is_zero() {
                     continue;
@@ -9252,22 +9271,11 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
         .map(|(i, &j)| (j as u32, i))
         .collect();
 
-    // LANE A packing rows (`Σ v·x ≤ ub`, all coeffs `v`, `2v > ub`), by exact f64 comparison — the
-    // same test `separate_clique` uses. On a pure set-partitioning model this is every row.
+    // LANE A uses the same authoritative uniform packing-row test as cliques.
+    // On a pure set-partitioning model this is every row.
     let mut pack: Vec<usize> = Vec::new();
     for r in 0..n_rows {
-        let (coeffs, _lb, ub) = model.row(Row(r as u32));
-        if coeffs.len() < 2 || !ub.is_finite() {
-            continue;
-        }
-        let v = coeffs[0].1;
-        if v <= 0.0 || 2.0 * v <= ub {
-            continue;
-        }
-        if coeffs
-            .iter()
-            .all(|&(c, a)| a == v && is_binary(c) && model.col_bounds(Col(c)).0 >= 0.0)
-        {
+        if is_conflict_packing_row(model, Row(r as u32)) {
             pack.push(r);
         }
     }
@@ -11721,3 +11729,6 @@ mod adversarial_knap_soundness2;
 
 mod rlt;
 pub(crate) use rlt::separate_rlt;
+
+#[cfg(test)]
+mod exact_conflict_source_tests;

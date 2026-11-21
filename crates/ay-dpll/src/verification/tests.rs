@@ -166,6 +166,50 @@ mod dedup_conflict_tests {
         );
     }
 
+    /// AY-SMT-2 (2026-11-19): the #6853 shape over an opaque UF application
+    /// with a constant argument, `{f(1) != 0, 0 <= f(1), f(1) <= 0}`. The
+    /// verification combiner's LIA used to answer `Sat` from a finite-domain
+    /// witness `f(1) = 0` that ignored the EUF-shared disequality, so the
+    /// mixed verifier called this UNSAT set satisfiable and the search ended
+    /// `unknown` (QF_UFLIA `(<= 0 (f 1)) (<= (f 1) 0) (not (= 0 (f 1)))`,
+    /// and the AUFLIA SMT-COMP instance 498486a2 through a skolem function
+    /// applied to `0`).
+    #[test]
+    fn test_uf_constant_argument_disequality_bounds_conflict_not_refuted() {
+        use ay_core::term::Symbol;
+        let mut terms = TermStore::new();
+        let one = terms.mk_int(BigInt::from(1));
+        let zero = terms.mk_int(BigInt::from(0));
+        let f1 = terms.mk_app(Symbol::named("f"), [one], Sort::Int);
+        let eq = terms.mk_eq(zero, f1);
+        let lower = terms.mk_le(zero, f1);
+        let upper = terms.mk_le(f1, zero);
+        let conflict = vec![
+            TheoryLit::new(eq, false),
+            TheoryLit::new(lower, true),
+            TheoryLit::new(upper, true),
+        ];
+        assert!(
+            verify_conflict_semantic(&conflict, &terms, &[]).is_ok(),
+            "{{f(1) != 0, 0 <= f(1), f(1) <= 0}} is UNSAT and must be accepted"
+        );
+        // `Ok` alone would also admit `AcceptedUnchecked` (a split, a budget
+        // stop, an uncheckable fragment): the claim is that the fresh
+        // combiner RE-DERIVES the UNSAT, so assert exactly that.
+        let verdict = verify_mixed_conflict_semantic(&conflict, &terms, &[]);
+        assert!(
+            matches!(
+                verdict,
+                Ok(super::dispatch::ConflictSemanticVerdict::Reproved)
+            ),
+            "the mixed (Nelson-Oppen) verifier must re-derive UNSAT for this set, got {verdict:?}"
+        );
+        // No satisfiable control here: without the disequality the combiner
+        // proposes the model equality `f(1) = 0`, which the verifier accepts
+        // unchecked by design. The LIA-level control lives in `ay-lia`
+        // (`finite_domain_witness_kept_when_shared_disequality_holds`).
+    }
+
     /// #4666: a duplicate-bearing copy of the #6853 conflict is structurally
     /// rejected as-is; after `dedup_conflict_literals` it passes the
     /// structural check AND verifies UNSAT semantically, so it can be

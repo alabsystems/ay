@@ -31,7 +31,7 @@ impl VSIDS {
         } else {
             (num_vars as u32 - 1, 0, bump_order[0])
         };
-        Ok(Self {
+        let mut vsids = Self {
             activities: try_vec_with(owner, num_vars, |_| 0.0)?,
             increment: 1.0,
             decay: default_vsids_decay(),
@@ -60,7 +60,9 @@ impl VSIDS {
             queue_freeze: ay_core::sat_ab_switches().queue_freeze_kissat == Some(true),
             // This constructor initializes 32 empty Vecs and scalar metadata.
             bucket_queue: BucketQueue::new(),
-        })
+        };
+        vsids.apply_initial_order_switch();
+        Ok(vsids)
     }
 }
 

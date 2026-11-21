@@ -249,9 +249,23 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 );
             }
             ay_core::TheoryResult::NeedSplit(split) => {
-                let oscillation_detected = $crate::executor::theories::solve_harness::check_split_oscillation(
+                let mut oscillation_detected = $crate::executor::theories::solve_harness::check_split_oscillation(
                     &mut $lsv, split.variable, &split.value,
                 );
+
+                // AY-SMT-5 (#nia-persist-until-deadline): a theory under a
+                // wall deadline that no outer strategy is waiting on may ask
+                // to keep branching. The split below is the tautology
+                // `x <= floor OR x >= ceil`, so continuing is sound; the
+                // drift record restarts so the SAT-only offer before the
+                // guard (#split-walk-sat-fallback) comes once per
+                // UNBOUNDED_THRESHOLD rounds, not on every round.
+                if oscillation_detected
+                    && ay_core::TheorySolver::continue_split_walk_until_deadline(&$theory)
+                {
+                    $lsv.remove(&split.variable);
+                    oscillation_detected = false;
+                }
 
                 if oscillation_detected {
                     // Unbounded drift detected (#1836): the split variable's

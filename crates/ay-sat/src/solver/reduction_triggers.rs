@@ -109,7 +109,7 @@ impl Solver {
     /// - `watches.heap_bytes()` — unified watcher buffers (`buf_blockers`,
     ///   `buf_clauses`, `meta`). Two watchers per non-binary learned clause,
     ///   so this scales linearly with the learned set.
-    /// - `cold.clause_ids` — LRAT clause-id side vector indexed by arena
+    /// - `cold.clause_ids` — LRAT clause-id side table keyed by arena
     ///   offset. Grows whenever the arena grows, only rebuilt by
     ///   compaction.
     /// - `cold.original_ledger.heap_bytes()` — immutable original-formula
@@ -124,7 +124,6 @@ impl Solver {
     /// Finding #2).
     #[inline]
     pub(crate) fn clause_db_memory_bytes(&self) -> usize {
-        use std::mem::size_of;
         // `clause_ids` defers its construction reservation to the first
         // write (`ColdState::clause_ids_grow_for`). While unallocated, bill
         // the deferred hint as a phantom charge: the historical trigger basis
@@ -133,13 +132,14 @@ impl Solver {
         // exposure `load_slack_reclaimed_bytes` below compensates for. Once
         // the first write lands, the real capacity equals the hint and takes
         // over seamlessly.
-        let clause_ids_cap = match self.cold.clause_ids.capacity() {
-            0 => self.cold.clause_ids_reserve_hint,
-            cap => cap,
+        let clause_ids_bytes = if self.cold.clause_ids.is_allocated() {
+            self.cold.clause_ids.heap_bytes()
+        } else {
+            ClauseIdTable::bytes_for_len(self.cold.clause_ids_reserve_hint)
         };
         self.arena.memory_bytes()
             + self.watches.heap_bytes()
-            + clause_ids_cap * size_of::<u64>()
+            + clause_ids_bytes
             + self.cold.original_ledger.heap_bytes()
             // Load-time slack reclamation shrank the two REAL-capacity terms
             // above; add back what it handed off so this trigger stays on its
@@ -283,6 +283,16 @@ impl Solver {
         // check underreported actual clause-DB memory by 2x-5x and caused this
         // branch to fire late under real memory pressure.
         self.clause_db_byte_limit_exceeded()
+    }
+
+    /// Whether a clause-DB limit (`max_learned_clauses`,
+    /// `max_clause_db_bytes`) asks for a reduction outside the conflict
+    /// schedule. Only the limits count here: the interval schedule stays on
+    /// conflicts.
+    pub(super) fn clause_db_limit_reduction_due(&self) -> bool {
+        self.pending_theory_conflicts.is_empty()
+            && !self.suppress_reduce_db
+            && (self.learned_clause_limit_exceeded() || self.clause_db_byte_limit_exceeded())
     }
 
     /// Poll the process-wide memory limit on the shared conflict cadence.

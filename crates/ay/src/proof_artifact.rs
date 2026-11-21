@@ -672,6 +672,7 @@ mod tests {
             is_temp: false,
             synthesized_default: false,
             format_was_explicit: false,
+            label: None,
         }
     }
 

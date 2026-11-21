@@ -12,6 +12,44 @@ use crate::{
 };
 
 #[test]
+fn disequality_split_normalizes_negated_integer_comparison_branches() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("neg_branch_x", Sort::Int);
+    let y = terms.mk_var("neg_branch_y", Sort::Int);
+    let below = terms.mk_lt(x, y);
+    let le = terms.mk_le(x, y);
+    let above = terms.mk_not_raw(le);
+    let eq = terms.mk_eq(x, y);
+    let clause = [below, above, eq];
+    assert!(super::lia::recognize_arith_disequality_split(
+        &terms, &clause
+    ));
+    assert_eq!(
+        super::lia::arith_disequality_split_primitive_guard_is_reversed(&terms, &clause),
+        Some(false)
+    );
+    for a in -3..=3 {
+        for b in -3..=3 {
+            assert!(a < b || !(a <= b) || a == b);
+        }
+    }
+    let one = terms.mk_int(BigInt::from(1));
+    let shifted = terms.mk_add(vec![y, one]);
+    let forged_guard = terms.mk_eq(x, shifted);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[below, above, forged_guard]
+    ));
+    let not_below = terms.mk_not_raw(below);
+    // This is not the required one-value gap: x=y-1 falsifies both
+    // non-strict complements and the equality.
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[not_below, above, eq]
+    ));
+}
+
+#[test]
 fn test_bounds_gap_simple_contradiction() {
     // x <= 5 AND x >= 10 is contradictory
     let mut terms = TermStore::new();
@@ -872,11 +910,28 @@ fn scaled_guard_accepts_the_benchmark_clause_and_reports_its_multiplier() {
         super::lia::arith_disequality_split_guard_multiplier(&terms, &clause),
         Some(BigInt::from(2))
     );
-    // The emission-side narrowing: a scaled guard is NOT primitive, so the
-    // Alethe printer must not lower it through the guard's own operands.
+    // Unit-coefficient emission remains too narrow; the checked witness
+    // supplies the scale for the weighted lowering instead.
     assert!(!super::lia::arith_disequality_split_has_primitive_guard(
         &terms, &clause
     ));
+}
+
+#[test]
+fn scaled_disequality_split_witness_preserves_positive_scale_and_raw_orientation() {
+    for coefficient in [-3, -2, -1, 1, 2, 3] {
+        let mut terms = TermStore::new();
+        let q = terms.mk_var("q", Sort::Int);
+        let clause = scaled_split_clause(&mut terms, q, (-1, 1), (coefficient, 0, 0, 0));
+        let witness = super::lia::arith_disequality_split_lowering_witness(&terms, &clause)
+            .expect("uniform nonzero scale has an oriented witness");
+        assert_eq!(witness.guard_multiplier, BigInt::from(coefficient.abs()));
+        assert_eq!(witness.guard_is_reversed, coefficient < 0);
+        assert_eq!(
+            super::lia::arith_disequality_split_primitive_guard_is_reversed(&terms, &clause),
+            (coefficient.abs() == 1).then_some(coefficient < 0)
+        );
+    }
 }
 
 #[test]

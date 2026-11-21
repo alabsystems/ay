@@ -265,8 +265,9 @@ fn test_solve_pb_proof_timeout_clears_cached_best_solution() {
     );
 
     let mut out = PbOutputWriter::new(&mut output);
-    let status = write_result_or_best_known(&mut out, &solution.solution, true, &best_solution)
-        .expect("UNKNOWN result should render");
+    let status =
+        write_result_or_best_known(&mut out, &solution.solution, &|_| true, &best_solution)
+            .expect("UNKNOWN result should render");
     let rendered = String::from_utf8(output).expect("output should be utf-8");
 
     assert_eq!(status, PbStatus::Unknown);
@@ -1460,7 +1461,7 @@ fn test_write_result_or_best_known_preserves_completed_result_after_late_sigterm
         objective: Some(7),
     }));
 
-    let status = write_result_or_best_known(&mut writer, &result, true, &best_solution)
+    let status = write_result_or_best_known(&mut writer, &result, &|_| true, &best_solution)
         .expect("write should succeed");
 
     let rendered = String::from_utf8(output).expect("output should be utf-8");
@@ -1481,7 +1482,7 @@ fn test_write_result_or_best_known_uses_best_known_witness_for_interrupted_unkno
     let best_solution = Mutex::new(None);
 
     cache_optimization_incumbent(&best_solution, 2, 3, &[true, false]);
-    let status = write_result_or_best_known(&mut writer, &result, true, &best_solution)
+    let status = write_result_or_best_known(&mut writer, &result, &|_| true, &best_solution)
         .expect("write should succeed");
 
     let rendered = String::from_utf8(output).expect("output should be utf-8");
@@ -1547,13 +1548,98 @@ fn test_write_result_or_best_known_uses_best_known_for_interrupted_unknown() {
     let best_solution = Mutex::new(None);
 
     cache_optimization_incumbent(&best_solution, 2, 11, &[]);
-    let status = write_result_or_best_known(&mut writer, &result, true, &best_solution)
+    let status = write_result_or_best_known(&mut writer, &result, &|_| true, &best_solution)
         .expect("write should succeed");
 
     let rendered = String::from_utf8(output).expect("output should be utf-8");
     assert_eq!(status, PbStatus::Unknown);
     assert_eq!(pb_exit_code(status), 0);
     assert_eq!(rendered, "s UNKNOWN\n");
+}
+
+// AY-SAT-8: a WBO run that ends UNKNOWN at a plain timeout (no SIGTERM)
+// flushes its streamed, checked incumbent as SATISFIABLE with its model. Before,
+// the flush required SIGTERM, so the CLI printed its `o` lines and then
+// `s UNKNOWN` with no model.
+#[test]
+fn test_wbo_plain_timeout_unknown_flushes_the_checked_incumbent() {
+    let wbo = ay_pb::parse_wbo("soft: 5 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+        .expect("WBO fixture should parse");
+    let instance = ParsedPbInstance::Wbo(wbo);
+    let best_solution = Mutex::new(Some(PbExactSolution {
+        status: PbStatus::Satisfiable,
+        assignment: vec![false, true],
+        objective: Some(3),
+    }));
+    let unknown = PbSolution {
+        status: PbStatus::Unknown,
+        assignment: Vec::new(),
+        objective: None,
+    };
+    let mut output = Vec::new();
+    let mut out = PbOutputWriter::new(&mut output);
+    out.write_objective(3).expect("write should succeed");
+    let status = write_result_or_best_known(
+        &mut out,
+        &unknown,
+        &|assignment: &[bool]| instance.admits_recovered_incumbent(assignment),
+        &best_solution,
+    )
+    .expect("write should succeed");
+    drop(out);
+    assert_eq!(status, PbStatus::Satisfiable);
+    assert_eq!(
+        String::from_utf8(output).expect("utf-8"),
+        "o 3\ns SATISFIABLE\nv -x1 x2\n"
+    );
+}
+
+// The flush is gated against the ORIGINAL instance: a cached WBO assignment
+// that breaks a hard row, reaches `top`, or carries projected-PBO variables
+// prints `s UNKNOWN`, never a model.
+#[test]
+fn test_unknown_flush_refuses_models_the_instance_does_not_admit() {
+    let wbo = ay_pb::parse_wbo("soft: 3 ;\n+1 x1 +1 x2 >= 1 ;\n[3] +1 x1 >= 1 ;\n")
+        .expect("WBO fixture should parse");
+    let instance = ParsedPbInstance::Wbo(wbo);
+    let unknown = PbSolution {
+        status: PbStatus::Unknown,
+        assignment: Vec::new(),
+        objective: None,
+    };
+    for bad in [
+        vec![false, false],
+        vec![false, true],
+        vec![true, false, true],
+    ] {
+        let best_solution = Mutex::new(Some(PbExactSolution {
+            status: PbStatus::Satisfiable,
+            assignment: bad.clone(),
+            objective: Some(0),
+        }));
+        let mut output = Vec::new();
+        let mut out = PbOutputWriter::new(&mut output);
+        let status = write_result_or_best_known(
+            &mut out,
+            &unknown,
+            &|assignment: &[bool]| instance.admits_recovered_incumbent(assignment),
+            &best_solution,
+        )
+        .expect("write should succeed");
+        drop(out);
+        assert_eq!(status, PbStatus::Unknown, "{bad:?}");
+        assert_eq!(String::from_utf8(output).expect("utf-8"), "s UNKNOWN\n");
+    }
+    // An OPB incumbent is checked against every original constraint.
+    let opb = ay_pb::parse_opb(concat!(
+        "* #variable= 2 #constraint= 1\n",
+        "min: +1 x1 ;\n",
+        "+1 x1 +1 x2 >= 1 ;\n",
+    ))
+    .expect("OPB fixture should parse");
+    let instance = ParsedPbInstance::Opb(Arc::new(opb));
+    assert!(instance.admits_recovered_incumbent(&[false, true]));
+    assert!(!instance.admits_recovered_incumbent(&[false, false]));
 }
 
 #[test]
@@ -1574,7 +1660,7 @@ fn test_interrupted_best_known_output_after_bound_query_incumbents() {
         assignment: Vec::new(),
         objective: None,
     };
-    let status = write_result_or_best_known(&mut out, &interrupted, true, &best_solution)
+    let status = write_result_or_best_known(&mut out, &interrupted, &|_| true, &best_solution)
         .expect("write should succeed");
 
     let rendered = String::from_utf8(output).expect("output should be utf-8");

@@ -2765,7 +2765,12 @@ fn validate_strict_steps_with_evidence<'proof>(
     // Whole-fragment Skolem/forall provenance is independent of derived
     // clauses and re-validates its own steps. Complete this metered registry
     // before the step loop so no legacy callback follows its final step.
-    quantifier::validate_sko_forall_uniqueness_with_progress(proof, context.terms, progress)?;
+    quantifier::validate_registered_skolem_source_scope_with_progress(
+        proof,
+        context.terms,
+        context.problem_assertions.unwrap_or_default(),
+        progress,
+    )?;
     let mut state = StrictStepState::new(proof, generic_theory_deferral, progress)?;
     // #strict-charge-census: constructed only under the probe flag; its Drop
     // prints on every exit path of this function, refusal included.

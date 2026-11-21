@@ -3928,6 +3928,7 @@ fn optimization_worker_specs_with_upgrade(
                         term_flag,
                         on_improve,
                         Some(bounds),
+                        None,
                     )
                 },
             )),
@@ -6520,6 +6521,7 @@ fn solve_nonlinear_native_optimization(
                 term_flag,
                 &mut native_on_improve,
                 None,
+                None,
             ),
             instance,
             objective,
@@ -6658,6 +6660,7 @@ fn solve_nonlinear_native_oll_worker(
         term_flag,
         &mut native_on_improve,
         external_bounds,
+        None,
     );
     sanitize_optimization_solution(oll, instance, objective)
 }
@@ -6896,6 +6899,22 @@ fn solve_optimization_native_with_deadline(
     )
 }
 
+/// Denominator of the share of the sequential native-OLL PRE-PASS slice its
+/// root LP-relaxation floor may take (AY-SAT-8). The size-scaled floor budget
+/// reaches 35 s from about 4,400 variables and runs before the first core; on
+/// the all-soft WBO instance `elf.rf7` (4,677 variables after the WBO
+/// projection) it took the whole 36 s pre-pass slice of a 60 s run and proved
+/// 0, while the descent proves the optimum, 1, in 0.3 s without it (measured
+/// binary, one core: `AY_PB_LP_FLOOR_MS=0` OPTIMUM 1 at 0.28 s; `=12000`
+/// OPTIMUM 1 at 12.3 s; default `s SATISFIABLE` 8385 at 60 s). Only the
+/// pre-pass is capped ([`try_pre_native_oll`]); the full-budget parallel
+/// `native-oll-opt` worker, the post-B&B OLL phase and the NLC linearized OLL
+/// keep the uncapped size-scaled floor, which the families closed by a tight
+/// LP (pebbling, injcomp) rely on and whose short-run behaviour was not
+/// measured under a cap. At competition budgets a third of the pre-pass slice
+/// exceeds the 35 s ceiling, so the cap binds only on short runs.
+const NATIVE_OLL_LP_FLOOR_SLICE_DEN: u32 = 3;
+
 /// Native PB-CDCL core-guided (OLL) optimization over the native engine.
 ///
 /// Builds ONE persistent [`PbCdclSolver`] internally and drives an incremental
@@ -6909,6 +6928,12 @@ fn solve_optimization_native_with_deadline(
 /// `Some` ONLY on the parallel `native-oll-opt` worker, where the engine reads
 /// the coordinator-published `ub` as a prune-only cutoff. Every sequential
 /// caller passes `None` — the sequential path is untouched by the bus.
+///
+/// `lp_floor_slice_den`: `Some(d)` caps the root LP floor at `1/d` of the
+/// engine's slice, counted from entry (AY-SAT-8; only the sequential pre-pass
+/// passes it, see [`NATIVE_OLL_LP_FLOOR_SLICE_DEN`]); `None` keeps the
+/// size-scaled floor budget.
+#[allow(clippy::too_many_arguments)]
 fn solve_optimization_native_oll(
     instance: &PbInstance,
     objective: &PbObjective,
@@ -6917,11 +6942,18 @@ fn solve_optimization_native_oll(
     term_flag: &AtomicBool,
     on_improve: &mut dyn FnMut(i128, &[bool]),
     external_bounds: Option<&SharedBounds>,
+    lp_floor_slice_den: Option<u32>,
 ) -> PbSolution {
     if term_flag.load(Ordering::Relaxed) || budget_expired(timeout_dur, start) {
         return unknown_solution();
     }
     let deadline = timeout_dur.map(|d| start + d);
+    // When the caller asks for it, the root LP floor gets at most `1/den` of
+    // the engine's slice, as an absolute deadline from here (solver
+    // construction and the first model count against it); the rest belongs to
+    // the core-guided descent (AY-SAT-8; see
+    // `native_oll::solve_with_floor_budget`).
+    let floor_deadline = floor_deadline_for_slice(deadline, Instant::now(), lp_floor_slice_den);
     // R4: strided term/deadline/memory closure (see make_native_deadline_closure);
     // the memory-footprint syscall runs at 1/16 the wall-clock cadence, not per
     // OLL propagation poll.
@@ -6935,12 +6967,13 @@ fn solve_optimization_native_oll(
         }
     };
 
-    let Some(result) = crate::optimize::native_oll::solve(
+    let Some(result) = crate::optimize::native_oll::solve_with_floor_budget(
         instance,
         objective,
         should_stop,
         Some(&mut validated_on_improve),
         external_bounds,
+        floor_deadline,
     ) else {
         // Native OLL did not apply to this objective shape; let other workers
         // cover it.
@@ -6948,6 +6981,20 @@ fn solve_optimization_native_oll(
     };
 
     sanitize_optimization_solution(opt_result_to_solution(result), instance, objective)
+}
+
+/// The LP-floor deadline of a native-OLL run that ends at `deadline` and starts
+/// at `now`: `1/den` of the remaining slice when the caller asks for a cap
+/// (`Some(den)`, den >= 1) and the run has a deadline; `None` (size-scaled
+/// floor budget) otherwise.
+fn floor_deadline_for_slice(
+    deadline: Option<Instant>,
+    now: Instant,
+    lp_floor_slice_den: Option<u32>,
+) -> Option<Instant> {
+    let den = lp_floor_slice_den.filter(|&den| den >= 1)?;
+    let slice = deadline?.saturating_duration_since(now);
+    Some(now + slice / den)
 }
 
 /// Large-Neighborhood-Search primal-improvement optimization worker.
@@ -8767,6 +8814,8 @@ fn try_pre_native_oll(
         term_flag,
         &mut oll_on_improve,
         None,
+        // AY-SAT-8: only the sequential pre-pass caps its LP floor.
+        Some(NATIVE_OLL_LP_FLOOR_SLICE_DEN),
     );
     update_best_from_solution(best_assignment, &oll_result);
     if term_flag.load(Ordering::Relaxed) {

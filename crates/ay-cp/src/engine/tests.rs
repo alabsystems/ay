@@ -949,7 +949,10 @@ fn test_circuit_3_nodes() {
     let x1 = engine.new_int_var(Domain::new(1, 3), Some("x1"));
     let x2 = engine.new_int_var(Domain::new(1, 3), Some("x2"));
 
-    engine.add_constraint(Constraint::Circuit(vec![x0, x1, x2]));
+    engine.add_constraint(Constraint::Circuit {
+        succ: vec![x0, x1, x2],
+        base: 1,
+    });
 
     match engine.solve() {
         CpSolveResult::Sat(assignment) => {
@@ -989,7 +992,10 @@ fn test_circuit_no_self_loop() {
     let x0 = engine.new_int_var(Domain::new(1, 2), Some("x0"));
     let x1 = engine.new_int_var(Domain::new(1, 2), Some("x1"));
 
-    engine.add_constraint(Constraint::Circuit(vec![x0, x1]));
+    engine.add_constraint(Constraint::Circuit {
+        succ: vec![x0, x1],
+        base: 1,
+    });
 
     match engine.solve() {
         CpSolveResult::Sat(assignment) => {
@@ -1017,6 +1023,8 @@ fn test_inverse_3_vars() {
     engine.add_constraint(Constraint::Inverse {
         x: vec![x0, x1, x2],
         y: vec![y0, y1, y2],
+        base_x: 1,
+        base_y: 1,
     });
 
     match engine.solve() {

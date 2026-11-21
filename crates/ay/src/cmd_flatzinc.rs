@@ -46,7 +46,7 @@ pub(crate) enum FlatzincCommand {
         #[arg(short = 'f', long)]
         free_search: bool,
 
-        /// Parallel workers (CP satisfaction only)
+        /// Parallel workers (CP satisfaction only; counts above the portfolio size are clamped)
         #[arg(short = 'p', value_name = "N")]
         parallel: Option<usize>,
     },
@@ -112,60 +112,42 @@ pub(crate) fn run(cmd: &FlatzincCommand) -> Result<()> {
             parallel,
         } => cmd_solve_portfolio(
             file,
-            *timeout,
-            *fd_search,
-            *all_solutions,
-            *free_search,
-            parallel.unwrap_or(1),
+            &ay_fzn2smt::portfolio::PortfolioOptions {
+                timeout_ms: *timeout,
+                fd_search: *fd_search,
+                all_solutions: *all_solutions,
+                free_search: *free_search,
+                parallel_workers: parallel.unwrap_or(1),
+            },
         ),
     }
 }
 
-/// Portfolio solve: prefer CP backend, fall back to SMT.
-///
-/// Mirrors the logic from the original fzn2smt binary's main().
+/// Portfolio solve: prefer CP backend, fall back to SMT
+/// (`ay_fzn2smt::portfolio`).
 fn cmd_solve_portfolio(
     file: &PathBuf,
-    timeout_ms: Option<u64>,
-    mut fd_search: bool,
-    all_solutions: bool,
-    free_search: bool,
-    parallel_workers: usize,
+    options: &ay_fzn2smt::portfolio::PortfolioOptions,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    // Stop with UNKNOWN before a memory limit the harness states or the
+    // kernel shows, rather than be killed at it.
+    let _ = ay_fzn2smt::memory_guard::arm_from_environment(&mut io::stderr());
+    // `-t` bounds the whole run, steps that do not poll it included.
+    if let Some(deadline) = options
+        .timeout_ms
+        .and_then(|ms| started.checked_add(std::time::Duration::from_millis(ms)))
+    {
+        ay_fzn2smt::memory_guard::arm_deadline(deadline);
+    }
     let model = parse_model(file)?;
-
-    // Probe the CP backend for unsupported constraints.
-    let cp_unsupported = match ay_fzn2smt::solve_cp::unsupported_constraints(&model) {
-        Ok(unsupported) => Some(unsupported),
-        Err(err) => {
-            eprintln!("warning: CP backend probe failed, falling back to SMT: {err}");
-            None
-        }
-    };
-
-    let use_cp = cp_unsupported.as_ref().is_some_and(Vec::is_empty);
-    if use_cp {
-        ay_fzn2smt::solve_cp::cmd_solve_cp(
-            &model,
-            timeout_ms,
-            all_solutions,
-            parallel_workers,
-            cp_unsupported.as_deref(),
-        )?;
-        return Ok(());
-    }
-
-    // Fall back to SMT solve path.
-    let result = ay_flatzinc_smt::translate(&model)
-        .map_err(|e| anyhow::anyhow!("translation error: {e}"))?;
-
-    // Auto-activate branching search when the model has search annotations
-    // and the user didn't explicitly request free search with -f.
-    if !free_search && !fd_search && !result.search_annotations.is_empty() {
-        fd_search = true;
-    }
-
-    ay_fzn2smt::solve::cmd_solve(&result, timeout_ms, fd_search, all_solutions)?;
+    // Unlocked stdout: the memory watchdog may write the final status line.
+    let mut out = ay_fzn2smt::memory_guard::GuardedOutput::new(io::stdout());
+    // Unlocked: CP portfolio workers write notes to stderr from their own
+    // threads.
+    let mut err = io::stderr();
+    ay_fzn2smt::portfolio::solve_portfolio(&model, options, started, &mut out, &mut err)?;
+    out.flush()?;
     Ok(())
 }
 

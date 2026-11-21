@@ -1077,6 +1077,11 @@ struct IntBlaster<'a> {
     /// residue vector.
     var_bv: HashMap<TermId, TermId>,
     memo: HashMap<TermId, TermId>,
+    /// Translate a product of two or more symbolic factors with `bvmul`
+    /// instead of declining. Only the small-box NIA lane (`int_blast_box.rs`)
+    /// sets it, and only with a plan whose width bounds every product's
+    /// interval, so the product cannot wrap.
+    nonlinear_products: bool,
 }
 
 impl<'a> IntBlaster<'a> {
@@ -1086,6 +1091,7 @@ impl<'a> IntBlaster<'a> {
             plan,
             var_bv: HashMap::default(),
             memo: HashMap::default(),
+            nonlinear_products: false,
         }
     }
 
@@ -1275,7 +1281,14 @@ impl<'a> IntBlaster<'a> {
                     Some(acc)
                 }
                 "*" if !args.is_empty() => {
-                    let (constant, symbolic) = split_constant_product(self.terms, &args)?;
+                    let Some((constant, symbolic)) = split_constant_product(self.terms, &args)
+                    else {
+                        if !self.nonlinear_products {
+                            return None;
+                        }
+                        let args = self.translate_all(&args)?;
+                        return fold_binary(self.terms, args, |t, a, b| t.mk_bvmul(vec![a, b]));
+                    };
                     let constant_bv = self.terms.mk_bitvec(constant.clone(), width);
                     match symbolic {
                         None => Some(constant_bv),
@@ -2365,3 +2378,6 @@ mod tests {
 #[cfg(test)]
 #[path = "int_blast_lane_tests.rs"]
 mod lane_tests;
+
+#[path = "int_blast_box.rs"]
+mod box_lane;

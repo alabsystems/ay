@@ -425,7 +425,7 @@ fn retained_native_sentinels_use_authenticated_roots_and_share_the_retry_key() {
     let a = executor.ctx.terms.mk_eq(x, zero);
     let b = executor.ctx.terms.mk_eq(x, one);
     for root in [a, b] {
-        executor.ctx.add_assertion_with_parsed(
+        executor.ctx.add_native_assertion_with_parsed(
             root,
             ay_frontend::command::Term::Symbol(
                 crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string(),
@@ -458,7 +458,7 @@ fn restored_named_native_fixture() -> (Executor, Vec<TermId>) {
     let (mut executor, roots) = fixture();
     executor.ctx.assertions.clear();
     for &root in &roots {
-        executor.ctx.add_assertion_with_parsed(
+        executor.ctx.add_native_assertion_with_parsed(
             root,
             ay_frontend::command::Term::Symbol(
                 crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string(),
@@ -574,7 +574,7 @@ fn native_only_misaligned_source_cannot_fall_back_to_legacy_roots() {
     // Source inventory mismatch: native rows authenticate a different ordering
     // from this query's frozen original assertions. This is no parsed fallback.
     for &root in roots.iter().rev() {
-        executor.ctx.add_assertion_with_parsed(
+        executor.ctx.add_native_assertion_with_parsed(
             root,
             ay_frontend::command::Term::Symbol(
                 crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string(),

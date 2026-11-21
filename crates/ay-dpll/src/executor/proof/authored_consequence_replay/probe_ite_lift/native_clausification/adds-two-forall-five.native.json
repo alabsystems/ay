@@ -1,0 +1,5117 @@
+{
+  "assertions": [
+    {
+      "index": 1,
+      "name": null,
+      "scope_depth": 0,
+      "term": 44
+    },
+    {
+      "index": 2,
+      "name": "__verification_consumer_precondition_1",
+      "scope_depth": 0,
+      "term": 45
+    },
+    {
+      "index": 3,
+      "name": "__verification_consumer_precondition_2",
+      "scope_depth": 0,
+      "term": 47
+    },
+    {
+      "index": 25,
+      "name": "__verification_consumer_precondition_24",
+      "scope_depth": 0,
+      "term": 123
+    },
+    {
+      "index": 27,
+      "name": null,
+      "scope_depth": 2,
+      "term": 59
+    }
+  ],
+  "ay_revision": "c417dda18361ad73a5ccc53f6c9bf063356a41b4",
+  "ay_version": "0.27.0",
+  "checked_replay": null,
+  "created_unix_ms": "1794322755770",
+  "declarations": [
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_c_view",
+      "name": "__verification_consumer_source_var_v1_b_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 14
+    },
+    {
+      "core_name": "__closure_mapping_0",
+      "name": "__closure_mapping_0",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 15
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 46
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 48
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 50
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 52
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24call_4",
+      "name": "__verification_consumer_source_var_v1_b_~24call_4",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 54
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 61
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 68
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 72
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 78
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 82
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 86
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 93
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 99
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 103
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 109
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 113
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "term": 117
+    }
+  ],
+  "events": [
+    {
+      "index": 0,
+      "kind": {
+        "event": "set_logic",
+        "logic": "ALL"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 1,
+      "kind": {
+        "event": "declare_const",
+        "name": "heap",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 2
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 2,
+      "kind": {
+        "event": "declare_const",
+        "name": "domain",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 3
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 3,
+      "kind": {
+        "event": "declare_const",
+        "name": "perms",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 4
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 4,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "unsafecell_value",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "UnsafeCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "UnsafeCell"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 5,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "cell_value",
+                "sort": "UnsafeCell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "unsafecell_value",
+                            "sort": "Int",
+                            "sort_data": {
+                              "kind": "int"
+                            }
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      }
+                    ],
+                    "name": "UnsafeCell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "Cell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "Cell"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 6,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "predcell_0",
+                "sort": "Cell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "cell_value",
+                            "sort": "UnsafeCell",
+                            "sort_data": {
+                              "datatype": {
+                                "constructors": [
+                                  {
+                                    "fields": [
+                                      {
+                                        "name": "unsafecell_value",
+                                        "sort": "Int",
+                                        "sort_data": {
+                                          "kind": "int"
+                                        }
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  }
+                                ],
+                                "name": "UnsafeCell"
+                              },
+                              "kind": "datatype"
+                            }
+                          }
+                        ],
+                        "name": "Cell"
+                      }
+                    ],
+                    "name": "Cell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "PredCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "PredCell"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 7,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 5
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 8,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 6
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 9,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 7
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 10,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 8
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 11,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 9
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 12,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 10
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 13,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 11
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 14,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 12
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 15,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_c",
+        "sort": "PredCell",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        },
+        "term": 13
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 16,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 14
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 17,
+      "kind": {
+        "event": "declare_const",
+        "name": "__closure_mapping_0",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 15
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 18,
+      "kind": {
+        "domain": [
+          "Int",
+          "Int"
+        ],
+        "domain_data": [
+          {
+            "kind": "int"
+          },
+          {
+            "kind": "int"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "__verification_consumer_int_div_trunc",
+        "range": "Int",
+        "range_data": {
+          "kind": "int"
+        }
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 19,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_0",
+        "term": 36
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 20,
+      "kind": {
+        "domain": [
+          "Mapping",
+          "Int"
+        ],
+        "domain_data": [
+          {
+            "kind": "uninterpreted",
+            "name": "Mapping"
+          },
+          {
+            "kind": "int"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "mapping_get",
+        "range": "Int",
+        "range_data": {
+          "kind": "int"
+        }
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 21,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 44
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 22,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_1",
+        "term": 45
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 23,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 46
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 24,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_2",
+        "term": 47
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 25,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 48
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 26,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_3",
+        "term": 49
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 27,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 50
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 28,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_4",
+        "term": 51
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 29,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 52
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 30,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_5",
+        "term": 53
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 31,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24call_4",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 54
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 32,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 61
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 33,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_6",
+        "term": 65
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 34,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_7",
+        "term": 67
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 35,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 68
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 36,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_8",
+        "term": 71
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 37,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 72
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 38,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_9",
+        "term": 75
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 39,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_10",
+        "term": 77
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 40,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 78
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 41,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_11",
+        "term": 81
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 42,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 82
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 43,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_12",
+        "term": 85
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 44,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_13",
+        "term": 67
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 45,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 86
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 46,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_14",
+        "term": 89
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 47,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 93
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 48,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_15",
+        "term": 96
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 49,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_16",
+        "term": 98
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 50,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 99
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 51,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_17",
+        "term": 102
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 52,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 103
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 53,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_18",
+        "term": 106
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 54,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_19",
+        "term": 108
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 55,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 109
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 56,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_20",
+        "term": 112
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 57,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 113
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 58,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_21",
+        "term": 116
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 59,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_22",
+        "term": 98
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 60,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "sort": "Mapping",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        "term": 117
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 61,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_23",
+        "term": 120
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 62,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_24",
+        "term": 123
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 63,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_unit",
+        "sort": "Unit",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        },
+        "term": 124
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 64,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 65,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 66,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 56
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 67,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 59
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 68,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 132
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 69,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 138
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 70,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 145
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 71,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 72,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 73,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "unsafecell_value",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "UnsafeCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "UnsafeCell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 74,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "cell_value",
+                "sort": "UnsafeCell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "unsafecell_value",
+                            "sort": "Int",
+                            "sort_data": {
+                              "kind": "int"
+                            }
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      }
+                    ],
+                    "name": "UnsafeCell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "Cell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "Cell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 75,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "predcell_0",
+                "sort": "Cell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "cell_value",
+                            "sort": "UnsafeCell",
+                            "sort_data": {
+                              "datatype": {
+                                "constructors": [
+                                  {
+                                    "fields": [
+                                      {
+                                        "name": "unsafecell_value",
+                                        "sort": "Int",
+                                        "sort_data": {
+                                          "kind": "int"
+                                        }
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  }
+                                ],
+                                "name": "UnsafeCell"
+                              },
+                              "kind": "datatype"
+                            }
+                          }
+                        ],
+                        "name": "Cell"
+                      }
+                    ],
+                    "name": "Cell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "PredCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "PredCell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 76,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 77,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_encoding_axiom_25",
+        "term": 132
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 78,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_encoding_axiom_26",
+        "term": 138
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 79,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_encoding_axiom_27",
+        "term": 145
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 80,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 81,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_negated_goal_slice_0_28",
+        "term": 56
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 82,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_negated_goal_slice_0_29",
+        "term": 59
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 83,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_ground_instance_30",
+        "term": 132
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 84,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_ground_instance_31",
+        "term": 138
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 85,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_ground_instance_32",
+        "term": 145
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 86,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 132
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 87,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 138
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 88,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 145
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 89,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 3
+    },
+    {
+      "index": 90,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 91,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "unsafecell_value",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "UnsafeCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "UnsafeCell"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 92,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "cell_value",
+                "sort": "UnsafeCell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "unsafecell_value",
+                            "sort": "Int",
+                            "sort_data": {
+                              "kind": "int"
+                            }
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      }
+                    ],
+                    "name": "UnsafeCell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "Cell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "Cell"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 93,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "predcell_0",
+                "sort": "Cell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "cell_value",
+                            "sort": "UnsafeCell",
+                            "sort_data": {
+                              "datatype": {
+                                "constructors": [
+                                  {
+                                    "fields": [
+                                      {
+                                        "name": "unsafecell_value",
+                                        "sort": "Int",
+                                        "sort_data": {
+                                          "kind": "int"
+                                        }
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  }
+                                ],
+                                "name": "UnsafeCell"
+                              },
+                              "kind": "datatype"
+                            }
+                          }
+                        ],
+                        "name": "Cell"
+                      }
+                    ],
+                    "name": "Cell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "PredCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "PredCell"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 94,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 95,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "unsafecell_value",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "UnsafeCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "UnsafeCell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 96,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "cell_value",
+                "sort": "UnsafeCell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "unsafecell_value",
+                            "sort": "Int",
+                            "sort_data": {
+                              "kind": "int"
+                            }
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      }
+                    ],
+                    "name": "UnsafeCell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "Cell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "Cell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 97,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "predcell_0",
+                "sort": "Cell",
+                "sort_data": {
+                  "datatype": {
+                    "constructors": [
+                      {
+                        "fields": [
+                          {
+                            "name": "cell_value",
+                            "sort": "UnsafeCell",
+                            "sort_data": {
+                              "datatype": {
+                                "constructors": [
+                                  {
+                                    "fields": [
+                                      {
+                                        "name": "unsafecell_value",
+                                        "sort": "Int",
+                                        "sort_data": {
+                                          "kind": "int"
+                                        }
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  }
+                                ],
+                                "name": "UnsafeCell"
+                              },
+                              "kind": "datatype"
+                            }
+                          }
+                        ],
+                        "name": "Cell"
+                      }
+                    ],
+                    "name": "Cell"
+                  },
+                  "kind": "datatype"
+                }
+              }
+            ],
+            "name": "PredCell"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "PredCell"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 98,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 99,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 56
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 100,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 59
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 101,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 132
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 102,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 138
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 103,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 145
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 104,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    }
+  ],
+  "function_declarations": [
+    {
+      "core_name": "__verification_consumer_int_div_trunc",
+      "domain": [
+        "Int",
+        "Int"
+      ],
+      "domain_data": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "name": "__verification_consumer_int_div_trunc",
+      "range": "Int",
+      "range_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "core_name": "mapping_get",
+      "domain": [
+        "Mapping",
+        "Int"
+      ],
+      "domain_data": [
+        {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "name": "mapping_get",
+      "range": "Int",
+      "range_data": {
+        "kind": "int"
+      }
+    }
+  ],
+  "logic": "ALL",
+  "metadata": {
+    "consumer": null,
+    "consumer_revision": null,
+    "fixture_path": null,
+    "function_path": null,
+    "notes": "DIAGNOSTIC REDUCTION of 29654d669ab1b2c73c3843708fa8f0ef4c815656611e0d3982f902477e9b49f7 active assertion indices [1, 2, 3, 25, 27]; no original-query certificate claim",
+    "obligation_kind": null,
+    "source_span": null
+  },
+  "panic_payload": null,
+  "replay_gaps": [],
+  "schema": "ay.native-replay.v1",
+  "scope_depth": 2,
+  "selected_route": "native-api:ALL",
+  "solve": {
+    "elapsed_ms": "448",
+    "executor_error": null,
+    "model": {
+      "delegated_checks": 0,
+      "incomplete_checks": 0,
+      "independent_checks": 0,
+      "validated": false,
+      "validation_failures": 0,
+      "validation_skips": 2
+    },
+    "proof": {
+      "available": false,
+      "checker_failures": 0,
+      "clause_count": 0,
+      "complete": false,
+      "strictly_verified": false,
+      "trust_fallbacks": 0
+    },
+    "resources": {
+      "learned_clause_count": 22,
+      "limit_hit": null,
+      "rss_bytes": 25494248,
+      "term_bytes": 150521,
+      "term_count": 880
+    },
+    "result": "unknown",
+    "statistics": {
+      "conflicts": 2,
+      "decisions": 99,
+      "ematching_instances_created": 3,
+      "ematching_rounds_completed": 3,
+      "learned_clauses": 22,
+      "partial_clause_count": 0,
+      "propagations": 328,
+      "refinement_count": 4,
+      "restarts": 0,
+      "theory_conflicts": 2,
+      "theory_propagations": 5,
+      "theory_unknown_count": 0
+    },
+    "unknown_phase": "quantifier-instantiation",
+    "unknown_progress": {
+      "reason": "(incomplete quantifier-ematching-exists)",
+      "responsible_phase": "quantifier-instantiation",
+      "wall_time_budget_ms": "5624",
+      "wall_time_elapsed_ms": "448"
+    },
+    "unknown_reason": "(incomplete quantifier-ematching-exists)",
+    "verification_level": "debug-checked"
+  },
+  "symbol_identities": [
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "unsafecell_value",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "UnsafeCell"
+              }
+            ],
+            "name": "UnsafeCell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "cell_value",
+                  "sort": "UnsafeCell",
+                  "sort_data": {
+                    "datatype": {
+                      "constructors": [
+                        {
+                          "fields": [
+                            {
+                              "name": "unsafecell_value",
+                              "sort": "Int",
+                              "sort_data": {
+                                "kind": "int"
+                              }
+                            }
+                          ],
+                          "name": "UnsafeCell"
+                        }
+                      ],
+                      "name": "UnsafeCell"
+                    },
+                    "kind": "datatype"
+                  }
+                }
+              ],
+              "name": "Cell"
+            }
+          ],
+          "name": "Cell"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "Cell",
+      "datatype_core": "Cell",
+      "datatype_surface": "Cell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "UnsafeCell"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Cell"
+      },
+      "kind": "datatype_constructor",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "UnsafeCell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Cell"
+        }
+      },
+      "surface_name": "Cell"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "cell_value",
+                    "sort": "UnsafeCell",
+                    "sort_data": {
+                      "datatype": {
+                        "constructors": [
+                          {
+                            "fields": [
+                              {
+                                "name": "unsafecell_value",
+                                "sort": "Int",
+                                "sort_data": {
+                                  "kind": "int"
+                                }
+                              }
+                            ],
+                            "name": "UnsafeCell"
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      },
+                      "kind": "datatype"
+                    }
+                  }
+                ],
+                "name": "Cell"
+              }
+            ],
+            "name": "Cell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "predcell_0",
+                  "sort": "Cell",
+                  "sort_data": {
+                    "datatype": {
+                      "constructors": [
+                        {
+                          "fields": [
+                            {
+                              "name": "cell_value",
+                              "sort": "UnsafeCell",
+                              "sort_data": {
+                                "datatype": {
+                                  "constructors": [
+                                    {
+                                      "fields": [
+                                        {
+                                          "name": "unsafecell_value",
+                                          "sort": "Int",
+                                          "sort_data": {
+                                            "kind": "int"
+                                          }
+                                        }
+                                      ],
+                                      "name": "UnsafeCell"
+                                    }
+                                  ],
+                                  "name": "UnsafeCell"
+                                },
+                                "kind": "datatype"
+                              }
+                            }
+                          ],
+                          "name": "Cell"
+                        }
+                      ],
+                      "name": "Cell"
+                    },
+                    "kind": "datatype"
+                  }
+                }
+              ],
+              "name": "PredCell"
+            }
+          ],
+          "name": "PredCell"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "PredCell",
+      "datatype_core": "PredCell",
+      "datatype_surface": "PredCell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "Cell"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "PredCell"
+      },
+      "kind": "datatype_constructor",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "Cell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        }
+      },
+      "surface_name": "PredCell"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "unsafecell_value",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "UnsafeCell"
+            }
+          ],
+          "name": "UnsafeCell"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "UnsafeCell",
+      "datatype_core": "UnsafeCell",
+      "datatype_surface": "UnsafeCell",
+      "engine_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "UnsafeCell"
+      },
+      "kind": "datatype_constructor",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "UnsafeCell"
+        }
+      },
+      "surface_name": "UnsafeCell"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__closure_mapping_0",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__closure_mapping_0"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_int_div_trunc",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        },
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_int_div_trunc"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_~24call_4",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_~24call_4"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "cell_value",
+                    "sort": "UnsafeCell",
+                    "sort_data": {
+                      "datatype": {
+                        "constructors": [
+                          {
+                            "fields": [
+                              {
+                                "name": "unsafecell_value",
+                                "sort": "Int",
+                                "sort_data": {
+                                  "kind": "int"
+                                }
+                              }
+                            ],
+                            "name": "UnsafeCell"
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      },
+                      "kind": "datatype"
+                    }
+                  }
+                ],
+                "name": "Cell"
+              }
+            ],
+            "name": "Cell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "unsafecell_value",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "UnsafeCell"
+            }
+          ],
+          "name": "UnsafeCell"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "cell_value",
+      "datatype_core": "Cell",
+      "datatype_surface": "Cell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "Cell"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "UnsafeCell"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "Cell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "UnsafeCell"
+        }
+      },
+      "surface_name": "cell_value"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "cell_value",
+                    "sort": "UnsafeCell",
+                    "sort_data": {
+                      "datatype": {
+                        "constructors": [
+                          {
+                            "fields": [
+                              {
+                                "name": "unsafecell_value",
+                                "sort": "Int",
+                                "sort_data": {
+                                  "kind": "int"
+                                }
+                              }
+                            ],
+                            "name": "UnsafeCell"
+                          }
+                        ],
+                        "name": "UnsafeCell"
+                      },
+                      "kind": "datatype"
+                    }
+                  }
+                ],
+                "name": "Cell"
+              }
+            ],
+            "name": "Cell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "is-Cell",
+      "datatype_core": "Cell",
+      "datatype_surface": "Cell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "Cell"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "datatype_tester",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "Cell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "is-Cell"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "predcell_0",
+                    "sort": "Cell",
+                    "sort_data": {
+                      "datatype": {
+                        "constructors": [
+                          {
+                            "fields": [
+                              {
+                                "name": "cell_value",
+                                "sort": "UnsafeCell",
+                                "sort_data": {
+                                  "datatype": {
+                                    "constructors": [
+                                      {
+                                        "fields": [
+                                          {
+                                            "name": "unsafecell_value",
+                                            "sort": "Int",
+                                            "sort_data": {
+                                              "kind": "int"
+                                            }
+                                          }
+                                        ],
+                                        "name": "UnsafeCell"
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  },
+                                  "kind": "datatype"
+                                }
+                              }
+                            ],
+                            "name": "Cell"
+                          }
+                        ],
+                        "name": "Cell"
+                      },
+                      "kind": "datatype"
+                    }
+                  }
+                ],
+                "name": "PredCell"
+              }
+            ],
+            "name": "PredCell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "is-PredCell",
+      "datatype_core": "PredCell",
+      "datatype_surface": "PredCell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "datatype_tester",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "PredCell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "is-PredCell"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "unsafecell_value",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "UnsafeCell"
+              }
+            ],
+            "name": "UnsafeCell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "is-UnsafeCell",
+      "datatype_core": "UnsafeCell",
+      "datatype_surface": "UnsafeCell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "UnsafeCell"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "datatype_tester",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "UnsafeCell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "is-UnsafeCell"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "mapping_get",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "Mapping"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "Mapping"
+          }
+        },
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "mapping_get"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "predcell_0",
+                    "sort": "Cell",
+                    "sort_data": {
+                      "datatype": {
+                        "constructors": [
+                          {
+                            "fields": [
+                              {
+                                "name": "cell_value",
+                                "sort": "UnsafeCell",
+                                "sort_data": {
+                                  "datatype": {
+                                    "constructors": [
+                                      {
+                                        "fields": [
+                                          {
+                                            "name": "unsafecell_value",
+                                            "sort": "Int",
+                                            "sort_data": {
+                                              "kind": "int"
+                                            }
+                                          }
+                                        ],
+                                        "name": "UnsafeCell"
+                                      }
+                                    ],
+                                    "name": "UnsafeCell"
+                                  },
+                                  "kind": "datatype"
+                                }
+                              }
+                            ],
+                            "name": "Cell"
+                          }
+                        ],
+                        "name": "Cell"
+                      },
+                      "kind": "datatype"
+                    }
+                  }
+                ],
+                "name": "PredCell"
+              }
+            ],
+            "name": "PredCell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "cell_value",
+                  "sort": "UnsafeCell",
+                  "sort_data": {
+                    "datatype": {
+                      "constructors": [
+                        {
+                          "fields": [
+                            {
+                              "name": "unsafecell_value",
+                              "sort": "Int",
+                              "sort_data": {
+                                "kind": "int"
+                              }
+                            }
+                          ],
+                          "name": "UnsafeCell"
+                        }
+                      ],
+                      "name": "UnsafeCell"
+                    },
+                    "kind": "datatype"
+                  }
+                }
+              ],
+              "name": "Cell"
+            }
+          ],
+          "name": "Cell"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "predcell_0",
+      "datatype_core": "PredCell",
+      "datatype_surface": "PredCell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "PredCell"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Cell"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "PredCell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Cell"
+        }
+      },
+      "surface_name": "predcell_0"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "unsafecell_value",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "UnsafeCell"
+              }
+            ],
+            "name": "UnsafeCell"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "unsafecell_value",
+      "datatype_core": "UnsafeCell",
+      "datatype_surface": "UnsafeCell",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "UnsafeCell"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "UnsafeCell"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "unsafecell_value"
+    }
+  ],
+  "terms": [
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "0"
+        }
+      },
+      "id": 23,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__closure_param_0_14",
+        "var_id": 14
+      },
+      "id": 16,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "2"
+        }
+      },
+      "id": 17,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          16,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_int_div_trunc"
+        }
+      },
+      "id": 18,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "-2"
+        }
+      },
+      "id": 20,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          18,
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "*"
+        }
+      },
+      "id": 21,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          16,
+          21
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 22,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          22
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 26,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          22,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 27,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          26,
+          27
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "and"
+        }
+      },
+      "id": 28,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          16
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 24,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 24,
+        "kind": "not"
+      },
+      "id": 29,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          28,
+          29
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 30,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          20,
+          22
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 31,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          22,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 32,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          31,
+          32
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "and"
+        }
+      },
+      "id": 33,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          16,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 25,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 25,
+        "kind": "not"
+      },
+      "id": 34,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          34
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 35,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          30,
+          35
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "and"
+        }
+      },
+      "id": 36,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          22,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 37,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__closure_mapping_0",
+        "var_id": 13
+      },
+      "id": 15,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15,
+          16
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 38,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "1"
+        }
+      },
+      "id": 39,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          38,
+          39
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 41,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          38
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 42,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "cond": 37,
+        "else": 42,
+        "kind": "ite",
+        "then": 41
+      },
+      "id": 43,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "body": 43,
+        "kind": "forall",
+        "triggers": [
+          [
+            38
+          ]
+        ],
+        "vars": [
+          {
+            "name": "__closure_param_0_14",
+            "sort": "Int",
+            "sort_data": {
+              "kind": "int"
+            }
+          }
+        ]
+      },
+      "id": 44,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_c_view",
+        "var_id": 12
+      },
+      "id": 14,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          14,
+          15
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 45,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "var_id": 15
+      },
+      "id": 46,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          14,
+          46
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 47,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "var_id": 16
+      },
+      "id": 48,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          48
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 49,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "var_id": 17
+      },
+      "id": 50,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          14,
+          50
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 51,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "var_id": 18
+      },
+      "id": 52,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          50,
+          52
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 53,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24call_4",
+        "var_id": 19
+      },
+      "id": 54,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 57,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          57
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 58,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 59,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "var_id": 20
+      },
+      "id": 61,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          61
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 62,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "100000"
+        }
+      },
+      "id": 55,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          55
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 56,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 56,
+        "kind": "not"
+      },
+      "id": 64,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          62,
+          64
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 65,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49,
+          59,
+          64
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 67,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "var_id": 21
+      },
+      "id": 68,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          61,
+          68
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 69,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          64,
+          69
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 71,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "var_id": 22
+      },
+      "id": 72,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          50,
+          72
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 73,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          64,
+          73
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 75,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          53,
+          59,
+          64
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 77,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "var_id": 23
+      },
+      "id": 78,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          72,
+          78
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 79,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          64,
+          79
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 81,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "var_id": 24
+      },
+      "id": 82,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          82
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 83,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          64,
+          83
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 85,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_4_9_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "var_id": 25
+      },
+      "id": 86,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          82,
+          86
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 87,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          59,
+          64,
+          87
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 89,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 90,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          90
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 91,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "var_id": 26
+      },
+      "id": 93,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          93
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 94,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          94
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 96,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49,
+          56,
+          91
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 98,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_1_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "var_id": 27
+      },
+      "id": 99,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          93,
+          99
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 100,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          100
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 102,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_view",
+        "var_id": 28
+      },
+      "id": 103,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          50,
+          103
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 104,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          104
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 106,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          53,
+          56,
+          91
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 108,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_5_~24__verification_consumer_predcell_0_6_1_5_c_current_view",
+        "var_id": 29
+      },
+      "id": 109,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          103,
+          109
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 110,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          110
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 112,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_view",
+        "var_id": 30
+      },
+      "id": 113,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          46,
+          113
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 114,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          114
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 116,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_~24__verification_consumer_predcell_0_6_6_14_~24__verification_consumer_predcell_0_6_1_1_c_current_view",
+        "var_id": 31
+      },
+      "id": 117,
+      "is_datatype_constructor": false,
+      "sort": "Mapping",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Mapping"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          113,
+          117
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 118,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          56,
+          91,
+          118
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 120,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          14,
+          54
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 121,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          121
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 122,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 122,
+        "kind": "not"
+      },
+      "id": 123,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15,
+          57
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 126,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          57,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_int_div_trunc"
+        }
+      },
+      "id": 127,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          127,
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "*"
+        }
+      },
+      "id": 128,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          128,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 129,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          129
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 130,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "cond": 130,
+        "else": 23,
+        "kind": "ite",
+        "then": 39
+      },
+      "id": 131,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          126,
+          131
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 132,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 133,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_int_div_trunc"
+        }
+      },
+      "id": 134,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          134,
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "*"
+        }
+      },
+      "id": 135,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          135
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 136,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "cond": 136,
+        "else": 23,
+        "kind": "ite",
+        "then": 39
+      },
+      "id": 137,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          133,
+          137
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 138,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          15,
+          54
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mapping_get"
+        }
+      },
+      "id": 139,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          17
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_int_div_trunc"
+        }
+      },
+      "id": 140,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          140,
+          20
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "*"
+        }
+      },
+      "id": 141,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          141
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 142,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          142
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 143,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "cond": 143,
+        "else": 23,
+        "kind": "ite",
+        "then": 39
+      },
+      "id": 144,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          139,
+          144
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 145,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "timeout_ms": "5624",
+  "unsupported_atoms": []
+}

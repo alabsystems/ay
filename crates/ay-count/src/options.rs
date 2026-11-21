@@ -27,6 +27,14 @@ pub struct SolveOptions {
     /// Explicit FlowCutter binary path (else `AY_FLOWCUTTER` env / exe dir /
     /// PATH).
     pub flow_cutter: Option<std::path::PathBuf>,
+    /// Let definability elimination remove unshown variables of a projected
+    /// instance (`pmc`, `pwmc` with a show set smaller than the variable
+    /// set). Off by default: it is count-preserving (the argument is in
+    /// `prep_eg`'s module comment), but it spends up
+    /// to 8 s of oracle budget and its speed effect on the projected tracks
+    /// has not been measured, so it must not be able to turn an instance
+    /// solved today into a timeout. Unprojected tracks are not affected.
+    pub projected_definability_elimination: bool,
 }
 
 impl SolveOptions {
@@ -66,6 +74,7 @@ impl Default for SolveOptions {
             phase1_secs: 10.0,
             decow: 100.0,
             flow_cutter: None,
+            projected_definability_elimination: false,
         }
     }
 }

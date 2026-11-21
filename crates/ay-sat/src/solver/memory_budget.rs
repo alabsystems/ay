@@ -102,7 +102,7 @@ impl Solver {
             return;
         }
         let mb = |bytes: usize| bytes as f64 / 1e6;
-        let clause_ids = self.cold.clause_ids.capacity() * size_of::<u64>();
+        let clause_ids = self.cold.clause_ids.heap_bytes();
         eprintln!(
             "c mem_probe {phase} conflicts={} footprint={:.1} live={:.1} db={:.1} \
              arena={:.1} watches={:.1} ledger={:.1} clause_ids={:.1} reconstruction={:.1} \

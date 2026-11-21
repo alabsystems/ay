@@ -3478,7 +3478,11 @@ fn test_factor_applies_with_clause_ids_disabled_and_no_proof() {
         "the grid factors with clause ids"
     );
     let mut without_ids = grid_solver(true);
-    assert!(without_ids.cold.clause_ids.iter().all(|&id| id == 0));
+    assert!(without_ids
+        .cold
+        .clause_ids
+        .iter_recorded()
+        .all(|(_, id)| id == 0));
     without_ids.factorize();
     assert_eq!(
         without_ids.cold.factor_factored_total, with_ids.cold.factor_factored_total,
@@ -3527,4 +3531,41 @@ fn test_kissat_eliminate_interval_nlog2n() {
             "n={n}: {ratio}"
         );
     }
+}
+
+/// AY-SAT-1: the prober's per-literal arrays are allocated on first use.
+/// A probing round on a lazily built prober gives exactly what it gives on
+/// one whose arrays were allocated before any clause was added (the old
+/// eager construction): same verdict, statistics, fixed literals and trail.
+#[test]
+fn test_probe_lazy_arrays_match_eager_arrays() {
+    let run = |eager: bool| {
+        let mut solver: Solver = Solver::new(6);
+        if eager {
+            // Allocates all three per-literal arrays at construction size.
+            let _ = solver.inproc.prober.uip_seen_mut();
+        }
+        let v = |i: u32| Variable(i);
+        // x0 -> x1, x0 -> -x1 (x0 fails); x2 -> x3 -> x4, x2 -> -x4 (x2 fails).
+        solver.add_clause(vec![Literal::negative(v(0)), Literal::positive(v(1))]);
+        solver.add_clause(vec![Literal::negative(v(0)), Literal::negative(v(1))]);
+        solver.add_clause(vec![Literal::negative(v(2)), Literal::positive(v(3))]);
+        solver.add_clause(vec![Literal::negative(v(3)), Literal::positive(v(4))]);
+        solver.add_clause(vec![Literal::negative(v(2)), Literal::negative(v(4))]);
+        solver.add_clause(vec![Literal::positive(v(5)), Literal::positive(v(1))]);
+        assert!(solver.process_initial_clauses().is_none());
+        solver.initialize_watches();
+        assert!(solver.propagate().is_none());
+        let unsat = solver.probe();
+        let trail: Vec<usize> = solver.trail.iter().map(|lit| lit.index()).collect();
+        (
+            unsat,
+            format!("{:?}", solver.inproc.prober.stats()),
+            solver.fixed_count,
+            trail,
+        )
+    };
+    let lazy = run(false);
+    assert_eq!(lazy, run(true));
+    assert!(!lazy.0, "the formula is satisfiable");
 }

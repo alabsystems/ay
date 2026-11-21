@@ -183,7 +183,7 @@ impl Executor {
         assertions: &[TermId],
     ) {
         for &root in assertions {
-            probe_ctx.add_assertion_with_parsed(
+            probe_ctx.add_native_assertion_with_parsed(
                 root,
                 ay_frontend::command::Term::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
             );
@@ -199,6 +199,61 @@ impl Executor {
         &self,
         assertions: &[TermId],
     ) -> Option<ay_frontend::Context> {
+        if ay_core::misc_cli_flags().debug_cert {
+            ay_core::safe_eprintln!(
+                "c source-origin isolated-input exec={:p} roots={} ematching={} guarded={}",
+                self,
+                assertions.len(),
+                self.ematching_proof_records.len(),
+                self.guarded_instance_records.len(),
+            );
+            for (row, &root) in assertions.iter().take(64).enumerate() {
+                ay_core::safe_eprintln!(
+                    "c source-origin isolated-root row={row} root={root:?} stamp={:?}",
+                    self.ctx.terms.entry_stamp(root),
+                );
+            }
+            // Borrow at most sixty-four records and eight positional bindings
+            // each. This exposes actual recorded provenance, not a structural
+            // guess that a current working conjunct was originally asserted.
+            for (row, record) in self.ematching_proof_records.iter().take(64).enumerate() {
+                ay_core::safe_eprintln!(
+                    "c source-origin forall-record row={row} source={:?} source-stamp={:?} binding={:?} binding-count={} instance={:?} instance-stamp={:?}",
+                    record.quantifier,
+                    self.ctx.terms.entry_stamp(record.quantifier),
+                    &record.binding[..record.binding.len().min(8)],
+                    record.binding.len(),
+                    record.instance,
+                    self.ctx.terms.entry_stamp(record.instance),
+                );
+            }
+            for (row, record) in self
+                .mbqi_refinement_instance_records
+                .iter()
+                .take(64)
+                .enumerate()
+            {
+                ay_core::safe_eprintln!(
+                    "c source-origin mbqi-record row={row} source={:?} source-stamp={:?} binding={:?} binding-count={} instance={:?} instance-stamp={:?}",
+                    record.quantifier,
+                    self.ctx.terms.entry_stamp(record.quantifier),
+                    &record.binding[..record.binding.len().min(8)],
+                    record.binding.len(),
+                    record.instance,
+                    self.ctx.terms.entry_stamp(record.instance),
+                );
+            }
+            for (row, record) in self.guarded_instance_records.iter().take(64).enumerate() {
+                ay_core::safe_eprintln!(
+                    "c source-origin guarded-record row={row} source={:?} binding={:?} binding-count={} instance={:?} instance-stamp={:?}",
+                    record.quantifier,
+                    &record.binding[..record.binding.len().min(8)],
+                    record.binding.len(),
+                    record.instance,
+                    self.ctx.terms.entry_stamp(record.instance),
+                );
+            }
+        }
         let mut probe_ctx = self.ctx.clone();
         // Strip the outer query before installing exact roots. The nested
         // proof/source epoch must authenticate this obligation, not objectives,

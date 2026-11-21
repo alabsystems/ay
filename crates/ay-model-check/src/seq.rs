@@ -8,7 +8,9 @@
 //! [`crate::value_eq`], so an unevaluable element comparison makes the whole
 //! operation unevaluable (fail closed). Operations whose result is
 //! under-specified in SMT-LIB on the given inputs (e.g. `seq.nth` out of range)
-//! return `Err` (unevaluable), never a fabricated value.
+//! return `Err` here, never a fabricated value. The full evaluator may select a
+//! typed model commitment only after separately proving the exact unconstrained
+//! input condition and enforcing its value-keyed single-valued interpretation.
 
 use crate::{array_select, value_eq, ArrayValue, ModelValue};
 use num_bigint::BigInt;

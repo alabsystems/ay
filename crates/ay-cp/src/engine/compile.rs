@@ -13,11 +13,13 @@ use crate::propagators::alldifferent::AllDifferentBounds;
 use crate::propagators::alldifferent_ac::{AllDifferentAc, ALLDIFF_AC_DOMAIN_LIMIT};
 use crate::propagators::cumulative::Cumulative;
 use crate::propagators::disjunctive::Disjunctive;
+use crate::propagators::div::Div;
 use crate::propagators::element::Element;
 use crate::propagators::linear::LinearLe;
 use crate::propagators::linear_ne::LinearNotEqual;
 use crate::propagators::shifted_alldifferent::ShiftedAllDifferentBounds;
 use crate::propagators::table::Table;
+use crate::propagators::times::Times;
 use crate::variable::IntVarId;
 
 use super::{CpSatEngine, LazyNeq, LAZY_NEQ_DOMAIN_THRESHOLD};
@@ -171,10 +173,23 @@ impl CpSatEngine {
                         self.encode_pairwise_neq(*x, *y, *offset);
                     }
                 }
-                Constraint::Circuit(vars) => self.encode_circuit(vars),
-                Constraint::Inverse { x, y } => self.encode_inverse(x, y),
+                Constraint::Circuit { succ, base } => self.encode_circuit(succ, *base),
+                Constraint::Inverse {
+                    x,
+                    y,
+                    base_x,
+                    base_y,
+                } => self.encode_inverse(x, y, *base_x, *base_y),
                 Constraint::BoolClause { pos, neg } => self.encode_bool_clause(pos, neg),
                 Constraint::Abs { result, arg } => self.encode_abs(*result, *arg),
+                Constraint::Times { x, y, result } => {
+                    self.dirty.push(true);
+                    self.propagators.push(Box::new(Times::new(*x, *y, *result)));
+                }
+                Constraint::Div { x, y, result } => {
+                    self.dirty.push(true);
+                    self.propagators.push(Box::new(Div::new(*x, *y, *result)));
+                }
                 Constraint::Maximum { result, args } => self.encode_maximum(*result, args),
                 Constraint::Minimum { result, args } => self.encode_minimum(*result, args),
                 Constraint::Diffn { x, y, dx, dy } => self.encode_diffn(x, y, dx, dy),
@@ -498,7 +513,7 @@ impl CpSatEngine {
             if let Some(next_vy) = vy.checked_add(1) {
                 clause.push(self.encoder.get_or_create_ge(&mut self.sat, y, next_vy));
             }
-            self.sat.add_clause(clause);
+            self.add_model_clause("encode_pairwise_neq", clause);
         }
     }
 
@@ -555,7 +570,7 @@ impl CpSatEngine {
                 clause.push(lit);
             }
             if !clause.is_empty() {
-                self.sat.add_clause(clause);
+                self.add_model_clause("encode_alldiff_pigeon_hole", clause);
             }
         }
 
@@ -580,7 +595,7 @@ impl CpSatEngine {
                 clause.push(lit.negated());
             }
             if !clause.is_empty() {
-                self.sat.add_clause(clause);
+                self.add_model_clause("encode_alldiff_pigeon_hole", clause);
             }
         }
     }

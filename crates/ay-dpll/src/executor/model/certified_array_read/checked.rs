@@ -90,6 +90,16 @@ impl<'a> CertifiedArrayRead<'a> {
                 | (Sort::Int, Sort::Int)
                 | (Sort::Real, Sort::Real)
                 | (Sort::String, Sort::String) => {}
+                // A constant function does not inspect its arguments. Its
+                // exact declaration/signature and scope stamp are checked by
+                // the package reader; this bounded shape check must also admit
+                // uninterpreted parameter carriers such as a Seq projection.
+                (Sort::Uninterpreted(a), Sort::Uninterpreted(b)) => {
+                    if a.is_empty() || !self.charge(exec, a.len().saturating_add(b.len())) || a != b
+                    {
+                        return false;
+                    }
+                }
                 (Sort::BitVec(a), Sort::BitVec(b)) if a.width == b.width && a.width > 0 => {}
                 (Sort::Array(a), Sort::Array(b)) => {
                     if !self.charge(exec, 2) {

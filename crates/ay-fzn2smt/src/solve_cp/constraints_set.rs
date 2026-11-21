@@ -30,22 +30,8 @@ impl CpContext {
     /// set_card(S, c): |S| = c
     /// Encoding: sum of boolean indicators = c.
     pub(super) fn translate_set_card(&mut self, c: &ConstraintItem) -> Result<()> {
-        let set_name = match &c.args[0] {
-            ay_flatzinc_parser::ast::Expr::Ident(name) => name.clone(),
-            _ => {
-                return Err(Fzn2smtError::ExpectedSetVariableIdentifier {
-                    constraint: "set_card".into(),
-                });
-            }
-        };
-        let (_, indicators) = self
-            .set_var_map
-            .get(&set_name)
-            .ok_or_else(|| Fzn2smtError::UnknownSetVariable {
-                constraint: "set_card".into(),
-                name: set_name.clone(),
-            })?
-            .clone();
+        let set_name = self.resolve_set_name(&c.args[0], "set_card")?;
+        let (_, indicators) = self.get_set_indicators(&set_name)?;
 
         if let Some(card) = self.eval_const_int(&c.args[1]) {
             let n = indicators.len();
@@ -73,9 +59,9 @@ impl CpContext {
     /// set_intersect(S1, S2, S3): S3 = S1 ∩ S2
     /// Encoding: for each position i, b3[i] = b1[i] AND b2[i].
     pub(super) fn translate_set_intersect(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_intersect")?;
-        let name2 = resolve_set_name(&c.args[1], "set_intersect")?;
-        let name3 = resolve_set_name(&c.args[2], "set_intersect")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_intersect")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_intersect")?;
+        let name3 = self.resolve_set_name(&c.args[2], "set_intersect")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -97,9 +83,9 @@ impl CpContext {
     /// set_union(S1, S2, S3): S3 = S1 ∪ S2
     /// Encoding: for each position i, b3[i] = b1[i] OR b2[i].
     pub(super) fn translate_set_union(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_union")?;
-        let name2 = resolve_set_name(&c.args[1], "set_union")?;
-        let name3 = resolve_set_name(&c.args[2], "set_union")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_union")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_union")?;
+        let name3 = self.resolve_set_name(&c.args[2], "set_union")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -135,9 +121,9 @@ impl CpContext {
     /// set_diff(S1, S2, S3): S3 = S1 \ S2
     /// Encoding: for each position i, b3[i] = b1[i] AND NOT b2[i].
     pub(super) fn translate_set_diff(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_diff")?;
-        let name2 = resolve_set_name(&c.args[1], "set_diff")?;
-        let name3 = resolve_set_name(&c.args[2], "set_diff")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_diff")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_diff")?;
+        let name3 = self.resolve_set_name(&c.args[2], "set_diff")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -177,9 +163,9 @@ impl CpContext {
     /// set_symdiff(S1, S2, S3): S3 = (S1 \ S2) ∪ (S2 \ S1)
     /// Encoding: for each position i, b3[i] = b1[i] XOR b2[i].
     pub(super) fn translate_set_symdiff(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_symdiff")?;
-        let name2 = resolve_set_name(&c.args[1], "set_symdiff")?;
-        let name3 = resolve_set_name(&c.args[2], "set_symdiff")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_symdiff")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_symdiff")?;
+        let name3 = self.resolve_set_name(&c.args[2], "set_symdiff")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -226,8 +212,8 @@ impl CpContext {
     /// Encoding: for each element value, b1 => b2, with absent indicators
     /// represented as fixed zero.
     pub(super) fn translate_set_subset(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_subset")?;
-        let name2 = resolve_set_name(&c.args[1], "set_subset")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_subset")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_subset")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -247,8 +233,8 @@ impl CpContext {
     /// Encoding: reverse of set_subset, with absent indicators represented as
     /// fixed zero.
     pub(super) fn translate_set_superset(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_superset")?;
-        let name2 = resolve_set_name(&c.args[1], "set_superset")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_superset")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_superset")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -268,8 +254,8 @@ impl CpContext {
     /// Encoding: elementwise equality over the union of declared domains, with
     /// absent indicators represented as fixed zero.
     pub(super) fn translate_set_eq(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_eq")?;
-        let name2 = resolve_set_name(&c.args[1], "set_eq")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_eq")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_eq")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -289,8 +275,8 @@ impl CpContext {
     /// Encoding: XOR aligned indicators over the union of declared domains,
     /// then require at least one XOR result to be true.
     pub(super) fn translate_set_ne(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_ne")?;
-        let name2 = resolve_set_name(&c.args[1], "set_ne")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_ne")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_ne")?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
         let (lo2, ind2) = self.get_set_indicators(&name2)?;
@@ -330,8 +316,8 @@ impl CpContext {
     /// set_lt(S1, S2): the sorted element list of S1 is lexicographically less
     /// than the sorted element list of S2.
     pub(super) fn translate_set_lt(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_lt")?;
-        let name2 = resolve_set_name(&c.args[1], "set_lt")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_lt")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_lt")?;
         let required = self.get_const_var(1);
         self.add_set_lex_reif(&name1, &name2, required, SetLexOrder::Less, "set_lt")
     }
@@ -339,8 +325,8 @@ impl CpContext {
     /// set_eq_reif(S1, S2, r): r is true iff both sets contain exactly the
     /// same elements.
     pub(super) fn translate_set_eq_reif(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_eq_reif")?;
-        let name2 = resolve_set_name(&c.args[1], "set_eq_reif")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_eq_reif")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_eq_reif")?;
         let result = self.resolve_var(&c.args[2])?;
 
         let (lo1, ind1) = self.get_set_indicators(&name1)?;
@@ -392,8 +378,8 @@ impl CpContext {
     /// set_ne_reif(S1, S2, r): r is true iff at least one element is in
     /// exactly one set.
     pub(super) fn translate_set_ne_reif(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_ne_reif")?;
-        let name2 = resolve_set_name(&c.args[1], "set_ne_reif")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_ne_reif")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_ne_reif")?;
         let result = self.resolve_var(&c.args[2])?;
         self.add_set_ne_reif(&name1, &name2, result)
     }
@@ -457,8 +443,8 @@ impl CpContext {
     /// set_superset_reif(S1, S2, r): r is true iff every element in S2 is also
     /// in S1.
     pub(super) fn translate_set_superset_reif(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_superset_reif")?;
-        let name2 = resolve_set_name(&c.args[1], "set_superset_reif")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_superset_reif")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_superset_reif")?;
         let result = self.resolve_var(&c.args[2])?;
         self.add_set_subset_reif(&name2, &name1, result)
     }
@@ -466,8 +452,8 @@ impl CpContext {
     /// set_le_reif(S1, S2, r): r is true iff the sorted element list of S1 is
     /// lexicographically less than or equal to that of S2.
     pub(super) fn translate_set_le_reif(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_le_reif")?;
-        let name2 = resolve_set_name(&c.args[1], "set_le_reif")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_le_reif")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_le_reif")?;
         let result = self.resolve_var(&c.args[2])?;
         self.add_set_lex_reif(
             &name1,
@@ -481,8 +467,8 @@ impl CpContext {
     /// set_lt_reif(S1, S2, r): r is true iff the sorted element list of S1 is
     /// lexicographically less than that of S2.
     pub(super) fn translate_set_lt_reif(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_lt_reif")?;
-        let name2 = resolve_set_name(&c.args[1], "set_lt_reif")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_lt_reif")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_lt_reif")?;
         let result = self.resolve_var(&c.args[2])?;
         self.add_set_lex_reif(&name1, &name2, result, SetLexOrder::Less, "set_lt_reif")
     }
@@ -492,8 +478,8 @@ impl CpContext {
         c: &ConstraintItem,
         constraint: &str,
     ) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], constraint)?;
-        let name2 = resolve_set_name(&c.args[1], constraint)?;
+        let name1 = self.resolve_set_name(&c.args[0], constraint)?;
+        let name2 = self.resolve_set_name(&c.args[1], constraint)?;
         let result = self.resolve_var(&c.args[2])?;
         self.add_set_subset_reif(&name1, &name2, result)
     }
@@ -733,7 +719,7 @@ impl CpContext {
         use ay_flatzinc_parser::ast::Expr;
 
         let index = self.resolve_var(&c.args[0])?;
-        let result_name = resolve_set_name(&c.args[2], "array_set_element")?;
+        let result_name = self.resolve_set_name(&c.args[2], "array_set_element")?;
         let (res_lo, res_ind) = self.get_set_indicators(&result_name)?;
 
         match &c.args[1] {
@@ -758,10 +744,10 @@ impl CpContext {
             }
             Expr::ArrayLit(elems) => {
                 // Variable array of sets.
-                let set_names: Vec<String> = elems
-                    .iter()
-                    .map(|e| resolve_set_name(e, "array_set_element"))
-                    .collect::<Result<Vec<_>>>()?;
+                let mut set_names = Vec::with_capacity(elems.len());
+                for e in elems {
+                    set_names.push(self.resolve_set_name(e, "array_set_element")?);
+                }
                 self.add_array_set_element_vars(index, 1, res_lo, &res_ind, set_names)?;
             }
             _ => {
@@ -882,10 +868,80 @@ impl CpContext {
     /// set_le(S1, S2): the sorted element list of S1 is lexicographically less
     /// than or equal to the sorted element list of S2.
     pub(super) fn translate_set_le(&mut self, c: &ConstraintItem) -> Result<()> {
-        let name1 = resolve_set_name(&c.args[0], "set_le")?;
-        let name2 = resolve_set_name(&c.args[1], "set_le")?;
+        let name1 = self.resolve_set_name(&c.args[0], "set_le")?;
+        let name2 = self.resolve_set_name(&c.args[1], "set_le")?;
         let required = self.get_const_var(1);
         self.add_set_lex_reif(&name1, &name2, required, SetLexOrder::LessEqual, "set_le")
+    }
+
+    /// Name the indicator set for a set-constraint operand.
+    ///
+    /// A set variable is named by its identifier. A constant set (a range
+    /// such as the empty `1..0` that MiniZinc's `disjoint` produces, a set
+    /// literal, `{}`, or a par set identifier) gets a fixed indicator set
+    /// over min..max made of the shared 0/1 constants, registered once under
+    /// a name no FlatZinc identifier can take. Every set translator then
+    /// reads constant and variable operands alike.
+    fn resolve_set_name(
+        &mut self,
+        expr: &ay_flatzinc_parser::ast::Expr,
+        constraint: &str,
+    ) -> Result<String> {
+        use ay_flatzinc_parser::ast::Expr;
+        let constant = match expr {
+            Expr::Ident(name) if self.set_var_map.contains_key(name) => return Ok(name.clone()),
+            Expr::Ident(name) => match self.par_sets.get(name).cloned() {
+                Some(value) => value,
+                // Unknown names are reported by `get_set_indicators`.
+                None => return Ok(name.clone()),
+            },
+            other => other.clone(),
+        };
+        let mut values = self.const_set_operand_values(&constant).ok_or_else(|| {
+            Fzn2smtError::ExpectedSetVariableIdentifier {
+                constraint: constraint.to_string(),
+            }
+        })?;
+        values.sort_unstable();
+        values.dedup();
+        let key = format!("{{const set {values:?}}}");
+        if self.set_var_map.contains_key(&key) {
+            return Ok(key);
+        }
+        let (lo, indicators) = match (values.first(), values.last()) {
+            (Some(&lo), Some(&hi)) => {
+                let n = super::materialized_range_len(lo, hi, constraint)?;
+                let one = self.get_const_var(1);
+                let zero = self.get_const_var(0);
+                let mut indicators = Vec::with_capacity(n);
+                for offset in 0..n {
+                    let element = checked_indicator_value(lo, offset, constraint)?;
+                    let present = values.binary_search(&element).is_ok();
+                    indicators.push(if present { one } else { zero });
+                }
+                (lo, indicators)
+            }
+            _ => (0, Vec::new()),
+        };
+        self.set_var_map.insert(key.clone(), (lo, indicators));
+        Ok(key)
+    }
+
+    /// The members of a constant set expression, or `None` if it is not one.
+    fn const_set_operand_values(&self, expr: &ay_flatzinc_parser::ast::Expr) -> Option<Vec<i64>> {
+        use ay_flatzinc_parser::ast::Expr;
+        match expr {
+            Expr::EmptySet => Some(Vec::new()),
+            Expr::IntRange(lo, hi) if lo > hi => Some(Vec::new()),
+            Expr::IntRange(lo, hi) => {
+                let n = super::materialized_range_len(*lo, *hi, "constant set").ok()?;
+                (0..n)
+                    .map(|offset| checked_indicator_value(*lo, offset, "constant set").ok())
+                    .collect()
+            }
+            Expr::SetLit(elems) => elems.iter().map(|e| self.eval_const_int(e)).collect(),
+            _ => None,
+        }
     }
 
     /// Look up a set variable's indicators, returning (lo, indicators).
@@ -897,15 +953,6 @@ impl CpContext {
                 constraint: "set".into(),
                 name: name.to_string(),
             })
-    }
-}
-
-fn resolve_set_name(expr: &ay_flatzinc_parser::ast::Expr, constraint: &str) -> Result<String> {
-    match expr {
-        ay_flatzinc_parser::ast::Expr::Ident(n) => Ok(n.clone()),
-        _ => Err(Fzn2smtError::ExpectedSetVariableIdentifier {
-            constraint: constraint.to_string(),
-        }),
     }
 }
 

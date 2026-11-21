@@ -368,6 +368,7 @@ impl Context {
     /// collected as a solvable variable, resolves in `get-value`, and is
     /// published by `(get-model)` unless separately suppressed.
     fn register_domain_symbol(&mut self, name: String, term: TermId, sort: &Sort) {
+        self.advance_source_revision();
         self.track_scoped_symbol(&name);
         self.symbols.insert(
             name,

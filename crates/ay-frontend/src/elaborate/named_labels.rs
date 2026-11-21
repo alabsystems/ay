@@ -250,6 +250,7 @@ impl Context {
     fn commit_labels(&mut self, pending: Vec<PendingLabel>) {
         for PendingLabel { name, body, sort } in pending {
             let public_sort = PublicSort::from_engine(&sort);
+            self.advance_source_revision_introducing(&name);
             self.fun_defs
                 .insert(name.clone(), (Vec::new(), sort.clone(), body));
             let internal_name = self.ordinary_source_binding_internal_name(&name);
@@ -268,7 +269,6 @@ impl Context {
                 ),
             );
             self.track_scoped_fun_def(name.clone());
-            self.advance_source_revision_introducing(&name);
         }
     }
 

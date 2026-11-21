@@ -184,38 +184,60 @@ fn mixed_int_and_real_atoms_are_named_before_the_search() {
     assert_eq!(engine.stats().solve_calls, 0);
 }
 
-/// `1 ≤ 2n ≤ 1` over Int: the simplex says n = 1/2, and branch and bound
-/// refutes both sides inside the one search (design §3.5, `NeedSplit`).
+/// Retain the original `1 ≤ 2n ≤ 1` theorem. The small arrangement now
+/// closes with a checked cross-row cut. Adding independent satisfiable rows
+/// leaves the bounded cut fragment and still exercises in-search branching.
 #[test]
 fn branch_and_bound_stays_in_the_search() {
-    let mut terms = TermStore::new();
-    let n = terms.mk_var("n", Sort::Int);
-    let two = terms.mk_int(BigInt::from(2));
-    let one = terms.mk_int(BigInt::from(1));
-    let twice = terms.mk_mul(vec![two, n]);
-    let above = terms.mk_ge(twice, one);
-    let below = terms.mk_le(twice, one);
-    let mut engine = Engine::new(EngineConfig {
-        record_proofs: true,
-        ..EngineConfig::default()
-    });
-    engine.assert(above);
-    engine.assert(below);
-    let outcome = engine.check(&mut terms, &[], &Guard::new());
-    assert_eq!(outcome.verdict, Verdict::Unsat);
-    let stats = engine.stats().clone();
-    assert_eq!(stats.solve_calls, 1, "{stats:?}");
-    assert!(stats.minted_atoms >= 2, "branch atoms minted: {stats:?}");
-    assert!(
-        outcome
-            .proof
-            .as_ref()
-            .expect("recorded")
-            .steps()
-            .iter()
-            .any(|s| s.hint.kind == TheoryLemmaKind::IntBoundsTautology),
-        "the branch lemma is recorded with its kind"
-    );
+    for independent_rows in [0, 16] {
+        let mut terms = TermStore::new();
+        let n = terms.mk_var("n", Sort::Int);
+        let two = terms.mk_int(BigInt::from(2));
+        let one = terms.mk_int(BigInt::from(1));
+        let zero = terms.mk_int(BigInt::from(0));
+        let twice = terms.mk_mul(vec![two, n]);
+        let above = terms.mk_ge(twice, one);
+        let below = terms.mk_le(twice, one);
+        let mut roots = vec![above, below];
+        for index in 0..independent_rows {
+            let extra = terms.mk_var(format!("independent_{index}"), Sort::Int);
+            roots.push(terms.mk_ge(extra, zero));
+        }
+        let mut engine = Engine::new(EngineConfig {
+            record_proofs: true,
+            ..EngineConfig::default()
+        });
+        for &root in &roots {
+            engine.assert(root);
+        }
+        let outcome = engine.check(&mut terms, &[], &Guard::new());
+        assert_eq!(outcome.verdict, Verdict::Unsat);
+        let stats = engine.stats().clone();
+        assert_eq!(stats.solve_calls, 1, "{stats:?}");
+        let recorded = outcome.proof.as_ref().expect("recorded");
+        let kind = if independent_rows == 0 {
+            TheoryLemmaKind::IntCgCutChain
+        } else {
+            assert!(stats.minted_atoms >= 2, "branch atoms minted: {stats:?}");
+            TheoryLemmaKind::IntBoundsTautology
+        };
+        assert!(
+            recorded.steps().iter().any(|step| step.hint.kind == kind),
+            "the actual inference is recorded: {stats:?}"
+        );
+        let proof = recorded
+            .assemble(&mut terms, None)
+            .expect("whole original-scope proof");
+        assert!(ay_proof::check_proof_strict_with_context(
+            &proof.proof,
+            &terms,
+            None,
+            None,
+            Some(&roots)
+        )
+        .unwrap()
+        .is_complete());
+    }
 }
 
 /// A binary `=` over Booleans and an `ite` over Booleans are Boolean

@@ -47,6 +47,7 @@ use crate::{bv_blast_export::BvBlastValidateLimits, bv_blast_solver::BvExprProof
 mod array_congruence;
 mod array_finite;
 mod authenticated_query;
+mod boolean_complement;
 mod bounded_eval;
 mod case_split;
 mod classification;
@@ -369,15 +370,13 @@ pub fn recognize_bool_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_bool_tautology(terms, ProofId(0), clause).is_ok()
 }
 
-/// Validate a `BoolTautology` lemma in strict mode: a propositional/Boolean
-/// equality or formula that is TRUE under every assignment of its bounded
-/// variables (e.g. `(= (not (not p)) p)`, `(= (and p p) p)`). Reuses the same
-/// exhaustive bounded evaluator as the bit-blast path, but WITHOUT the
-/// `clause_mentions_bv` content requirement — a pure-Boolean tautology has no
-/// bitvector sub-term, and the exhaustive evaluation IS the soundness check
-/// (every assignment satisfies the clause), so no BV content is needed. Every
-/// literal must be `Bool`-sorted, and all variables must be bounded (else the
-/// checker cannot exhaustively evaluate and fails closed).
+/// Validate a `BoolTautology` lemma in strict mode. Exact propositional
+/// schemas treat Boolean theory atoms opaquely, including complementary raw
+/// negation chains. Other clauses use the same exhaustive bounded evaluator
+/// as the bit-blast path, without its `clause_mentions_bv` requirement (e.g.
+/// `(= (not (not p)) p)`, `(= (and p p) p)`). Every literal must be Boolean;
+/// the evaluation fallback requires bounded variables and fails closed when
+/// it cannot enumerate every assignment.
 pub(crate) fn validate_bool_tautology(
     terms: &TermStore,
     step_id: ProofId,
@@ -422,6 +421,14 @@ fn validate_bool_tautology_controlled(
                 ),
             });
         }
+    }
+    // A raw double-negation bridge is propositional even when its atom
+    // contains an operator outside the bounded evaluator's theory fragment.
+    // Compare exact Bool atom identity and negation parity without evaluating
+    // that atom. In particular, this checks `(cl (not (not (not p))) p)`
+    // emitted by the authenticated closed-fold replay.
+    if boolean_complement::holds(terms, clause, poll)? {
+        return Ok(());
     }
     // Packed clausification units can contain theory atoms the bounded
     // Bool/BV evaluator intentionally cannot interpret. Their propositional
@@ -1794,7 +1801,7 @@ impl<'a> ProofProducingLowerer<'a, '_> {
                     _ => {
                         return Err(
                             "array select did not produce its declared Bool sort".to_string()
-                        )
+                        );
                     }
                 }
             }
@@ -1944,7 +1951,7 @@ impl<'a> ProofProducingLowerer<'a, '_> {
                     _ => {
                         return Err(
                             "array select did not produce its declared BitVec sort".to_string()
-                        )
+                        );
                     }
                 }
             }

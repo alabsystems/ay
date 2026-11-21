@@ -44,6 +44,8 @@ mod ay_library_bench;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_const_set_operands;
+#[cfg(test)]
 mod tests_error;
 #[cfg(test)]
 mod tests_extended;

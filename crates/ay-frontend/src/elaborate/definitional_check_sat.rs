@@ -490,6 +490,7 @@ impl Context {
         &mut self,
         snapshot: DefinitionalAdoptionSnapshot,
     ) {
+        self.advance_source_revision();
         let DefinitionalAdoptionSnapshot {
             assertions,
             assertion_finite_set_metadata,
@@ -516,7 +517,6 @@ impl Context {
         self.authored_assertions = authored_assertions;
         self.named_terms = named_terms;
         self.definitional_pass.retry.clear();
-        self.advance_source_revision();
     }
 
     /// Run `f` with the check-sat-time pass held off.
@@ -628,5 +628,37 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn fail_next_check_sat_reelaboration(&mut self) {
         self.fail_next_check_sat_reelaboration = true;
+    }
+}
+
+// A restoration of identical declaration bytes is still a new source epoch.
+#[cfg(test)]
+mod projection_lease_tests {
+    use super::*;
+
+    #[test]
+    fn projection_binding_lease_snapshot_restore_does_not_restore_revision() {
+        let mut context = Context::new();
+        for command in crate::parse("(declare-fun f (Int) Int)").unwrap() {
+            context.process_command(&command).unwrap();
+        }
+        let checked = context
+            .check_projection_declaration(&super::super::ProjectionBindingRequest {
+                symbol: ay_core::Symbol::named("f"),
+                parameter_sorts: vec![ay_core::Sort::Int],
+                result_sort: ay_core::Sort::Int,
+            })
+            .unwrap();
+        let snapshot = context.definitional_adoption_snapshot(&[]);
+        context.restore_definitional_adoption_snapshot(snapshot);
+        assert!(!context.projection_binding_lease_still_current(&checked));
+        assert!(!context.projection_binding_still_current(&checked));
+        assert!(context
+            .check_projection_declaration(&super::super::ProjectionBindingRequest {
+                symbol: ay_core::Symbol::named("f"),
+                parameter_sorts: vec![ay_core::Sort::Int],
+                result_sort: ay_core::Sort::Int,
+            })
+            .is_ok());
     }
 }

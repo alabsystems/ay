@@ -9,12 +9,33 @@ use crate::test_util::lit;
 fn test_factor_new() {
     let f = Factor::new(10);
     assert_eq!(f.num_vars, 10);
+    // AY-SAT-1: the literal-indexed arrays wait for the first factoring round.
+    assert!(!f.arrays_allocated());
+    let mut f = f;
+    f.ensure_num_vars(10);
     assert_eq!(f.marks.len(), 20);
+    assert_eq!(f.occ_next_large_counts.len(), 20);
+}
+
+/// Variable growth before the first round allocates nothing; the round
+/// then sizes every array to the grown count (AY-SAT-1).
+#[test]
+fn test_factor_arrays_wait_for_first_round() {
+    let mut f = Factor::new(4);
+    f.grow_num_vars(9);
+    assert!(!f.arrays_allocated());
+    f.ensure_num_vars(9);
+    assert_eq!(f.marks.len(), 18);
+    assert_eq!(f.counts.len(), 18);
+    f.grow_num_vars(12);
+    assert_eq!(f.occ_binary_counts.len(), 24);
+    assert_eq!(f.occ_large_counts.len(), 24);
 }
 
 #[test]
 fn test_factor_marks() {
     let mut f = Factor::new(5);
+    f.ensure_num_vars(5);
     let l = lit(2, true);
     assert!(!f.is_marked(l, MARK_FACTOR));
     f.mark(l, MARK_FACTOR);
@@ -54,6 +75,7 @@ fn test_find_next_factor_nounted_prevents_same_source_overcount() {
     }
 
     let mut factor = Factor::new(8);
+    factor.ensure_num_vars(8);
     let vals = vec![0i8; 16];
     let deleted = vec![false; clause_db.len()];
     let mut ticks = 0;

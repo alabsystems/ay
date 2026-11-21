@@ -27,6 +27,13 @@ impl IndependentModelView<'_> {
             Ok(None) => {}
             Err(()) => return None,
         }
+        // A trial value of a self-referential leaf being checked by
+        // `array_self_referential_fixpoint` (AY-SMT-3), read inside its own
+        // resolution: bookkept as a cycle cut, so nothing above is memoized.
+        let seeded = self.array_seeds.borrow().get(&t).cloned();
+        if let Some(seed) = seeded {
+            return self.note_trial_read(t).then_some(seed);
+        }
         // Exact memo and cycle cut (#gate-exact-leaf-memo): a memoized value
         // is returned only where resolving `t` again would compute it.
         if let Some(memoized) = self.memoized_leaf(t) {
@@ -35,11 +42,103 @@ impl IndependentModelView<'_> {
         if !self.enter_leaf(t) {
             return None; // cycle
         }
-        let result = self.array_leaf_inner(t, index_sort, element_sort);
+        let result = self
+            .array_leaf_inner(t, index_sort, element_sort)
+            .or_else(|| self.array_self_referential_fixpoint(t, index_sort, element_sort));
         self.leave_leaf(t, &result, true);
         result
     }
 
+    /// Last resort for an array leaf nothing else pins (AY-SMT-3): an asserted
+    /// definition `(= t E)` whose `E` reads `t` itself, such as the nested
+    /// store `(= d (store c i (store (select c i) j (select (select d i) j))))`
+    /// of SMT-COMP incremental QF_AUFLIA 2721719d. Resolving `E` cuts the
+    /// cycle at `t`, so the definition never evaluated and the gate answered
+    /// "model does not pin this leaf" on a satisfiable query.
+    ///
+    /// The fixpoint: give `t` a canonical trial value `R0` (the all-default
+    /// array of its sort), evaluate `E` to `R1`, then `E` again with `t = R1`,
+    /// and so on for a few rounds. Once a round gives back the value it was
+    /// given, `R = E[t := R]` holds exactly, so `t := R` satisfies the
+    /// definition under the current values of every other leaf. That is a
+    /// candidate value only: every assertion, this definition included, is
+    /// still re-checked by the gate with `t := R`, so a wrong candidate can
+    /// only end in `ModelViolates`, never in a confirmed wrong `sat`. Trial
+    /// reads are bookkept as cycle cuts (`note_trial_read`), so no value that
+    /// depended on a trial is memoized; the result is a function of the model
+    /// alone, the same for the gate and the printer. A read-conflicted
+    /// (withheld) leaf stays fail-closed.
+    fn array_self_referential_fixpoint(
+        &self,
+        t: TermId,
+        index_sort: &Sort,
+        element_sort: &Sort,
+    ) -> Option<ModelValue> {
+        const ROUNDS: usize = 4;
+        if self
+            .model
+            .array_model
+            .as_ref()
+            .is_some_and(|arrays| arrays.is_withheld(&t))
+            || self.array_seeds.borrow().contains_key(&t)
+        {
+            return None;
+        }
+        let start = canonical_trial_value(&Sort::array(index_sort.clone(), element_sort.clone()))?;
+        for def in self.array_definitions(t)? {
+            if !term_reads(self, def, t) {
+                continue;
+            }
+            let mut given = start.clone();
+            for _ in 0..ROUNDS {
+                self.array_seeds.borrow_mut().insert(t, given.clone());
+                let ev = Evaluator::new(&self.exec.ctx.terms, self);
+                let outcome = ev.evaluate(def);
+                self.array_seeds.borrow_mut().remove(&t);
+                let EvalOutcome::Value(produced @ ModelValue::Array(_)) = outcome else {
+                    break;
+                };
+                if super::values_equal(&produced, &given) {
+                    return Some(produced);
+                }
+                given = produced;
+            }
+        }
+        None
+    }
+}
+
+/// The all-default value of an array sort over Int/Bool elements, nested
+/// arrays included; `None` for any other element sort.
+fn canonical_trial_value(sort: &Sort) -> Option<ModelValue> {
+    match sort {
+        Sort::Bool => Some(ModelValue::Bool(false)),
+        Sort::Int => Some(ModelValue::Int(0.into())),
+        Sort::Array(array) => Some(ModelValue::Array(Box::new(ArrayValue {
+            default: canonical_trial_value(&array.element_sort)?,
+            store: Vec::new(),
+        }))),
+        _ => None,
+    }
+}
+
+/// Whether `t` occurs in the term DAG of `root` (each term visited once).
+fn term_reads(view: &IndependentModelView<'_>, root: TermId, t: TermId) -> bool {
+    let terms = &view.exec.ctx.terms;
+    let mut seen: DetHashSet<TermId> = DetHashSet::default();
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current == t {
+            return true;
+        }
+        if seen.insert(current) {
+            stack.extend(terms.children(current));
+        }
+    }
+    false
+}
+
+impl IndependentModelView<'_> {
     fn array_leaf_inner(
         &self,
         t: TermId,

@@ -498,9 +498,13 @@ impl ModDivElimState {
                     }
                 }
 
-                // NOTE: Avoid introducing free vars across binders.
-                // Quantified terms are handled separately by the executor; keep them unchanged here.
+                // Purification creates free quotient/remainder witnesses.
+                // Only run it after instantiation or beta reduction has
+                // removed the binder at the actual use site.
                 TermData::Forall(..) | TermData::Exists(..) | TermData::Let(..) => term,
+                // A lambda array is an application in the core representation,
+                // including each binder of a curried lambda.
+                TermData::App(Symbol::Named(name), _) if name == "lambda-array" => term,
 
                 TermData::App(Symbol::Named(name), args) if name == "mod" && args.len() == 2 => {
                     if let Some(k) = extract_int_constant(terms, args[1]) {

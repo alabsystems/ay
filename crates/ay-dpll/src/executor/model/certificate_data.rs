@@ -436,6 +436,7 @@ pub(in crate::executor) enum CertifiedConstInterpReadError {
 /// it after proving the corresponding completed interpretation M'.
 #[derive(Debug, Default)]
 pub(super) struct CertifiedTotalUfModel {
+    pub(super) symbolic: super::symbolic_uf::SymbolicUfModel,
     pub(super) by_symbol: HashMap<String, CertifiedTotalUfInterpretation>,
     /// Exact ground projection of a certificate-constructed interpretation.
     ///
@@ -453,6 +454,7 @@ pub(super) struct CertifiedTotalUfModel {
 impl Clone for CertifiedTotalUfModel {
     fn clone(&self) -> Self {
         Self {
+            symbolic: self.symbolic.clone(),
             by_symbol: self.by_symbol.clone(),
             ground_pins: self.ground_pins.clone(),
             // A clone is a distinct model witness. Preserve semantic tables and

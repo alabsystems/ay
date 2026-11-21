@@ -223,14 +223,14 @@ impl Solver {
         if !self.cold.clause_ids.is_empty() {
             let old_ids = std::mem::take(&mut self.cold.clause_ids);
             let new_arena_len = self.arena.len();
-            let mut new_ids = vec![0u64; new_arena_len];
+            let mut new_ids = ClauseIdTable::with_len(new_arena_len);
             for &old_off in &ordered {
                 let old_idx = old_off as usize;
                 let new_off = remap[old_idx];
                 if new_off != u32::MAX && old_idx < old_ids.len() {
                     let new_off_usize = new_off as usize;
                     if new_off_usize < new_ids.len() {
-                        new_ids[new_off_usize] = old_ids[old_idx];
+                        new_ids.set(new_off_usize, old_ids[old_idx]);
                     }
                 }
             }

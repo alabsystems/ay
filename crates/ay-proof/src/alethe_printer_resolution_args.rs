@@ -108,11 +108,13 @@ impl AlethePrinter<'_> {
             return;
         }
         if let TermData::Not(inner) = self.terms.get(term_id) {
-            if let Some(eliminated) = self.let_bridge_renderings.borrow().get(inner).cloned() {
-                self.charge((eliminated.len() + "(not )".len()) as u64);
-                out.push_str("(not ");
-                out.push_str(&eliminated);
-                out.push(')');
+            if self.write_rendering_channel_into(
+                out,
+                *inner,
+                &self.let_bridge_renderings,
+                "(not ",
+                ")",
+            ) {
                 return;
             }
         }

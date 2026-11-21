@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::counted_storage::{checked_double, try_vec_with, Result};
+use crate::counted_storage::Result;
 use ay_core::original_query::CountedAdmission;
 
 impl Factor {
@@ -11,11 +11,12 @@ impl Factor {
         owner.admit(1, size_of::<Self>())?;
         Ok(Self {
             num_vars,
-            marks: try_vec_with(owner, checked_double(owner, num_vars)?, |_| 0)?,
-            counts: try_vec_with(owner, checked_double(owner, num_vars)?, |_| 0)?,
-            occ_binary_counts: try_vec_with(owner, checked_double(owner, num_vars)?, |_| 0)?,
-            occ_large_counts: try_vec_with(owner, checked_double(owner, num_vars)?, |_| 0)?,
-            occ_next_large_counts: try_vec_with(owner, checked_double(owner, num_vars)?, |_| 0)?,
+            // Allocated on the first factoring round, as in `Factor::new`.
+            marks: Vec::new(),
+            counts: Vec::new(),
+            occ_binary_counts: Vec::new(),
+            occ_large_counts: Vec::new(),
+            occ_next_large_counts: Vec::new(),
             occ_candidates: Vec::new(),
             counted: Vec::new(),
             nounted: Vec::new(),

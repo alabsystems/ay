@@ -11,7 +11,7 @@
 //   - Print "=====UNKNOWN=====" on timeout or inconclusive result
 //   - Flush stdout after each solution (scoring uses best-found)
 
-use std::io;
+use std::io::{self, Write};
 
 use ay_flatzinc_smt::{SolverConfig, TranslationResult};
 
@@ -34,18 +34,29 @@ pub fn cmd_solve(
     fd_search: bool,
     all_solutions: bool,
 ) -> Result<()> {
+    let mut out = io::stdout().lock();
+    solve_translated(result, timeout_ms, fd_search, all_solutions, &mut out)
+}
+
+/// [`cmd_solve`] writing the solution stream to `out`.
+pub(crate) fn solve_translated(
+    result: &TranslationResult,
+    timeout_ms: Option<u64>,
+    fd_search: bool,
+    all_solutions: bool,
+    out: &mut impl Write,
+) -> Result<()> {
     let global_deadline = checked_deadline(timeout_ms)?;
     let config = SolverConfig {
         timeout_ms,
         all_solutions,
         global_deadline,
     };
-    let mut out = io::stdout().lock();
     if fd_search {
-        ay_flatzinc_smt::solve_branching(result, &config, &mut out)
+        ay_flatzinc_smt::solve_branching(result, &config, out)
             .map_err(|e| Fzn2smtError::Solver(e.to_string()))?;
     } else {
-        ay_flatzinc_smt::solve(result, &config, &mut out)
+        ay_flatzinc_smt::solve(result, &config, out)
             .map_err(|e| Fzn2smtError::Solver(e.to_string()))?;
     }
     Ok(())

@@ -2,8 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! The route of `ay lp solve` for MPS input: AY's MILP engine (`ay-milp`)
-//! on the one exact reading of the file, run in rounds so that each improving
+//! The route of `ay lp solve` for MPS and CPLEX LP input (and of the
+//! z3-compatible `-lp` mode): AY's MILP engine (`ay-milp`) on the one exact
+//! reading of the file, run in rounds so that each improving
 //! point is written as soon as a round ends.
 //!
 //! `ay-milp` reports its point only when `BabSession::check` returns, and it
@@ -14,7 +15,8 @@
 //!
 //! # One model
 //!
-//! The file is read once, exactly, by [`ay_lp::parse_mps_exact`]. The
+//! The file is read once, exactly, by [`ay_lp::parse_mps_exact`] or
+//! [`ay_lp::parse_lp_exact`]. The
 //! engine's model is built from those rationals ([`engine_model`],
 //! [`ay_milp::model_from_exact`]), column for column; nothing passes through
 //! `f64` on the way in. The engine's verdicts, the printed objective and the
@@ -47,6 +49,10 @@
 //!   model. Otherwise `s UNKNOWN` with a `c infeasibility not confirmed:`
 //!   line.
 //! - `s UNBOUNDED` is never printed: the engine exports no ray to check.
+//!
+//! The dense simplex of `ay-lp` answers for no input: it works on a rounded
+//! copy and has no exact certificate, so none of its verdicts could be
+//! confirmed (AY-N11, AY-N12).
 
 use std::io::Write;
 use std::time::{Duration, Instant};

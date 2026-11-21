@@ -284,7 +284,7 @@ pub fn try_export_alethe_with_authored_surfaces_until(
         .with_authored_surfaces(surfaces)
         .asking_complete_blast(CompleteBlastAsk::AskedUntil(stop));
     rendered(|output| {
-        export_alethe_with_printer_to(output, proof, terms, problem_assertions, &printer)
+        export_alethe_with_printer_to(output, proof, terms, problem_assertions, &printer, None)
     })
 }
 
@@ -324,7 +324,37 @@ pub fn try_export_alethe_with_authored_surfaces_within_solve(
         .asking_complete_blast(CompleteBlastAsk::AskedUntil(solve.stop))
         .reading_support_declines(solve.declines);
     rendered(|output| {
-        export_alethe_with_printer_to(output, proof, terms, problem_assertions, &printer)
+        export_alethe_with_printer_to(output, proof, terms, problem_assertions, &printer, None)
+    })
+}
+
+/// Render with the exact nullary datatype constructors emitted by the
+/// accompanying problem encoder. Those declarations authorize names only.
+/// Every assumption is still validated against `problem_assertions`.
+///
+/// # Errors
+///
+/// Returns the same rendering and scope errors as
+/// [`try_export_alethe_with_authored_surfaces`].
+pub fn try_export_alethe_with_paired_datatype_constructors(
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+    constructors: &std::collections::BTreeMap<&str, TermId>,
+    work_budget: Option<u64>,
+) -> Result<String, AlethePrintError> {
+    let printer = AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, work_budget)
+        .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
+    rendered(|output| {
+        export_alethe_with_printer_to(
+            output,
+            proof,
+            terms,
+            problem_assertions,
+            &printer,
+            Some(constructors),
+        )
     })
 }
 

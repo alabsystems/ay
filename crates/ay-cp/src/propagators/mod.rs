@@ -41,11 +41,13 @@ pub mod alldifferent;
 pub mod alldifferent_ac;
 pub mod cumulative;
 pub mod disjunctive;
+pub mod div;
 pub mod element;
 pub mod linear;
 pub mod linear_ne;
 pub mod shifted_alldifferent;
 pub mod table;
+pub mod times;
 
 #[cfg(test)]
 pub(crate) mod soundness_tests;

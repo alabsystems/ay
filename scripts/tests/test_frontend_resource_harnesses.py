@@ -331,6 +331,8 @@ class DirectRunnerEnvelopeTest(unittest.TestCase):
                 "test \"$1\" = solve || exit 93\n"
                 "test \"$2\" = --memory || exit 94\n"
                 "test \"$3\" = 4096 || exit 95\n"
+                "test \"$4\" = --proof-store || exit 96\n"
+                f"test \"$5\" = {directory}/store || exit 97\n"
                 "printf 'sat\\n'\n",
             )
             result = rewrite_oracle_check.run_one(
@@ -339,6 +341,7 @@ class DirectRunnerEnvelopeTest(unittest.TestCase):
                 2,
                 4096,
                 dict(os.environ, MEMLIMIT="4096", NBCORE="2"),
+                f"{directory}/store",
             )
         self.assertEqual(result["status"], "sat", result)
 
@@ -382,14 +385,21 @@ class PersistedEnvelopeTest(unittest.TestCase):
                  mock.patch.object(rewrite_oracle_check, "plan_solver_resources",
                                    return_value=self.PLAN), \
                  mock.patch.object(rewrite_oracle_check, "run_one",
-                                   return_value=fake) as run:
+                                   return_value=fake) as run, \
+                 mock.patch.object(tempfile, "tempdir", directory):
                 rewrite_oracle_check.main()
             payload = json.loads(output.read_text())
-            child_env = run.call_args.args[-1]
-        self.assertEqual(child_env["MEMLIMIT"], "3072")
-        self.assertEqual(child_env["NBCORE"], "2")
-        self.assertEqual(payload["resource_plan"]["jobs"], 1)
-        self.assertEqual(payload["counts"]["confirmed"], 1)
+            child_env = run.call_args.args[4]
+            proof_store = run.call_args.args[5]
+            self.assertEqual(child_env["MEMLIMIT"], "3072")
+            self.assertEqual(child_env["NBCORE"], "2")
+            self.assertEqual(payload["resource_plan"]["jobs"], 1)
+            self.assertEqual(payload["counts"]["confirmed"], 1)
+            # A new, empty store for this run: a stored proof counts, and ay
+            # then writes none, so a reused store would shed the proof cycle.
+            self.assertEqual(Path(proof_store).parent, Path(directory))
+            self.assertTrue(Path(proof_store).name.startswith("ay-proof-store-"))
+            self.assertEqual(list(Path(proof_store).iterdir()), [])
 
     def test_sat_main_persists_symmetric_plan(self):
         with tempfile.TemporaryDirectory() as directory:

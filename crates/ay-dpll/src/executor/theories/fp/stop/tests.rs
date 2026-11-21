@@ -4,22 +4,22 @@
 use super::*;
 use crate::executor_types::SolveResult;
 use ay_core::time::Instant;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 
 fn memory_probe(
     interrupt: Option<Arc<AtomicBool>>,
     deadline: SolveDeadlineCell,
-    exceeded: &Rc<Cell<bool>>,
-    calls: &Rc<Cell<usize>>,
+    exceeded: &Arc<AtomicBool>,
+    calls: &Arc<AtomicUsize>,
 ) -> FpStop {
-    let (exceeded, calls) = (Rc::clone(exceeded), Rc::clone(calls));
+    let (exceeded, calls) = (Arc::clone(exceeded), Arc::clone(calls));
     FpStop::with_sources(
         interrupt,
         deadline,
         Box::new(move || {
-            calls.set(calls.get() + 1);
-            exceeded.get()
+            calls.fetch_add(1, Ordering::Relaxed);
+            exceeded.load(Ordering::Relaxed)
         }),
     )
 }
@@ -63,21 +63,25 @@ fn actual_executor_deadline_remains_live_but_observed_expiry_is_sticky() {
 
 #[test]
 fn disappearing_memory_failure_does_not_repoll_or_revive_an_attempt() {
-    let exceeded = Rc::new(Cell::new(false));
-    let calls = Rc::new(Cell::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
     let stop = memory_probe(None, SolveDeadlineCell::new(), &exceeded, &calls);
     assert_eq!(stop.check(), Ok(()));
-    assert_eq!(calls.get(), 1);
-    exceeded.set(true);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    exceeded.store(true, Ordering::Relaxed);
     assert_eq!(stop.check(), Err(UnknownOrigin::MemoryBudget));
-    assert_eq!(calls.get(), 2);
-    exceeded.set(false);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    exceeded.store(false, Ordering::Relaxed);
     assert_eq!(stop.check(), Err(UnknownOrigin::MemoryBudget));
     assert!(stop.should_stop());
-    assert_eq!(calls.get(), 2, "a latched refusal never resamples a source");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "a latched refusal never resamples a source"
+    );
     let fresh = memory_probe(None, SolveDeadlineCell::new(), &exceeded, &calls);
     assert_eq!(fresh.check(), Ok(()));
-    assert_eq!(calls.get(), 3);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -85,8 +89,8 @@ fn first_poll_uses_existing_executor_source_priority() {
     let interrupt = Arc::new(AtomicBool::new(true));
     let deadline = SolveDeadlineCell::new();
     deadline.set(Some(Instant::now()));
-    let exceeded = Rc::new(Cell::new(true));
-    let calls = Rc::new(Cell::new(0));
+    let exceeded = Arc::new(AtomicBool::new(true));
+    let calls = Arc::new(AtomicUsize::new(0));
     let stop = memory_probe(
         Some(Arc::clone(&interrupt)),
         deadline.clone(),
@@ -94,46 +98,46 @@ fn first_poll_uses_existing_executor_source_priority() {
         &calls,
     );
     assert_eq!(stop.check(), Err(UnknownOrigin::InterruptFlag));
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     interrupt.store(false, Ordering::Relaxed);
     let deadline_stop = memory_probe(None, deadline.clone(), &exceeded, &calls);
     assert_eq!(deadline_stop.check(), Err(UnknownOrigin::SolveDeadline));
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     deadline.set(None);
     let memory_stop = memory_probe(None, deadline, &exceeded, &calls);
     assert_eq!(memory_stop.check(), Err(UnknownOrigin::MemoryBudget));
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(stop.check(), Err(UnknownOrigin::InterruptFlag));
     assert_eq!(deadline_stop.check(), Err(UnknownOrigin::SolveDeadline));
 }
 
 #[test]
 fn builder_refusals_keep_the_first_captured_origin() {
-    let exceeded = Rc::new(Cell::new(false));
-    let calls = Rc::new(Cell::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
     let variable_stop = memory_probe(None, SolveDeadlineCell::new(), &exceeded, &calls);
     assert_eq!(
         variable_stop.refuse_build_error(FpBuildError::VariableLimit),
         UnknownOrigin::DeterministicResourceBudget
     );
-    exceeded.set(true);
+    exceeded.store(true, Ordering::Relaxed);
     assert_eq!(
         variable_stop.refuse_build_error(FpBuildError::Interrupted),
         UnknownOrigin::DeterministicResourceBudget
     );
-    assert_eq!(calls.get(), 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
 
     let memory_stop = memory_probe(None, SolveDeadlineCell::new(), &exceeded, &calls);
     assert_eq!(
         memory_stop.refuse_build_error(FpBuildError::Interrupted),
         UnknownOrigin::MemoryBudget
     );
-    exceeded.set(false);
+    exceeded.store(false, Ordering::Relaxed);
     assert_eq!(
         memory_stop.refuse_build_error(FpBuildError::VariableLimit),
         UnknownOrigin::MemoryBudget
     );
-    assert_eq!(calls.get(), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 
     let fallback = memory_probe(None, SolveDeadlineCell::new(), &exceeded, &calls);
     assert_eq!(
@@ -141,7 +145,7 @@ fn builder_refusals_keep_the_first_captured_origin() {
         UnknownOrigin::InterruptFlag
     );
     assert_eq!(fallback.check(), Err(UnknownOrigin::InterruptFlag));
-    assert_eq!(calls.get(), 2);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -244,15 +248,15 @@ fn memory_poll_gate_observes_once_the_period_has_elapsed() {
 #[test]
 fn a_hot_check_loop_takes_one_observation_per_interval_or_period() {
     const CHECKS: u64 = 1 << 18;
-    let observations = Rc::new(Cell::new(0u64));
-    let counted = Rc::clone(&observations);
+    let observations = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&observations);
     let stop = FpStop::with_sources(None, SolveDeadlineCell::new(), {
         let gate = MemoryPollGate::new();
         memory_source(
             false,
             move || gate.due_lazily(Instant::now),
             move || {
-                counted.set(counted.get() + 1);
+                counted.fetch_add(1, Ordering::Relaxed);
                 false
             },
         )
@@ -264,9 +268,9 @@ fn a_hot_check_loop_takes_one_observation_per_interval_or_period() {
     let periods = started.elapsed().as_nanos() / MEMORY_POLL_PERIOD.as_nanos();
     let bound = 1 + CHECKS / u64::from(MEMORY_POLL_INTERVAL) + periods as u64;
     assert!(
-        (1..=bound).contains(&observations.get()),
+        (1..=bound).contains(&observations.load(Ordering::Relaxed)),
         "{} observations for {CHECKS} checks (bound {bound})",
-        observations.get()
+        observations.load(Ordering::Relaxed)
     );
 }
 

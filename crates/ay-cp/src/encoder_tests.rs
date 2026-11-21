@@ -74,3 +74,32 @@ fn i64_max_domain_omits_the_unrepresentable_upper_sentinel() {
     assert!(enc.lookup_ge(IntVarId(0), i64::MAX).is_some());
     assert!(enc.lookup_le(IntVarId(0), i64::MAX).is_some());
 }
+
+/// A refusal reports the whole model's literal count, not the partial sum at
+/// the variable where it crossed the limit.
+#[test]
+fn capacity_refusal_reports_the_whole_sum() {
+    let mut enc = IntegerEncoder::new();
+    enc.register_var(0, 600_000);
+    enc.register_var(0, 600_000);
+    enc.register_var(0, 600_000);
+    assert_eq!(
+        enc.preallocation_plan(),
+        Err(OrderEncodingCapacityError::LiteralLimitExceeded {
+            required: 3 * 600_002,
+            limit: MAX_PREALLOCATED_ORDER_LITERALS,
+        })
+    );
+}
+
+/// The limit is the encoder's own: a larger one admits a larger model.
+#[test]
+fn literal_limit_is_configurable() {
+    let mut enc = IntegerEncoder::new();
+    enc.register_var(0, 600_000);
+    enc.register_var(0, 600_000);
+    enc.set_literal_limit(2 * 600_002);
+    assert_eq!(enc.preallocation_plan(), Ok(2 * 600_002));
+    enc.set_literal_limit(2 * 600_002 - 1);
+    assert!(enc.preallocation_plan().is_err());
+}

@@ -76,14 +76,12 @@ impl Solver {
         // Arena: self-compensating (`accounted_words` is pinned).
         self.arena.shrink_words_to_fit();
 
-        // LRAT clause ids: indexed by arena WORD offset, so this is the biggest
-        // of the three on a wide formula whenever it is maintained at all.
-        let clause_id_slack =
-            (self.cold.clause_ids.capacity() - self.cold.clause_ids.len()) * size_of::<u64>();
-        if clause_id_slack >= MIN_RECLAIM_BYTES {
-            let before = self.cold.clause_ids.capacity() * size_of::<u64>();
+        // LRAT clause ids: keyed by arena WORD offset, so this is large on a
+        // wide formula whenever it is maintained at all.
+        if self.cold.clause_ids.slack_bytes() >= MIN_RECLAIM_BYTES {
+            let before = self.cold.clause_ids.heap_bytes();
             self.cold.clause_ids.shrink_to_fit();
-            let after = self.cold.clause_ids.capacity() * size_of::<u64>();
+            let after = self.cold.clause_ids.heap_bytes();
             self.cold.load_slack_reclaimed_bytes += before - after;
         }
 

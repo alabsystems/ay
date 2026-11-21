@@ -4,25 +4,28 @@
 
 //! CPLEX LP format tokenizer.
 //!
-//! Splits the input text into a stream of [`SpannedTok`]s. Multi-word headers
-//! (`Subject To`, `s.t.`, `Such That`) are folded into single [`Tok::Header`]
-//! entries so the parser in `lp.rs` can dispatch on them directly.
+//! Splits the input text into a stream of [`SpannedTok`]s. A line that holds
+//! only a section keyword (`Subject To`, `s.t.`, `Bounds`, ...) becomes one
+//! [`Tok::Header`]; the reading of every token is documented in `lp.rs`.
+//! Numbers are kept as the exact rational their decimal text denotes
+//! ([`crate::exact::decimal::parse_decimal`]).
+
+use num_rational::BigRational;
 
 use crate::error::LpError;
+use crate::exact::decimal::parse_decimal;
 use crate::model::Sense;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Tok {
     Word(String),
-    Num(f64),
+    Num(BigRational),
     Colon,
     Plus,
     Minus,
     Le,
     Ge,
     Eq,
-    LBracket,
-    RBracket,
     /// Header tokens emitted by the tokenizer after keyword folding.
     Header(Section),
     End,
@@ -34,21 +37,19 @@ pub(crate) enum Section {
     Subject,
     Bounds,
     General,
-    Integer,
     Binary,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct SpannedTok {
     pub(crate) tok: Tok,
     pub(crate) line: usize,
 }
 
-impl Clone for SpannedTok {
-    fn clone(&self) -> Self {
-        Self {
-            tok: self.tok.clone(),
-            line: self.line,
-        }
+fn refuse(line: usize, msg: impl Into<String>) -> LpError {
+    LpError::Parse {
+        line,
+        msg: msg.into(),
     }
 }
 
@@ -56,25 +57,11 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<SpannedTok>, LpError> {
     let mut out = Vec::new();
     for (idx, raw) in input.lines().enumerate() {
         let line_no = idx + 1;
-        let stripped = strip_comment(raw);
-
-        // Detect multi-word section headers first (case-insensitive).
-        let trimmed = stripped.trim();
-        if let Some(section) = match_header(trimmed) {
-            let tok = match section {
-                HeaderKind::Min => Tok::Header(Section::Objective(Sense::Min)),
-                HeaderKind::Max => Tok::Header(Section::Objective(Sense::Max)),
-                HeaderKind::Subject => Tok::Header(Section::Subject),
-                HeaderKind::Bounds => Tok::Header(Section::Bounds),
-                HeaderKind::General => Tok::Header(Section::General),
-                HeaderKind::Integer => Tok::Header(Section::Integer),
-                HeaderKind::Binary => Tok::Header(Section::Binary),
-                HeaderKind::End => Tok::End,
-            };
+        let stripped = strip_comment(raw, line_no)?;
+        if let Some(tok) = match_header(stripped.trim(), line_no)? {
             out.push(SpannedTok { tok, line: line_no });
             continue;
         }
-
         tokenize_line(stripped, line_no, &mut out)?;
     }
     Ok(out)
@@ -83,131 +70,62 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<SpannedTok>, LpError> {
 fn tokenize_line(line: &str, line_no: usize, out: &mut Vec<SpannedTok>) -> Result<(), LpError> {
     let bytes = line.as_bytes();
     let mut i = 0;
+    let mut push = |tok| out.push(SpannedTok { tok, line: line_no });
     while i < bytes.len() {
         let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
         if c.is_ascii_whitespace() {
             i += 1;
             continue;
         }
-        match c {
-            b'+' => {
-                out.push(SpannedTok {
-                    tok: Tok::Plus,
-                    line: line_no,
-                });
-                i += 1;
+        let (tok, used) = match (c, next) {
+            (b'-', Some(b'>')) => {
+                return Err(refuse(
+                    line_no,
+                    "indicator constraints ('->') are not supported",
+                ))
             }
-            b'-' => {
-                out.push(SpannedTok {
-                    tok: Tok::Minus,
-                    line: line_no,
-                });
-                i += 1;
+            (b'[' | b']' | b'^', _) => {
+                return Err(refuse(line_no, "quadratic terms are not supported"))
             }
-            b':' => {
-                out.push(SpannedTok {
-                    tok: Tok::Colon,
-                    line: line_no,
-                });
-                i += 1;
-            }
-            b'[' => {
-                out.push(SpannedTok {
-                    tok: Tok::LBracket,
-                    line: line_no,
-                });
-                i += 1;
-            }
-            b']' => {
-                out.push(SpannedTok {
-                    tok: Tok::RBracket,
-                    line: line_no,
-                });
-                i += 1;
-            }
-            b'=' => {
-                // `=<`, `=>` (old-style) or bare `=`.
-                if i + 1 < bytes.len() && (bytes[i + 1] == b'<' || bytes[i + 1] == b'=') {
-                    let op = if bytes[i + 1] == b'<' {
-                        Tok::Le
-                    } else {
-                        Tok::Eq
-                    };
-                    out.push(SpannedTok {
-                        tok: op,
-                        line: line_no,
-                    });
-                    i += 2;
-                } else if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                    out.push(SpannedTok {
-                        tok: Tok::Ge,
-                        line: line_no,
-                    });
-                    i += 2;
-                } else {
-                    out.push(SpannedTok {
-                        tok: Tok::Eq,
-                        line: line_no,
-                    });
-                    i += 1;
-                }
-            }
-            b'<' => {
-                let step = usize::from(i + 1 < bytes.len() && bytes[i + 1] == b'=');
-                out.push(SpannedTok {
-                    tok: Tok::Le,
-                    line: line_no,
-                });
-                i += 1 + step;
-            }
-            b'>' => {
-                let step = usize::from(i + 1 < bytes.len() && bytes[i + 1] == b'=');
-                out.push(SpannedTok {
-                    tok: Tok::Ge,
-                    line: line_no,
-                });
-                i += 1 + step;
-            }
+            (b'+', _) => (Tok::Plus, 1),
+            (b'-', _) => (Tok::Minus, 1),
+            (b':', _) => (Tok::Colon, 1),
+            (b'=', Some(b'<')) | (b'<', Some(b'=')) => (Tok::Le, 2),
+            (b'=', Some(b'>')) | (b'>', Some(b'=')) => (Tok::Ge, 2),
+            (b'=', Some(b'=')) => (Tok::Eq, 2),
+            (b'=', _) => (Tok::Eq, 1),
+            (b'<', _) => (Tok::Le, 1),
+            (b'>', _) => (Tok::Ge, 1),
             _ if c.is_ascii_digit() || c == b'.' => {
-                let (n, used) = read_number(&bytes[i..], line_no)?;
-                out.push(SpannedTok {
-                    tok: Tok::Num(n),
-                    line: line_no,
-                });
-                i += used;
+                let (value, used) = read_number(&bytes[i..], line_no)?;
+                (Tok::Num(value), used)
             }
             _ if is_name_start(c) => {
-                let start = i;
-                while i < bytes.len() && is_name_cont(bytes[i]) {
-                    i += 1;
+                let mut end = i;
+                while end < bytes.len() && is_name_cont(bytes[end]) {
+                    end += 1;
                 }
-                let word = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
-                // Word-form comparators keep `free` and `inf` as identifiers;
-                // the parser dispatches on them by context.
-                out.push(SpannedTok {
-                    tok: Tok::Word(word.to_string()),
-                    line: line_no,
-                });
+                let word = std::str::from_utf8(&bytes[i..end]).unwrap_or("");
+                (Tok::Word(word.to_string()), end - i)
             }
             _ => {
-                return Err(LpError::Parse {
-                    line: line_no,
-                    msg: format!("unexpected character '{}'", c as char),
-                });
+                return Err(refuse(
+                    line_no,
+                    format!("unexpected character '{}'", char::from(c)),
+                ))
             }
-        }
+        };
+        push(tok);
+        i += used;
     }
     Ok(())
 }
 
-fn read_number(bytes: &[u8], line: usize) -> Result<(f64, usize), LpError> {
+/// `digits [. digits] [e [+-] digits]`, read exactly; the text must be a
+/// number of [`parse_decimal`]'s grammar and in its range.
+fn read_number(bytes: &[u8], line: usize) -> Result<(BigRational, usize), LpError> {
     let mut j = 0;
-    // Optional leading sign is already consumed by the +/- lexer path, but we
-    // accept it here too to make the parser forgiving for expressions like
-    // `1e-3`.
-    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-        j += 1;
-    }
     while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
         j += 1;
     }
@@ -221,18 +139,12 @@ fn read_number(bytes: &[u8], line: usize) -> Result<(f64, usize), LpError> {
         }
     }
     let raw = std::str::from_utf8(&bytes[..j]).unwrap_or("");
-    let parsed = raw.parse::<f64>().map_err(|_| LpError::InvalidNumber {
-        line,
-        raw: raw.to_string(),
-    })?;
-    if parsed.is_finite() {
-        Ok((parsed, j))
-    } else {
-        Err(LpError::InvalidNumber {
+    parse_decimal(raw)
+        .map(|value| (value, j))
+        .ok_or_else(|| LpError::InvalidNumber {
             line,
             raw: raw.to_string(),
         })
-    }
 }
 
 fn is_name_start(c: u8) -> bool {
@@ -244,40 +156,65 @@ fn is_name_cont(c: u8) -> bool {
     is_name_start(c) || c.is_ascii_digit()
 }
 
-fn strip_comment(line: &str) -> &str {
-    if let Some(pos) = line.find('\\') {
-        &line[..pos]
-    } else {
-        line
+/// The line before its comment: `\` starts a comment that runs to the end of
+/// the line. A `\*` comment must close (`*\`) on its own line: a block
+/// comment spanning lines would be read as content by a line reader.
+fn strip_comment(line: &str, line_no: usize) -> Result<&str, LpError> {
+    let Some(pos) = line.find('\\') else {
+        return Ok(line);
+    };
+    let comment = &line[pos..];
+    if comment.starts_with("\\*") && !comment[2..].contains("*\\") {
+        return Err(refuse(
+            line_no,
+            "a '\\*' comment that does not close on its line is not supported",
+        ));
     }
+    Ok(&line[..pos])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderKind {
-    Min,
-    Max,
-    Subject,
-    Bounds,
-    General,
-    Integer,
-    Binary,
-    End,
-}
-
-fn match_header(line: &str) -> Option<HeaderKind> {
-    // Some headers are multi-word. Normalize whitespace and compare against a
-    // small table of canonical forms.
-    let canonical: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = canonical.to_ascii_lowercase();
-    match lower.as_str() {
-        "minimize" | "minimise" | "min" => Some(HeaderKind::Min),
-        "maximize" | "maximise" | "max" => Some(HeaderKind::Max),
-        "subject to" | "such that" | "st" | "s.t." | "st." => Some(HeaderKind::Subject),
-        "bounds" | "bound" => Some(HeaderKind::Bounds),
-        "general" | "generals" | "gin" => Some(HeaderKind::General),
-        "integer" | "integers" => Some(HeaderKind::Integer),
-        "binary" | "binaries" | "bin" => Some(HeaderKind::Binary),
-        "end" => Some(HeaderKind::End),
-        _ => None,
-    }
+/// The header token of a line holding only a section keyword, an error for a
+/// section ay does not read, `None` for any other line.
+fn match_header(line: &str, line_no: usize) -> Result<Option<Tok>, LpError> {
+    let canonical = line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let tok = match canonical.as_str() {
+        "minimize" | "minimise" | "minimum" | "min" => Tok::Header(Section::Objective(Sense::Min)),
+        "maximize" | "maximise" | "maximum" | "max" => Tok::Header(Section::Objective(Sense::Max)),
+        "subject to" | "such that" | "st" | "s.t." | "st." => Tok::Header(Section::Subject),
+        "bounds" | "bound" => Tok::Header(Section::Bounds),
+        "general" | "generals" | "gen" | "integer" | "integers" => Tok::Header(Section::General),
+        "binary" | "binaries" | "bin" => Tok::Header(Section::Binary),
+        "end" => Tok::End,
+        "semi-continuous"
+        | "semi-continuous variables"
+        | "semi"
+        | "semis"
+        | "semicontinuous"
+        | "sos"
+        | "sos1"
+        | "sos2"
+        | "lazy constraints"
+        | "user cuts"
+        | "pwlobj"
+        | "gin"
+        | "general constraints"
+        | "genconstrs"
+        | "gencons"
+        | "scenarios"
+        | "multi-objectives"
+        | "semi-integer"
+        | "semi-integers"
+        | "sint" => {
+            return Err(refuse(
+                line_no,
+                format!("section '{}' is not supported", line.trim()),
+            ))
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(tok))
 }

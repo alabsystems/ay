@@ -60,6 +60,7 @@ impl Context {
         {
             return Err(ElaborateError::SortRedeclaration(name.to_string()));
         }
+        self.advance_source_revision();
         self.sort_parameters.insert(name.to_string());
         Ok(())
     }
@@ -332,6 +333,9 @@ impl Context {
 
         self.validate_polymorphic_rank(argument_sorts, result_sort, &parameters)?;
 
+        // A family can remain unmaterialized or fail during instantiation.
+        // Retire binding leases before publishing even its first namespace row.
+        self.advance_source_revision();
         let global = self.global_declarations_enabled();
         self.polymorphic_declarations.push(PolymorphicDeclaration {
             name: name.to_string(),
@@ -395,6 +399,7 @@ impl Context {
             self.authored_assertions
                 .push(super::AuthoredAssertion::Concrete {
                     term: self.assertions[asserted_index],
+                    origin: super::AuthoredAssertionOrigin::Text,
                     parsed_index,
                     source_is_literal_false,
                 });

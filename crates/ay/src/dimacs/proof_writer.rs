@@ -239,6 +239,7 @@ mod proof_write_buffer_tests {
             is_temp: false,
             synthesized_default: false,
             format_was_explicit: true,
+            label: None,
         }
     }
 

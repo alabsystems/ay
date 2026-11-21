@@ -9,7 +9,7 @@ use ay_frontend::SourceContextStamp;
 
 use crate::api::{Solver, SolverCacheToken, Term};
 
-mod resources;
+pub(in crate::api::proofs) mod resources;
 
 /// Opaque same-solver binding for one exact, plain SMT-LIB parse delta.
 ///

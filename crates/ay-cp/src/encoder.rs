@@ -31,7 +31,8 @@ use rustc_hash::FxHashMap;
 
 use crate::variable::IntVarId;
 
-/// Maximum total number of dense order literals materialized by one engine.
+/// Maximum total number of dense order literals materialized by one engine
+/// that was given no memory budget (see [`IntegerEncoder::set_literal_limit`]).
 pub const MAX_PREALLOCATED_ORDER_LITERALS: u128 = 1 << 20;
 
 /// Dense order-encoding preallocation would exceed a safe resource boundary.
@@ -48,7 +49,7 @@ pub enum OrderEncodingCapacityError {
         /// Inclusive upper bound.
         ub: i64,
     },
-    /// Total required literals exceed the fixed safety limit.
+    /// Total required literals exceed the encoder's limit.
     #[error("order encoding requires {required} literals, exceeding limit {limit}")]
     LiteralLimitExceeded {
         /// Total literals required, including bound sentinels.
@@ -99,6 +100,8 @@ pub struct IntegerEncoder {
     /// Whether dense allocation has completed, including the zero-variable
     /// case where `ge_array.is_empty()` cannot encode that state.
     preallocated: bool,
+    /// Most dense order literals this encoder materializes.
+    literal_limit: u128,
 }
 
 /// What a SAT literal means in terms of integer bounds.
@@ -123,7 +126,19 @@ impl IntegerEncoder {
             ge_array: Vec::new(),
             decode_array: Vec::new(),
             preallocated: false,
+            literal_limit: MAX_PREALLOCATED_ORDER_LITERALS,
         }
+    }
+
+    /// Set the most dense order literals this encoder materializes
+    /// (default [`MAX_PREALLOCATED_ORDER_LITERALS`]).
+    pub fn set_literal_limit(&mut self, limit: u128) {
+        self.literal_limit = limit;
+    }
+
+    /// The most dense order literals this encoder materializes.
+    pub fn literal_limit(&self) -> u128 {
+        self.literal_limit
     }
 
     /// Register a new integer variable with bounds [lb, ub].
@@ -359,12 +374,14 @@ impl IntegerEncoder {
             // the always-true lower-bound literal directly.
             let literals = span + u128::from(ub != i64::MAX);
             required = required.saturating_add(literals);
-            if required > MAX_PREALLOCATED_ORDER_LITERALS {
-                return Err(OrderEncodingCapacityError::LiteralLimitExceeded {
-                    required,
-                    limit: MAX_PREALLOCATED_ORDER_LITERALS,
-                });
-            }
+        }
+        // The whole sum is reported, not the partial sum where it crossed
+        // the limit, so a refusal says how far over the model is.
+        if required > self.literal_limit {
+            return Err(OrderEncodingCapacityError::LiteralLimitExceeded {
+                required,
+                limit: self.literal_limit,
+            });
         }
         Ok(required)
     }

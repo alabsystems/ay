@@ -47,6 +47,8 @@ pub(super) enum FactReason {
     NegatedDisjunct { parent: usize, position: u32 },
     /// A closed bit-vector literal the recognizer proves.
     Closed,
+    /// A Boolean constant axiom (true or not false).
+    BooleanConstant,
     /// `(= s t)` with `s` and `t` merged.
     EqualityHolds,
     /// `(not (= s t))` with classes holding two different constants.
@@ -416,6 +418,12 @@ impl Executor {
         literal: TermId,
         probes: &mut usize,
     ) -> Option<FactReason> {
+        if literal == self.ctx.terms.true_term()
+            || matches!(self.ctx.terms.get(literal), TermData::Not(inner)
+                if *inner == self.ctx.terms.false_term())
+        {
+            return Some(FactReason::BooleanConstant);
+        }
         let (atom, negated) = literal_atom(&self.ctx.terms, literal);
         if let Some((lhs, rhs)) = decode_eq_local(&self.ctx.terms, atom) {
             if self.ctx.terms.sort(lhs) != self.ctx.terms.sort(rhs) {

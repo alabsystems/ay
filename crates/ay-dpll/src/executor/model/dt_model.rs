@@ -2531,7 +2531,30 @@ impl Executor {
     /// its datatype argument, so we don't need to. We DO descend into the ordinary
     /// arguments of non-boundary applications to find boundary subterms nested
     /// inside them (e.g. the `(s d0)` inside `(str.++ (s d0) "x")`).
+    ///
+    /// Collect the boundary overrides of [`Self::dt_mat_eval`] for `term`; see
+    /// [`Self::collect_dt_overrides_paths`]. With no datatype
+    /// declared, the walk visits each `(term, depth)` pair once
+    /// ([`Self::collect_var_defaults_once`], AY-SMT-3); otherwise it
+    /// is the original per-path walk, unchanged, because a selector's
+    /// materialized value can depend on the depth left at the visit.
     fn collect_dt_field_overrides(
+        &self,
+        model: &Model,
+        term: TermId,
+        depth: u32,
+        overrides: &mut HashMap<TermId, EvalValue>,
+    ) -> bool {
+        let no_datatypes = self.ctx.datatype_iter().next().is_none()
+            && self.ctx.ctor_selectors_iter().next().is_none();
+        if no_datatypes {
+            let mut walked = HashSet::default();
+            return self.collect_var_defaults_once(model, term, depth, overrides, &mut walked);
+        }
+        self.collect_dt_overrides_paths(model, term, depth, overrides)
+    }
+
+    fn collect_dt_overrides_paths(
         &self,
         model: &Model,
         term: TermId,
@@ -2616,20 +2639,20 @@ impl Executor {
             // Ordinary application: recurse into every argument.
             TermData::App(_sym, args) => args
                 .iter()
-                .all(|&a| self.collect_dt_field_overrides(model, a, depth - 1, overrides)),
+                .all(|&a| self.collect_dt_overrides_paths(model, a, depth - 1, overrides)),
             TermData::Not(inner) => {
-                self.collect_dt_field_overrides(model, *inner, depth - 1, overrides)
+                self.collect_dt_overrides_paths(model, *inner, depth - 1, overrides)
             }
             TermData::Ite(c, t, e) => {
-                self.collect_dt_field_overrides(model, *c, depth - 1, overrides)
-                    && self.collect_dt_field_overrides(model, *t, depth - 1, overrides)
-                    && self.collect_dt_field_overrides(model, *e, depth - 1, overrides)
+                self.collect_dt_overrides_paths(model, *c, depth - 1, overrides)
+                    && self.collect_dt_overrides_paths(model, *t, depth - 1, overrides)
+                    && self.collect_dt_overrides_paths(model, *e, depth - 1, overrides)
             }
             TermData::Let(bindings, body) => {
                 bindings
                     .iter()
-                    .all(|(_, v)| self.collect_dt_field_overrides(model, *v, depth - 1, overrides))
-                    && self.collect_dt_field_overrides(model, *body, depth - 1, overrides)
+                    .all(|(_, v)| self.collect_dt_overrides_paths(model, *v, depth - 1, overrides))
+                    && self.collect_dt_overrides_paths(model, *body, depth - 1, overrides)
             }
             // Plain variable leaf: if the theory model leaves it unconstrained, the
             // model PRINTER still presents it with a canonical default (String -> "",
@@ -2643,31 +2666,90 @@ impl Executor {
             // exhibited value). A datatype-sorted leaf has no scalar default here
             // (handled by the DtOracle) and is left for the evaluator.
             TermData::Var(_, _) => {
-                if matches!(self.evaluate_term(model, term), EvalValue::Unknown) {
-                    // Only the data sorts with an unambiguous printer default; Bool
-                    // is deliberately excluded (an eliminated/irrelevant Bool var is a
-                    // genuine don't-care, not a fixed exhibited value, so pinning it
-                    // to `false` could over-demote a valid disjunction).
-                    let def = match self.ctx.terms.sort(term) {
-                        Sort::String => EvalValue::String(String::new()),
-                        Sort::BitVec(bv) => EvalValue::BitVec {
-                            value: num_bigint::BigInt::from(0),
-                            width: bv.width,
-                        },
-                        Sort::Int | Sort::Real => {
-                            EvalValue::Rational(BigRational::from(num_bigint::BigInt::from(0)))
-                        }
-                        _ => EvalValue::Unknown,
-                    };
-                    if !matches!(def, EvalValue::Unknown) {
-                        overrides.insert(term, def);
-                    }
-                }
+                self.collect_var_default_override(model, term, overrides);
                 true
             }
             // Constant leaf: the evaluator resolves it exactly.
             _ => true,
         }
+    }
+
+    /// The `Var` leaf of [`Self::collect_dt_field_overrides`]: pin the
+    /// printer's default for a variable the evaluator cannot resolve.
+    fn collect_var_default_override(
+        &self,
+        model: &Model,
+        term: TermId,
+        overrides: &mut HashMap<TermId, EvalValue>,
+    ) {
+        if matches!(self.evaluate_term(model, term), EvalValue::Unknown) {
+            // Only the data sorts with an unambiguous printer default; Bool
+            // is deliberately excluded (an eliminated/irrelevant Bool var is a
+            // genuine don't-care, not a fixed exhibited value, so pinning it
+            // to `false` could over-demote a valid disjunction).
+            let def = match self.ctx.terms.sort(term) {
+                Sort::String => EvalValue::String(String::new()),
+                Sort::BitVec(bv) => EvalValue::BitVec {
+                    value: num_bigint::BigInt::from(0),
+                    width: bv.width,
+                },
+                Sort::Int | Sort::Real => {
+                    EvalValue::Rational(BigRational::from(num_bigint::BigInt::from(0)))
+                }
+                _ => EvalValue::Unknown,
+            };
+            if !matches!(def, EvalValue::Unknown) {
+                overrides.insert(term, def);
+            }
+        }
+    }
+
+    /// [`Self::collect_dt_overrides_paths`] when no datatype is
+    /// declared (AY-SMT-3). Then no selector, recognizer or constructor
+    /// equality can occur, every arm that fires is structural, and the only
+    /// overrides are the `Var` defaults, which do not depend on the depth. So
+    /// the answer for a term at a given remaining depth is the same at every
+    /// visit, and a `(term, depth)` pair that already answered `true` (its
+    /// overrides already inserted) is not walked again. A `false` ends the
+    /// whole walk, as before. The per-path walk visited a shared Boolean
+    /// `define-fun` DAG once per path: the 4th check-sat of SMT-COMP
+    /// incremental QF_UFLRA 12f58cf7 (6,585 `define-fun`s) never finished.
+    fn collect_var_defaults_once(
+        &self,
+        model: &Model,
+        term: TermId,
+        depth: u32,
+        overrides: &mut HashMap<TermId, EvalValue>,
+        walked: &mut HashSet<(TermId, u32)>,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if walked.contains(&(term, depth)) {
+            return true;
+        }
+        let mut walk = |child: TermId, overrides: &mut HashMap<TermId, EvalValue>| {
+            self.collect_var_defaults_once(model, child, depth - 1, overrides, walked)
+        };
+        let complete = match self.ctx.terms.get(term) {
+            TermData::App(_, args) => args.iter().all(|&a| walk(a, overrides)),
+            TermData::Not(inner) => walk(*inner, overrides),
+            TermData::Ite(c, t, e) => {
+                walk(*c, overrides) && walk(*t, overrides) && walk(*e, overrides)
+            }
+            TermData::Let(bindings, body) => {
+                bindings.iter().all(|(_, v)| walk(*v, overrides)) && walk(*body, overrides)
+            }
+            TermData::Var(_, _) => {
+                self.collect_var_default_override(model, term, overrides);
+                true
+            }
+            _ => true,
+        };
+        if complete {
+            walked.insert((term, depth));
+        }
+        complete
     }
 
     /// Materialize a single selector application `(sel dt_term)`.
@@ -2818,6 +2900,20 @@ impl Executor {
     ) -> Option<num_bigint::BigInt> {
         if fuel == 0 {
             return None; // cyclic or unresolvably deep: no finite depth
+        }
+        if let TermData::Var(name, _) = self.ctx.terms.get(term) {
+            // The frontend gives a nullary constructor a fresh Var identity.
+            // Match that exact registered term, including its sort, so an
+            // unrelated fresh variable with the same spelling stays unrelated.
+            if self.ctx.constructor_metadata(name).is_some() {
+                let signature = self.ctx.exact_datatype_member_info(name)?;
+                if signature.term == Some(term)
+                    && signature.arg_sorts.is_empty()
+                    && &signature.sort == self.ctx.terms.sort(term)
+                {
+                    return Some(num_bigint::BigInt::from(0));
+                }
+            }
         }
         if let TermData::App(sym, args) = self.ctx.terms.get(term) {
             let head = sym.name().to_string();
@@ -3212,6 +3308,7 @@ impl Executor {
             .collect();
         names.sort();
         let mut defs: Vec<String> = Vec::with_capacity(names.len());
+        let parameter = self.model_formal_name("@p", 0, None);
         for name in names {
             let (_, info) = sel_infos
                 .iter()
@@ -3229,7 +3326,7 @@ impl Executor {
                 && wrong_cases.get(name).map_or(true, |c| c.is_empty())
             {
                 defs.push(format!(
-                    "  (define-fun {sel} ((@p0 {dt})) {ret} ({sel} @p0))",
+                    "  (define-fun {sel} (({parameter} {dt})) {ret} ({sel} {parameter}))",
                     sel = quote_symbol(name),
                     dt = quote_symbol(&info.dt_name),
                     ret = format_sort_surface(&self.ctx, &info.ret_sort),
@@ -3249,10 +3346,10 @@ impl Executor {
                 for (arg, val) in cases.iter().rev() {
                     let arg = ascribe(arg, &arg_sort);
                     let val = ascribe(val, &info.ret_sort);
-                    els = format!("(ite (= @p0 {arg}) {val} {els})");
+                    els = format!("(ite (= {parameter} {arg}) {val} {els})");
                 }
             }
-            let tester = |c: &String| format!("((_ is {}) @p0)", self.dt_value_head(c));
+            let tester = |c: &String| format!("((_ is {}) {parameter})", self.dt_value_head(c));
             let cond = if info.ctors.len() == 1 {
                 tester(&info.ctors[0])
             } else {
@@ -3262,7 +3359,7 @@ impl Executor {
                 )
             };
             defs.push(format!(
-                "  (define-fun {sel} ((@p0 {dt})) {ret} (ite {cond} ({sel} @p0) {els}))",
+                "  (define-fun {sel} (({parameter} {dt})) {ret} (ite {cond} ({sel} {parameter}) {els}))",
                 sel = quote_symbol(name),
                 dt = quote_symbol(&info.dt_name),
                 ret = format_sort_surface(&self.ctx, &info.ret_sort),
@@ -3589,4 +3686,41 @@ pub(super) struct SelectorTables {
 /// tester arm, see [`Executor::total_selector_definitions`]).
 fn sexpr_head(s: &str) -> &str {
     ay_core::smtlib_application_parts(s).map_or("", |(head, _)| head)
+}
+
+#[cfg(test)]
+mod shared_dag_override_tests {
+    use super::*;
+
+    /// AY-SMT-3: with no datatype declared, the override walk of
+    /// [`Executor::dt_mat_eval`] visits each `(term, depth)` pair once. On a
+    /// 60-level shared `and` DAG (2^60 paths, inside the depth bound of 64)
+    /// the per-path walk does not return; the 4th check-sat of SMT-COMP
+    /// incremental QF_UFLRA 12f58cf7 sat in it for the whole time limit.
+    /// Depth exhaustion still answers the fail-closed `false`.
+    #[test]
+    #[ntest::timeout(60_000)]
+    fn var_default_overrides_walk_a_shared_dag_once_per_depth() {
+        let mut exec = Executor::new();
+        let y = exec.ctx.terms.mk_var("dag_override_y", Sort::Int);
+        let zero = exec.ctx.terms.mk_int(num_bigint::BigInt::from(0));
+        let mut root = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("<"), vec![y, zero], Sort::Bool);
+        for _ in 0..60 {
+            root = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("and"), vec![root, root], Sort::Bool);
+        }
+        let model = Model::empty();
+        let mut overrides = HashMap::default();
+        assert!(exec.collect_dt_field_overrides(&model, root, 64, &mut overrides));
+        let mut overrides = HashMap::default();
+        assert!(
+            !exec.collect_dt_field_overrides(&model, root, 30, &mut overrides),
+            "a DAG deeper than the depth left still fails closed"
+        );
+    }
 }

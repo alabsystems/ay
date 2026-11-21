@@ -26,6 +26,9 @@ use crate::logic_detection::LogicCategory;
 use super::Executor;
 
 mod apply;
+mod datatype_problem;
+mod native_support;
+pub(in crate::executor) use native_support::CheckedExternalSupportProblem;
 
 #[allow(clippy::panic)]
 #[cfg(test)]
@@ -43,6 +46,21 @@ const SMTLIB_VERSION_INFO: &str = concat!(
     " build.stamp=",
     env!("AY_BUILD_STAMP"),
 );
+
+#[derive(Clone, Copy)]
+enum FreeConstantSurface {
+    SourceText,
+    AletheProblem,
+}
+
+impl FreeConstantSurface {
+    fn declares(self, name: &str) -> bool {
+        !ay_frontend::is_reserved_symbol(name)
+            || (matches!(self, Self::AletheProblem)
+                && ay_frontend::is_internal_namespace_name(name)
+                && !ay_frontend::is_reserved_op_name(name))
+    }
+}
 
 impl Executor {
     /// Generate output for get-info command
@@ -314,10 +332,9 @@ impl Executor {
     /// was actually authored against, rather than a consumer-side
     /// reconstruction that can silently normalize to a different term.
     ///
-    /// Datatype and `define-fun` contexts currently decline this transport:
-    /// serializing either as an uninterpreted declaration would not preserve
-    /// the asserted theory. Ordinary core declarations, arrays, and free
-    /// programmatic constants remain self-contained.
+    /// Monomorphic datatype contexts retain their exact constructors and
+    /// selectors. Ambiguous/parametric datatype and `define-fun` contexts
+    /// decline rather than replace interpreted declarations with free UFs.
     pub(crate) fn alethe_problem_smt2_for(
         &self,
         assertions: &[TermId],
@@ -336,7 +353,7 @@ impl Executor {
         }
         let (plain_sorts, datatype_sorts) = self.referenced_uninterpreted_sorts(assertions);
         if !datatype_sorts.is_empty() {
-            return None;
+            return self.alethe_datatype_problem_smt2_for(assertions, term_overrides);
         }
 
         let mut out = String::from("(set-logic ALL)\n");
@@ -363,7 +380,16 @@ impl Executor {
         }
         let mut extra = Vec::new();
         for &assertion in assertions {
-            self.collect_undeclared_symbol_decls(assertion, &mut declared, &mut extra);
+            // Replay-local constants already belong to the typed native
+            // problem. Declaring them in its proof transport does not grant
+            // untrusted source text authority to mint reserved names.
+            self.collect_undeclared_symbol_decls_with_bindings(
+                assertion,
+                &mut declared,
+                &mut extra,
+                &std::collections::HashSet::new(),
+                FreeConstantSurface::AletheProblem,
+            );
         }
         for declaration in extra {
             out.push_str(&declaration);
@@ -462,6 +488,7 @@ impl Executor {
             declared,
             out,
             &std::collections::HashSet::new(),
+            FreeConstantSurface::SourceText,
         );
     }
 
@@ -471,6 +498,7 @@ impl Executor {
         declared: &mut std::collections::HashSet<String>,
         out: &mut Vec<String>,
         bound: &std::collections::HashSet<String>,
+        surface: FreeConstantSurface,
     ) {
         use ay_core::term::Symbol;
         match self.ctx.terms.get(term_id) {
@@ -499,21 +527,31 @@ impl Executor {
                     }
                 }
                 for &a in args {
-                    self.collect_undeclared_symbol_decls_with_bindings(a, declared, out, bound);
+                    self.collect_undeclared_symbol_decls_with_bindings(
+                        a, declared, out, bound, surface,
+                    );
                 }
             }
             TermData::App(_, args) => {
                 for &a in args {
-                    self.collect_undeclared_symbol_decls_with_bindings(a, declared, out, bound);
+                    self.collect_undeclared_symbol_decls_with_bindings(
+                        a, declared, out, bound, surface,
+                    );
                 }
             }
-            TermData::Not(inner) => {
-                self.collect_undeclared_symbol_decls_with_bindings(*inner, declared, out, bound)
-            }
+            TermData::Not(inner) => self.collect_undeclared_symbol_decls_with_bindings(
+                *inner, declared, out, bound, surface,
+            ),
             TermData::Ite(c, t, e) => {
-                self.collect_undeclared_symbol_decls_with_bindings(*c, declared, out, bound);
-                self.collect_undeclared_symbol_decls_with_bindings(*t, declared, out, bound);
-                self.collect_undeclared_symbol_decls_with_bindings(*e, declared, out, bound);
+                self.collect_undeclared_symbol_decls_with_bindings(
+                    *c, declared, out, bound, surface,
+                );
+                self.collect_undeclared_symbol_decls_with_bindings(
+                    *t, declared, out, bound, surface,
+                );
+                self.collect_undeclared_symbol_decls_with_bindings(
+                    *e, declared, out, bound, surface,
+                );
             }
             TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
                 let mut nested_bound = bound.clone();
@@ -523,6 +561,7 @@ impl Executor {
                     declared,
                     out,
                     &nested_bound,
+                    surface,
                 );
                 for trig_set in triggers {
                     for &t in trig_set {
@@ -531,6 +570,7 @@ impl Executor {
                             declared,
                             out,
                             &nested_bound,
+                            surface,
                         );
                     }
                 }
@@ -539,7 +579,9 @@ impl Executor {
                 for (_, t) in bindings {
                     // SMT-LIB `let` bindings are simultaneous: each right-hand
                     // side is evaluated outside the new binder scope.
-                    self.collect_undeclared_symbol_decls_with_bindings(*t, declared, out, bound);
+                    self.collect_undeclared_symbol_decls_with_bindings(
+                        *t, declared, out, bound, surface,
+                    );
                 }
                 let mut nested_bound = bound.clone();
                 nested_bound.extend(bindings.iter().map(|(name, _)| name.clone()));
@@ -548,6 +590,7 @@ impl Executor {
                     declared,
                     out,
                     &nested_bound,
+                    surface,
                 );
             }
             TermData::Var(name, _) => {
@@ -557,10 +600,7 @@ impl Executor {
                 // declared in a self-contained dump. Quantifier/let binders
                 // are tracked lexically above and must not leak out as global
                 // declarations.
-                if !bound.contains(name)
-                    && !declared.contains(name)
-                    && !ay_frontend::is_reserved_symbol(name)
-                {
+                if !bound.contains(name) && !declared.contains(name) && surface.declares(name) {
                     declared.insert(name.clone());
                     out.push(format!(
                         "(declare-const {} {})\n",
@@ -899,7 +939,7 @@ impl Executor {
         }
         match self.ctx.terms.get(term_id) {
             TermData::Var(name, _) => match formals.iter().position(|&formal| formal == term_id) {
-                Some(index) => output::format(owner, format_args!("x!{index}")),
+                Some(index) => self.model_formal_name("x!", index, owner),
                 None => self.format_declared_symbol_identity_owned(
                     name,
                     self.ctx.terms.sort(term_id),

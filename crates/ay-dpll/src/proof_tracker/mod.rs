@@ -60,6 +60,7 @@ pub(crate) mod checkpoint_budget;
 mod checkpoint_budget_tests;
 pub(crate) mod guarded_instance;
 mod lemma_dedup;
+mod native_premise;
 mod packed_integer;
 mod vacuous_collapse;
 

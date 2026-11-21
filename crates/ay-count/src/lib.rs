@@ -386,22 +386,19 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
         Ok(prepared) => prepared,
         Err(error) => return format_error_outcome(instance.ptype, warnings, error),
     };
-    // Count-safe preprocessing (equivalence-preserving: same models over the
-    // same variables, so sound for every track).
-    let weighted = matches!(
-        instance.ptype,
-        ProblemType::Wmc | ProblemType::Pwmc | ProblemType::AmcComplex
+    // Count-safe preprocessing: equivalence-preserving steps for every
+    // track, plus definability elimination restricted to the variables whose
+    // removal keeps this track's count.
+    let eliminable = eliminable_variables(
+        instance,
+        &prepared_weights,
+        options.projected_definability_elimination,
     );
-    let projected = instance
-        .show
-        .as_ref()
-        .is_some_and(|s| s.len() < instance.num_vars);
     let prepped = prep::preprocess(
         instance.num_vars,
         &instance.clauses,
         prep::PrepOptions {
-            weighted,
-            projected,
+            elimination: eliminable.as_elimination(),
         },
     );
     if prepped.unsat {
@@ -431,6 +428,12 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
             prepped.model_preserving,
         );
     }
+    if !prepped.pinned_defined.is_empty() {
+        warnings.push(format!(
+            "definability elimination: {} defined variables removed",
+            prepped.pinned_defined.len()
+        ));
+    }
     let clauses = &prepped.clauses;
 
     match prepared_weights {
@@ -441,6 +444,100 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
         PreparedWeights::Complex(weights) => {
             solve_complex_weighted(instance, clauses, options, warnings, &weights)
         }
+    }
+}
+
+/// Owned form of [`prep::Elimination`] for one instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EliminableVariables {
+    /// Definability elimination does not run.
+    Off,
+    /// Every variable may be removed (unweighted, unprojected).
+    All,
+    /// Variable `v` may be removed iff `mask[v - 1]` is true.
+    Only(Vec<bool>),
+}
+
+impl EliminableVariables {
+    fn as_elimination(&self) -> prep::Elimination<'_> {
+        match self {
+            Self::Off => prep::Elimination::Off,
+            Self::All => prep::Elimination::AllVariables,
+            Self::Only(mask) => prep::Elimination::Variables(mask.as_slice()),
+        }
+    }
+}
+
+/// The variables definability elimination may remove for this instance
+/// (AY-OTHER-3; the rule and its reason are in `prep_eg`'s module comment).
+///
+/// Unweighted and unprojected: every variable. Projected (a show set smaller
+/// than the variable set): [`EliminableVariables::Off`] unless
+/// `projected_elimination` is set, because the speed of G on the projected
+/// tracks has not been measured. Otherwise variable `v` is admitted iff its
+/// two resolved literal weights are exactly equal, `c` (1 when undeclared or,
+/// on `pwmc`, unshown), and, when projected, `v` is outside the show set.
+/// Eliminating a defined `v` then keeps the count: in every model its unique
+/// defined value contributed `c`, and the pin `{+v}` contributes
+/// `w(+v) = c`; outside the projection set existential elimination leaves
+/// every projected model in place.
+fn eliminable_variables(
+    instance: &Instance,
+    weights: &PreparedWeights,
+    projected_elimination: bool,
+) -> EliminableVariables {
+    let num_vars = instance.num_vars;
+    let projection: Option<Vec<bool>> = instance
+        .show
+        .as_ref()
+        .filter(|show| show.len() < num_vars)
+        .map(|show| {
+            let mut in_show = vec![false; num_vars];
+            for &variable in show {
+                if let Some(entry) = (variable as usize)
+                    .checked_sub(1)
+                    .and_then(|index| in_show.get_mut(index))
+                {
+                    *entry = true;
+                }
+            }
+            in_show
+        });
+    if projection.is_some() && !projected_elimination {
+        return EliminableVariables::Off;
+    }
+    let equal_pair: Option<Vec<bool>> = match weights {
+        PreparedWeights::Unweighted => None,
+        PreparedWeights::Real(table) => Some(
+            (0..num_vars)
+                .map(|var| match (table.get(var * 2), table.get(var * 2 + 1)) {
+                    (Some(positive), Some(negative)) => positive == negative,
+                    _ => false,
+                })
+                .collect(),
+        ),
+        PreparedWeights::Complex(table) => Some(
+            (0..num_vars)
+                .map(|var| match (table.get(var * 2), table.get(var * 2 + 1)) {
+                    (Some(positive), Some(negative)) => positive == negative,
+                    _ => false,
+                })
+                .collect(),
+        ),
+    };
+    match (projection, equal_pair) {
+        (None, None) => EliminableVariables::All,
+        (Some(in_show), None) => {
+            EliminableVariables::Only(in_show.iter().map(|&shown| !shown).collect())
+        }
+        (None, Some(equal)) => EliminableVariables::Only(equal),
+        (Some(in_show), Some(equal)) => EliminableVariables::Only(
+            in_show
+                .iter()
+                .zip(&equal)
+                .map(|(&shown, &same)| !shown && same)
+                .collect(),
+        ),
     }
 }
 

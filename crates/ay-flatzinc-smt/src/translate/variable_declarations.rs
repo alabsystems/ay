@@ -76,6 +76,15 @@ impl Context {
         ty: &FznType,
         val: &Expr,
     ) -> Result<(), TranslateError> {
+        // A set variable is its member bits, not one SMT symbol: a fixed
+        // value (`= {1, 3}`, `= 1..0`) or an alias (`= other`) is set
+        // equality, bit by bit.
+        if matches!(ty, FznType::SetOfIntRange(..)) {
+            return crate::set_constraints::set_eq(
+                self,
+                &[Expr::Ident(name.to_string()), val.clone()],
+            );
+        }
         // Defer assignments to after all declarations (same as bounds).
         if let FznType::ArrayOf { index, .. } = ty {
             let (lo, hi) = index_range(index)?;

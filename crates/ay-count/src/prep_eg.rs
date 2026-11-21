@@ -13,8 +13,13 @@
 //! * **G** is count-preserving but NOT model-preserving: a Padoa-defined
 //!   variable has exactly one extension per model of `∃v.F`, so DP
 //!   resolution elimination plus a pin unit `{+v}` preserves the count.
-//!   Unweighted, unprojected only (a defined var still carries per-model
-//!   weights; projection support is future work).
+//!   The caller names the variables G may remove: all of them for
+//!   unweighted, unprojected counting; for weighted counting only variables
+//!   whose two literals carry the same weight `c` (the pin then multiplies
+//!   each model by `w(+v) = c`, the factor `w(f(x)) = c` the eliminated
+//!   value carried); for projected counting only such variables outside the
+//!   projection set, whose existential elimination leaves every projection
+//!   unchanged (AY-OTHER-3).
 //! * Every oracle verdict used is an UNSAT proof from `ay-sat`
 //!   (fail-closed: Unknown/timeout ⇒ no transformation).
 
@@ -275,14 +280,45 @@ pub fn merge_adjacent_equivalences(
 }
 
 /// G — definability elimination on simplicial variables
-/// (sspp preprocessor.cpp:477-648). Unweighted, unprojected callers only.
+/// (sspp preprocessor.cpp:477-648).
+///
+/// `eliminable` restricts the variables that may be eliminated: `None`
+/// admits every variable (unweighted, unprojected counting only); with
+/// `Some(mask)`, variable `v` is a candidate only if `mask[v - 1]` is true.
+/// The caller must admit only variables whose elimination keeps its track's
+/// count (see `prep::Elimination`).
 pub fn eliminate_defined_simplicial(
     num_vars: usize,
     clauses: &[Vec<i32>],
+    eliminable: Option<&[bool]>,
     budget: Duration,
 ) -> Option<GResult> {
     let deadline = Instant::now() + budget;
-    let mut current: Vec<Vec<i32>> = clauses.to_vec();
+    // Drop tautologies and repeated literals first: DP resolution on a
+    // clause holding both `v` and `¬v` would produce resolvents the formula
+    // does not entail. (The preprocessing residual is already normalized;
+    // this keeps the function sound for any caller.)
+    let mut current: Vec<Vec<i32>> = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let mut normalized = clause.clone();
+        normalized.sort_unstable_by_key(|l| (l.unsigned_abs(), *l < 0));
+        normalized.dedup();
+        let tautology = normalized
+            .windows(2)
+            .any(|w| w[0].unsigned_abs() == w[1].unsigned_abs());
+        if !tautology {
+            current.push(normalized);
+        }
+    }
+    let admitted = |v: u32| -> bool {
+        eliminable.is_none_or(|mask| {
+            (v as usize)
+                .checked_sub(1)
+                .and_then(|index| mask.get(index))
+                .copied()
+                .unwrap_or(false)
+        })
+    };
     let mut all_pinned: Vec<i32> = Vec::new();
 
     // G7: waves until fixpoint or budget.
@@ -322,6 +358,9 @@ pub fn eliminate_defined_simplicial(
                 if pinned_set.contains(v) {
                     return false; // already eliminated+pinned: re-eliminating
                                   // would churn forever (pin stays a unit)
+                }
+                if !admitted(*v) {
+                    return false; // the caller's track forbids removing it
                 }
                 let p = pos_occ.get(v).copied().unwrap_or(0);
                 let n = neg_occ.get(v).copied().unwrap_or(0);
@@ -626,6 +665,8 @@ mod tests {
     use crate::engine::{Engine, EngineConfig};
     use crate::value::WeightTable;
     use num_bigint::BigUint;
+    use num_rational::BigRational;
+    use num_traits::{One, Zero};
 
     fn count(num_vars: usize, clauses: &[Vec<i32>]) -> BigUint {
         let mut e: Engine<BigUint> = Engine::new(
@@ -720,7 +761,7 @@ mod tests {
         ];
         let before = count(3, &clauses);
         assert_eq!(before, BigUint::from(4u32));
-        let r = eliminate_defined_simplicial(3, &clauses, SECS).expect("eliminates");
+        let r = eliminate_defined_simplicial(3, &clauses, None, SECS).expect("eliminates");
         // In an XOR every variable is defined by the others; any single
         // elimination is sound — the count is the invariant that matters.
         assert!(!r.pinned.is_empty(), "pinned: {:?}", r.pinned);
@@ -742,7 +783,7 @@ mod tests {
         ];
         let before = count(5, &clauses);
         assert_eq!(before, BigUint::from(8u32));
-        let r = eliminate_defined_simplicial(5, &clauses, SECS).expect("eliminates");
+        let r = eliminate_defined_simplicial(5, &clauses, None, SECS).expect("eliminates");
         assert_ne!(r.pinned.as_slice(), &[] as &[i32]);
         assert_eq!(count(5, &r.clauses), before);
     }
@@ -753,7 +794,7 @@ mod tests {
         let clauses = vec![vec![1, -2], vec![-1, 2]];
         let before = count(2, &clauses);
         assert_eq!(before, BigUint::from(2u32));
-        if let Some(r) = eliminate_defined_simplicial(2, &clauses, SECS) {
+        if let Some(r) = eliminate_defined_simplicial(2, &clauses, None, SECS) {
             assert_eq!(
                 count(2, &r.clauses),
                 before,
@@ -766,6 +807,237 @@ mod tests {
                 "must not eliminate both: {:?}",
                 r.pinned
             );
+        }
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// A random formula over at most 10 variables: 3..=5 free inputs, then
+    /// 2..=5 gate variables each defined as AND, OR or XOR of two distinct
+    /// earlier variables (literals of either sign), then up to 3 random side
+    /// clauses over all variables.
+    fn planted_gate_formula(state: &mut u64) -> (usize, Vec<Vec<i32>>) {
+        let inputs = 3 + (next_random(state) % 3) as usize;
+        let gates = 2 + (next_random(state) % 4) as usize;
+        let num_vars = inputs + gates;
+        let mut clauses: Vec<Vec<i32>> = Vec::new();
+        for g in 0..gates {
+            let out = (inputs + g + 1) as i32;
+            let earlier = (inputs + g) as u64;
+            let a = 1 + (next_random(state) % earlier) as i32;
+            let mut b = 1 + (next_random(state) % earlier) as i32;
+            if b == a {
+                b = if a == 1 { 2 } else { 1 };
+            }
+            let a = if next_random(state) % 2 == 0 { a } else { -a };
+            let b = if next_random(state) % 2 == 0 { b } else { -b };
+            match next_random(state) % 3 {
+                0 => {
+                    clauses.push(vec![-out, a]);
+                    clauses.push(vec![-out, b]);
+                    clauses.push(vec![out, -a, -b]);
+                }
+                1 => {
+                    clauses.push(vec![out, -a]);
+                    clauses.push(vec![out, -b]);
+                    clauses.push(vec![-out, a, b]);
+                }
+                _ => {
+                    clauses.push(vec![-out, a, b]);
+                    clauses.push(vec![-out, -a, -b]);
+                    clauses.push(vec![out, -a, b]);
+                    clauses.push(vec![out, a, -b]);
+                }
+            }
+        }
+        for _ in 0..next_random(state) % 4 {
+            let len = 1 + (next_random(state) % 3) as usize;
+            let clause: Vec<i32> = (0..len)
+                .map(|_| {
+                    let v = 1 + (next_random(state) % num_vars as u64) as i32;
+                    if next_random(state) % 2 == 0 {
+                        v
+                    } else {
+                        -v
+                    }
+                })
+                .collect();
+            clauses.push(clause);
+        }
+        (num_vars, clauses)
+    }
+
+    fn rational(numer: i64, denom: i64) -> BigRational {
+        BigRational::new(numer.into(), denom.into())
+    }
+
+    /// A weight pair: weight 1 on both literals (often), equal pairs other
+    /// than 1, pairs that do not sum to 1, zero and negative weights.
+    fn random_weight_pair(state: &mut u64) -> (BigRational, BigRational) {
+        match next_random(state) % 9 {
+            0..=2 => (rational(1, 1), rational(1, 1)),
+            3 => (rational(1, 2), rational(1, 2)),
+            4 => (rational(3, 5), rational(1, 5)),
+            5 => (rational(1, 20), rational(19, 20)),
+            6 => (rational(0, 1), rational(2, 1)),
+            7 => (rational(-1, 3), rational(4, 1)),
+            _ => (rational(0, 1), rational(0, 1)),
+        }
+    }
+
+    /// Exact weighted count by enumeration. With `show`, the sum runs over
+    /// the distinct projections of the models onto the shown variables and
+    /// multiplies only their weights (the pwmc semantics); without it, over
+    /// every model.
+    fn brute_force_weighted(
+        num_vars: usize,
+        clauses: &[Vec<i32>],
+        weights: &[(BigRational, BigRational)],
+        show: Option<&[bool]>,
+    ) -> BigRational {
+        let shown = |v: usize| show.is_none_or(|mask| mask[v]);
+        let show_bits: u64 = (0..num_vars)
+            .filter(|&v| shown(v))
+            .fold(0u64, |bits, v| bits | (1u64 << v));
+        let mut projections: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for m in 0..(1u64 << num_vars) {
+            let satisfied = clauses.iter().all(|clause| {
+                clause.iter().any(|&l| {
+                    let bit = (m >> (l.unsigned_abs() - 1)) & 1 == 1;
+                    if l > 0 {
+                        bit
+                    } else {
+                        !bit
+                    }
+                })
+            });
+            if satisfied {
+                projections.insert(m & show_bits);
+            }
+        }
+        let mut total = BigRational::zero();
+        for m in projections {
+            let mut product = BigRational::one();
+            for (v, (positive, negative)) in weights.iter().enumerate().take(num_vars) {
+                if shown(v) {
+                    product *= if (m >> v) & 1 == 1 {
+                        positive
+                    } else {
+                        negative
+                    };
+                }
+            }
+            total += product;
+        }
+        total
+    }
+
+    /// A copy of the admission rule of `lib::eliminable_variables` (equal
+    /// weights on both literals and, when projected, outside the projection
+    /// set), so that G is tested here on raw weight pairs. The real function
+    /// is tested on parsed instances in `lib_tests`
+    /// (`eliminable_variables_admits_exactly_equal_weight_pairs_outside_the_show_set`).
+    fn admitted_mask(weights: &[(BigRational, BigRational)], show: Option<&[bool]>) -> Vec<bool> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(v, (positive, negative))| {
+                positive == negative && show.is_none_or(|mask| !mask[v])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn g_keeps_exact_weighted_and_projected_counts_of_admitted_variables() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut pinned_unprojected = 0usize;
+        let mut pinned_projected = 0usize;
+        let mut pinned_beside_unequal_weights = 0usize;
+        for trial in 0..160 {
+            let (num_vars, clauses) = planted_gate_formula(&mut state);
+            let weights: Vec<(BigRational, BigRational)> = (0..num_vars)
+                .map(|_| random_weight_pair(&mut state))
+                .collect();
+            let show: Option<Vec<bool>> = (trial % 2 == 1).then(|| {
+                (0..num_vars)
+                    .map(|_| next_random(&mut state) % 2 == 0)
+                    .collect()
+            });
+            let mask = admitted_mask(&weights, show.as_deref());
+            let before = brute_force_weighted(num_vars, &clauses, &weights, show.as_deref());
+            let Some(r) =
+                eliminate_defined_simplicial(num_vars, &clauses, Some(mask.as_slice()), SECS)
+            else {
+                continue;
+            };
+            for &p in &r.pinned {
+                assert!(
+                    mask[p.unsigned_abs() as usize - 1],
+                    "trial {trial}: pinned {p} is not admitted by {mask:?}"
+                );
+            }
+            let after = brute_force_weighted(num_vars, &r.clauses, &weights, show.as_deref());
+            assert_eq!(
+                after, before,
+                "trial {trial}: clauses {clauses:?} weights {weights:?} show {show:?} -> {:?} pinned {:?}",
+                r.clauses, r.pinned
+            );
+            if show.is_some() {
+                pinned_projected += r.pinned.len();
+            } else {
+                pinned_unprojected += r.pinned.len();
+                if weights
+                    .iter()
+                    .any(|(positive, negative)| positive != negative)
+                {
+                    pinned_beside_unequal_weights += r.pinned.len();
+                }
+            }
+        }
+        // The property must not hold vacuously.
+        assert!(pinned_unprojected > 0, "no unprojected elimination fired");
+        assert!(pinned_projected > 0, "no projected elimination fired");
+        assert!(
+            pinned_beside_unequal_weights > 0,
+            "no elimination fired in a formula with unequal weights"
+        );
+    }
+
+    #[test]
+    fn g_without_the_weight_mask_changes_some_weighted_count() {
+        // Control for the test above: admitting every variable is wrong for
+        // weighted counting, so the brute-force comparison discriminates.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut changed = 0usize;
+        for _ in 0..160 {
+            let (num_vars, clauses) = planted_gate_formula(&mut state);
+            let weights: Vec<(BigRational, BigRational)> = (0..num_vars)
+                .map(|_| random_weight_pair(&mut state))
+                .collect();
+            let before = brute_force_weighted(num_vars, &clauses, &weights, None);
+            if let Some(r) = eliminate_defined_simplicial(num_vars, &clauses, None, SECS) {
+                if brute_force_weighted(num_vars, &r.clauses, &weights, None) != before {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(changed > 0, "unrestricted G never changed a weighted count");
+    }
+
+    #[test]
+    fn g_ignores_tautological_clauses() {
+        // (x1 ∨ ¬x1 ∨ x3) resolved on x1 against (¬x1 ∨ x2) would give the
+        // non-entailed (x3 ∨ x2). x2 ≡ x1 is defined either way.
+        let clauses = vec![vec![1, -1, 3], vec![-1, 2], vec![1, -2]];
+        let before = count(3, &clauses);
+        assert_eq!(before, BigUint::from(4u32));
+        if let Some(r) = eliminate_defined_simplicial(3, &clauses, None, SECS) {
+            assert_eq!(count(3, &r.clauses), before, "{:?}", r.clauses);
         }
     }
 
@@ -806,7 +1078,7 @@ mod tests {
                 cur = r.clauses;
                 assert_eq!(count(num_vars, &cur), before, "E broke trial {trial}");
             }
-            if let Some(r) = eliminate_defined_simplicial(num_vars, &cur, SECS) {
+            if let Some(r) = eliminate_defined_simplicial(num_vars, &cur, None, SECS) {
                 cur = r.clauses;
                 assert_eq!(count(num_vars, &cur), before, "G broke trial {trial}");
             }

@@ -7,13 +7,13 @@ use ay_core::TermId;
 use ay_proof::ProofCheckError;
 use std::mem::size_of;
 
-pub(super) struct Control<'a> {
+pub(in crate::api::proofs) struct Control<'a> {
     progress: &'a mut dyn FnMut(usize, usize) -> bool,
     refused: bool,
 }
 
 impl<'a> Control<'a> {
-    pub(super) fn new(progress: &'a mut dyn FnMut(usize, usize) -> bool) -> Self {
+    pub(in crate::api::proofs) fn new(progress: &'a mut dyn FnMut(usize, usize) -> bool) -> Self {
         Self {
             progress,
             refused: false,
@@ -22,7 +22,11 @@ impl<'a> Control<'a> {
 
     /// Latch before invoking user code, including a callback panic caught by
     /// an inner operation. Refusal never calls the callback again.
-    pub(super) fn charge(&mut self, work: usize, bytes: usize) -> Result<(), ProofCheckError> {
+    pub(in crate::api::proofs) fn charge(
+        &mut self,
+        work: usize,
+        bytes: usize,
+    ) -> Result<(), ProofCheckError> {
         if self.refused {
             return Err(ProofCheckError::ResourceLimit);
         }
@@ -35,7 +39,7 @@ impl<'a> Control<'a> {
         }
     }
 
-    pub(super) fn run<T>(
+    pub(in crate::api::proofs) fn run<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, ProofCheckError>,
     ) -> Result<T, ProofCheckError> {
@@ -58,7 +62,7 @@ impl<'a> Control<'a> {
     /// operation-local source owners drop. This is not the legacy v3 check's
     /// completed-verdict contract: retained evidence must still be admitted
     /// under the caller's same sticky callback before it escapes this lane.
-    pub(super) fn run_retained<T>(
+    pub(in crate::api::proofs) fn run_retained<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, ProofCheckError>,
     ) -> Result<T, ProofCheckError> {
@@ -69,8 +73,10 @@ impl<'a> Control<'a> {
         result
     }
 
-    #[cfg(test)]
-    pub(super) fn copy_ids(&mut self, source: &[TermId]) -> Result<Vec<TermId>, ProofCheckError> {
+    pub(in crate::api::proofs) fn copy_ids(
+        &mut self,
+        source: &[TermId],
+    ) -> Result<Vec<TermId>, ProofCheckError> {
         let mut copied = self.reserve_ids(source.len())?;
         // reserve_ids prepaid both the complete traversal and output storage.
         copied.extend_from_slice(source);
@@ -80,7 +86,7 @@ impl<'a> Control<'a> {
 
     /// Preserve first-use order and reserve at most one output slot per input.
     /// Quadratic comparison work is explicit; no unpriced hash table is used.
-    pub(super) fn ordered_unique_ids(
+    pub(in crate::api::proofs) fn ordered_unique_ids(
         &mut self,
         source: &[TermId],
     ) -> Result<Vec<TermId>, ProofCheckError> {
@@ -96,7 +102,7 @@ impl<'a> Control<'a> {
     }
 
     /// Pure membership, not authentication: empty input is vacuously included.
-    pub(super) fn all_ids_in(
+    pub(in crate::api::proofs) fn all_ids_in(
         &mut self,
         source: &[TermId],
         allowed: &[TermId],

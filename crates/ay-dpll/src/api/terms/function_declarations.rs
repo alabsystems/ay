@@ -12,6 +12,36 @@ use super::super::{NativeFunctionRegistration, Solver};
 
 #[allow(clippy::panic, deprecated)]
 impl Solver {
+    /// Declare a new function without adopting any existing declaration.
+    ///
+    /// Embedders use this when a fresh logical predicate or projection has
+    /// its own meaning. Matching a name and signature is not ownership of a
+    /// previously declared function, constructor, selector or theory symbol.
+    /// Failed collisions leave the context and native event history unchanged.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_declare_new_fun(
+        &mut self,
+        name: &str,
+        domain: &[Sort],
+        range: Sort,
+    ) -> Result<FuncDecl, SolverError> {
+        if name.is_empty()
+            || ay_core::is_smtlib_reserved_word(name)
+            || ay_frontend::is_reserved_symbol(name)
+            || ay_frontend::is_builtin_operator_name(name)
+            || self.native_fun_signatures.contains_key(name)
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_new_fun",
+                message: format!("function '{name}' is not a new owned function name"),
+            });
+        }
+        self.reject_reused_native_function_name(name, "declare_new_fun")?;
+        // No caller code or mutation can intervene between this read-only
+        // collision check and native registration through the same &mut self.
+        self.try_declare_fun(name, domain, range)
+    }
+
     /// Declare a function (n-arity) with the given name, domain, and range sorts.
     ///
     /// The function is registered with the SMT context so it appears in models.

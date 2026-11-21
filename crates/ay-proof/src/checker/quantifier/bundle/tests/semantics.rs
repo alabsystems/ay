@@ -81,6 +81,51 @@ fn problem_assertions_and_authored_assumptions_both_forbid_witness_mentions() {
 }
 
 #[test]
+fn registered_freshness_checks_the_complete_raw_original_scope() {
+    let mut fixture = Fixture::new();
+    let original = fixture.terms.mk_not_raw(fixture.source);
+    let raw_true = fixture.terms.mk_app(
+        Symbol::named("="),
+        [fixture.witness, fixture.witness],
+        Sort::Bool,
+    );
+    assert_ne!(raw_true, fixture.terms.true_term());
+    let check = |roots: &[TermId], progress: &mut dyn FnMut(usize, usize) -> bool| {
+        validate_registered_skolem_source_scope_with_progress(
+            &fixture.proof,
+            &fixture.terms,
+            roots,
+            progress,
+        )
+    };
+    check(&[original], &mut |_, _| true).expect("genuinely fresh registered choice");
+    for roots in [vec![original, raw_true], vec![raw_true, original, raw_true]] {
+        assert_invalid(
+            check(&roots, &mut |_, _| true),
+            "claimed problem obligation or an Assume step",
+        );
+    }
+
+    // The live full-scope wrapper shares every walk/copy debit with its
+    // caller, including the entry and final fences; cancellation never grants
+    // freshness for a checked prefix of the original roots.
+    let mut calls = 0usize;
+    check(&[original], &mut |_, _| {
+        calls += 1;
+        true
+    })
+    .unwrap();
+    for stop_at in 1..=calls {
+        let mut current = 0usize;
+        assert_resource(check(&[original], &mut |_, _| {
+            current += 1;
+            current < stop_at
+        }));
+        assert_eq!(current, stop_at);
+    }
+}
+
+#[test]
 fn cyclic_choice_dependencies_remain_rejected_after_exact_substitution() {
     let mut fixture = Fixture::new();
     fixture.add_dependent(true);

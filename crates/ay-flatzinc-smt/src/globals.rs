@@ -64,6 +64,9 @@ pub(crate) fn translate_global(
         "fzn_circuit" | "circuit" => {
             circuit(ctx, &c.args)?;
         }
+        "ay_circuit" => {
+            circuit_with_base(ctx, &c.args)?;
+        }
         "fzn_cumulative" | "cumulative" => {
             cumulative(ctx, &c.args)?;
         }
@@ -159,7 +162,8 @@ fn global_arity(name: &str) -> Option<usize> {
         | "fzn_disjunctive"
         | "disjunctive"
         | "fzn_disjunctive_strict"
-        | "disjunctive_strict" => Some(2),
+        | "disjunctive_strict"
+        | "ay_circuit" => Some(2),
         "fzn_count_eq"
         | "count_eq"
         | "fzn_count_neq"
@@ -277,6 +281,35 @@ fn circuit(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
         });
     }
     let (lo, hi, vars) = ctx.expr_to_smt_indexed_array(&args[0])?;
+    circuit_over_nodes(ctx, lo, hi, vars)
+}
+
+/// `ay_circuit(x, base)`: `circuit` over the nodes `base..base+len(x)-1`.
+///
+/// FlatZinc arrays are 1-based, so MiniZinc's `circuit` on an array indexed
+/// from another base reaches FlatZinc with that base lost. AY's mznlib passes
+/// it explicitly here (as Gecode's and OR-Tools' libraries do); the array's
+/// own FlatZinc index set is ignored.
+fn circuit_with_base(ctx: &mut Context, args: &[Expr]) -> Result<(), TranslateError> {
+    let vars = ctx.expr_to_smt_array(&args[0])?;
+    let base = ctx.resolve_int(&args[1])?;
+    let len = i64::try_from(vars.len())
+        .map_err(|_| TranslateError::UnsupportedConstraint("ay_circuit: array too large".into()))?;
+    let hi = base
+        .checked_add(len)
+        .and_then(|v| v.checked_sub(1))
+        .ok_or_else(|| {
+            TranslateError::UnsupportedConstraint("ay_circuit: node range overflows i64".into())
+        })?;
+    circuit_over_nodes(ctx, base, hi, vars)
+}
+
+fn circuit_over_nodes(
+    ctx: &mut Context,
+    lo: i64,
+    hi: i64,
+    vars: Vec<String>,
+) -> Result<(), TranslateError> {
     let n = vars.len();
     validate_indexed_array_cardinality("circuit", lo, hi, n)?;
     // Pairwise distinctness plus the edge/rank implications are both

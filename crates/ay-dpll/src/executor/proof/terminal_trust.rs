@@ -452,6 +452,9 @@ impl Executor {
     /// folds in the report of the render that streamed the CLI's certificate.
     pub(crate) fn strict_gate_carcara_surface(&self) -> Option<ay_proof::CarcaraSurface> {
         let proof = self.retained_unsat_proof_for_policy()?;
+        if let Some(support) = self.checked_external_proof_support_for_current_proof() {
+            return Some(support.surface().clone());
+        }
         Some(self.problem_and_proof_surface(proof, self.last_proof_term_overrides.as_ref()))
     }
 
@@ -669,6 +672,7 @@ impl Executor {
         let mut shadowed_store_work = 64 * 1024 * 1024;
         let mut ground_substitution_work = 8 * 1024 * 1024;
         let mut guarded_row_work = 8 * 1024 * 1024;
+        let mut negated_exists_work = 8 * 1024 * 1024;
         let mut arith_chain_work = 8 * 1024 * 1024;
         let stop = self.make_proof_assembly_should_stop();
         let complete_blast = self
@@ -843,6 +847,48 @@ impl Executor {
                 {
                     return false;
                 }
+                if ay_proof::arith_disequality_split_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                ) {
+                    return false;
+                }
+                if ay_proof::arith_proportional_equality_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                ) {
+                    return false;
+                }
+                if ay_proof::checked_unary_congruence_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                ) {
+                    return false;
+                }
+                if ay_proof::checked_lia_equality_chain_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                    &mut arith_chain_work,
+                ) {
+                    return false;
+                }
+                if ay_proof::checked_affine_equality_cycle_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                    &mut arith_chain_work,
+                ) {
+                    return false;
+                }
                 if matches!(kind, ay_core::TheoryLemmaKind::ArithEqImpliesBound)
                     && ay_proof::arith_eq_implies_bound_lowering_supported(
                         &self.ctx.terms,
@@ -905,6 +951,16 @@ impl Executor {
                 premises,
                 args,
             } => {
+                if matches!(rule, ay_core::AletheRule::QntNegExists) {
+                    return !premises.is_empty()
+                        || !args.is_empty()
+                        || !ay_proof::qnt_neg_exists_step_lowering_supported(
+                            &self.ctx.terms,
+                            clause,
+                            term_overrides.as_ref(),
+                            &mut negated_exists_work,
+                        );
+                }
                 if matches!(rule, ay_core::AletheRule::BvReconstructV1) {
                     return !ay_proof::bv_reconstruct_step_lowering_supported(
                         self.alethe_dialect(),

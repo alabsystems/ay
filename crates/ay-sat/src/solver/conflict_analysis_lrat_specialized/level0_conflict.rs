@@ -176,7 +176,7 @@ impl Solver {
             if trusted_id != 0 {
                 let conflict_idx = conflict_ref.0 as usize;
                 if conflict_idx < self.cold.clause_ids.len() {
-                    self.cold.clause_ids[conflict_idx] = trusted_id;
+                    self.cold.clause_ids.set(conflict_idx, trusted_id);
                 }
                 conflict_id = trusted_id;
             }

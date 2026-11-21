@@ -962,6 +962,13 @@ impl Executor {
                             .iter()
                             .find(|record| !record.from_exists && record.quantified == quantified)
                         {
+                            self.note_native_skolem_instance(
+                                original,
+                                record.quantified,
+                                record.witness,
+                                record.instance,
+                                body,
+                            );
                             let _ = self.proof_tracker.add_single_forall_skolemized_assertion(
                                 &mut self.ctx.terms,
                                 original,

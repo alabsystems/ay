@@ -22,11 +22,17 @@ pub(super) fn row(
 
 fn clause_ids(solver: &mut Solver, offset: usize, owner: &CountedAdmission) -> Result<()> {
     // Preserve the ordinary hint/capacity schedule: it feeds reduction policy.
-    if solver.cold.clause_ids.capacity() == 0 && solver.cold.clause_ids_reserve_hint > 0 {
-        solver.cold.clause_ids = try_reserved_exact(owner, solver.cold.clause_ids_reserve_hint)?;
+    let hint = solver.cold.clause_ids_reserve_hint;
+    if !solver.cold.clause_ids.is_allocated() && hint > 0 {
+        solver
+            .cold
+            .clause_ids
+            .try_reserve_exact_len_counted(owner, hint)?;
     }
-    let additional = (offset + 1).saturating_sub(solver.cold.clause_ids.len());
-    crate::counted_storage::try_reserve(owner, &mut solver.cold.clause_ids, additional)
+    solver
+        .cold
+        .clause_ids
+        .try_reserve_len_counted(owner, offset + 1)
 }
 
 pub(super) fn identity(solver: &mut Solver, owner: &CountedAdmission) -> Result<()> {

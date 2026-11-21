@@ -192,3 +192,29 @@ fn kissat_parity_switches_agree_on_the_default_route() {
         assert_eq!(kissat, default, "threshold seed {seed}");
     }
 }
+
+/// `--sat-initial-order-high-first` (AY-SAT-3 satcoin lead): the initial
+/// decision order changes neither a verdict nor the model check, alone and on
+/// top of every parity switch, through the plain solver and the Default route.
+#[test]
+fn initial_order_high_first_agrees_with_the_defaults() {
+    let alone = ay_core::SatAbSwitches {
+        initial_order_high_first: Some(true),
+        ..Default::default()
+    };
+    let with_parity = ay_core::SatAbSwitches {
+        initial_order_high_first: Some(true),
+        ..all_parity_switches()
+    };
+    for seed in 0..8u64 {
+        let clauses = mixed_formula(300, 30, 1_250, 3_000 + seed);
+        let (default, _) = solve(300, &clauses, &ay_core::SatAbSwitches::default());
+        assert!(default.is_some());
+        let (high, _) = solve(300, &clauses, &alone);
+        let (high_parity, _) = solve(300, &clauses, &with_parity);
+        assert_eq!(high, default, "seed {seed}");
+        assert_eq!(high_parity, default, "parity seed {seed}");
+        let routed = solve_default_route(300, &clauses, &alone);
+        assert_eq!(routed, default, "default route seed {seed}");
+    }
+}

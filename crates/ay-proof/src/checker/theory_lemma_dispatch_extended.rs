@@ -229,12 +229,13 @@ fn validate_theory_datatype_congruence_and_ground(
         // Independently refute the negated clause with congruence closure and
         // sound datatype rules under both registries.
         TheoryLemmaKind::DatatypeGroundConflict => {
-            datatype_ground::validate_datatype_ground_conflict(
+            datatype_ground::validate_datatype_ground_conflict_with_progress(
                 context.terms,
                 context.step_id,
                 context.clause,
                 decls,
                 selectors,
+                &mut *context.progress,
             )?;
         }
         _ => return Ok(false),

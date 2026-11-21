@@ -84,11 +84,8 @@ impl Solver {
     /// ```
     #[must_use = "this creates a term that is usually needed for assertions"]
     pub fn seq_empty(&mut self, element_sort: Sort) -> Term {
-        let seq_sort = Sort::seq(element_sort);
-        let result = self
-            .terms_mut()
-            .mk_app(Symbol::named("seq.empty"), vec![], seq_sort);
-        self.wrap_term(result)
+        self.try_seq_empty(element_sort)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Create a unit sequence (`seq.unit`) containing a single element.

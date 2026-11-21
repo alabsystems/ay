@@ -69,6 +69,8 @@ pub(super) fn derive(
         push(&mut cuts, 0, meter)?;
         push(&mut cuts, N, meter)?;
         match description.kind {
+            // Periodic snapshots have integer indices; this partition certifies BV64 copies.
+            SnapshotKind::Periodic(_) => return Err(FunctionalArrayError::Sort),
             SnapshotKind::Finite(value) => {
                 for (index, _) in &value.store {
                     let k = u128::from(key(index, meter)?);

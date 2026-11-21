@@ -35,7 +35,21 @@ impl CpContext {
         // Deriving this from successor variable bounds is unsound: ordinary
         // constraints may have tightened every successor's lower bound without
         // changing the nodes in the circuit.
-        let (lo, declared_hi, vars) = self.resolve_var_array_with_bounds(&c.args[0])?;
+        //
+        // FlatZinc itself only has 1-based arrays, so MiniZinc's `circuit` on
+        // an array indexed `0..n-1` reaches FlatZinc with its node base lost.
+        // AY's mznlib therefore emits `ay_circuit(x, base)`, whose second
+        // argument names the first node explicitly (as Gecode's and OR-Tools'
+        // libraries do); the array's own FlatZinc index set is ignored.
+        let (lo, declared_hi, vars) = if c.id == "ay_circuit" {
+            let (_, _, vars) = self.resolve_var_array_with_bounds(&c.args[0])?;
+            let base = self.resolve_const_int(&c.args[1])?;
+            let len = i64::try_from(vars.len()).map_err(|_| linear_encoding_overflow(&c.id))?;
+            let hi = encoding_i64(i128::from(base) + i128::from(len) - 1, &c.id)?;
+            (base, hi, vars)
+        } else {
+            self.resolve_var_array_with_bounds(&c.args[0])?
+        };
         let n = vars.len();
 
         if n == 0 {

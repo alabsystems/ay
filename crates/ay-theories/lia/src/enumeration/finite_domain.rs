@@ -236,13 +236,19 @@ impl LiaSolver<'_> {
             return DirectEnumResult::NoConclusion;
         };
 
-        let Some(constraints) = self.collect_finite_domain_constraints(&term_to_idx) else {
+        let Some(mut constraints) = self.collect_finite_domain_constraints(&term_to_idx) else {
             return DirectEnumResult::NoConclusion;
         };
 
         if constraints.is_empty() {
             return DirectEnumResult::NoConclusion;
         }
+        // Disequalities EUF forwarded as SHARED pairs (not asserted literals)
+        // are search constraints too, so the search looks for a witness that
+        // keeps them instead of finding one that breaks them (AY-SMT-2:
+        // `0 <= f(1) <= 0` asserted, `f(1) != 0` shared). A pair over a term
+        // outside the index cannot be encoded; the witness check below covers it.
+        self.push_shared_disequality_constraints(&term_to_idx, &mut constraints);
 
         let mut assignment = vec![None; idx_to_term.len()];
         let mut budget = FdBudget::new(MAX_FD_SEARCH_NODES, MAX_FD_SEARCH_WORK);
@@ -269,6 +275,21 @@ impl LiaSolver<'_> {
             .enumerate()
             .filter_map(|(idx, value)| value.map(|v| (idx, v)))
             .collect();
+
+        // A shared disequality the search could not encode must still hold,
+        // or the `Sat` is a false one. This lane answers `Sat` for LIA on its
+        // own, so a pair the witness leaves undetermined is handed on to the
+        // simplex path, which carries every shared disequality (AY-SMT-2).
+        let diseq_status = self.witness_shared_disequality_status(&solution, &idx_to_term);
+        if diseq_status != SharedDiseqWitnessStatus::Holds {
+            if debug {
+                safe_eprintln!(
+                    "[FD] witness vs shared disequalities: {:?} - no conclusion",
+                    diseq_status
+                );
+            }
+            return DirectEnumResult::NoConclusion;
+        }
 
         match self.check_solution_satisfies_asserted(&solution, &idx_to_term, debug) {
             Some(true) => {
@@ -467,6 +488,23 @@ impl LiaSolver<'_> {
         }
 
         Some(constraints)
+    }
+
+    /// Encode every shared (cross-theory) disequality whose two sides are
+    /// linear over indexed columns as a `Ne` search constraint. A pair that
+    /// cannot be encoded (a side over a term outside `term_to_idx`, or a
+    /// non-integral form) is skipped here; the callers check the finished
+    /// witness against it (AY-SMT-2).
+    fn push_shared_disequality_constraints(
+        &self,
+        term_to_idx: &HashMap<TermId, usize>,
+        constraints: &mut Vec<FiniteConstraint>,
+    ) {
+        for (lhs, rhs, _reasons) in &self.shared_disequalities {
+            if let Some(expr) = self.finite_linear_difference(*lhs, *rhs, term_to_idx) {
+                constraints.push(FiniteConstraint::Cmp(expr, FiniteCmp::Ne));
+            }
+        }
     }
 
     fn finite_linear_difference(
@@ -852,6 +890,10 @@ impl LiaSolver<'_> {
             };
             constraints.push(FiniteConstraint::Cmp(expr, FiniteCmp::Eq));
         }
+        // Shared disequalities are search constraints as well (AY-SMT-2), so
+        // the rescue finds a witness that keeps them rather than one it must
+        // throw away.
+        self.push_shared_disequality_constraints(&term_to_idx, &mut constraints);
         if constraints.is_empty() {
             return false;
         }
@@ -900,6 +942,20 @@ impl LiaSolver<'_> {
             .enumerate()
             .filter_map(|(idx, value)| value.map(|v| (idx, v)))
             .collect();
+
+        // Shared equalities and the encodable shared disequalities are search
+        // constraints above. A disequality over a term outside the index is
+        // refused only when the witness is shown to violate it: an
+        // undetermined pair is left to the combiner's materialization and the
+        // independent model gate this witness goes through anyway (AY-SMT-2).
+        if self.witness_shared_disequality_status(&solution, &idx_to_term)
+            == SharedDiseqWitnessStatus::Violated
+        {
+            if debug {
+                safe_eprintln!("[FD] uflia witness violates a shared disequality - not installed");
+            }
+            return false;
+        }
 
         match self.check_solution_satisfies_asserted(&solution, &idx_to_term, debug) {
             Some(true) => {

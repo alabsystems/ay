@@ -58,6 +58,17 @@ const SYMMETRY_DETECTOR_MAX_CLAUSES: usize = 1_000_000;
 /// so huge instances are kept out until the route earns a default-on.
 const SIGNED_SYMMETRY_MAX_VARS: usize = 200_000;
 const SIGNED_SYMMETRY_MAX_CLAUSES: usize = 1_000_000;
+
+/// The signed route's active-clause cap: `SIGNED_SYMMETRY_MAX_CLAUSES`, or
+/// `--sat-signed-symmetry-max-clauses` when given (AY-SAT-3 knights lead). The
+/// route itself stays opt-in behind `--sat-signed-symmetry`.
+fn signed_symmetry_max_clauses() -> usize {
+    ay_core::sat_ab_switches()
+        .signed_symmetry_max_clauses
+        .map_or(SIGNED_SYMMETRY_MAX_CLAUSES, |cap| {
+            usize::try_from(cap).unwrap_or(usize::MAX)
+        })
+}
 const SYMMETRY_MAX_PAIRS: usize = 128;
 const SYMMETRY_MAX_GROUP_SIZE: usize = 64;
 /// Size bound for the orbitope route, which runs BEFORE the caps above and so
@@ -328,7 +339,7 @@ impl Solver {
             && self.cold.symmetry_stats.runs == 1
             && !proof_surface_active
             && self.num_vars <= SIGNED_SYMMETRY_MAX_VARS
-            && self.arena.active_clause_count() <= SIGNED_SYMMETRY_MAX_CLAUSES
+            && self.arena.active_clause_count() <= signed_symmetry_max_clauses()
         {
             let before = self.cold.symmetry_stats.sb_clauses_added;
             let (unsat, changed) = self.preprocess_symmetry_signed();
@@ -1346,5 +1357,25 @@ impl Solver {
     #[inline]
     fn symmetry_proof_surface_active(&self) -> bool {
         self.proof_manager.is_some() || self.cold.lrat_enabled || self.has_live_clause_trace()
+    }
+}
+
+#[cfg(test)]
+mod signed_cap_tests {
+    use super::{signed_symmetry_max_clauses, SIGNED_SYMMETRY_MAX_CLAUSES};
+
+    fn cap_under(switch: Option<u64>) -> usize {
+        let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            signed_symmetry_max_clauses: switch,
+            ..Default::default()
+        });
+        signed_symmetry_max_clauses()
+    }
+
+    #[test]
+    fn the_signed_cap_defaults_to_the_constant_and_the_switch_replaces_it() {
+        assert_eq!(cap_under(None), SIGNED_SYMMETRY_MAX_CLAUSES);
+        assert_eq!(cap_under(Some(2_000_000)), 2_000_000);
+        assert_eq!(cap_under(Some(10)), 10);
     }
 }

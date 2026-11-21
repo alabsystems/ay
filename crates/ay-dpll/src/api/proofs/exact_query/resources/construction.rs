@@ -12,7 +12,7 @@ type Progress<'a> = &'a mut dyn FnMut(usize, usize) -> bool;
 /// state that declines is terminal: it never authorizes generic reconstruction.
 /// The complete problem collector is lazy so sealed/finite routes do not add a
 /// source walk. No route performs an independent proof check here.
-pub(super) fn bundle(
+pub(in crate::api::proofs) fn bundle(
     solver: &Solver,
     proof: &Proof,
     complete_problem: impl FnOnce(Progress<'_>) -> Result<Vec<TermId>, ProofCheckError>,

@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod memory_guard;
+pub mod portfolio;
 pub mod solve;
 pub mod solve_cp;
 

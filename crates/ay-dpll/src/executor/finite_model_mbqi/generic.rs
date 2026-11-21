@@ -158,11 +158,18 @@ impl Executor {
         interp: &Interpretation,
         budget: LaneBudget,
     ) -> TruthOutcome {
-        if budget.spent() {
+        if budget.spent()
+            || interp
+                .symbolic_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.pay_for(self, 0, 0))
+        {
             return TruthOutcome::Unknown;
         }
         let (matrix_sk, skolems) = self.finite_model_skolemize(leaf);
-        let fixed = interp.substitute(&mut self.ctx.terms, matrix_sk);
+        let Some(fixed) = interp.substitute_symbolic(&mut self.ctx.terms, matrix_sk) else {
+            return TruthOutcome::Unknown;
+        };
         let with = |extra: TermId| {
             let mut v = interp.pins.clone();
             v.push(extra);
@@ -185,7 +192,10 @@ impl Executor {
                 // the pass, where the instance moves the candidate model.
                 return TruthOutcome::Refine(instance);
             }
-            let fixed_instance = interp.substitute(&mut self.ctx.terms, instance);
+            let Some(fixed_instance) = interp.substitute_symbolic(&mut self.ctx.terms, instance)
+            else {
+                return TruthOutcome::Unknown;
+            };
             if self.qmc_refutes(with(fixed_instance), budget) {
                 return TruthOutcome::Determined(false);
             }
@@ -206,7 +216,9 @@ impl Executor {
             // of the problem that this candidate violates.
             return TruthOutcome::Refine(self.ctx.terms.mk_not(instance));
         }
-        let fixed_instance = interp.substitute(&mut self.ctx.terms, instance);
+        let Some(fixed_instance) = interp.substitute_symbolic(&mut self.ctx.terms, instance) else {
+            return TruthOutcome::Unknown;
+        };
         let negated_instance = self.ctx.terms.mk_not(fixed_instance);
         if self.qmc_refutes(with(negated_instance), budget) {
             TruthOutcome::Determined(true)
@@ -223,14 +235,155 @@ impl Executor {
         universals: &[AuthoredUniversal],
         instances: &mut Vec<TermId>,
         budget: LaneBudget,
+        symbolic_owner: Option<&crate::executor::model::SymbolicAdmission>,
     ) -> PassOutcome {
         if budget.spent() {
             return PassOutcome::Declined;
         }
-        let Some(interp) = self.model_check_interpretation(universals, roots) else {
+        let Some(mut interp) = self.model_check_interpretation(universals, roots) else {
             trace(|| format!("qmc round {round}: no candidate model"));
             return PassOutcome::Declined;
         };
+        let mut original_refinement = None;
+        if let Some(original) = interp.without_array_defaults() {
+            let mut original_instances = Vec::new();
+            let outcome = self.qmc_certificate_with_interpretation(
+                round,
+                roots,
+                universals,
+                &mut original_instances,
+                budget,
+                &original,
+            );
+            match outcome {
+                PassOutcome::Certified(model) => return PassOutcome::Certified(model),
+                PassOutcome::Refined => original_refinement = Some(original_instances),
+                PassOutcome::Declined => {}
+            }
+            trace(|| {
+                format!(
+                    "qmc round {round}: trying closed-array candidate; remaining={}ms",
+                    budget.remaining_ms()
+                )
+            });
+        }
+        let mut array_instances = Vec::new();
+        let outcome = self.qmc_certificate_with_interpretation(
+            round,
+            roots,
+            universals,
+            &mut array_instances,
+            budget,
+            &interp,
+        );
+        if matches!(&outcome, PassOutcome::Certified(_)) {
+            return outcome;
+        }
+        if let Some(owner) = symbolic_owner {
+            if let Some(candidate) = self.qmc_symbolic_candidate(roots, owner) {
+                interp.symbolic = candidate;
+                interp.symbolic_owner = Some(owner.clone());
+                trace(|| format!("qmc round {round}: trying authored symbolic function bodies"));
+                let mut symbolic_instances = Vec::new();
+                let symbolic_outcome = self.qmc_certificate_with_interpretation(
+                    round,
+                    roots,
+                    universals,
+                    &mut symbolic_instances,
+                    budget,
+                    &interp,
+                );
+                if matches!(&symbolic_outcome, PassOutcome::Certified(_)) && owner.pay(0, 0) {
+                    return symbolic_outcome;
+                }
+                interp.symbolic = Default::default();
+                interp.symbolic_owner = None;
+            }
+            if !owner.pay(0, 0) {
+                return PassOutcome::Declined;
+            }
+        }
+        if let Some(positive) = interp.with_true_boolean_tables(&mut self.ctx.terms) {
+            trace(|| format!("qmc round {round}: trying constant-true Boolean functions"));
+            let mut positive_instances = Vec::new();
+            let positive_outcome = self.qmc_certificate_with_interpretation(
+                round,
+                roots,
+                universals,
+                &mut positive_instances,
+                budget,
+                &positive,
+            );
+            if matches!(&positive_outcome, PassOutcome::Certified(_)) {
+                return positive_outcome;
+            }
+        }
+        // Keep the existing proposals and their refinement preference first.
+        // Extra numeric defaults spend the SAME query-owned wall budget and
+        // grant only through the unchanged complete interpretation checker.
+        if !budget.spent() {
+            if let Some(zero) = interp.with_zero_numeric_defaults(&mut self.ctx.terms) {
+                trace(|| format!("qmc round {round}: trying zero numeric function defaults"));
+                let mut zero_instances = Vec::new();
+                let zero_outcome = self.qmc_certificate_with_interpretation(
+                    round,
+                    roots,
+                    universals,
+                    &mut zero_instances,
+                    budget,
+                    &zero,
+                );
+                if matches!(&zero_outcome, PassOutcome::Certified(_)) {
+                    return zero_outcome;
+                }
+                if !budget.spent() {
+                    if let Some(positive) = zero.with_true_boolean_tables(&mut self.ctx.terms) {
+                        let mut positive_instances = Vec::new();
+                        let positive_outcome = self.qmc_certificate_with_interpretation(
+                            round,
+                            roots,
+                            universals,
+                            &mut positive_instances,
+                            budget,
+                            &positive,
+                        );
+                        if matches!(&positive_outcome, PassOutcome::Certified(_)) {
+                            return positive_outcome;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(original_instances) = original_refinement {
+            // The additional candidate supplies authority only after all
+            // existing checks succeed. Otherwise retain the original model's
+            // licensed instances and refinement preference unchanged.
+            instances.extend(original_instances);
+            PassOutcome::Refined
+        } else {
+            instances.extend(array_instances);
+            outcome
+        }
+    }
+
+    fn qmc_certificate_with_interpretation(
+        &mut self,
+        round: usize,
+        roots: &[TermId],
+        universals: &[AuthoredUniversal],
+        instances: &mut Vec<TermId>,
+        budget: LaneBudget,
+        interp: &Interpretation,
+    ) -> PassOutcome {
+        if budget.spent()
+            || interp
+                .symbolic_owner
+                .as_ref()
+                .is_some_and(|owner| !owner.pay_for(self, 0, 0))
+            || !interp.symbolic.is_current(self)
+        {
+            return PassOutcome::Declined;
+        }
         let mut values: HashMap<TermId, TermId> = HashMap::default();
         let mut refined = false;
         trace(|| {
@@ -277,10 +430,13 @@ impl Executor {
             .iter()
             .map(|&root| replace_subterms(&mut self.ctx.terms, root, &values, &mut memo))
             .collect();
-        let mut confirm: Vec<TermId> = residual
+        let Some(mut confirm): Option<Vec<TermId>> = residual
             .iter()
-            .map(|&root| interp.substitute(&mut self.ctx.terms, root))
-            .collect();
+            .map(|&root| interp.substitute_symbolic(&mut self.ctx.terms, root))
+            .collect()
+        else {
+            return PassOutcome::Declined;
+        };
         confirm.extend_from_slice(&interp.pins);
         let outcome = match self.checked_model_check_solve(confirm.clone(), budget.sub_solve_ms()) {
             Some(CheckedGroundDecision::Sat(checked)) => checked
@@ -311,7 +467,20 @@ impl Executor {
         budget: LaneBudget,
     ) -> Option<Model> {
         let mut model = self.finite_model_prepare_witness(confirm, &interp.completions, budget)?;
+        let mut array_defaults = Vec::new();
         for table in &interp.tables {
+            if interp.symbolic.contains(&table.symbol) {
+                continue;
+            }
+            if matches!(table.result_sort, ay_core::Sort::Array(_)) && table.rows.is_empty() {
+                array_defaults.push((
+                    table.symbol.clone(),
+                    table.arg_sorts.clone(),
+                    table.result_sort.clone(),
+                    table.default,
+                ));
+                continue;
+            }
             if self
                 .install_model_check_total_uf(
                     &mut model,
@@ -327,9 +496,33 @@ impl Executor {
                 return None;
             }
         }
-        let holds = residual
-            .iter()
-            .all(|&root| matches!(self.evaluate_term(&model, root), EvalValue::Bool(true)));
+        if !array_defaults.is_empty() {
+            if self
+                .install_model_check_array_defaults(&mut model, array_defaults)
+                .is_none()
+            {
+                trace(|| "qmc: closed-array candidate package not installable".to_string());
+                return None;
+            }
+        }
+        if !interp.symbolic.is_empty() {
+            self.install_model_check_symbolic_ufs(
+                &mut model,
+                interp.symbolic.clone(),
+                interp.symbolic_owner.as_ref()?,
+            )?;
+        }
+        let holds = if interp.symbolic.is_empty() {
+            residual
+                .iter()
+                .all(|&root| matches!(self.evaluate_term(&model, root), EvalValue::Bool(true)))
+        } else {
+            self.symbolic_residual_holds(&model, residual)
+                && interp
+                    .symbolic_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.pay(0, 0))
+        };
         if !holds {
             trace(|| "qmc: staged model falsifies the original residual".to_string());
             return None;
@@ -347,6 +540,11 @@ impl Executor {
         let Some(budget) = self.finite_model_lane_open() else {
             return false;
         };
+        let symbolic_scope = crate::executor::model::SymbolicRecoveryScope::enter(
+            self,
+            Box::new(move |_, _| !budget.spent()),
+        );
+        let symbolic_owner = symbolic_scope.as_ref().map(|scope| scope.admission());
         let roots = match self.independent_gate_query_roots() {
             Ok(roots) => roots,
             Err(_) => {
@@ -360,7 +558,14 @@ impl Executor {
         let nodes = certified_nodes(&universals);
         let mut instances = Vec::new();
         let trust_mark = self.finite_model_trust_mark();
-        let outcome = self.qmc_certificate_pass(0, &roots, &universals, &mut instances, budget);
+        let outcome = self.qmc_certificate_pass(
+            0,
+            &roots,
+            &universals,
+            &mut instances,
+            budget,
+            symbolic_owner.as_ref(),
+        );
         self.finite_model_lane_settle(budget, matches!(outcome, PassOutcome::Certified(_)));
         match outcome {
             PassOutcome::Certified(model) => {
@@ -407,6 +612,11 @@ impl Executor {
             return None;
         }
         let budget = self.finite_model_lane_open()?;
+        let symbolic_scope = crate::executor::model::SymbolicRecoveryScope::enter(
+            self,
+            Box::new(move |_, _| !budget.spent()),
+        );
+        let symbolic_owner = symbolic_scope.as_ref().map(|scope| scope.admission());
         let roots = match self.independent_gate_query_roots() {
             Ok(roots) => roots,
             Err(_) => {
@@ -428,6 +638,7 @@ impl Executor {
             budget,
             &mut certified,
             &mut refuted,
+            symbolic_owner.as_ref(),
         );
         self.finite_model_lane_settle(budget, certified);
         if outcome.is_none() {
@@ -444,6 +655,7 @@ impl Executor {
         budget: LaneBudget,
         certified: &mut bool,
         refuted: &mut bool,
+        symbolic_owner: Option<&crate::executor::model::SymbolicAdmission>,
     ) -> Option<Result<SolveResult>> {
         let nodes = certified_nodes(universals);
         for round in 0..MAX_FINITE_MODEL_ROUNDS {
@@ -453,7 +665,14 @@ impl Executor {
             }
             let mut new_instances = Vec::new();
             let trust_mark = self.finite_model_trust_mark();
-            match self.qmc_certificate_pass(round, roots, universals, &mut new_instances, budget) {
+            match self.qmc_certificate_pass(
+                round,
+                roots,
+                universals,
+                &mut new_instances,
+                budget,
+                symbolic_owner,
+            ) {
                 PassOutcome::Declined => return None,
                 PassOutcome::Certified(model) => {
                     *certified = true;
@@ -501,3 +720,6 @@ impl Executor {
         None
     }
 }
+
+#[cfg(test)]
+mod array_defaults_tests;

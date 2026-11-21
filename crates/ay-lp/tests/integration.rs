@@ -199,8 +199,10 @@ ENDATA
     check_feasible(&problem, &sol);
 }
 
+/// A binary variable with a lower bound of 2 is refused: CPLEX replaces
+/// its bounds by `[0, 1]`, other readers intersect them (AY-N12).
 #[test]
-fn test_lp_binary_with_explicit_inconsistent_bound_is_infeasible() {
+fn test_lp_binary_with_explicit_inconsistent_bound_is_refused() {
     let input = "\
 Maximize
  x
@@ -210,6 +212,5 @@ Binary
  x
 End
 ";
-    let problem = parse_lp(input).expect("parse lp");
-    assert!(matches!(solve(&problem), Err(LpError::Infeasible)));
+    assert!(matches!(parse_lp(input), Err(LpError::Parse { .. })));
 }

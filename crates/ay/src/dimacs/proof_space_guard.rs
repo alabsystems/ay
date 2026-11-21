@@ -125,6 +125,56 @@ impl ProofSpaceGuard {
     }
 }
 
+/// A proof writer that keeps the free-space reserve: the Alethe and CHC
+/// writers' counterpart of the DRAT writer's `HashingProofFile`. The reserve
+/// and the optional ceiling stop the proof here, before the bytes land, as a
+/// write error; each writer's existing failure posture decides what that
+/// costs the run.
+pub(crate) struct ReservedProofWriter<W> {
+    inner: W,
+    len: u64,
+    guard: ProofSpaceGuard,
+}
+
+impl<W> ReservedProofWriter<W> {
+    /// Guard writes to `inner`, a fresh proof file in the folder of `path`.
+    pub(crate) fn for_proof(inner: W, path: &str) -> Self {
+        Self {
+            inner,
+            len: 0,
+            guard: ProofSpaceGuard::for_proof(path),
+        }
+    }
+
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl std::borrow::Borrow<File> for ReservedProofWriter<File> {
+    fn borrow(&self) -> &File {
+        &self.inner
+    }
+}
+
+impl<W: Write> Write for ReservedProofWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.guard.check(self.len, buffer.len())?;
+        let written = self.inner.write(buffer)?;
+        self.len += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.guard.probe_now(self.len)
+    }
+}
+
 /// The disk reserve that stops a proof before the filesystem fills
 /// (2026-09-20). A stop is a write error, so what these assert is the arithmetic
 /// and the cadence; that a write error stops the proof and not the search is
@@ -251,6 +301,38 @@ mod proof_space_guard_tests {
             error.to_string().contains("4096-byte ceiling"),
             "the stop names the ceiling: {error}"
         );
+    }
+
+    /// The Alethe and CHC writers keep the same reserve as DRAT (DC-77):
+    /// before this, `write_alethe_proof` streamed into a bare file, and a
+    /// 785 MB certificate could fill the disk the DRAT writer stops short of.
+    #[test]
+    fn the_alethe_and_chc_writer_stops_at_the_reserve() {
+        set_free(1_900_000_000);
+        let mut writer = ReservedProofWriter {
+            inner: Vec::new(),
+            len: 0,
+            guard: guard(2 * 1024 * 1024 * 1024, None, probed),
+        };
+        let error = writer
+            .write_all(b"(assume a0 false)")
+            .expect_err("under the reserve, the proof stops");
+        assert!(error.to_string().contains("proof reserve"), "{error}");
+        assert!(writer.get_ref().is_empty(), "no byte landed past the stop");
+    }
+
+    #[test]
+    fn the_alethe_and_chc_writer_writes_on_above_the_reserve() {
+        set_free(8 * 1024 * 1024 * 1024);
+        let mut writer = ReservedProofWriter {
+            inner: Vec::new(),
+            len: 0,
+            guard: guard(2 * 1024 * 1024 * 1024, None, probed),
+        };
+        writer.write_all(b"(assume a0 false)").expect("room");
+        writer.flush().expect("room at the flush");
+        assert_eq!(writer.into_inner(), b"(assume a0 false)");
+        assert_eq!(probes(), 2, "the first write and the flush look");
     }
 
     #[test]

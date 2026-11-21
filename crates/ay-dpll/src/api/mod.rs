@@ -82,6 +82,8 @@ pub(crate) const MAX_API_BITVECTOR_WIDTH: u32 = 1 << 20;
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::check_paired_document_for_test;
 
 // Re-export FP/BV bridge classification constants (#8332)
 pub use de_bruijn::de_bruijn_index;
@@ -95,7 +97,9 @@ pub use rec_defs::{
 // Re-export all public types for backwards compatibility
 pub use introspect::TermKind;
 pub use proofs::{
-    AletheDialect, CarcaraSurface, CleanOnlySpelling, ExactSmtlibQueryBinding, FarkasCertificate,
+    AletheDialect, CarcaraSurface, CleanOnlySpelling, ExactSmtlibQueryBinding,
+    ExternalProofAssumption, ExternalProofSupport, FarkasCertificate, NativeDiagnosticSolve,
+    NativeQueryBinding, NativeQueryDiagnosticDocument, NativeQueryProofEnvelope,
     ProofAcceptanceError, ProofAcceptanceMode, StrictProofVerdict, StrictVerdictStop,
     UnsatProofArtifact,
 };

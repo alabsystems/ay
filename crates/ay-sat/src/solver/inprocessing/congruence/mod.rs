@@ -613,7 +613,7 @@ impl Solver {
                 // manager panics with "deleting unknown LRAT clause ID" because
                 // the ID was already removed from known_lrat_ids above.
                 if idx < self.cold.clause_ids.len() {
-                    self.cold.clause_ids[idx] = 0;
+                    self.cold.clause_ids.set(idx, 0);
                 }
                 self.stats.clear_bcp_learned_1963_blocker_cert(idx);
                 self.mark_clause_garbage_counted(idx);

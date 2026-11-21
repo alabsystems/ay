@@ -102,9 +102,9 @@ impl MemoryPollGate {
 /// [`MemoryPollGate`]) says an observation is due.
 fn memory_source(
     term_memory_exceeded: bool,
-    due: impl Fn() -> bool + 'static,
-    observe: impl Fn() -> bool + 'static,
-) -> Box<dyn Fn() -> bool> {
+    due: impl Fn() -> bool + Send + 'static,
+    observe: impl Fn() -> bool + Send + 'static,
+) -> Box<dyn Fn() -> bool + Send> {
     Box::new(move || term_memory_exceeded || (due() && observe()))
 }
 
@@ -113,7 +113,7 @@ pub(in crate::executor) struct FpStop {
     deadline: SolveDeadlineCell,
     // An explicitly captured original end for mutable term construction.
     construction_end: Option<Instant>,
-    memory_exceeded: Box<dyn Fn() -> bool>,
+    memory_exceeded: Box<dyn Fn() -> bool + Send>,
     refusal: Cell<Option<UnknownOrigin>>,
     read_controls: Option<EvaluationReadControls>,
 }
@@ -136,7 +136,7 @@ impl FpStop {
     /// per poll (one per evaluated term) would take one syscall per poll.
     pub(in crate::executor) fn from_executor_gated(
         executor: &Executor,
-        due: impl Fn() -> bool + 'static,
+        due: impl Fn() -> bool + Send + 'static,
     ) -> Self {
         let read_controls = executor.evaluation_read_controls();
         let memory_limit = executor
@@ -183,7 +183,7 @@ impl FpStop {
     fn with_sources(
         interrupt: Option<Arc<AtomicBool>>,
         deadline: SolveDeadlineCell,
-        memory_exceeded: Box<dyn Fn() -> bool>,
+        memory_exceeded: Box<dyn Fn() -> bool + Send>,
     ) -> Self {
         Self {
             interrupt,

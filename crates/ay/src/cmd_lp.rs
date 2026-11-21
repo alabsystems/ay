@@ -4,7 +4,10 @@
 
 //! `ay lp solve FILE` subcommand.
 //!
-//! MPS input uses the sparse MILP engine. CPLEX LP uses the dense simplex.
+//! Reads an MPS or CPLEX LP file exactly and solves it with AY's sparse MILP
+//! engine, printing only verdicts confirmed on the exact model
+//! ([`sparse`]). The format is inferred from the file extension and falls
+//! back to content sniffing via [`ay_lp::detect_format`].
 
 use std::fs;
 use std::io::{Read as _, Write};
@@ -12,16 +15,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ay_lp::{
-    detect_format, parse_lp, parse_mps_exact, solve, solve_with_incumbents, InputFormat, Problem,
-    Sense, Solution,
-};
+use ay_lp::{detect_format, parse_lp_exact, parse_mps_exact, InputFormat, Sense};
 use clap::Subcommand;
 
 mod sparse;
 
 #[cfg(test)]
 mod differential_tests;
+#[cfg(test)]
+mod lp_differential_tests;
 
 /// LP/MIP solver subcommands.
 #[derive(Subcommand)]
@@ -35,7 +37,7 @@ pub(crate) enum LpCommand {
         #[arg(long, value_name = "FORMAT")]
         format: Option<String>,
 
-        /// Wall-clock limit in seconds for the MPS (sparse) route. Without it
+        /// Wall-clock limit in seconds. Without it
         /// the search runs until a proof or a signal; improving solutions are
         /// written as they are found either way.
         #[arg(long, value_name = "SECONDS")]
@@ -48,7 +50,6 @@ pub(crate) enum LpCommand {
 /// - `0`: optimal solution printed, or a stop without a proof (`s FEASIBLE`
 ///   with the last `o`/`v` block as the answer, or `s UNKNOWN`)
 /// - `10`: infeasible
-/// - `11`: unbounded
 /// - `1`: any other error
 pub(crate) fn run(cmd: &LpCommand) -> Result<i32> {
     match cmd {
@@ -91,55 +92,85 @@ pub(crate) fn run_z3_compat(
         let path = path.context("input file was not specified")?;
         fs::read_to_string(path).with_context(|| format!("failed to read '{}'", path.display()))?
     };
-    let problem = parse_lp(&input).context("parsing CPLEX LP input")?;
-    match solve(&problem) {
-        Ok(solution) => {
-            println!("sat");
+    z3_transcript(
+        &input,
+        display_model,
+        display_stats,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// Z3's `-lp` transcript for `input`, from the route `ay lp solve` takes:
+/// the exact reading ([`parse_lp_exact`]) solved by [`sparse::solve_sparse`].
+/// `sat` and the optimum only when the optimum was confirmed exactly,
+/// `unsat` only when the infeasibility was, `unknown` otherwise.
+fn z3_transcript(
+    input: &str,
+    display_model: bool,
+    display_stats: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let exact = parse_lp_exact(input).context("parsing CPLEX LP input")?;
+    let mut transcript: Vec<u8> = Vec::new();
+    let (end, _) = sparse::solve_sparse(&exact, None, &mut transcript)?;
+    let transcript = String::from_utf8_lossy(&transcript);
+    let mut text = String::new();
+    match (end, last_block(&transcript, exact.columns.len())) {
+        (sparse::SparseEnd::Optimal, Some((objective, values))) => {
+            text.push_str("sat\n");
             if display_stats {
-                println!("time:                0.00 secs");
+                text.push_str("time:                0.00 secs\n");
             }
             if display_model {
-                emit_z3_model(&problem, &solution);
+                for (column, value) in exact.columns.iter().zip(&values) {
+                    let integral = column.is_integral();
+                    let sort = if integral { "Int" } else { "Real" };
+                    text.push_str(&format!(
+                        "(define-fun {} () {sort}\n  {})\n",
+                        column.name,
+                        z3_number(value, !integral)
+                    ));
+                }
             }
-            println!("   {}", z3_number(solution.objective, false));
+            text.push_str(&format!("   {}\n", z3_number(&objective, false)));
         }
-        Err(ay_lp::LpError::Infeasible) => println!("unsat"),
-        Err(ay_lp::LpError::Unbounded) => println!("unknown"),
-        Err(error) => return Err(error.into()),
+        (sparse::SparseEnd::Infeasible, _) => text.push_str("unsat\n"),
+        _ => text.push_str("unknown\n"),
     }
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .context("writing to stdout")?;
     Ok(0)
 }
 
-fn emit_z3_model(problem: &Problem, solution: &Solution) {
-    for (variable, value) in problem.variables.iter().zip(&solution.values) {
-        let is_integer = variable.is_integral();
-        let sort = if is_integer { "Int" } else { "Real" };
-        println!("(define-fun {} () {sort}", variable.name);
-        println!("  {})", z3_number(*value, !is_integer));
+/// The objective text and the `n` value texts of the last whole `o`/`v`
+/// block of a transcript of [`sparse::solve_sparse`].
+fn last_block(transcript: &str, n: usize) -> Option<(String, Vec<String>)> {
+    let start = transcript.rfind("\no ").map_or(0, |i| i + 1);
+    let mut lines = transcript[start..].lines();
+    let objective = lines.next()?.strip_prefix("o ")?.to_string();
+    let values: Vec<String> = lines
+        .take(n)
+        .map(|l| l.split_once(" = ").map(|(_, v)| v.to_string()))
+        .collect::<Option<_>>()?;
+    (values.len() == n).then_some((objective, values))
+}
+
+/// A checked decimal text as Z3 prints it: a Real that is an integer gets
+/// `.0`.
+fn z3_number(text: &str, force_real: bool) -> String {
+    let integer = !text.contains(['.', 'e', 'E']);
+    if force_real && integer {
+        format!("{text}.0")
+    } else {
+        text.to_string()
     }
 }
 
-fn z3_number(value: f64, force_real: bool) -> String {
-    if value == 0.0 {
-        return if force_real { "0.0" } else { "0" }.to_string();
-    }
-    if value.is_finite() && value.fract().abs() <= 1e-9 {
-        let integer = format!("{value:.0}");
-        return if force_real {
-            format!("{integer}.0")
-        } else {
-            integer
-        };
-    }
-    format!("{value:.15}")
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
-}
-
-/// Solves `file`. MPS input is read exactly and goes to AY's sparse MILP
-/// engine ([`sparse::solve_sparse`]); CPLEX LP input goes to the dense
-/// tableau solver, which refuses a model too large for it.
+/// Solves `file`. MPS and CPLEX LP input are both read exactly
+/// ([`parse_mps_exact`], [`parse_lp_exact`]) and go to AY's sparse MILP
+/// engine ([`sparse::solve_sparse`]), which prints a verdict only when it is
+/// confirmed on the exact model.
 fn run_solve(
     file: &Path,
     forced_format: Option<&str>,
@@ -149,96 +180,22 @@ fn run_solve(
     let input =
         fs::read_to_string(file).with_context(|| format!("failed to read '{}'", file.display()))?;
 
-    let format = resolve_format(file, &input, forced_format)?;
-
-    if format == InputFormat::Mps {
-        // The one reading every route, check and printed number uses.
-        let exact = parse_mps_exact(&input)
-            .with_context(|| format!("failed to parse MPS '{}'", file.display()))?;
-        let integers = exact.columns.iter().filter(|c| c.is_integral()).count();
-        write_block(
-            out,
-            &canonical_lines(exact.sense, exact.columns.len(), exact.rows.len(), integers),
-        )
-        .context("writing to stdout")?;
-        let (end, written) = sparse::solve_sparse(&exact, time_limit, out)?;
-        return sparse_status(end, written, out);
-    }
-    let problem = match format {
-        InputFormat::Lp => {
-            parse_lp(&input).with_context(|| format!("failed to parse LP '{}'", file.display()))?
-        }
+    // The one reading every route, check and printed number uses.
+    let exact = match resolve_format(file, &input, forced_format)? {
+        InputFormat::Mps => parse_mps_exact(&input)
+            .with_context(|| format!("failed to parse MPS '{}'", file.display()))?,
+        InputFormat::Lp => parse_lp_exact(&input)
+            .with_context(|| format!("failed to parse LP '{}'", file.display()))?,
         _ => anyhow::bail!("unsupported input format detected"),
     };
-    let integers = problem.variables.iter().filter(|v| v.is_integral()).count();
+    let integers = exact.columns.iter().filter(|c| c.is_integral()).count();
     write_block(
         out,
-        &canonical_lines(
-            problem.sense,
-            problem.variables.len(),
-            problem.constraints.len(),
-            integers,
-        ),
+        &canonical_lines(exact.sense, exact.columns.len(), exact.rows.len(), integers),
     )
     .context("writing to stdout")?;
-    let (result, incumbents) = solve_reporting_incumbents(&problem, out)?;
-    final_status(&problem, &result, incumbents, out)
-}
-
-/// Runs the solver, writing each improving incumbent to `out` as one
-/// complete `o`/`v` block as soon as it is found, so that a run stopped by
-/// a signal or a limit leaves its best checked solution behind. Returns the
-/// solver's result and the number of incumbent blocks written.
-fn solve_reporting_incumbents(
-    problem: &Problem,
-    out: &mut dyn Write,
-) -> Result<(Result<Solution, ay_lp::LpError>, usize)> {
-    let mut written = 0usize;
-    let mut write_error: Option<std::io::Error> = None;
-    let result = solve_with_incumbents(problem, &mut |sol| {
-        if write_error.is_none() {
-            match write_block(out, &solution_block(problem, sol)) {
-                Ok(()) => written += 1,
-                Err(e) => write_error = Some(e),
-            }
-        }
-    });
-    if let Some(e) = write_error {
-        return Err(anyhow::Error::new(e).context("writing an incumbent to stdout"));
-    }
-    Ok((result, written))
-}
-
-/// Prints the final status for `result` and returns the exit code. A proven
-/// optimum is printed as `s OPTIMAL` followed by its `o`/`v` block (for a MIP
-/// the same point as the last incumbent block).
-///
-/// A solve that stops without a conclusion (node or iteration limit, a model
-/// too large for the dense tableau, a numerical failure) is not an error of
-/// the run: it ends `s FEASIBLE` when an incumbent block was written (that
-/// block is the answer) and `s UNKNOWN` otherwise, with the reason on a
-/// `c stopped:` line, and exits 0.
-fn final_status(
-    problem: &Problem,
-    result: &Result<Solution, ay_lp::LpError>,
-    incumbents: usize,
-    out: &mut dyn Write,
-) -> Result<i32> {
-    let (text, code) = match result {
-        Ok(sol) => (format!("s OPTIMAL\n{}", solution_block(problem, sol)), 0),
-        Err(ay_lp::LpError::Infeasible) => ("s INFEASIBLE\n".to_string(), 10),
-        Err(ay_lp::LpError::Unbounded) => ("s UNBOUNDED\n".to_string(), 11),
-        Err(e) => {
-            let status = if incumbents > 0 {
-                "FEASIBLE"
-            } else {
-                "UNKNOWN"
-            };
-            (format!("c stopped: {e}\ns {status}\n"), 0)
-        }
-    };
-    write_block(out, &text).context("writing the final status to stdout")?;
-    Ok(code)
+    let (end, written) = sparse::solve_sparse(&exact, time_limit, out)?;
+    sparse_status(end, written, out)
 }
 
 fn resolve_format(file: &Path, input: &str, forced: Option<&str>) -> Result<InputFormat> {
@@ -278,8 +235,9 @@ fn canonical_lines(sense: Sense, variables: usize, constraints: usize, integers:
 }
 
 /// Prints the final status of a sparse solve and returns the exit code
-/// (the codes of [`run`]; a stop without a proof exits 0, see
-/// [`final_status`]).
+/// (the codes of [`run`]): a stop without a confirmed verdict is not an
+/// error of the run; it ends `s FEASIBLE` when a checked point was written
+/// (that block is the answer) and `s UNKNOWN` otherwise, and exits 0.
 fn sparse_status(end: sparse::SparseEnd, written: usize, out: &mut dyn Write) -> Result<i32> {
     let (line, code) = match end {
         sparse::SparseEnd::Optimal => ("s OPTIMAL\n", 0),
@@ -289,20 +247,6 @@ fn sparse_status(end: sparse::SparseEnd, written: usize, out: &mut dyn Write) ->
     };
     write_block(out, line).context("writing the final status to stdout")?;
     Ok(code)
-}
-
-/// One `o <objective>` line, a `v <name> = <value>` line per variable
-/// (`{}` prints each `f64` with full round-trip precision), and the block's
-/// end line ([`block_end`]).
-fn solution_block(problem: &Problem, sol: &Solution) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::new();
-    let _ = writeln!(text, "o {}", sol.objective);
-    for (var, &val) in problem.variables.iter().zip(sol.values.iter()) {
-        let _ = writeln!(text, "v {} = {}", var.name, val);
-    }
-    text.push_str(&block_end(problem.variables.len()));
-    text
 }
 
 /// The line that ends a solution block of `values` `v` lines:
@@ -377,9 +321,7 @@ End"
         assert_eq!(code, 0);
     }
 
-    fn knapsack() -> Problem {
-        parse_lp(
-            "Maximize
+    const KNAPSACK_LP: &str = "Maximize
  3 x + 4 y
 Subject To
  cap: 2 x + 3 y <= 6
@@ -388,60 +330,60 @@ Bounds
  0 <= y <= 2
 General
  x y
-End",
-        )
-        .expect("parse")
+End
+";
+
+    /// Runs `ay lp solve` on `text` as a file with `suffix` and a 60 s
+    /// limit: (exit code, stdout, or the parse error).
+    fn solve_text(text: &str, suffix: &str) -> (Result<i32, String>, String) {
+        let mut f = tempfile::Builder::new()
+            .suffix(suffix)
+            .tempfile()
+            .expect("tmp");
+        f.write_all(text.as_bytes()).expect("write");
+        let mut out: Vec<u8> = Vec::new();
+        let code = run_solve(f.path(), None, Some(Duration::from_secs(60)), &mut out)
+            .map_err(|e| format!("{e:#}"));
+        (code, String::from_utf8(out).expect("utf8"))
     }
 
-    /// Each incumbent is written as one complete `o`/`v` block before the
-    /// final status, so a run stopped part-way leaves its last checked point.
+    /// Each checked point is written as one complete `o`/`v` block before
+    /// the final status; the optimum of an LP-format file is confirmed on
+    /// the exact model like that of an MPS file.
     #[test]
     fn test_incumbent_blocks_precede_final_status() {
-        let problem = knapsack();
-        let mut out: Vec<u8> = Vec::new();
-        let (result, incumbents) = solve_reporting_incumbents(&problem, &mut out).expect("solve");
-        assert!(incumbents >= 1);
-        let code = final_status(&problem, &result, incumbents, &mut out).expect("status");
-        assert_eq!(code, 0);
-        let text = String::from_utf8(out).expect("utf8");
-        let first_o = text.find("o ").expect("o line");
+        let (code, text) = solve_text(KNAPSACK_LP, ".lp");
+        assert_eq!(code, Ok(0), "{text}");
+        let first_o = text.find("\no ").expect("o line");
         let status = text.find("s OPTIMAL").expect("status");
         assert!(first_o < status, "{text}");
         assert!(
-            text.ends_with("o 8\nv x = 0\nv y = 2\nc solution end 2\n"),
+            text.contains("o 8\nv x = 0\nv y = 2\nc solution end 2\nc optimal: "),
             "{text}"
         );
+        assert!(text.ends_with("s OPTIMAL\n"), "{text}");
     }
 
-    /// AY-N6: a solve that stops without a conclusion ends with a status
-    /// line and exit 0 instead of an error: `s UNKNOWN` without an incumbent,
-    /// `s FEASIBLE` after one (whose block is the answer).
+    /// AY-N6: a solve that stops without a confirmed verdict ends with a
+    /// status line and exit 0 instead of an error: `s UNKNOWN` without a
+    /// written point, `s FEASIBLE` after one (whose block is the answer).
     #[test]
     fn test_stopped_solve_reports_unknown_or_feasible() {
-        let problem = knapsack();
-        let stopped: Result<Solution, ay_lp::LpError> =
-            Err(ay_lp::LpError::ResourceLimit("too big".into()));
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            final_status(&problem, &stopped, 0, &mut out).expect("status"),
+            sparse_status(sparse::SparseEnd::Stopped, 0, &mut out).expect("status"),
             0
         );
-        assert_eq!(
-            String::from_utf8(out).expect("utf8"),
-            "c stopped: resource limit: too big\ns UNKNOWN\n"
-        );
+        assert_eq!(String::from_utf8(out).expect("utf8"), "s UNKNOWN\n");
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            final_status(&problem, &stopped, 2, &mut out).expect("status"),
+            sparse_status(sparse::SparseEnd::Stopped, 2, &mut out).expect("status"),
             0
         );
-        assert!(String::from_utf8(out)
-            .expect("utf8")
-            .ends_with("s FEASIBLE\n"));
+        assert_eq!(String::from_utf8(out).expect("utf8"), "s FEASIBLE\n");
         let mut out: Vec<u8> = Vec::new();
-        let infeasible: Result<Solution, ay_lp::LpError> = Err(ay_lp::LpError::Infeasible);
         assert_eq!(
-            final_status(&problem, &infeasible, 0, &mut out).expect("status"),
+            sparse_status(sparse::SparseEnd::Infeasible, 0, &mut out).expect("status"),
             10
         );
     }
@@ -486,18 +428,8 @@ End",
         }
     }
 
-    /// Runs `ay lp solve` on `text` as an `.mps` file with a 60 s limit:
-    /// (exit code, stdout, or the parse error).
     fn solve_mps(text: &str) -> (Result<i32, String>, String) {
-        let mut f = tempfile::Builder::new()
-            .suffix(".mps")
-            .tempfile()
-            .expect("tmp");
-        f.write_all(text.as_bytes()).expect("write");
-        let mut out: Vec<u8> = Vec::new();
-        let code = run_solve(f.path(), None, Some(Duration::from_secs(60)), &mut out)
-            .map_err(|e| format!("{e:#}"));
-        (code, String::from_utf8(out).expect("utf8"))
+        solve_text(text, ".mps")
     }
 
     /// The last `o`/`v` block of `text`, `o` line first.
@@ -654,11 +586,7 @@ End",
     /// it, takes a cut block as the answer.)
     #[test]
     fn test_a_cut_block_is_never_taken_for_an_answer() {
-        let problem = knapsack();
-        let mut out: Vec<u8> = Vec::new();
-        let (result, incumbents) = solve_reporting_incumbents(&problem, &mut out).expect("solve");
-        final_status(&problem, &result, incumbents, &mut out).expect("status");
-        let text = String::from_utf8(out).expect("utf8");
+        let (_, text) = solve_text(KNAPSACK_LP, ".lp");
         assert!(text.contains("c solution end 2\n"), "{text}");
         let blocks: Vec<(String, Vec<String>)> = format!("\n{text}")
             .split("\no ")
@@ -687,5 +615,113 @@ End",
         }
         assert!(cut_taken_the_old_way > 0);
         assert_eq!(complete_answer(&text).map(|a| a.0), Some("8".to_string()));
+    }
+
+    /// AY-N12: the six AY-N11 models written in CPLEX LP format, with the
+    /// witness each must end with. ay's main read LP numbers as `f64` and
+    /// printed the dense simplex's `s INFEASIBLE` on all six.
+    const SIX_LP: [(&str, &str, &str); 6] = [
+        (
+            "bound-loss",
+            "Minimize\n obj: 0 X\nSubject To\n MATCH: X + Y = 1\nBounds\n X = 9007199254740993\n Y = -9007199254740992\nEnd\n",
+            "o 0\nv X = 9007199254740993\nv Y = -9007199254740992\n",
+        ),
+        (
+            "rhs-loss",
+            "Minimize\n obj: 0 X\nSubject To\n MATCH: X + Y = 9007199254740993\nBounds\n X = 9007199254740992\n Y = 1\nEnd\n",
+            "o 0\nv X = 9007199254740992\nv Y = 1\n",
+        ),
+        (
+            "range-sum-loss",
+            "Minimize\n obj: 0 X\nSubject To\n MATCH: X + Y >= 9007199254740992\n MATCH_rng: X + Y <= 9007199254740993\nBounds\n X = 9007199254740992\n Y = 1\nEnd\n",
+            "o 0\nv X = 9007199254740992\nv Y = 1\n",
+        ),
+        (
+            "coefficient-sum-loss",
+            "Minimize\n obj: 0 X\nSubject To\n MATCH: 9007199254740992 X + X - 9007199254740992 Y = 1\nBounds\n X = 1\n Y = 1\nEnd\n",
+            "o 0\nv X = 1\nv Y = 1\n",
+        ),
+        (
+            "decimal-exponent-loss",
+            "Minimize\n obj: 0 X\nSubject To\n MATCH: 9.007199254740993e15 X - 9007199254740992 Y = 1\nBounds\n X = 1\n Y = 1\nEnd\n",
+            "o 0\nv X = 1\nv Y = 1\n",
+        ),
+        (
+            "cancel-sat",
+            "Minimize\n obj: X\nSubject To\n MATCH: 9007199254740993 X - 9007199254740992 Y = 1\nBounds\n X = 1\n Y = 1\nEnd\n",
+            "o 1\nv X = 1\nv Y = 1\n",
+        ),
+    ];
+
+    /// `cancel-bad` in LP format: infeasible (activity 1, side 0); main
+    /// printed `o 1` and `s OPTIMAL`.
+    const CANCEL_BAD_LP: &str = "Minimize\n obj: X\nSubject To\n MATCH: 9007199254740993 X - 9007199254740992 Y = 0\nBounds\n X = 1\n Y = 1\nEnd\n";
+
+    /// AY-N12: the six LP files end `s OPTIMAL` with their witness, and
+    /// `cancel-bad` ends `s INFEASIBLE` without a point.
+    #[test]
+    fn test_six_exactly_feasible_lp_files_are_solved_not_called_infeasible() {
+        for (name, text, block) in SIX_LP {
+            let (code, out) = solve_text(text, ".lp");
+            assert_eq!(code, Ok(0), "{name}\n{out}");
+            assert!(out.ends_with("s OPTIMAL\n"), "{name}\n{out}");
+            assert_eq!(last_block(&out), block, "{name}\n{out}");
+        }
+        let (code, out) = solve_text(CANCEL_BAD_LP, ".lp");
+        assert!(!out.contains("\no "), "{out}");
+        assert_eq!(code, Ok(10), "{out}");
+        assert!(out.ends_with("s INFEASIBLE\n"), "{out}");
+    }
+
+    /// AY-N12: LP input gets no verdict the exact route cannot confirm, and
+    /// constructs readers disagree on are refused before anything is
+    /// printed.
+    #[test]
+    fn test_lp_constructs_readers_disagree_on_get_no_verdict() {
+        for (name, text) in [
+            (
+                "binary with bounds",
+                "Maximize\n x\nBounds\n x >= 2\nBinary\n x\nEnd\n",
+            ),
+            (
+                "negative upper bound",
+                "Minimize\n x\nBounds\n x <= -1\nEnd\n",
+            ),
+            (
+                "bound in [1e20, 1e30)",
+                "Maximize\n x\nBounds\n x <= 1e25\nEnd\n",
+            ),
+            ("no End", "Minimize\n x\nSubject To\n c: x >= 1\n"),
+            (
+                "semi-continuous",
+                "Minimize\n x\nSubject To\n c: x >= 1\nSemi-continuous\n x\nEnd\n",
+            ),
+        ] {
+            let (code, out) = solve_text(text, ".lp");
+            assert!(code.is_err(), "{name}: {code:?}\n{out}");
+            assert!(!out.contains("s "), "{name}: {out}");
+        }
+    }
+
+    /// The z3-compatible `-lp` transcript comes from the same confirmed
+    /// route: `sat` with the exact optimum, `unsat` only when confirmed.
+    #[test]
+    fn test_z3_lp_transcript_is_confirmed_exactly() {
+        let transcript = |text: &str, model: bool| {
+            let mut out: Vec<u8> = Vec::new();
+            let code = z3_transcript(text, model, false, &mut out).expect("transcript");
+            assert_eq!(code, 0);
+            String::from_utf8(out).expect("utf8")
+        };
+        assert_eq!(transcript(SIX_LP[0].1, false), "sat\n   0\n");
+        assert_eq!(
+            transcript(SIX_LP[5].1, true),
+            "sat\n(define-fun X () Real\n  1.0)\n(define-fun Y () Real\n  1.0)\n   1\n"
+        );
+        assert_eq!(transcript(CANCEL_BAD_LP, false), "unsat\n");
+        assert_eq!(
+            transcript("minimize\nx\nsubject to\nx >= 2\nend\n", false),
+            "sat\n   2\n"
+        );
     }
 }

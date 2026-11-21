@@ -455,7 +455,7 @@ impl Executor {
         }
 
         // Freeze proof authority before ANY semantic preprocessing. The
-        // post-merge snapshot below is only solver-state restoration data;
+        // restoration snapshot below is only solver-state restoration data;
         // merged binder towers, finite-domain expansions, Skolem bodies, and
         // every later replacement must be derived rather than whitelisted as
         // authored Assumes.
@@ -468,18 +468,32 @@ impl Executor {
             return rewritten;
         }
 
-        // 1a2. (#defn-fold-under-forall) BEFORE the original_assertions snapshot.
+        // A genuine native source keeps its pre-offer restoration data;
+        // other source routes retain their original post-fold snapshot path.
+        let native_source_preimage = self.native_source_offer_restoration_preimage();
+        if native_source_preimage.is_some() {
+            // Derive guarded consequences while the exact raw quantified
+            // originals are still present. Every inserted unit already has an
+            // independently authenticated source proof. Ordinary publication
+            // and full-original model validation remain in charge.
+            let _ = self.offer_native_quantified_source_units();
+        }
+
+        // 1a2. (#defn-fold-under-forall) BEFORE the post-fold snapshot.
         self.fold_ground_definitions_into_universals();
 
         // 1b. (#p2-nested-forall) Merge directly nested same-polarity binder
-        // towers (`∀x.∀y.B ⇒ ∀x,y.B`, alpha-renamed) BEFORE the
-        // original_assertions snapshot, so every downstream snapshot /
-        // CE-lemma / support-axiom artifact sees one consistent flattened
-        // term. Detect-before-mint: byte-identical no-op on non-tower inputs.
+        // towers (`∀x.∀y.B ⇒ ∀x,y.B`, alpha-renamed) BEFORE the ordinary
+        // restoration snapshot. Native source offers keep their earlier
+        // pre-transform restoration data. Downstream working clauses use the
+        // flattened term. Detect-before-mint: no-op on non-tower inputs.
         self.merge_adjacent_universals();
 
-        // 2. Snapshot assertions for post-solve restoration (#2844).
-        let original_assertions = Some(self.ctx.assertions.clone());
+        // 2. Snapshot assertions for post-solve restoration (#2844). Source
+        // offers preserve their earlier original working window; all other
+        // routes retain the existing post-merge working restoration window.
+        let original_assertions =
+            Some(native_source_preimage.unwrap_or_else(|| self.ctx.assertions.clone()));
 
         // Detect universal quantifiers whose binders include sorts MBQI
         // cannot synthesize (Array, FP, Seq, RegLan). These require either

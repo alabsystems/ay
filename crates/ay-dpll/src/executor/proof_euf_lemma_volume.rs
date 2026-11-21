@@ -17,6 +17,7 @@ const MAX_PROMOTION_TEXT_BYTES: usize = 8 * 1024 * 1024;
 pub(super) struct PromotionPreflight {
     pub(super) reachable: Vec<bool>,
     pub(super) input_volume: usize,
+    pub(super) owned_text_bytes: usize,
 }
 
 fn spend_bounded(total: &mut usize, amount: usize, limit: usize) -> Option<()> {
@@ -28,14 +29,40 @@ fn spend_bounded(total: &mut usize, amount: usize, limit: usize) -> Option<()> {
 /// proof-owned vector or string. Reachability is computed in the same pass so
 /// a wide/repeated premise list cannot bypass the aggregate edge cap.
 pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
+    preflight_promotion_impl(proof, None)
+}
+
+/// The owned native route uses its SAME original repair owner, including each
+/// repeated physical premise edge. Header-length inspection never substitutes
+/// for the later traversal debit. Borrowed callers keep their existing fees.
+pub(super) fn preflight_promotion_with_progress(
+    proof: &Proof,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Option<PromotionPreflight> {
+    preflight_promotion_impl(proof, Some(progress))
+}
+
+fn tick(progress: &mut Option<&mut dyn FnMut(usize) -> bool>, work: usize) -> Option<()> {
+    if progress.as_mut().is_some_and(|pay| !pay(work)) {
+        None
+    } else {
+        Some(())
+    }
+}
+
+fn preflight_promotion_impl(
+    proof: &Proof,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Option<PromotionPreflight> {
     let step_count = proof.steps.len();
-    if step_count > MAX_PROMOTION_STEPS
-        || proof
-            .steps
-            .iter()
-            .any(|step| matches!(step, ProofStep::Anchor { .. }))
-    {
+    if step_count > MAX_PROMOTION_STEPS {
         return None;
+    }
+    for step in &proof.steps {
+        tick(&mut progress, 1)?;
+        if matches!(step, ProofStep::Anchor { .. }) {
+            return None;
+        }
     }
 
     // Count the `steps` allocation itself in addition to every owned child
@@ -43,6 +70,7 @@ pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
     let mut input_volume = step_count;
     let mut text_bytes = 0usize;
     for step in &proof.steps {
+        tick(&mut progress, 1)?;
         let admitted = match step {
             ProofStep::Assume(_) => Some(()),
             ProofStep::Resolution { clause, .. } => spend_bounded(
@@ -105,7 +133,12 @@ pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
         };
         admitted?;
     }
+    tick(
+        &mut progress,
+        proof.named_steps.allocation_size().saturating_add(1),
+    )?;
     for name in proof.named_steps.keys() {
+        tick(&mut progress, 1)?;
         // Invalid/non-Assume ids are intentionally admitted here: the
         // promoter's post-rebuild retain pass has always sanitized them.
         // Preflight owns only their allocation/work bound, not their proof
@@ -117,6 +150,7 @@ pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
     let mut reachable = vec![false; step_count];
     let mut stack = Vec::new();
     for (index, step) in proof.steps.iter().enumerate() {
+        tick(&mut progress, 1)?;
         let derives_empty = match step {
             ProofStep::Resolution { clause, .. }
             | ProofStep::TheoryLemma { clause, .. }
@@ -131,7 +165,9 @@ pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
     }
     let mut edge_work = 0usize;
     while let Some(index) = stack.pop() {
+        tick(&mut progress, 1)?;
         let mut mark = |premise: ProofId| -> Option<()> {
+            tick(&mut progress, 1)?;
             let premise = premise.0 as usize;
             if premise >= step_count {
                 return None;
@@ -162,6 +198,7 @@ pub(super) fn preflight_promotion(proof: &Proof) -> Option<PromotionPreflight> {
     Some(PromotionPreflight {
         reachable,
         input_volume,
+        owned_text_bytes: text_bytes,
     })
 }
 
@@ -310,12 +347,14 @@ mod tests {
         let mut proof = Proof::new();
         executor.emit_euf_lemma(&mut proof, &bare);
         assert!(clause_volume(&proof) <= bare.emitted_literal_volume().unwrap());
+        assert!(proof.steps.len() <= bare.emitted_literal_volume().unwrap());
 
         let or_term = executor.ctx.terms.mk_or(clause.to_vec());
         let wrapped = executor.plan_euf_lemma(&[or_term]).expect("or-unit recipe");
         let mut proof = Proof::new();
         executor.emit_euf_lemma(&mut proof, &wrapped);
         assert!(clause_volume(&proof) <= wrapped.emitted_literal_volume().unwrap());
+        assert!(proof.steps.len() <= wrapped.emitted_literal_volume().unwrap());
     }
 
     #[test]
@@ -337,6 +376,7 @@ mod tests {
         let preflight = PromotionPreflight {
             reachable: vec![true; plans.len()],
             input_volume: 0,
+            owned_text_bytes: 0,
         };
         assert!(promotion_output_within(&preflight, &plans, emitted * 2));
         assert!(!promotion_output_within(

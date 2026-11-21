@@ -22,7 +22,7 @@ impl CpContext {
     ///
     /// - Constant × variable: direct LinearEq
     /// - Variable × variable with small domains: Table constraint
-    /// - Otherwise: unsupported
+    /// - Otherwise: the `Times` bounds propagator
     pub(super) fn translate_int_times(&mut self, c: &ConstraintItem) -> Result<()> {
         let a_const = self.eval_const_int(&c.args[0]);
         let b_const = self.eval_const_int(&c.args[1]);
@@ -64,7 +64,12 @@ impl CpContext {
                         tuples,
                     });
                 } else {
-                    self.mark_unsupported("int_times");
+                    // Above the table size: bounds propagation, any domain.
+                    self.engine.add_constraint(Constraint::Times {
+                        x: a,
+                        y: b,
+                        result: r,
+                    });
                 }
             }
         }

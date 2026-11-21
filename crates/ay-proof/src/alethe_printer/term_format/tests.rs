@@ -259,3 +259,110 @@ fn streaming_does_not_hide_expanded_output_exhaustion() {
     );
     assert!(printer.check_emission_progress(0).is_err());
 }
+
+#[test]
+fn bounded_channel_copy_refuses_override_skolem_bridge_and_cache_before_copying() {
+    let mut terms = TermStore::new();
+    let variable = terms.mk_var("x", Sort::Int);
+    let huge = "oversized_payload".repeat(65_536);
+    for channel in 0..4 {
+        let overrides = HashMap::from_iter([(variable, huge.clone())]);
+        let printer = AlethePrinter::new_with_overrides_and_budget(
+            &terms,
+            (channel == 0).then_some(&overrides),
+            Some(64),
+        );
+        match channel {
+            1 => {
+                printer
+                    .skolem_overrides
+                    .borrow_mut()
+                    .insert(variable, huge.clone());
+            }
+            2 => {
+                printer
+                    .let_bridge_renderings
+                    .borrow_mut()
+                    .insert(variable, huge.clone());
+            }
+            3 => {
+                printer
+                    .format_cache
+                    .borrow_mut()
+                    .insert(variable, huge.clone());
+            }
+            _ => {}
+        }
+        let text = printer.format_term(variable);
+        assert!(printer.work_budget_exhausted());
+        assert!(
+            text.len() < 64 && text.capacity() < 128,
+            "channel {channel} copied oversized bytes"
+        );
+        assert!(!text.contains("oversized_payload"));
+    }
+}
+
+#[test]
+fn bounded_derived_negation_does_not_clone_an_oversized_inner_bridge() {
+    let mut terms = TermStore::new();
+    let predicate = terms.mk_var("p", Sort::Bool);
+    let negation = terms.mk_not_raw(predicate);
+    let printer = AlethePrinter::new_with_overrides_and_budget(&terms, None, Some(64));
+    printer
+        .let_bridge_renderings
+        .borrow_mut()
+        .insert(predicate, "large".repeat(200_000));
+    let text = printer.format_derived_literal(negation);
+    assert!(printer.work_budget_exhausted());
+    assert!(text.len() < 64 && text.capacity() < 128);
+    assert!(!text.contains("large"));
+}
+
+#[test]
+fn explicit_unbounded_rendering_keeps_the_requested_channel_bytes() {
+    let mut terms = TermStore::new();
+    let variable = terms.mk_var("x", Sort::Int);
+    let huge = "unbounded_payload".repeat(8_192);
+    let overrides = HashMap::from_iter([(variable, huge.clone())]);
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+    assert_eq!(printer.format_term(variable), huge);
+    assert!(!printer.work_budget_exhausted());
+}
+
+#[test]
+fn bounded_channel_copy_polls_without_a_borrow_and_rejects_changed_admission() {
+    let mut terms = TermStore::new();
+    let variable = terms.mk_var("x", Sort::Int);
+    let channel = std::cell::RefCell::new(HashMap::from_iter([(variable, "small".into())]));
+    let mut changed = false;
+    let mut progress = || {
+        if !changed {
+            channel
+                .borrow_mut()
+                .insert(variable, "late_large".repeat(100_000));
+            changed = true;
+        }
+        true
+    };
+    let printer = AlethePrinter::new_with_overrides_and_budget(&terms, None, Some(u64::MAX))
+        .with_emission_progress(&mut progress);
+    let mut out = String::new();
+    assert!(printer.write_rendering_channel_into(&mut out, variable, &channel, "", ""));
+    assert!(printer.work_budget_exhausted());
+    assert!(out.len() < 64 && out.capacity() < 128);
+}
+
+#[test]
+fn bounded_channel_copy_preserves_caller_cancellation_before_copy() {
+    let mut terms = TermStore::new();
+    let variable = terms.mk_var("x", Sort::Int);
+    let channel = std::cell::RefCell::new(HashMap::from_iter([(variable, "not_emitted".into())]));
+    let mut progress = || false;
+    let printer = AlethePrinter::new_with_overrides_and_budget(&terms, None, Some(1024))
+        .with_emission_progress(&mut progress);
+    let mut out = String::new();
+    assert!(printer.write_rendering_channel_into(&mut out, variable, &channel, "", ""));
+    assert!(printer.emission_progress.refused());
+    assert!(!out.contains("not_emitted"));
+}

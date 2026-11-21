@@ -3,7 +3,7 @@
 
 //! Complete admission precedes construction, including unreachable nodes.
 
-use super::super::{cell, key, scalar_cost};
+use super::super::{array_key, cell, scalar_cost, supported_sort};
 use super::{
     ArraySnapshot, ArrayValue, Budget, FunctionalArrayError, ModelValue, Node, SnapshotKind,
     SnapshotNode, Sort, MAX_NODES,
@@ -84,17 +84,38 @@ pub(super) fn validate_export(
             budget.storage(backing)?;
             scalar(&value.default, element, budget)?;
             for (index, datum) in &value.store {
-                index_value(index, budget)?;
+                index_value(index, description.sort, budget)?;
                 scalar(datum, element, budget)?;
             }
         }
+        SnapshotKind::Periodic(values) => {
+            if !matches!(description.sort, Sort::Array(sort) if sort.index_sort == Sort::Int)
+                || values.is_empty()
+            {
+                return Err(FunctionalArrayError::Sort);
+            }
+            budget.stores(values.len())?;
+            budget.storage(
+                values
+                    .len()
+                    .checked_mul(size_of::<ModelValue>())
+                    .ok_or(FunctionalArrayError::Resource)?,
+            )?;
+            for value in values {
+                scalar(value, element, budget)?;
+            }
+        }
         SnapshotKind::Store { index, value, .. } => {
-            index_value(index, budget)?;
+            index_value(index, description.sort, budget)?;
             scalar(value, element, budget)?;
         }
         SnapshotKind::Range {
             lo, hi, source_lo, ..
         } => {
+            if !matches!(description.sort, Sort::Array(sort) if matches!(&sort.index_sort, Sort::BitVec(index) if index.width == 64))
+            {
+                return Err(FunctionalArrayError::Sort);
+            }
             for bound in [lo, hi, source_lo] {
                 budget.storage(8)?;
                 if bound.is_negative() || bound.bits() > 64 {
@@ -110,8 +131,7 @@ fn element_sort(sort: &Sort) -> Result<&Sort, FunctionalArrayError> {
     let Sort::Array(array) = sort else {
         return Err(FunctionalArrayError::Sort);
     };
-    if !matches!(&array.index_sort, Sort::BitVec(width) if width.width == 64)
-        || !matches!(&array.element_sort, Sort::Bool | Sort::BitVec(_))
+    if !supported_sort(sort)
         || matches!(&array.element_sort, Sort::BitVec(width) if width.width == 0)
     {
         return Err(FunctionalArrayError::Sort);
@@ -131,10 +151,11 @@ fn scalar(
 
 fn index_value(
     value: &ModelValue,
+    sort: &Sort,
     budget: &mut Budget<'_, '_>,
 ) -> Result<(), FunctionalArrayError> {
-    budget.storage(8)?;
-    key(value).map(|_| ())
+    budget.storage(scalar_cost(value)?)?;
+    array_key(value, sort).map(|_| ())
 }
 
 fn parent_depth(
@@ -168,7 +189,7 @@ fn depth(
     budget: &mut Budget<'_, '_>,
 ) -> Result<usize, FunctionalArrayError> {
     let previous = match node.kind {
-        SnapshotKind::Finite(_) => 0,
+        SnapshotKind::Finite(_) | SnapshotKind::Periodic(_) => 0,
         SnapshotKind::Store { base, .. } => {
             parent_depth(base, index, node.sort, nodes, depths, budget)?
         }
@@ -211,6 +232,17 @@ fn copy_node(
                 default: value.default.clone(),
                 store,
             }))
+        }
+        SnapshotKind::Periodic(values) => {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(values.len())
+                .map_err(|_| FunctionalArrayError::Allocation)?;
+            for value in values {
+                budget.poll()?;
+                owned.push(value.clone());
+            }
+            Ok(Node::Periodic(owned))
         }
         SnapshotKind::Store { base, index, value } => Ok(Node::Store {
             base: get(base)?,

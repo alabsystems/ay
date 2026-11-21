@@ -13,6 +13,7 @@ Solve — decide, enumerate, count, simplify.
 Prove & trust — certificates in, certificates out.
   check         Verify DRAT/LRAT/DPR/SR/VeriPB proofs and SAT models
   diagnose      Diagnose a wrong answer: validate, cross-check z3, explain
+  proof         Where proofs go: every name ay writes beside an input
 
 Formats — native front ends beyond SMT-LIB.
   maxsat        MaxSAT solving

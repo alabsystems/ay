@@ -93,17 +93,30 @@ impl TermStore {
         hash: u64,
         term: &TermData,
         sort: &Sort,
+        comparison_work: usize,
         admission: &mut Admission<'_>,
     ) -> Result<BucketPlan> {
         self.controlled_probe_fee(admission)?;
         let bucket = self.hash_cons.get(&hash);
         if let Some(ids) = bucket {
             for &id in ids {
-                admission.pay(256, 0)?;
+                // Integer payload and recursive requested-sort equality are
+                // both included in the caller's admitted comparison bound.
+                admission.pay(comparison_work, 0)?;
                 let entry = self
                     .terms
                     .get(id.index())
                     .ok_or(ControlledTermInternError::InvalidInput)?;
+                if let (
+                    TermData::Const(Constant::Rational(requested)),
+                    TermData::Const(Constant::Rational(stored)),
+                ) = (term, &entry.term)
+                {
+                    // Ratio equality may divide arbitrary-precision operands;
+                    // byte equality pricing alone does not bound that work.
+                    super::rational::admit(&requested.0, admission)?;
+                    super::rational::admit(&stored.0, admission)?;
+                }
                 if &entry.term == term && &entry.sort == sort {
                     return Ok(BucketPlan {
                         existing: Some(id),
@@ -198,8 +211,7 @@ impl TermStore {
         }
     }
 
-    pub(super) fn controlled_credit(&mut self, bucket: usize) -> Result<Credit> {
-        let heap = 4096usize;
+    pub(super) fn controlled_credit(&mut self, heap: usize, bucket: usize) -> Result<Credit> {
         let inline = size_of::<TermEntry>();
         let total = inline
             .checked_add(heap)

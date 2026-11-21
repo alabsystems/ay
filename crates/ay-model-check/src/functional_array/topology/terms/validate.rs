@@ -11,8 +11,7 @@ pub(super) fn element(sort: &Sort) -> Result<&Sort> {
     let Sort::Array(array) = sort else {
         return Err(SnapshotTermError::UnsupportedSort);
     };
-    if !matches!(&array.index_sort, Sort::BitVec(width) if width.width == 64)
-        || !matches!(&array.element_sort, Sort::Bool | Sort::BitVec(_))
+    if !crate::functional_array::supported_sort(sort)
         || matches!(&array.element_sort, Sort::BitVec(width) if !(1..=128).contains(&width.width))
     {
         return Err(SnapshotTermError::UnsupportedSort);
@@ -44,8 +43,27 @@ pub(super) fn complete(
                     .ok_or(SnapshotTermError::ResourceLimit)?;
                 scalar(&value.default, element, admission)?;
                 for (key, datum) in &value.store {
-                    scalar(key, &Sort::bitvec(64), admission)?;
+                    scalar(key, index_sort(node.sort)?, admission)?;
                     scalar(datum, element, admission)?;
+                }
+            }
+            SnapshotKind::Periodic(values) => {
+                if index_sort(node.sort)? != &Sort::Int || values.is_empty() {
+                    return Err(SnapshotTermError::InvalidTopology);
+                }
+                stores = stores
+                    .checked_add(values.len())
+                    .filter(|n| *n <= super::super::MAX_STORES)
+                    .ok_or(SnapshotTermError::ResourceLimit)?;
+                admission.pay(
+                    values
+                        .len()
+                        .checked_mul(std::mem::size_of::<ModelValue>())
+                        .ok_or(SnapshotTermError::ResourceLimit)?,
+                    0,
+                )?;
+                for value in values {
+                    scalar(value, element, admission)?;
                 }
             }
             SnapshotKind::Store {
@@ -54,7 +72,7 @@ pub(super) fn complete(
                 value,
             } => {
                 previous = parent(base, index, node.sort, topology, &depths, admission)?;
-                scalar(key, &Sort::bitvec(64), admission)?;
+                scalar(key, index_sort(node.sort)?, admission)?;
                 scalar(value, element, admission)?;
             }
             SnapshotKind::Range {
@@ -64,6 +82,9 @@ pub(super) fn complete(
                 hi,
                 source_lo,
             } => {
+                if !matches!(index_sort(node.sort)?, Sort::BitVec(width) if width.width == 64) {
+                    return Err(SnapshotTermError::UnsupportedSort);
+                }
                 let left = parent(destination, index, node.sort, topology, &depths, admission)?;
                 let right = parent(source, index, node.sort, topology, &depths, admission)?;
                 previous = left.max(right);
@@ -106,10 +127,22 @@ fn parent(
         .ok_or(SnapshotTermError::InvalidTopology)
 }
 
+fn index_sort(sort: &Sort) -> Result<&Sort> {
+    match sort {
+        Sort::Array(array) => Ok(&array.index_sort),
+        _ => Err(SnapshotTermError::UnsupportedSort),
+    }
+}
+
 fn scalar(value: &ModelValue, sort: &Sort, admission: &mut Admission<'_>) -> Result<()> {
     admission.pay(64, 0)?;
     match (value, sort) {
         (ModelValue::Bool(_), Sort::Bool) => Ok(()),
+        (ModelValue::Int(value), Sort::Int) => {
+            let bytes = usize::try_from(value.bits().max(1).div_ceil(8))
+                .map_err(|_| SnapshotTermError::ResourceLimit)?;
+            admission.pay(bytes, bytes)
+        }
         (ModelValue::BitVec { value, width }, Sort::BitVec(sort)) if *width == sort.width => {
             unsigned(value, *width, admission)
         }

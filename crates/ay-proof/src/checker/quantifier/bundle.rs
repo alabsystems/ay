@@ -59,6 +59,63 @@ pub(crate) fn validate_sko_forall_uniqueness_with_progress(
     poll(progress)
 }
 
+/// The live registry authenticates witness provenance, but does not prove
+/// freshness against the original problem. Premise producers owe both.
+pub(crate) fn validate_registered_skolem_source_scope_with_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    poll(progress)?;
+    let bindings = collect_skolem_bindings(
+        proof,
+        terms,
+        SkolemWitnessAuthority::TermStoreRegistry,
+        progress,
+    )?;
+    if bindings.is_empty() {
+        return poll(progress);
+    }
+    let mut registry_work = 0usize;
+    let registry = {
+        let mut meter =
+            QuantifierMeter::new(ProofId(0), "sko_forall", &mut registry_work, progress);
+        // There is no serialized declaration namespace on this live API.
+        // The actual arena and full original roots remain mandatory below.
+        let declared = HashMap::default();
+        let registry = build_bundle_registry(&bindings, &declared, &mut meter)?;
+        validate_global_name_freshness(terms, &registry, &mut meter)?;
+        registry
+    };
+    let mut problem_work = 0usize;
+    validate_problem_freshness(
+        proof,
+        terms,
+        problem_assertions,
+        &registry,
+        &mut QuantifierMeter::new(
+            registry.fallback_step,
+            "sko_forall",
+            &mut problem_work,
+            progress,
+        ),
+    )?;
+    let mut dependency_work = 0usize;
+    validate_acyclic_dependencies(
+        terms,
+        &bindings,
+        &registry,
+        &mut QuantifierMeter::new(
+            registry.fallback_step,
+            "sko_forall",
+            &mut dependency_work,
+            progress,
+        ),
+    )?;
+    poll(progress)
+}
+
 /// Compatibility wrapper for content-authenticated offline Skolem authority.
 #[cfg(test)]
 pub(crate) fn authenticate_bundle_skolems(

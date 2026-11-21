@@ -15,6 +15,53 @@
 use super::*;
 
 impl Executor {
+    /// Install QMC's closed array-valued constant functions into a staged
+    /// model. The caller has checked the substituted quantified obligations;
+    /// it still validates the original residual after this installation.
+    /// Existing certified packages are not replaced by this candidate.
+    pub(in crate::executor) fn install_model_check_array_defaults(
+        &self,
+        model: &mut Model,
+        defaults: Vec<(Symbol, Vec<Sort>, Sort, TermId)>,
+    ) -> Option<()> {
+        if !model.certified_const_interp_entries().is_empty()
+            || model.residual_arrays.is_some()
+            || model.functional_arrays.is_some()
+        {
+            // Those packages have their own read precedence and model-bound
+            // authority. A new constant function must not silently replace
+            // or be shadowed by a previously owned array interpretation.
+            return None;
+        }
+        let mut candidate = model.clone();
+        let mut entries = Vec::with_capacity(defaults.len());
+        for (symbol, parameter_sorts, result_sort, value) in defaults {
+            if !matches!(result_sort, Sort::Array(_)) || parameter_sorts.is_empty() {
+                return None;
+            }
+            let binding = self
+                .ctx
+                .check_projection_declaration(&ay_frontend::ProjectionBindingRequest {
+                    symbol: symbol.clone(),
+                    parameter_sorts,
+                    result_sort,
+                })
+                .ok()?;
+            // QMC chooses a new interpretation of this free function. Remove
+            // the old candidate's raw table, not any certified interpretation.
+            // The certified installer refuses overlapping semantic owners.
+            if let Some(euf) = candidate.euf_model.as_mut() {
+                euf.function_tables.remove(symbol.name());
+                euf.function_table_terms.remove(symbol.name());
+                euf.function_table_conflicts.remove(symbol.name());
+            }
+            entries.push((binding, CertifiedConstInterpWitness::Constant(value)));
+        }
+        candidate.install_certified_const_interps(&self.ctx, entries)?;
+        *model = candidate;
+        Some(())
+    }
+
     /// Whether `value` is a value of `sort` a model-check table may carry.
     pub(in crate::executor) fn model_check_carrier_matches(
         &self,

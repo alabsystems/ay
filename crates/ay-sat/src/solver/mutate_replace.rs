@@ -338,7 +338,7 @@ impl Solver {
         if let Some(new_clause_id) = replacement_clause_id {
             debug_assert!(new_clause_id != 0);
             debug_assert!(clause_idx < self.cold.clause_ids.len());
-            self.cold.clause_ids[clause_idx] = new_clause_id;
+            self.cold.clause_ids.set(clause_idx, new_clause_id);
             // Do NOT advance next_clause_id here (#5239).
             if let Some(trace) = self.live_clause_trace_mut() {
                 trace.add_clause_with_hints(

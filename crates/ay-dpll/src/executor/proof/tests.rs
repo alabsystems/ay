@@ -15,6 +15,8 @@ include!("tests/wire_gap_retry.rs");
 include!("tests/equality_lattice_wire_gap.rs");
 include!("tests/guarded_row_wire_gap.rs");
 include!("tests/arith_equality_chain_wire_gap.rs");
+include!("tests/arith_trichotomy_wire_gap.rs");
+include!("tests/proportional_equality_wire_gap.rs");
 include!("tests/authored_scope.rs");
 include!("tests/finite_enum.rs");
 include!("tests/strict_rebuilds.rs");

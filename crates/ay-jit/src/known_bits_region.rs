@@ -3,8 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! The known-bits region program: the vocabulary shared by the interpreted
-//! region in `ay-bv` and the compiled one emitted by
-//! `external_codegen_ir_emit::emit_known_bits_region_external_codegen_ir`.
+//! region in `ay-bv` and a compiled region, where the build has a backend.
 //!
 //! A region is a cone of bit-vector and Boolean terms in topological order
 //! (every operand index is below its node's index). Its state is two words
@@ -17,8 +16,8 @@
 //! the caller commits the trail as one transaction.
 //!
 //! The semantics of each rule are stated once, in `ay_bv::known_bits::rules`;
-//! the compiled region restates them in external-codegen-ir and is held to them by
-//! differential tests that compare whole trails.
+//! a compiled region is held to them by differential tests that compare whole
+//! trails.
 
 /// One node's operation. Operand fields are node indices below the node's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

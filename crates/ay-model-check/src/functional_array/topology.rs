@@ -23,6 +23,7 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 #[non_exhaustive]
 pub enum SnapshotKind<'a> {
     Finite(&'a ArrayValue),
+    Periodic(&'a [ModelValue]),
     Store {
         base: usize,
         index: &'a ModelValue,
@@ -254,6 +255,7 @@ fn visit<'a>(
     }
     let kind = match &current.node {
         Node::Finite(value) => SnapshotKind::Finite(value),
+        Node::Periodic(values) => SnapshotKind::Periodic(values),
         Node::Store { base, index, value } => SnapshotKind::Store {
             base: visit(base, depth + 1, originals, nodes, budget)?,
             index,

@@ -159,9 +159,13 @@ use crate::executor::Executor;
 /// worst-case retained memory small.
 const STRICT_WALK_MEMO_CAPACITY: usize = 4;
 
-/// Upper bound on a memoized document's payload (steps plus every clause
-/// literal, premise and argument across the proof). Documents past it are
-/// walked normally and simply not stored.
+#[path = "strict_memo/payload.rs"]
+mod payload;
+
+/// Upper bound on retained structural payload, including unused annotations,
+/// strings, sparse named-step capacity, and cloned context/verdict data.
+/// This bounds cache retention only: uncacheable inputs still take the ordinary
+/// bounded checker and receive its unchanged verdict.
 pub(in crate::executor) const STRICT_WALK_MEMO_MAX_PAYLOAD: usize = 16_000_000;
 
 /// One stored strict-check verdict together with EVERY input that produced it.
@@ -240,36 +244,6 @@ fn entry_is_current(
         && entry.proof == *proof
 }
 
-/// Structural payload of `proof`: steps plus every stored id/literal. Linear,
-/// and only computed when a walk finished and might be stored.
-pub(in crate::executor) fn document_payload(proof: &Proof) -> usize {
-    let mut payload = proof.steps.len();
-    for step in &proof.steps {
-        payload = payload.saturating_add(match step {
-            ay_core::ProofStep::Assume(_) => 1,
-            ay_core::ProofStep::Resolution { clause, .. } => clause.len().saturating_add(3),
-            ay_core::ProofStep::TheoryLemma { clause, farkas, .. } => clause
-                .len()
-                .saturating_add(farkas.as_ref().map_or(0, |f| f.coefficients.len())),
-            ay_core::ProofStep::Step {
-                clause,
-                premises,
-                args,
-                ..
-            } => clause
-                .len()
-                .saturating_add(premises.len())
-                .saturating_add(args.len()),
-            ay_core::ProofStep::Anchor { variables, .. } => variables.len().saturating_add(1),
-            // `ProofStep` is non-exhaustive: an unknown future variant has an
-            // unknown payload, so refuse to memoize documents containing one
-            // (fail closed towards re-walking).
-            _ => STRICT_WALK_MEMO_MAX_PAYLOAD,
-        });
-    }
-    payload
-}
-
 /// Diagnostic kill switch (`AY_NO_STRICT_WALK_MEMO=1`): every probe misses and
 /// every store is skipped, restoring the walk-every-time behavior byte for
 /// byte. Read once per process (repo precedent: `AY_MILP_NO_LATTICE`).
@@ -298,6 +272,11 @@ impl Executor {
             return Some((Err(ProofCheckError::Cancelled), 0));
         }
         let memo = self.strict_walk_memo.borrow();
+        // Price the pending owned metadata BEFORE any literal cache equality.
+        // A miss keeps the existing checker/caller envelope authoritative.
+        if !memo.entries.is_empty() && !payload::inputs_fit(proof, key, None) {
+            return None;
+        }
         for entry in memo.entries.iter() {
             if entry_is_current(entry, self, proof, key) {
                 return Some((entry.outcome.clone(), entry.work));
@@ -322,7 +301,7 @@ impl Executor {
         if matches!(outcome, Err(ProofCheckError::Cancelled)) {
             return;
         }
-        if document_payload(proof) > STRICT_WALK_MEMO_MAX_PAYLOAD {
+        if !payload::inputs_fit(proof, key, Some(outcome)) {
             return;
         }
         let entry = StrictWalkMemoEntry {

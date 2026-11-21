@@ -242,6 +242,7 @@ fn preexisting_status_marker_is_all_a_refused_transaction_leaves() {
         is_temp: false,
         synthesized_default: true,
         format_was_explicit: false,
+        label: None,
     };
     let status_path = dimacs_proof_status_path(&proof.path);
     std::fs::write(&status_path, b"unrelated status bytes\n").expect("seed status marker");

@@ -364,14 +364,20 @@ impl AllDifferentAc {
                 // Unsupported edge: emit x != value.
                 let value = self.idx_to_val[val_idx as usize];
 
+                // `x != value` is `[x <= value - 1] | [x >= value + 1]`; at
+                // `i64::MAX` the second literal does not exist (`x >= MAX + 1`
+                // is false), and the clause is `[x <= MAX - 1]` alone.
                 let ge_v = encoder.lookup_ge(var, value);
-                let ge_v1 = encoder.lookup_ge(var, value + 1);
+                let ge_v1 = match value.checked_add(1) {
+                    Some(next) => encoder.lookup_ge(var, next).map(Some),
+                    None => Some(None),
+                };
 
                 if let (Some(ge_v_lit), Some(ge_v1_lit)) = (ge_v, ge_v1) {
                     let mut clause = Vec::with_capacity(negated_base.len() + 2);
                     clause.extend_from_slice(&negated_base);
                     clause.push(ge_v_lit.negated());
-                    clause.push(ge_v1_lit);
+                    clause.extend(ge_v1_lit);
                     clauses.push(clause);
                 }
             }

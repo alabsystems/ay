@@ -1,0 +1,5202 @@
+{
+  "assertions": [
+    {
+      "index": 0,
+      "name": null,
+      "scope_depth": 0,
+      "term": 11
+    },
+    {
+      "index": 1,
+      "name": null,
+      "scope_depth": 0,
+      "term": 14
+    },
+    {
+      "index": 2,
+      "name": "__verification_consumer_precondition_0",
+      "scope_depth": 0,
+      "term": 16
+    },
+    {
+      "index": 3,
+      "name": "__verification_consumer_precondition_1",
+      "scope_depth": 0,
+      "term": 17
+    },
+    {
+      "index": 4,
+      "name": "__verification_consumer_precondition_2",
+      "scope_depth": 0,
+      "term": 19
+    },
+    {
+      "index": 5,
+      "name": null,
+      "scope_depth": 0,
+      "term": 22
+    },
+    {
+      "index": 6,
+      "name": null,
+      "scope_depth": 0,
+      "term": 28
+    },
+    {
+      "index": 7,
+      "name": null,
+      "scope_depth": 0,
+      "term": 31
+    },
+    {
+      "index": 8,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 9,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 10,
+      "name": null,
+      "scope_depth": 0,
+      "term": 35
+    },
+    {
+      "index": 11,
+      "name": null,
+      "scope_depth": 0,
+      "term": 37
+    },
+    {
+      "index": 12,
+      "name": null,
+      "scope_depth": 0,
+      "term": 40
+    },
+    {
+      "index": 13,
+      "name": null,
+      "scope_depth": 0,
+      "term": 42
+    },
+    {
+      "index": 14,
+      "name": null,
+      "scope_depth": 0,
+      "term": 44
+    },
+    {
+      "index": 15,
+      "name": null,
+      "scope_depth": 0,
+      "term": 46
+    },
+    {
+      "index": 16,
+      "name": null,
+      "scope_depth": 0,
+      "term": 48
+    },
+    {
+      "index": 17,
+      "name": null,
+      "scope_depth": 0,
+      "term": 54
+    },
+    {
+      "index": 18,
+      "name": null,
+      "scope_depth": 0,
+      "term": 57
+    },
+    {
+      "index": 19,
+      "name": null,
+      "scope_depth": 0,
+      "term": 63
+    },
+    {
+      "index": 20,
+      "name": null,
+      "scope_depth": 0,
+      "term": 66
+    },
+    {
+      "index": 21,
+      "name": null,
+      "scope_depth": 0,
+      "term": 67
+    },
+    {
+      "index": 22,
+      "name": null,
+      "scope_depth": 0,
+      "term": 68
+    },
+    {
+      "index": 23,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 24,
+      "name": null,
+      "scope_depth": 0,
+      "term": 0
+    },
+    {
+      "index": 25,
+      "name": null,
+      "scope_depth": 0,
+      "term": 69
+    },
+    {
+      "index": 26,
+      "name": null,
+      "scope_depth": 0,
+      "term": 75
+    },
+    {
+      "index": 27,
+      "name": null,
+      "scope_depth": 0,
+      "term": 78
+    },
+    {
+      "index": 28,
+      "name": null,
+      "scope_depth": 0,
+      "term": 79
+    },
+    {
+      "index": 29,
+      "name": null,
+      "scope_depth": 0,
+      "term": 85
+    },
+    {
+      "index": 30,
+      "name": null,
+      "scope_depth": 0,
+      "term": 88
+    },
+    {
+      "index": 31,
+      "name": null,
+      "scope_depth": 0,
+      "term": 94
+    },
+    {
+      "index": 32,
+      "name": null,
+      "scope_depth": 0,
+      "term": 97
+    },
+    {
+      "index": 33,
+      "name": null,
+      "scope_depth": 0,
+      "term": 98
+    },
+    {
+      "index": 34,
+      "name": null,
+      "scope_depth": 0,
+      "term": 104
+    },
+    {
+      "index": 35,
+      "name": null,
+      "scope_depth": 0,
+      "term": 107
+    },
+    {
+      "index": 36,
+      "name": null,
+      "scope_depth": 0,
+      "term": 108
+    },
+    {
+      "index": 37,
+      "name": null,
+      "scope_depth": 0,
+      "term": 114
+    },
+    {
+      "index": 38,
+      "name": null,
+      "scope_depth": 0,
+      "term": 117
+    },
+    {
+      "index": 39,
+      "name": null,
+      "scope_depth": 0,
+      "term": 118
+    },
+    {
+      "index": 40,
+      "name": null,
+      "scope_depth": 0,
+      "term": 121
+    },
+    {
+      "index": 41,
+      "name": null,
+      "scope_depth": 2,
+      "term": 26
+    },
+    {
+      "index": 42,
+      "name": null,
+      "scope_depth": 2,
+      "term": 550
+    },
+    {
+      "index": 43,
+      "name": null,
+      "scope_depth": 2,
+      "term": 578
+    }
+  ],
+  "ay_revision": "19cd4fa7243474fc1acc10c0f2a1b9c7aa56a537",
+  "ay_version": "0.27.0",
+  "checked_replay": null,
+  "created_unix_ms": "0",
+  "declarations": [
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p",
+      "name": "__verification_consumer_source_var_v1_b_p",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 5
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_current",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 18
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_final",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_final",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 20
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current",
+      "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 21
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p_current",
+      "name": "__verification_consumer_source_var_v1_b_p_current",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 23
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current_final",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_current_final",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 36
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current_view",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_current_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 38
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 39
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_old_p~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 41
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view",
+      "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 43
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_final_view",
+      "name": "__verification_consumer_source_var_v1_b_p~2e0_final_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 45
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_final_p~2e0_view",
+      "name": "__verification_consumer_source_var_v1_b_final_p~2e0_view",
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      },
+      "term": 47
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p_final",
+      "name": "__verification_consumer_source_var_v1_b_p_final",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 49
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_current",
+      "name": "__verification_consumer_source_var_v1_b_old_p_current",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 58
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p_current_final",
+      "name": "__verification_consumer_source_var_v1_b_p_current_final",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 70
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p_current_view",
+      "name": "__verification_consumer_source_var_v1_b_p_current_view",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 80
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_p_view",
+      "name": "__verification_consumer_source_var_v1_b_p_view",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 89
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_view",
+      "name": "__verification_consumer_source_var_v1_b_old_p_view",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 99
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_current_view",
+      "name": "__verification_consumer_source_var_v1_b_old_p_current_view",
+      "sort": "P",
+      "sort_data": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "term": 109
+    },
+    {
+      "core_name": "__verification_consumer_unit",
+      "name": "__verification_consumer_unit",
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "term": 119
+    },
+    {
+      "core_name": "__verification_consumer_source_var_v1_b_result",
+      "name": "__verification_consumer_source_var_v1_b_result",
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "term": 120
+    }
+  ],
+  "events": [
+    {
+      "index": 0,
+      "kind": {
+        "event": "set_logic",
+        "logic": "ALL"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 1,
+      "kind": {
+        "event": "declare_const",
+        "name": "heap",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 2
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 2,
+      "kind": {
+        "event": "declare_const",
+        "name": "domain",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 3
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 3,
+      "kind": {
+        "event": "declare_const",
+        "name": "perms",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 4
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 4,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 5,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 5
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 6,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 11
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 7,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 14
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 8,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_0",
+        "term": 16
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 9,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "domain_data": [
+          {
+            "kind": "int"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "logic_inv__placeholder_i__ret_b",
+        "range": "Bool",
+        "range_data": {
+          "kind": "bool"
+        }
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 10,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_1",
+        "term": 17
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 11,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 18
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 12,
+      "kind": {
+        "event": "assert",
+        "name": "__verification_consumer_precondition_2",
+        "term": 19
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 13,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_final",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 20
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 14,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 21
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 15,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 22
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 16,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p_current",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 23
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 17,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 28
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 18,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 31
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 19,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 20,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 21,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 35
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 22,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current_final",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 36
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 23,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 37
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 24,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 38
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 25,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 39
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 26,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 40
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 27,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 41
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 28,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 42
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 29,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 43
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 30,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 44
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 31,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_final_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 45
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 32,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 46
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 33,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_final_p~2e0_view",
+        "sort": "Int",
+        "sort_data": {
+          "kind": "int"
+        },
+        "term": 47
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 34,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 48
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 35,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p_final",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 49
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 36,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 54
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 37,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 57
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 38,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p_current",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 58
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 39,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 63
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 40,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 66
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 41,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 67
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 42,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 68
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 43,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 44,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 0
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 45,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 69
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 46,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p_current_final",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 70
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 47,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 75
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 48,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 78
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 49,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 79
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 50,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p_current_view",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 80
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 51,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 85
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 52,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 88
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 53,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_p_view",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 89
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 54,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 94
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 55,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 97
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 56,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 98
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 57,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p_view",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 99
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 58,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 104
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 59,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 107
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 60,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 108
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 61,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_old_p_current_view",
+        "sort": "P",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "P"
+        },
+        "term": 109
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 62,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 114
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 63,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 117
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 64,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 118
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 65,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_unit",
+        "sort": "Unit",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        },
+        "term": 119
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 66,
+      "kind": {
+        "event": "declare_const",
+        "name": "__verification_consumer_source_var_v1_b_result",
+        "sort": "Unit",
+        "sort_data": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        },
+        "term": 120
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 67,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 121
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 68,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 69,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 70,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 123
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 71,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 72,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 73,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 74,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 75,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 76,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 77,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 78,
+      "kind": {
+        "domain": [
+          "P"
+        ],
+        "domain_data": [
+          {
+            "datatype": {
+              "constructors": [
+                {
+                  "fields": [
+                    {
+                      "name": "p_a",
+                      "sort": "Int",
+                      "sort_data": {
+                        "kind": "int"
+                      }
+                    },
+                    {
+                      "name": "p_b",
+                      "sort": "Int",
+                      "sort_data": {
+                        "kind": "int"
+                      }
+                    }
+                  ],
+                  "name": "P"
+                }
+              ],
+              "name": "P"
+            },
+            "kind": "datatype"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "logic_____VERIFICATION_CONSUMER__tuple__get__0__placeholder_d50__ret_i",
+        "range": "Int",
+        "range_data": {
+          "kind": "int"
+        }
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 79,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 80,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 451
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 81,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 458
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 82,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 469
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 83,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 470
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 84,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 471
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 85,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 472
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 86,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 473
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 87,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 474
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 88,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 475
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 89,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 476
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 90,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 477
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 91,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 92,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 93,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 94,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 95,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 96,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 97,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 98,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 517
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 99,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 518
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 100,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 101,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 102,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 103,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 104,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 105,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 106,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 107,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 26
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 108,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 550
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 109,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 552
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 110,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 111,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 112,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 113,
+      "kind": {
+        "event": "pop"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 114,
+      "kind": {
+        "constructors": [
+          {
+            "fields": [
+              {
+                "name": "p_a",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              },
+              {
+                "name": "p_b",
+                "sort": "Int",
+                "sort_data": {
+                  "kind": "int"
+                }
+              }
+            ],
+            "name": "P"
+          }
+        ],
+        "event": "declare_datatype",
+        "name": "P"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 115,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 116,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 117,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 26
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 118,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 550
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 119,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 578
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 120,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    }
+  ],
+  "function_declarations": [
+    {
+      "core_name": "logic_inv__placeholder_i__ret_b",
+      "domain": [
+        "Int"
+      ],
+      "domain_data": [
+        {
+          "kind": "int"
+        }
+      ],
+      "name": "logic_inv__placeholder_i__ret_b",
+      "range": "Bool",
+      "range_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "logic": "ALL",
+  "metadata": {
+    "consumer": null,
+    "consumer_revision": null,
+    "fixture_path": null,
+    "function_path": null,
+    "notes": null,
+    "obligation_kind": null,
+    "source_span": null
+  },
+  "panic_payload": null,
+  "replay_gaps": [],
+  "schema": "ay.native-replay.v1",
+  "scope_depth": 2,
+  "selected_route": "native-api:ALL",
+  "solve": null,
+  "symbol_identities": [
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "P",
+      "datatype_core": "P",
+      "datatype_surface": "P",
+      "engine_domain": [
+        {
+          "kind": "int"
+        },
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "datatype_constructor",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        },
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "P"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_final_p~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_final_p~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_old_p~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_old_p~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p_current_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p_current_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "datatype": {
+          "constructors": [
+            {
+              "fields": [
+                {
+                  "name": "p_a",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                },
+                {
+                  "name": "p_b",
+                  "sort": "Int",
+                  "sort_data": {
+                    "kind": "int"
+                  }
+                }
+              ],
+              "name": "P"
+            }
+          ],
+          "name": "P"
+        },
+        "kind": "datatype"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "P"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_current"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_current_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_current_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_current_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_final",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_final"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_final_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_final_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_p~2e0_view",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_p~2e0_view"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "core_name": "__verification_consumer_source_var_v1_b_result",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        }
+      },
+      "surface_name": "__verification_consumer_source_var_v1_b_result"
+    },
+    {
+      "api_domain": [],
+      "api_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "core_name": "__verification_consumer_unit",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [],
+      "engine_range": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "uninterpreted",
+          "name": "Unit"
+        }
+      },
+      "surface_name": "__verification_consumer_unit"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "p_a",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  },
+                  {
+                    "name": "p_b",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "P"
+              }
+            ],
+            "name": "P"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "is-P",
+      "datatype_core": "P",
+      "datatype_surface": "P",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "datatype_tester",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "P"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "is-P"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "logic_inv__placeholder_i__ret_b",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "logic_inv__placeholder_i__ret_b"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "p_a",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  },
+                  {
+                    "name": "p_b",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "P"
+              }
+            ],
+            "name": "P"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "p_a",
+      "datatype_core": "P",
+      "datatype_surface": "P",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "P"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "p_a"
+    },
+    {
+      "api_domain": [
+        {
+          "datatype": {
+            "constructors": [
+              {
+                "fields": [
+                  {
+                    "name": "p_a",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  },
+                  {
+                    "name": "p_b",
+                    "sort": "Int",
+                    "sort_data": {
+                      "kind": "int"
+                    }
+                  }
+                ],
+                "name": "P"
+              }
+            ],
+            "name": "P"
+          },
+          "kind": "datatype"
+        }
+      ],
+      "api_range": {
+        "kind": "int"
+      },
+      "core_name": "p_b",
+      "datatype_core": "P",
+      "datatype_surface": "P",
+      "engine_domain": [
+        {
+          "kind": "uninterpreted",
+          "name": "P"
+        }
+      ],
+      "engine_range": {
+        "kind": "int"
+      },
+      "kind": "datatype_selector",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "uninterpreted",
+            "name": "P"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "int"
+        }
+      },
+      "surface_name": "p_b"
+    }
+  ],
+  "terms": [
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "0"
+        }
+      },
+      "id": 8,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p",
+        "var_id": 3
+      },
+      "id": 5,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 7,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          7
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 9,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 6,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 6,
+        "kind": "not"
+      },
+      "id": 10,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          9,
+          10
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 11,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 12,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          12
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 13,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          10,
+          13
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 14,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "100"
+        }
+      },
+      "id": 15,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          7,
+          15
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 16,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          7
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "logic_inv__placeholder_i__ret_b"
+        }
+      },
+      "id": 17,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current",
+        "var_id": 4
+      },
+      "id": 18,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          18
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "logic_inv__placeholder_i__ret_b"
+        }
+      },
+      "id": 19,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current",
+        "var_id": 6
+      },
+      "id": 21,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          18,
+          21
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 22,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p_current",
+        "var_id": 7
+      },
+      "id": 23,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 25,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          25
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 26,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 24,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 24,
+        "kind": "not"
+      },
+      "id": 27,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          26,
+          27
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 28,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 29,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          29
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 30,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          27,
+          30
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 31,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "bool",
+          "value": true
+        }
+      },
+      "id": 0,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_final",
+        "var_id": 5
+      },
+      "id": 20,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "1"
+        }
+      },
+      "id": 32,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          25,
+          32
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 33,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          20,
+          33
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 35,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current_final",
+        "var_id": 8
+      },
+      "id": 36,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          36
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 37,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_current_view",
+        "var_id": 9
+      },
+      "id": 38,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_view",
+        "var_id": 10
+      },
+      "id": 39,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          38,
+          39
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 40,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_view",
+        "var_id": 11
+      },
+      "id": 41,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          39,
+          41
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 42,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p~2e0_current_view",
+        "var_id": 12
+      },
+      "id": 43,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          38,
+          43
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 44,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p~2e0_final_view",
+        "var_id": 13
+      },
+      "id": 45,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          45
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 46,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_final_p~2e0_view",
+        "var_id": 14
+      },
+      "id": 47,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          47
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 48,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p_final",
+        "var_id": 15
+      },
+      "id": 49,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 51,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          51
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 52,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 50,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 50,
+        "kind": "not"
+      },
+      "id": 53,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          52,
+          53
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 54,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 55,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          55
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 56,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          53,
+          56
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 57,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p_current",
+        "var_id": 16
+      },
+      "id": 58,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 60,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          60
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 61,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 59,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 59,
+        "kind": "not"
+      },
+      "id": 62,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          61,
+          62
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 63,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 64,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          64
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 65,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          62,
+          65
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 66,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          23,
+          58
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 67,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5,
+          23
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 68,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          29
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "P"
+        }
+      },
+      "id": 34,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          34,
+          49
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 69,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p_current_final",
+        "var_id": 17
+      },
+      "id": 70,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          70
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 72,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          72
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 73,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          70
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 71,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 71,
+        "kind": "not"
+      },
+      "id": 74,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          73,
+          74
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 75,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          70
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 76,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          76
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 77,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          74,
+          77
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 78,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          34,
+          70
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 79,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p_current_view",
+        "var_id": 18
+      },
+      "id": 80,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          80
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 82,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          82
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 83,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          80
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 81,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 81,
+        "kind": "not"
+      },
+      "id": 84,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          83,
+          84
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 85,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          80
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 86,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          86
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 87,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          84,
+          87
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 88,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_p_view",
+        "var_id": 19
+      },
+      "id": 89,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          89
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 91,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          91
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 92,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          89
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 90,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 90,
+        "kind": "not"
+      },
+      "id": 93,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          92,
+          93
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 94,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          89
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 95,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          95
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 96,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          93,
+          96
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 97,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          80,
+          89
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 98,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p_view",
+        "var_id": 20
+      },
+      "id": 99,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          99
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 101,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          101
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 102,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          99
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 100,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 100,
+        "kind": "not"
+      },
+      "id": 103,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          102,
+          103
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 104,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          99
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 105,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          105
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 106,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          103,
+          106
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 107,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          89,
+          99
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 108,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_old_p_current_view",
+        "var_id": 21
+      },
+      "id": 109,
+      "is_datatype_constructor": false,
+      "sort": "P",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "P"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          109
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_a"
+        }
+      },
+      "id": 111,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          111
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 112,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          109
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "is-P"
+        }
+      },
+      "id": 110,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 110,
+        "kind": "not"
+      },
+      "id": 113,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          112,
+          113
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 114,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          109
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "p_b"
+        }
+      },
+      "id": 115,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8,
+          115
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 116,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          113,
+          116
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 117,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          80,
+          109
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 118,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_unit",
+        "var_id": 22
+      },
+      "id": 119,
+      "is_datatype_constructor": false,
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "__verification_consumer_source_var_v1_b_result",
+        "var_id": 23
+      },
+      "id": 120,
+      "is_datatype_constructor": false,
+      "sort": "Unit",
+      "sort_data": {
+        "kind": "uninterpreted",
+        "name": "Unit"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          119,
+          120
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 121,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "18446744073709551615"
+        }
+      },
+      "id": 450,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          25,
+          450
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 550,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          33,
+          450
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 577,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 577,
+        "kind": "not"
+      },
+      "id": 578,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "timeout_ms": "1125",
+  "unsupported_atoms": []
+}

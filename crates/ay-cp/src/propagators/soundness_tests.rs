@@ -33,11 +33,16 @@ use crate::trail::IntegerTrail;
 use crate::variable::IntVarId;
 
 use super::alldifferent::AllDifferentBounds;
+use super::alldifferent_ac::AllDifferentAc;
 use super::cumulative::Cumulative;
 use super::disjunctive::Disjunctive;
+use super::div::Div;
+use super::element::Element;
 use super::linear::LinearLe;
 use super::linear_ne::LinearNotEqual;
 use super::shifted_alldifferent::ShiftedAllDifferentBounds;
+use super::table::Table;
+use super::times::Times;
 
 /// xorshift64*: a fixed-seed generator, so a failure names its seed.
 pub(crate) struct Rng(pub(crate) u64);
@@ -68,6 +73,81 @@ impl Rng {
     pub(crate) fn chance(&mut self, percent: u64) -> bool {
         self.next() % 100 < percent
     }
+}
+
+/// Where a generator's values lie: its small template window around zero,
+/// or that window moved against `i64::MIN` or against `i64::MAX`. At the
+/// ends, `x + 1`, `x - 1`, `s + d`, `x + shift` and sums of terms leave the
+/// i64 range, which the code under test must handle without a panic (debug
+/// builds) or a wrap (release builds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum End {
+    Zero,
+    Min,
+    Max,
+}
+
+impl End {
+    /// The two ends of the i64 range.
+    pub(crate) const BOTH: [Self; 2] = [Self::Min, Self::Max];
+}
+
+/// A shift that moves a template window `lo..=hi` to an [`End`]: unchanged
+/// for `End::Zero`, starting at `i64::MIN`, or ending at `i64::MAX`. Every
+/// value a generator draws in the template window is moved by the same
+/// shift, so related values (domains, tuples, right-hand sides) keep their
+/// relation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Place {
+    shift: i128,
+}
+
+impl Place {
+    pub(crate) fn new(end: End, lo: i64, hi: i64) -> Self {
+        let shift = match end {
+            End::Zero => 0,
+            End::Min => i128::from(i64::MIN) - i128::from(lo),
+            End::Max => i128::from(i64::MAX) - i128::from(hi),
+        };
+        Self { shift }
+    }
+
+    /// The shift, for values derived from several placed ones.
+    pub(crate) fn shift(self) -> i128 {
+        self.shift
+    }
+
+    /// Template value `v` (inside the window) moved to the end.
+    pub(crate) fn at(self, v: i64) -> i64 {
+        i64::try_from(i128::from(v) + self.shift).expect("value inside the placed window")
+    }
+
+    /// [`random_domain`] in the template window `lo..=hi`, moved.
+    pub(crate) fn domain(self, rng: &mut Rng, lo: i64, hi: i64) -> Vec<i64> {
+        random_domain(rng, lo, hi)
+            .into_iter()
+            .map(|v| self.at(v))
+            .collect()
+    }
+
+    /// `rng.range(lo, hi)`, moved.
+    pub(crate) fn range(self, rng: &mut Rng, lo: i64, hi: i64) -> i64 {
+        self.at(rng.range(lo, hi))
+    }
+}
+
+/// `value` clamped into i64 (a right-hand side beyond every reachable sum).
+pub(crate) fn clamp_i64(value: i128) -> i64 {
+    i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// `coeffs . x` without overflow.
+pub(crate) fn dot_wide(coeffs: &[i64], x: &[i64]) -> i128 {
+    coeffs
+        .iter()
+        .zip(x)
+        .map(|(&c, &x)| i128::from(c) * i128::from(x))
+        .sum()
 }
 
 /// The meaning of a constraint: does this assignment of the instance's
@@ -129,11 +209,16 @@ fn vars_of(vars: &[IntVarId], map: &[usize]) -> Vec<IntVarId> {
 }
 
 // ---------------------------------------------------------------- generators
+//
+// Each generator draws its values in a small template window and moves them
+// to `end` (see [`Place`]): with `End::Zero` the instances are the ones the
+// generators have always drawn (same seeds, same values).
 
-fn linear_le_case(rng: &mut Rng) -> Case {
+fn linear_le_case(rng: &mut Rng, end: End) -> Case {
     let positions = usize::try_from(rng.range(1, 4)).expect("small");
     let (n, map) = scope(rng, positions, 10);
-    let domains = (0..n).map(|_| random_domain(rng, -4, 6)).collect();
+    let place = Place::new(end, -4, 6);
+    let domains = (0..n).map(|_| place.domain(rng, -4, 6)).collect();
     let coeffs: Vec<i64> = map
         .iter()
         .map(|_| {
@@ -145,16 +230,15 @@ fn linear_le_case(rng: &mut Rng) -> Case {
             }
         })
         .collect();
-    let rhs = rng.range(-12, 12);
+    // The template right-hand side, moved with the variables.
+    let total: i128 = coeffs.iter().map(|&c| i128::from(c)).sum();
+    let rhs = clamp_i64(i128::from(rng.range(-12, 12)) + total * place.shift());
     let label = format!("linear_le {coeffs:?} . x <= {rhs}, scope {map:?}");
     let c2 = coeffs.clone();
     let m2 = map.clone();
     Case {
         domains,
-        holds: Box::new(move |v| {
-            let x = pick(v, &m2);
-            c2.iter().zip(&x).map(|(c, x)| c * x).sum::<i64>() <= rhs
-        }),
+        holds: Box::new(move |v| dot_wide(&c2, &pick(v, &m2)) <= i128::from(rhs)),
         build: Box::new(move |vars| {
             Box::new(LinearLe::new(coeffs.clone(), vars_of(vars, &map), rhs))
         }),
@@ -162,21 +246,20 @@ fn linear_le_case(rng: &mut Rng) -> Case {
     }
 }
 
-fn linear_ne_case(rng: &mut Rng) -> Case {
+fn linear_ne_case(rng: &mut Rng, end: End) -> Case {
     let positions = usize::try_from(rng.range(1, 4)).expect("small");
     let (n, map) = scope(rng, positions, 10);
-    let domains = (0..n).map(|_| random_domain(rng, -3, 5)).collect();
+    let place = Place::new(end, -3, 5);
+    let domains = (0..n).map(|_| place.domain(rng, -3, 5)).collect();
     let coeffs: Vec<i64> = map.iter().map(|_| rng.range(-3, 3)).collect();
-    let rhs = rng.range(-6, 6);
+    let total: i128 = coeffs.iter().map(|&c| i128::from(c)).sum();
+    let rhs = clamp_i64(i128::from(rng.range(-6, 6)) + total * place.shift());
     let label = format!("linear_ne {coeffs:?} . x != {rhs}, scope {map:?}");
     let c2 = coeffs.clone();
     let m2 = map.clone();
     Case {
         domains,
-        holds: Box::new(move |v| {
-            let x = pick(v, &m2);
-            c2.iter().zip(&x).map(|(c, x)| c * x).sum::<i64>() != rhs
-        }),
+        holds: Box::new(move |v| dot_wide(&c2, &pick(v, &m2)) != i128::from(rhs)),
         build: Box::new(move |vars| {
             Box::new(LinearNotEqual::new(
                 coeffs.clone(),
@@ -192,9 +275,10 @@ fn distinct(x: &[i64]) -> bool {
     (0..x.len()).all(|i| ((i + 1)..x.len()).all(|j| x[i] != x[j]))
 }
 
-fn alldifferent_case(rng: &mut Rng) -> Case {
+fn alldifferent_case(rng: &mut Rng, end: End) -> Case {
     let n = usize::try_from(rng.range(2, 5)).expect("small");
-    let domains = (0..n).map(|_| random_domain(rng, 0, 5)).collect();
+    let place = Place::new(end, 0, 5);
+    let domains = (0..n).map(|_| place.domain(rng, 0, 5)).collect();
     Case {
         domains,
         holds: Box::new(distinct),
@@ -203,17 +287,38 @@ fn alldifferent_case(rng: &mut Rng) -> Case {
     }
 }
 
-fn shifted_alldifferent_case(rng: &mut Rng) -> Case {
+fn alldifferent_ac_case(rng: &mut Rng, end: End) -> Case {
+    let n = usize::try_from(rng.range(3, 5)).expect("small");
+    let place = Place::new(end, 0, 5);
+    let domains: Vec<Vec<i64>> = (0..n).map(|_| place.domain(rng, 0, 5)).collect();
+    let mut union: Vec<i64> = domains.iter().flatten().copied().collect();
+    union.sort_unstable();
+    union.dedup();
+    Case {
+        domains,
+        holds: Box::new(distinct),
+        build: Box::new(move |vars| Box::new(AllDifferentAc::new(vars.to_vec(), union.clone()))),
+        label: "alldifferent (AC)".to_string(),
+    }
+}
+
+fn shifted_alldifferent_case(rng: &mut Rng, end: End) -> Case {
     let n = usize::try_from(rng.range(2, 5)).expect("small");
-    let domains = (0..n).map(|_| random_domain(rng, 0, 5)).collect();
+    let place = Place::new(end, 0, 5);
+    let domains = (0..n).map(|_| place.domain(rng, 0, 5)).collect();
     let shifts: Vec<i64> = (0..n).map(|_| rng.range(-3, 3)).collect();
     let label = format!("shifted alldifferent, shifts {shifts:?}");
     let s2 = shifts.clone();
     Case {
         domains,
         holds: Box::new(move |v| {
-            let x: Vec<i64> = v.iter().zip(&s2).map(|(v, s)| v + s).collect();
-            distinct(&x)
+            // `x + shift` may leave i64 at the ends: compare in i128.
+            let x: Vec<i128> = v
+                .iter()
+                .zip(&s2)
+                .map(|(&v, &s)| i128::from(v) + i128::from(s))
+                .collect();
+            (0..x.len()).all(|i| ((i + 1)..x.len()).all(|j| x[i] != x[j]))
         }),
         build: Box::new(move |vars| {
             Box::new(ShiftedAllDifferentBounds::new(
@@ -225,38 +330,87 @@ fn shifted_alldifferent_case(rng: &mut Rng) -> Case {
     }
 }
 
-/// Does `[s, s + d)` contain `t`?
-fn runs_at(s: i64, d: i64, t: i64) -> bool {
-    s <= t && t < s + d
+fn element_case(rng: &mut Rng, end: End) -> Case {
+    let len = usize::try_from(rng.range(1, 4)).expect("small");
+    // Positions: index, result, array[0..len].
+    let (n, map) = scope(rng, len + 2, 8);
+    let place = Place::new(end, -2, 5);
+    let mut domains: Vec<Vec<i64>> = (0..n).map(|_| place.domain(rng, -2, 5)).collect();
+    // Index domain: mostly in range, sometimes reaching past either end; at
+    // an end of i64, sometimes there too (no position at all).
+    let top = i64::try_from(len).expect("small");
+    domains[map[0]] = if end != End::Zero && rng.chance(30) {
+        Place::new(end, -1, top).domain(rng, -1, top)
+    } else {
+        random_domain(rng, -1, top)
+    };
+    let label = format!("element, len {len}, scope {map:?}");
+    let m2 = map.clone();
+    Case {
+        domains,
+        holds: Box::new(move |v| {
+            let x = pick(v, &m2);
+            let (index, result) = (x[0], x[1]);
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| x[2..].get(i))
+                .is_some_and(|&a| a == result)
+        }),
+        build: Box::new(move |vars| {
+            let x = vars_of(vars, &map);
+            Box::new(Element::new(x[0], x[2..].to_vec(), x[1]))
+        }),
+        label,
+    }
 }
 
+fn table_case(rng: &mut Rng, end: End) -> Case {
+    let n = usize::try_from(rng.range(1, 3)).expect("small");
+    // Tuples reach one value past the domains on each side.
+    let place = Place::new(end, -1, 5);
+    let domains = (0..n).map(|_| place.domain(rng, 0, 4)).collect();
+    let tuples: Vec<Vec<i64>> = (0..rng.range(0, 8))
+        .map(|_| (0..n).map(|_| place.range(rng, -1, 5)).collect())
+        .collect();
+    let label = format!("table {tuples:?}");
+    let t2 = tuples.clone();
+    Case {
+        domains,
+        holds: Box::new(move |v| t2.iter().any(|t| t.as_slice() == v)),
+        build: Box::new(move |vars| Box::new(Table::new(vars.to_vec(), tuples.clone()))),
+        label,
+    }
+}
+
+/// Does `[s, s + d)` contain `t`? (In i128: `s + d` may pass `i64::MAX`.)
+fn runs_at(s: i64, d: i64, t: i128) -> bool {
+    i128::from(s) <= t && t < i128::from(s) + i128::from(d)
+}
+
+/// The load only rises at a start time, so those are the times checked.
 fn cumulative_holds(starts: &[i64], durations: &[i64], demands: &[i64], capacity: i64) -> bool {
-    let lo = starts.iter().copied().min().unwrap_or(0);
-    let hi = starts
-        .iter()
-        .zip(durations)
-        .map(|(s, d)| s + d)
-        .max()
-        .unwrap_or(0);
-    (lo..hi).all(|t| {
+    starts.iter().map(|&s| i128::from(s)).all(|t| {
         (0..starts.len())
             .filter(|&i| runs_at(starts[i], durations[i], t))
-            .map(|i| demands[i])
-            .sum::<i64>()
-            <= capacity
+            .map(|i| i128::from(demands[i]))
+            .sum::<i128>()
+            <= i128::from(capacity)
     })
 }
 
-fn cumulative_case(rng: &mut Rng) -> Case {
+fn cumulative_case(rng: &mut Rng, end: End) -> Case {
     let tasks = usize::try_from(rng.range(1, 4)).expect("small");
     let horizon = rng.range(4, 10);
     let capacity = rng.range(0, 4);
+    // Start times move to the end; durations and demands stay small, so at
+    // `End::Max` a task may run past `i64::MAX`.
+    let place = Place::new(end, 0, horizon);
     // Positions: starts, durations, demands. Durations and demands are often
     // constants, and constants are often shared.
     let mut domains: Vec<Vec<i64>> = Vec::new();
     let mut map = Vec::with_capacity(3 * tasks);
     for _ in 0..tasks {
-        domains.push(random_domain(rng, 0, horizon));
+        domains.push(place.domain(rng, 0, horizon));
         map.push(domains.len() - 1);
     }
     for kind in 0..2 {
@@ -307,33 +461,99 @@ fn cumulative_case(rng: &mut Rng) -> Case {
     }
 }
 
-fn disjunctive_case(rng: &mut Rng) -> Case {
+/// No two tasks `[s, s + d)` overlap (in i128).
+fn disjoint(s: &[i64], d: &[i64]) -> bool {
+    let end = |i: usize| i128::from(s[i]) + i128::from(d[i]);
+    (0..s.len()).all(|i| {
+        ((i + 1)..s.len()).all(|j| end(i) <= i128::from(s[j]) || end(j) <= i128::from(s[i]))
+    })
+}
+
+fn disjunctive_case(rng: &mut Rng, end: End) -> Case {
     let n = usize::try_from(rng.range(2, 4)).expect("small");
     let horizon = rng.range(5, 12);
-    let domains = (0..n).map(|_| random_domain(rng, 0, horizon)).collect();
+    let place = Place::new(end, 0, horizon);
+    let domains = (0..n).map(|_| place.domain(rng, 0, horizon)).collect();
     let durations: Vec<i64> = (0..n).map(|_| rng.range(1, 5)).collect();
     let label = format!("disjunctive, durations {durations:?}");
     let d2 = durations.clone();
     Case {
         domains,
-        holds: Box::new(move |s| {
-            (0..s.len())
-                .all(|i| ((i + 1)..s.len()).all(|j| s[i] + d2[i] <= s[j] || s[j] + d2[j] <= s[i]))
-        }),
+        holds: Box::new(move |s| disjoint(s, &d2)),
         build: Box::new(move |vars| Box::new(Disjunctive::new(vars.to_vec(), durations.clone()))),
         label,
     }
 }
 
+/// A generator of random small instances, at the given end of i64.
+pub(crate) type Generate = fn(&mut Rng, End) -> Case;
+
 /// Every propagator in `crate::propagators`, with a generator of random
 /// small instances. A new propagator registers itself here.
-pub(crate) const REGISTRY: &[(&str, fn(&mut Rng) -> Case)] = &[
+/// `x * y = result` (or `x div y = result`) over random domains; a
+/// position may share a variable with another (`x * x = r`, `x div y = x`).
+fn arithmetic_case(rng: &mut Rng, divide: bool) -> Case {
+    let (n, map) = scope(rng, 3, 15);
+    let domains = (0..n)
+        .map(|_| {
+            if rng.chance(40) {
+                random_domain(rng, -4, 5)
+            } else if divide {
+                random_domain(rng, -7, 7)
+            } else {
+                random_domain(rng, -12, 16)
+            }
+        })
+        .collect();
+    let m2 = map.clone();
+    let name = if divide { "div" } else { "times" };
+    let label = format!("{name}, scope {map:?}");
+    Case {
+        domains,
+        holds: Box::new(move |v| {
+            let x = pick(v, &m2);
+            let (a, b, r) = (i128::from(x[0]), i128::from(x[1]), i128::from(x[2]));
+            if divide {
+                b != 0 && a / b == r
+            } else {
+                a * b == r
+            }
+        }),
+        build: Box::new(move |vars| {
+            let v = vars_of(vars, &map);
+            if divide {
+                Box::new(Div::new(v[0], v[1], v[2]))
+            } else {
+                Box::new(Times::new(v[0], v[1], v[2]))
+            }
+        }),
+        label,
+    }
+}
+
+// The two arithmetic families are not moved to the ends of i64: a product
+// of two values there is not representable, so `end` is ignored and the
+// instances are the same at every end.
+fn times_case(rng: &mut Rng, _end: End) -> Case {
+    arithmetic_case(rng, false)
+}
+
+fn div_case(rng: &mut Rng, _end: End) -> Case {
+    arithmetic_case(rng, true)
+}
+
+pub(crate) const REGISTRY: &[(&str, Generate)] = &[
     ("linear", linear_le_case),
     ("linear_ne", linear_ne_case),
     ("alldifferent", alldifferent_case),
+    ("alldifferent_ac", alldifferent_ac_case),
     ("shifted_alldifferent", shifted_alldifferent_case),
+    ("element", element_case),
+    ("table", table_case),
     ("cumulative", cumulative_case),
     ("disjunctive", disjunctive_case),
+    ("times", times_case),
+    ("div", div_case),
 ];
 
 // ------------------------------------------------------------------- harness
@@ -428,7 +648,7 @@ impl Instance {
             .iter()
             .map(|&lit| match self.decode(lit) {
                 Ok((i, value)) if lit.is_positive() => format!("[x{i} >= {value}]"),
-                Ok((i, value)) => format!("[x{i} <= {}]", value - 1),
+                Ok((i, value)) => format!("[x{i} <= {}]", i128::from(value) - 1),
                 Err(_) => format!("{lit:?}"),
             })
             .collect::<Vec<_>>()
@@ -509,7 +729,11 @@ impl Instance {
         let result = if lit.is_positive() {
             self.trail.set_lb(var, value, lit, None)
         } else {
-            self.trail.set_ub(var, value - 1, lit, None)
+            // `not [x >= i64::MIN]` is false in every state: a wipeout.
+            let Some(ub) = value.checked_sub(1) else {
+                return false;
+            };
+            self.trail.set_ub(var, ub, lit, None)
         };
         result.is_ok()
     }
@@ -656,6 +880,12 @@ fn check_state(
 
 /// Run `seeds` random instances of the registered generator `name`.
 pub(crate) fn run(name: &str, seeds: u64) -> Result<Exercised, String> {
+    run_at(name, seeds, End::Zero)
+}
+
+/// Run `seeds` random instances of the registered generator `name`, with
+/// its values moved to `end`.
+pub(crate) fn run_at(name: &str, seeds: u64, end: End) -> Result<Exercised, String> {
     let generate = REGISTRY
         .iter()
         .find(|(n, _)| *n == name)
@@ -664,10 +894,10 @@ pub(crate) fn run(name: &str, seeds: u64) -> Result<Exercised, String> {
     let mut stats = Exercised::default();
     for seed in 1..=seeds {
         let mut rng = Rng::from_seed(seed);
-        let case = generate(&mut rng);
+        let case = generate(&mut rng, end);
         exercise(&case, &mut rng, &mut stats).map_err(|fault| {
             format!(
-                "{name} seed {seed}: {} (domains {:?}): {}",
+                "{name} seed {seed} at {end:?}: {} (domains {:?}): {}",
                 case.label, case.domains, fault.message
             )
         })?;
@@ -687,6 +917,52 @@ fn check_registered(name: &str) {
     }
 }
 
+/// Every propagator, with its values against `i64::MIN` and against
+/// `i64::MAX`: bounds at the ends, `x + 1` past them, sums beyond i64.
+/// The clauses must hold in every solution there too, and no propagator may
+/// panic on an overflow (debug builds) or wrap (release builds).
+#[test]
+fn test_every_propagator_at_the_ends_of_i64() {
+    let mut failures = Vec::new();
+    for &(name, _) in REGISTRY {
+        for end in End::BOTH {
+            // A panic (an overflow in a debug build) is a failure of this
+            // propagator at this end; the others still run.
+            let outcome = std::panic::catch_unwind(|| run_at(name, 800, end))
+                .unwrap_or_else(|_| Err(format!("{name} at {end:?}: panicked (see stderr)")));
+            match outcome {
+                Ok(stats) => {
+                    if stats.instances < 200 || stats.reasons + stats.conflicts < 50 {
+                        failures.push(format!(
+                            "{name} at {end:?}: too little exercised: {stats:?}"
+                        ));
+                    }
+                }
+                Err(message) => failures.push(message),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every propagator module declared in `propagators/mod.rs` has a
+/// generator in [`REGISTRY`] under its module name.
+#[test]
+fn test_registry_names_every_propagator() {
+    let modules: Vec<&str> = include_str!("mod.rs")
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub mod "))
+        .filter_map(|l| l.strip_suffix(';'))
+        .collect();
+    assert!(modules.len() >= 9, "module list not found: {modules:?}");
+    for module in modules {
+        assert!(
+            REGISTRY.iter().any(|(n, _)| *n == module),
+            "propagator module {module} has no soundness generator in REGISTRY"
+        );
+    }
+}
+
 #[test]
 fn test_linear_le_clauses_hold_in_every_solution() {
     check_registered("linear");
@@ -703,8 +979,23 @@ fn test_alldifferent_clauses_hold_in_every_solution() {
 }
 
 #[test]
+fn test_alldifferent_ac_clauses_hold_in_every_solution() {
+    check_registered("alldifferent_ac");
+}
+
+#[test]
 fn test_shifted_alldifferent_clauses_hold_in_every_solution() {
     check_registered("shifted_alldifferent");
+}
+
+#[test]
+fn test_element_clauses_hold_in_every_solution() {
+    check_registered("element");
+}
+
+#[test]
+fn test_table_clauses_hold_in_every_solution() {
+    check_registered("table");
 }
 
 #[test]
@@ -715,6 +1006,16 @@ fn test_cumulative_clauses_hold_in_every_solution() {
 #[test]
 fn test_disjunctive_clauses_hold_in_every_solution() {
     check_registered("disjunctive");
+}
+
+#[test]
+fn test_times_clauses_hold_in_every_solution() {
+    check_registered("times");
+}
+
+#[test]
+fn test_div_clauses_hold_in_every_solution() {
+    check_registered("div");
 }
 
 // ------------------------------------------------- regressions (2026-11-18)
@@ -743,4 +1044,55 @@ fn test_cumulative_backward_reason_names_the_blocking_task() {
     );
     let stats = stats.unwrap_or_else(|e| panic!("{e}"));
     assert!(stats.reasons > 0, "s0 <= 6 must still be derived");
+}
+
+/// An index whose upper bound drops below 0 (no position left) must give a
+/// conflict. Before 2026-11-18 the clamped bound `-1` was cast to `usize`
+/// before the emptiness test, wrapped to `usize::MAX`, and the propagator
+/// indexed past the array: a panic.
+#[test]
+fn test_element_negative_index_bound_is_a_conflict() {
+    // Variables: index, result, array[0].
+    let stats = check_state(
+        &[&[-2, -1, 0], &[0, 1], &[0, 1]],
+        Box::new(|x| x[0] == 0 && x[2] == x[1]),
+        Box::new(|v| Box::new(Element::new(v[0], vec![v[2]], v[1]))),
+        &[(0, -2, -1)],
+    );
+    let stats = stats.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(stats.conflicts, 1);
+}
+
+/// The value 2 is a hole of x1's root domain. Table and AllDifferentAc
+/// "explained" each hole `w` with the literal `[x >= w + 1]`, false on the
+/// trail: the conflict below had a literal that was not false (a conflict
+/// that is none), and pruning clauses were not unit. Root holes are
+/// permanent and need no reason.
+#[test]
+fn test_table_conflict_with_a_root_hole_is_false_on_the_trail() {
+    let tuples = vec![vec![1, 1, 2], vec![4, -1, 0], vec![1, -1, 0]];
+    let t = tuples.clone();
+    let stats = check_state(
+        &[&[4], &[0, 1, 3, 4], &[2, 3]],
+        Box::new(move |x| t.iter().any(|t| t.as_slice() == x)),
+        Box::new(move |v| Box::new(Table::new(v.to_vec(), tuples.clone()))),
+        &[(2, 2, 2)],
+    );
+    let stats = stats.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(stats.conflicts, 1);
+}
+
+/// See the table case: x3 has the root hole 1.
+#[test]
+fn test_alldifferent_ac_reasons_with_a_root_hole_are_false_on_the_trail() {
+    let domains: [&[i64]; 4] = [&[3, 4, 5], &[1], &[4, 5], &[0, 2, 3]];
+    let union = vec![0, 1, 2, 3, 4, 5];
+    let stats = check_state(
+        &domains,
+        Box::new(distinct),
+        Box::new(move |v| Box::new(AllDifferentAc::new(v.to_vec(), union.clone()))),
+        &[(0, 5, 5)],
+    );
+    let stats = stats.unwrap_or_else(|e| panic!("{e}"));
+    assert!(stats.reasons > 0);
 }

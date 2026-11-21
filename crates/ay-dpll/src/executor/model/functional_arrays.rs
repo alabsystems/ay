@@ -12,11 +12,13 @@ use ay_frontend::SourceContextStamp;
 use ay_model_check::{ArraySnapshot, EvalOutcome, Evaluator, ModelValue};
 
 use super::{eval_memo_clear, Executor, Model};
+use crate::executor::query_authority::QueryAuthorityEpoch;
 
 mod copy_confirmation;
 mod fill_confirmation;
 mod model_pins;
 mod named_values;
+mod periodic_candidate;
 mod pin_admission;
 mod producer;
 
@@ -62,6 +64,7 @@ pub(super) fn debit_retained_work(
 #[derive(Clone, Debug)]
 pub(super) struct FunctionalArrayModel {
     source: SourceContextStamp,
+    epoch: QueryAuthorityEpoch,
     roots: Vec<TermId>,
     stamps: Vec<(TermId, TermEntryStamp)>,
     entries: Vec<(TermId, Arc<ArraySnapshot>)>,
@@ -117,7 +120,8 @@ impl Model {
         };
         let walk_charge = if stamps_current { 0 } else { data.stamps.len() };
         self.charge_functional_array_work(exec, data.roots.len() + walk_charge + 1)?;
-        if data.source != exec.ctx.source_context_stamp()
+        if !data.epoch.is_same_epoch(&exec.query_authority_epoch)
+            || data.source != exec.ctx.source_context_stamp()
             || data.roots
                 != exec
                     .independent_gate_query_roots()
@@ -145,11 +149,22 @@ impl Model {
         exec: &Executor,
         amount: usize,
     ) -> Result<(), String> {
+        let symbolic = &self.certified_total_ufs.symbolic;
+        if !symbolic.is_empty() && !symbolic.pay_for(exec, amount, 0) {
+            return Err("retained symbolic model work owner refused".to_owned());
+        }
         if let Some(data) = &self.functional_arrays {
             debit_work(exec, &data.work_used, amount)?;
-        } else {
-            exec.poll_evaluation_stop()
-                .map_err(|_| "functional array owner interrupted".to_owned())?;
+        } else if symbolic.is_empty() {
+            if let Some(admission) = super::recovery_admission::RecoveryAdmission::current_for(exec)
+            {
+                admission.pay(amount, 0).then_some(()).ok_or_else(|| {
+                    "functional array original recovery owner exhausted".to_owned()
+                })?;
+            } else {
+                exec.poll_evaluation_stop()
+                    .map_err(|_| "functional array owner interrupted".to_owned())?;
+            }
         }
         Ok(())
     }
@@ -222,19 +237,31 @@ impl Executor {
         if model.charge_functional_array_work(self, 0).is_err() {
             return Some(super::EvalValue::Unknown);
         }
-        let super::EvalValue::BitVec {
-            value: key,
-            width: 64,
-        } = index
-        else {
+        let bytes = match index {
+            super::EvalValue::BitVec { value, width: 64 } => value.bits().max(64).div_ceil(8),
+            super::EvalValue::Rational(value) if value.is_integer() => {
+                value.numer().bits().max(1).div_ceil(8)
+            }
+            _ => return Some(super::EvalValue::Unknown),
+        };
+        let Ok(bytes) = usize::try_from(bytes) else {
             return Some(super::EvalValue::Unknown);
+        };
+        if model.charge_functional_array_work(self, bytes + 1).is_err() {
+            return Some(super::EvalValue::Unknown);
+        }
+        let key = match index {
+            super::EvalValue::BitVec { value, width: 64 } => ModelValue::bitvec(value.clone(), 64),
+            super::EvalValue::Rational(value) if value.is_integer() => {
+                ModelValue::Int(value.to_integer())
+            }
+            _ => return Some(super::EvalValue::Unknown),
         };
         let before = model.functional_work_left();
         let mut work = before;
-        let result =
-            value.read_with_stop(&ModelValue::bitvec(key.clone(), 64), &mut work, &mut || {
-                self.poll_evaluation_stop().is_err()
-            });
+        let result = value.read_with_stop(&key, &mut work, &mut || {
+            self.poll_evaluation_stop().is_err()
+        });
         if model
             .charge_functional_array_work(self, before - work)
             .is_err()

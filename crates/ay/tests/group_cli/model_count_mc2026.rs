@@ -31,11 +31,16 @@ fn write_temp_cnf(contents: &str) -> (std::path::PathBuf, CleanupGuard) {
 }
 
 fn run_model_count(cnf: &str) -> String {
+    run_model_count_with(cnf, &[])
+}
+
+fn run_model_count_with(cnf: &str, extra_args: &[&str]) -> String {
     let ay_path = env!("CARGO_BIN_EXE_ay");
     let (path, _cleanup) = write_temp_cnf(cnf);
     let output = Command::new(ay_path)
         .arg("model-count")
         .arg(&path)
+        .args(extra_args)
         .output_timeout(DEFAULT_CHILD_TIMEOUT)
         .expect("spawn ay model-count");
 
@@ -148,4 +153,33 @@ fn model_count_solves_amc_complex_spec_example_5() {
         stdout.contains("c s exact arb frac -24/25+23/25i"),
         "{stdout}"
     );
+}
+
+/// AY-OTHER-3: definability elimination stays off on projected inputs unless
+/// `--projected-definability-elimination` is given; the count is the same.
+/// 100 shown inputs, 100 unshown OR gates over pairs of them: 2^100.
+#[test]
+#[timeout(30_000)]
+fn model_count_projected_definability_elimination_is_opt_in() {
+    let mut cnf = String::from("c t pmc\np cnf 200 300\nc p show");
+    for input in 1..=100 {
+        cnf.push_str(&format!(" {input}"));
+    }
+    cnf.push_str(" 0\n");
+    for input in 1..=100 {
+        let other = input % 100 + 1;
+        let gate = 100 + input;
+        cnf.push_str(&format!("-{input} {gate} 0\n"));
+        cnf.push_str(&format!("-{other} {gate} 0\n"));
+        cnf.push_str(&format!("-{gate} {input} {other} 0\n"));
+    }
+    let count = "c s exact arb int 1267650600228229401496703205376";
+
+    let default = run_model_count(&cnf);
+    assert!(default.contains(count), "{default}");
+    assert!(!default.contains("definability elimination"), "{default}");
+
+    let opted_in = run_model_count_with(&cnf, &["--projected-definability-elimination"]);
+    assert!(opted_in.contains(count), "{opted_in}");
+    assert!(opted_in.contains("definability elimination"), "{opted_in}");
 }

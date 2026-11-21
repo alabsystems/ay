@@ -25,6 +25,7 @@ fn complete_lambda(exec: &Executor, rhs: TermId) -> bool {
     recognize_range_lambda(&exec.ctx.terms, rhs).is_some()
         || recognize_identity_lambda(&exec.ctx.terms, rhs).is_some()
         || recognize_fill_lambda(&exec.ctx.terms, rhs).is_some()
+        || recognize_int_scalar_lambda(&exec.ctx.terms, rhs).is_some()
 }
 
 // Eligibility is not evaluation or model authority. The existing capture
@@ -36,10 +37,12 @@ pub(super) fn finite_constructor(exec: &Executor, rhs: TermId) -> bool {
     let Sort::Array(sort) = exec.ctx.terms.sort(rhs) else {
         return false;
     };
-    if !matches!(&sort.index_sort, Sort::BitVec(index) if index.width == 64)
-        || !(matches!(&sort.element_sort, Sort::Bool)
-            || matches!(&sort.element_sort, Sort::BitVec(cell) if (1..=128).contains(&cell.width)))
-    {
+    let supported = (sort.index_sort == Sort::Int
+        && matches!(&sort.element_sort, Sort::Bool | Sort::Int))
+        || (matches!(&sort.index_sort, Sort::BitVec(index) if index.width == 64)
+            && (matches!(&sort.element_sort, Sort::Bool)
+                || matches!(&sort.element_sort, Sort::BitVec(cell) if (1..=128).contains(&cell.width))));
+    if !supported {
         return false;
     }
     let TermData::App(ay_core::Symbol::Named(symbol), args) = exec.ctx.terms.get(rhs) else {
@@ -205,10 +208,7 @@ fn original_stamps(
             continue;
         }
         stamps.insert(term, exec.ctx.terms.entry_stamp(term)?);
-        let children = exec.ctx.terms.children(term);
-        spend(exec, work, children.len())?;
-        stack.try_reserve(children.len()).ok()?;
-        stack.extend(children);
+        super::push_children(exec, term, &mut stack, work)?;
     }
     Some(stamps.into_iter().collect())
 }

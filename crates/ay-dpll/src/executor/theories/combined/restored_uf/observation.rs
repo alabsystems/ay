@@ -93,6 +93,11 @@ impl Probe {
             self.record.set(record);
         }
     }
+    /// Whether the closure phase finished (test observation only).
+    #[cfg(test)]
+    pub(super) fn closure_complete(&self) -> bool {
+        self.record.get().closed
+    }
     pub(super) fn emit(&self, exec: &Executor, result: &Checked<()>) {
         if !self.enabled {
             return;

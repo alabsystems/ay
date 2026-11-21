@@ -156,6 +156,61 @@ fn indexed_eq_congruent_proof(terms: &mut TermStore) -> Proof {
 }
 
 #[test]
+fn native_tester_eq_congruent_uses_scoped_indexed_cong_and_refuses_a_forged_head() {
+    let mut terms = TermStore::new();
+    let sort = Sort::Uninterpreted("Choice".to_owned());
+    let a = terms.mk_var("a", sort.clone());
+    let b = terms.mk_var("b", sort);
+    let left = terms.mk_app(Symbol::named("is-Left"), [a], Sort::Bool);
+    let right = terms.mk_app(Symbol::named("is-Left"), [b], Sort::Bool);
+    let equal = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+    let guard = terms.mk_not_raw(equal);
+    let conclusion = terms.mk_app(Symbol::named("="), [right, left], Sort::Bool);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(left, "((_ is Left) a)".to_owned());
+    overrides.insert(right, "((_ is Left) b)".to_owned());
+    let mut forged = overrides.clone();
+    forged.insert(right, "((_ is Right) b)".to_owned());
+    for theory in [false, true] {
+        let mut proof = Proof::new();
+        if theory {
+            proof.add_theory_lemma_with_kind(
+                "euf",
+                vec![guard, conclusion],
+                ay_core::TheoryLemmaKind::EufCongruent,
+            );
+        } else {
+            proof.add_rule_step(
+                AletheRule::EqCongruent,
+                vec![guard, conclusion],
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        let scope = super::scope_covering_proof(&proof);
+        let text = try_export_alethe_with_problem_scope_and_overrides(
+            &proof,
+            &terms,
+            &scope,
+            Some(&overrides),
+        )
+        .expect("checked indexed congruence");
+        assert!(text.contains(":rule cong :premises (t0.h0)"), "{text}");
+        assert!(text.contains(":rule subproof :discharge (t0.h0)"), "{text}");
+        assert!(!text.contains(":rule hole"), "{text}");
+        assert!(matches!(
+            try_export_alethe_with_problem_scope_and_overrides(
+                &proof,
+                &terms,
+                &scope,
+                Some(&forged)
+            ),
+            Err(AlethePrintError::InvalidCongruenceStep { .. })
+        ));
+    }
+}
+
+#[test]
 fn eq_congruent_over_an_indexed_head_is_rebuilt_as_a_cong_subproof() {
     // carcara 1.1.0's `eq_congruent` accepts only `Term::App` and `Term::Op`,
     // so `((_ extract 1 0) x)` is refused outright — MEASURED, and measured

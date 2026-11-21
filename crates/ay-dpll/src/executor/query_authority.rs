@@ -295,6 +295,11 @@ impl AuthoredPlainHardQuery<'_> {
     fn solve(self) -> Result<SolveResult> {
         self.executor.check_sat_with_authored_query(self.permit)
     }
+
+    fn solve_observed(self, observer: super::NativeProofObserver<'_>) -> Result<SolveResult> {
+        self.executor
+            .check_sat_with_authored_query_observed(self.permit, observer)
+    }
 }
 
 impl AuthoredPlainHardQueryPermit {
@@ -424,6 +429,26 @@ impl Executor {
                     }))
     }
 
+    /// A refinement may replace its predecessor only with the exact model
+    /// certified over the restored query. A model-free finite expansion or a
+    /// grant resting on discharged trust does not authorize that handoff.
+    pub(in crate::executor) fn has_checked_model_bound_full_domain_sat_authority(
+        &self,
+        roots: &[TermId],
+    ) -> bool {
+        self.last_model_validated
+            && self.bv_quantifier_full_domain_proof
+            && self
+                .bv_quantifier_full_domain_query_grant
+                .as_ref()
+                .is_some_and(|grant| {
+                    grant.model_epoch.is_some()
+                        && grant.admission()
+                            == crate::executor::unsat_cert::ProbeUnsatAuthority::Checked
+                        && grant.is_current_for(self, roots)
+                })
+    }
+
     /// Whether the exact closed-sentence theorem currently owns `roots`
     /// without naming a particular model.
     ///
@@ -521,6 +546,19 @@ impl Executor {
             return self.check_sat();
         }
         self.begin_authored_plain_hard_query(inventory).solve()
+    }
+
+    pub(crate) fn solve_authored_plain_hard_query_observed(
+        &mut self,
+        native_softs: &[NativeSoftQueryBinding],
+        observer: super::NativeProofObserver<'_>,
+    ) -> Result<SolveResult> {
+        let inventory = PlainHardQueryInventory::capture(self, native_softs);
+        if !inventory.is_plain_hard() {
+            return self.check_sat();
+        }
+        self.begin_authored_plain_hard_query(inventory)
+            .solve_observed(observer)
     }
 
     #[cfg(test)]

@@ -152,8 +152,10 @@ pub(super) fn branching_optimization(
     let mut step: i64 = 1;
 
     'outer: loop {
-        // Check global deadline before each probe.
+        // Check global deadline before each probe. Stopping here proves
+        // nothing about the incumbent: never claim optimality after it.
         if config.deadline_expired() {
+            hit_unknown = true;
             break;
         }
 
@@ -225,6 +227,7 @@ pub(super) fn branching_optimization(
                 while lo <= hi {
                     // Check deadline before each binary search probe.
                     if config.deadline_expired() {
+                        hit_unknown = true;
                         break 'outer;
                     }
 

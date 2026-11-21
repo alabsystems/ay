@@ -32,6 +32,8 @@
 //! assert!(set.contains(&1));
 //! ```
 
+pub mod hash_table_cost;
+
 /// Deterministic map type: hashbrown with fixed hash seed for reproducible
 /// iteration order across process runs.
 pub type DetHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::FixedState>;

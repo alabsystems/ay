@@ -182,6 +182,7 @@ mod budget;
 mod generic;
 mod interpretation;
 mod leaves;
+mod symbolic;
 mod tables;
 #[cfg(test)]
 mod trust_refutation_tests;

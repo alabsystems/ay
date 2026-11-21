@@ -96,6 +96,16 @@ impl TheorySolver for NiaSolver<'_> {
         matches!(self.try_local_search_lane(), Some(TheoryResult::Sat))
     }
 
+    /// #nia-persist-until-deadline (AY-SMT-5): under the top-level QF_NIA
+    /// persistence policy (a deadline installed and not yet reached), keep
+    /// branching past the split-drift guard. QF_NIA/826be49e (UNSAT) and
+    /// 924580cb (SAT) both ended `unknown` at ~40 s of 60 when one variable's
+    /// split value had moved the same way for 20 rounds (`-5/3 .. -65/3`,
+    /// `2/3 .. 62/3`), right after the local-search lane spent its share.
+    fn continue_split_walk_until_deadline(&self) -> bool {
+        self.persisting_until_deadline()
+    }
+
     /// The same lane before a stale request's `Sat` goes to the model gate
     /// (#stale-accept-sat-lane). The check loop forwards the inner LIA's
     /// model equalities when its point violates an asserted disequality

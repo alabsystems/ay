@@ -37,6 +37,7 @@ pub(super) struct ClosureEmitter<'c> {
     edge_units: DetHashMap<usize, DerivedUnit>,
     pub(super) fact_units: DetHashMap<usize, DerivedUnit>,
     assumed: DetHashMap<TermId, ProofId>,
+    pub(super) used_authored_clause: bool,
 }
 
 impl<'c> ClosureEmitter<'c> {
@@ -53,6 +54,7 @@ impl<'c> ClosureEmitter<'c> {
             edge_units: DetHashMap::default(),
             fact_units: DetHashMap::default(),
             assumed: DetHashMap::default(),
+            used_authored_clause: false,
         }
     }
 
@@ -132,6 +134,16 @@ impl Executor {
             }
         }
         emitter.within_budget()?;
+        if emitter.used_authored_clause {
+            // This extension uses only exact authored premises. A raw surface
+            // re-intern with a different declaration identity cannot acquire
+            // authority by participating in the new propagation lane.
+            ay_proof::validate_reachable_assumes_in_problem_scope(
+                &emitter.proof,
+                &self.exact_concrete_authored_scope(),
+            )
+            .ok()?;
+        }
         Some(emitter.proof)
     }
 

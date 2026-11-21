@@ -8,6 +8,9 @@
 //! into CP propagation during search. This is the core integration point
 //! for Lazy Clause Generation (LCG).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use ay_sat::{ExtCheckResult, ExtPropagateResult, Extension, Literal, SolverContext, Variable};
 
 use crate::encoder::IntegerEncoder;
@@ -66,6 +69,223 @@ pub struct CpExtension {
     /// Workspace: reused across `run_dirty_propagators` calls to avoid
     /// per-cycle allocation of the output clause buffer.
     pub(crate) ws_all_clauses: Vec<Vec<Literal>>,
+    /// Known solution that propagator clauses are checked against (debug
+    /// aid, set by `CpSatEngine::set_witness`).
+    pub(crate) witness: Option<Arc<Witness>>,
+    /// Restarts the SAT core made in this solve (see [`branching`]).
+    pub(crate) restarts: std::cell::Cell<u64>,
+}
+
+/// Who chooses the next decision variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Branching {
+    /// The engine's search heuristic over the model's search variables
+    /// (the FlatZinc search annotation, or the default strategy).
+    Annotated,
+    /// The SAT core's activity heuristic (VSIDS), which follows the conflicts.
+    Activity,
+}
+
+/// The branching of a search after `restarts` restarts. A satisfaction
+/// search always follows the annotated heuristic. An optimisation search
+/// alternates at each restart, starting with the annotated heuristic, as
+/// Chuffed's free search does (Chu, Stuckey: "Chuffed, a lazy clause
+/// generation solver"; OR-Tools CP-SAT alternates fixed and default search
+/// in the same way): a static order alone stalled on MiniZinc
+/// rect-euler/3venn at 946 after 30 s (rivals prove 821 in a second), with
+/// the alternation ay proves 821 in 7.75 s at a machine load of 250
+/// (2026-11-19, AY-N8). Only decisions change, never a clause, so it cannot
+/// change an answer.
+pub(crate) fn branching(optimising: bool, restarts: u64) -> Branching {
+    if optimising && restarts % 2 == 1 {
+        Branching::Activity
+    } else {
+        Branching::Annotated
+    }
+}
+
+/// Test hooks of the branching policy, per test thread (the engine runs a
+/// solve on the calling thread): the restart count every search starts
+/// from (1 starts an optimisation search in [`Branching::Activity`]), and
+/// the number of decisions left to the SAT core's activity heuristic.
+#[cfg(test)]
+pub(crate) mod branching_test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static FIRST_RESTART: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static ACTIVITY_DECISIONS: Cell<u64> = const { Cell::new(0) };
+    }
+}
+
+/// The restart count a search starts from: 0, or the test hook's value.
+pub(crate) fn first_restart() -> u64 {
+    #[cfg(test)]
+    {
+        branching_test_hooks::FIRST_RESTART.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
+
+/// A known solution of the model, for checking the clauses the engine
+/// gives the SAT core (propagator reasons and conflicts, encoder clauses,
+/// root-propagation and lazy not-equal clauses).
+#[derive(Debug)]
+pub(crate) struct Witness {
+    /// Value per integer variable, `None` where unknown. Grows when the
+    /// encoders define auxiliary variables (`CpSatEngine::witness_define`).
+    values: Vec<Option<i64>>,
+    /// Display name per integer variable.
+    names: Vec<String>,
+    /// Number of falsified clauses (reports stop at a cap).
+    reported: AtomicUsize,
+    /// Clauses checked.
+    checked: AtomicUsize,
+    /// Clauses neither satisfied nor falsified: a literal is on a variable
+    /// with no witness value and every known literal is false.
+    unknown: AtomicUsize,
+}
+
+/// At most this many falsified clauses are printed per engine.
+const WITNESS_REPORT_CAP: usize = 20;
+
+impl Witness {
+    pub(crate) fn new(values: Vec<Option<i64>>, names: Vec<String>) -> Self {
+        Self {
+            values,
+            names,
+            reported: AtomicUsize::new(0),
+            checked: AtomicUsize::new(0),
+            unknown: AtomicUsize::new(0),
+        }
+    }
+
+    /// Record the witness value of a variable created after `set_witness`
+    /// (an encoder's auxiliary variable), `None` if it is not determined.
+    pub(crate) fn define(&mut self, var: IntVarId, value: Option<i64>, name: String) {
+        let idx = var.index();
+        if self.values.len() <= idx {
+            self.values.resize(idx + 1, None);
+        }
+        if self.names.len() <= idx {
+            self.names.resize(idx + 1, String::new());
+        }
+        self.values[idx] = value;
+        self.names[idx] = name;
+    }
+
+    /// The witness value of `var`. A variable whose root domain is a single
+    /// value (a constant) is known even when the witness does not name it.
+    pub(crate) fn value(&self, encoder: &IntegerEncoder, var: IntVarId) -> Option<i64> {
+        if let Some(value) = self.values.get(var.index()).copied().flatten() {
+            return Some(value);
+        }
+        let (lb, ub) = encoder.var_bounds(var);
+        (lb == ub).then_some(lb)
+    }
+
+    /// `Some(truth)` of `lit` under the witness, `None` if unknown.
+    fn literal_value(&self, encoder: &IntegerEncoder, lit: Literal) -> Option<bool> {
+        let bound = encoder.decode(lit.variable())?;
+        let value = self.value(encoder, bound.var)?;
+        let ge = value >= bound.value;
+        Some(ge == lit.is_positive())
+    }
+
+    fn describe(&self, encoder: &IntegerEncoder, clause: &[Literal]) -> String {
+        clause
+            .iter()
+            .map(|&lit| match encoder.decode(lit.variable()) {
+                Some(bound) => {
+                    let name = self
+                        .names
+                        .get(bound.var.index())
+                        .filter(|n| !n.is_empty())
+                        .map_or_else(|| format!("v{}", bound.var.index()), Clone::clone);
+                    let value = self.value(encoder, bound.var);
+                    let shown = value.map_or_else(|| "?".to_string(), |v| v.to_string());
+                    if lit.is_positive() {
+                        format!("[{name} >= {}]({name}={shown})", bound.value)
+                    } else {
+                        format!("[{name} <= {}]({name}={shown})", bound.value - 1)
+                    }
+                }
+                None => format!("sat{}", lit.variable().index()),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    /// Check one clause; report it when the witness falsifies it.
+    pub(crate) fn check_clause(
+        &self,
+        encoder: &IntegerEncoder,
+        origin: &str,
+        kind: &str,
+        clause: &[Literal],
+    ) {
+        self.checked.fetch_add(1, Ordering::Relaxed);
+        let mut unknown = false;
+        for &lit in clause {
+            match self.literal_value(encoder, lit) {
+                Some(true) => return,
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            self.unknown.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let n = self.reported.fetch_add(1, Ordering::Relaxed);
+        if n < WITNESS_REPORT_CAP {
+            eprintln!(
+                "ay-cp witness: {origin} {kind} clause falsified by the witness: {}",
+                self.describe(encoder, clause)
+            );
+        }
+    }
+
+    /// Report each clause of `result` that the witness falsifies.
+    pub(crate) fn check(
+        &self,
+        encoder: &IntegerEncoder,
+        propagator: &str,
+        result: &PropagationResult,
+    ) {
+        match result {
+            PropagationResult::NoChange => {}
+            PropagationResult::Propagated(clauses) => {
+                for clause in clauses {
+                    self.check_clause(encoder, propagator, "reason", clause);
+                }
+            }
+            PropagationResult::Conflict(clause) => {
+                self.check_clause(encoder, propagator, "conflict", clause);
+            }
+        }
+    }
+
+    /// `(checked, falsified, unknown)` clause counts so far.
+    pub(crate) fn counts(&self) -> (usize, usize, usize) {
+        (
+            self.checked.load(Ordering::Relaxed),
+            self.reported.load(Ordering::Relaxed),
+            self.unknown.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One-line summary, printed when a solve ends without a solution.
+    pub(crate) fn summary(&self) -> String {
+        let (checked, falsified, unknown) = self.counts();
+        format!(
+            "ay-cp witness: {checked} clauses checked, {falsified} falsified, \
+             {unknown} unknown (a literal on a variable without a witness value)"
+        )
+    }
 }
 
 impl CpExtension {
@@ -207,6 +427,9 @@ impl CpExtension {
             self.dirty_count -= 1;
 
             let result = self.propagators[i].propagate(&self.trail, &self.encoder);
+            if let Some(witness) = &self.witness {
+                witness.check(&self.encoder, self.propagators[i].name(), &result);
+            }
 
             match result {
                 PropagationResult::NoChange => {}
@@ -350,6 +573,9 @@ impl CpExtension {
                     Some(clause)
                 })();
                 if let Some(clause) = clause {
+                    if let Some(witness) = &self.witness {
+                        witness.check_clause(&self.encoder, "lazy_neq", "conflict", &clause);
+                    }
                     return Some(clause);
                 }
                 // Explanation incomplete — skip this neq violation.
@@ -437,7 +663,18 @@ impl Extension for CpExtension {
         self.dirty_count > 0
     }
 
+    fn on_restart(&self) -> Vec<Variable> {
+        self.restarts.set(self.restarts.get() + 1);
+        Vec::new()
+    }
+
     fn suggest_decision(&self, ctx: &dyn SolverContext) -> Option<Literal> {
+        if branching(self.objective.is_some(), self.restarts.get()) == Branching::Activity {
+            // The SAT core's own activity-based (VSIDS) choice.
+            #[cfg(test)]
+            branching_test_hooks::ACTIVITY_DECISIONS.with(|c| c.set(c.get() + 1));
+            return None;
+        }
         // Use the configured search heuristic to select a variable
         let var = self
             .search

@@ -45,7 +45,7 @@ pub(crate) const DEFAULT_DAG_CAPS: DagCaps = DagCaps {
 const MAX_CONVERT_NODES: usize = 200_000;
 
 /// Reconstruction step budget of a proof-groups solve.
-const PROOF_STEP_BUDGET: u64 = 50_000_000;
+pub(super) const PROOF_STEP_BUDGET: u64 = 50_000_000;
 
 /// Ask the proof solve for its refutation.
 ///

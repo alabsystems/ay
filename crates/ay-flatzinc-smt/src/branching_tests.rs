@@ -447,3 +447,27 @@ fn test_build_search_plan_split_val_choice() {
 }
 
 include!("branching_tests/large_domain_and_binary_search.rs");
+
+/// A run whose `-t` expires between two probes has not proved optimality.
+/// With `indomain_max` the first solution of `minimize x` is x = 10; if the
+/// deadline has passed by then, the loop stops and must not print
+/// `==========` after it (it did: a false optimality claim).
+#[test]
+fn an_expired_deadline_never_claims_optimality() {
+    let fzn = "var 1..10: x :: output_var;\n\
+               solve :: int_search([x], input_order, indomain_max, complete) minimize x;\n";
+    let model = ay_flatzinc_parser::parse_flatzinc(fzn).expect("FlatZinc model must parse");
+    let result = crate::translate(&model).expect("model must translate");
+    let config = SolverConfig {
+        timeout_ms: None,
+        all_solutions: false,
+        global_deadline: Some(std::time::Instant::now()),
+    };
+    let mut out = Vec::new();
+    solve_branching(&result, &config, &mut out).expect("solve");
+    let out = String::from_utf8(out).expect("UTF-8");
+    assert!(
+        !out.contains("=========="),
+        "an expired deadline proves nothing: {out}"
+    );
+}

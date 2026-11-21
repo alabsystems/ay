@@ -627,6 +627,24 @@ impl Context {
                 == Some(DeclarationKind::Uninterpreted)
     }
 
+    /// Whether this positively checked binding's immutable source namespace
+    /// has remained unchanged. This is a fixed-header lease check, not a new
+    /// declaration check or model certificate. The binding has private fields
+    /// and can only be minted by the complete positive checker above.
+    ///
+    /// Every source-namespace write retires the context stamp BEFORE its first
+    /// mutation, including temporary declarations and failed elaborations.
+    /// Restoring a snapshot never restores that revision. Consumers must still
+    /// authenticate their query roots, term arena and any directly mutable core
+    /// operator metadata; those are deliberately not granted by this lease.
+    #[must_use]
+    pub fn projection_binding_lease_still_current(
+        &self,
+        binding: &CheckedProjectionBinding,
+    ) -> bool {
+        binding.stamp == self.source_context_stamp()
+    }
+
     fn check_projection_declaration_request(
         &self,
         request: &ProjectionBindingRequest,

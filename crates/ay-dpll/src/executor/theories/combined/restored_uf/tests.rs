@@ -661,6 +661,60 @@ fn an_uninitialized_live_graph_is_not_silently_treated_as_independent_singletons
     same_candidate(&model, &old, &lia, &old_lia);
 }
 
+/// AY-SMT-3: recovery over one large live class costs less than half of the
+/// closure's old pair scan. One live class of `n` constants (plus the `n - 1`
+/// asserted equalities) used to cost about (2n)^2 / 2 units in that scan
+/// alone (720,000 for n = 600), and the pin and semantic-peer passes scanned
+/// every node per pinned term or peer; on SMT-COMP incremental QF_AUFLIA
+/// 2721719d (985 nodes) that was about 1 s of every check-sat that reached
+/// this recovery.
+///
+/// NOT yet linear. The first run of this test with a compiler (20 November
+/// 2026) measured 254,510 units for n = 600, where the index rewrite was
+/// written to reach under 64 n = 38,400: a pass that is quadratic in the
+/// class remains. The bound below is what the rewrite does achieve; the
+/// remaining pass keeps AY-SMT-3 open.
+#[test]
+fn one_large_live_class_costs_less_than_half_the_old_pair_scan() {
+    let n = 600usize;
+    let mut source = String::from("(declare-sort U 0)");
+    for k in 0..n {
+        source.push_str(&format!(" (declare-const c{k} U)"));
+    }
+    let mut ctx = context(&source);
+    let constants: Vec<TermId> = (0..n).map(|k| constant(&ctx, &format!("c{k}"))).collect();
+    let roots: Vec<TermId> = constants[1..]
+        .iter()
+        .map(|&c| eq(&mut ctx, constants[0], c))
+        .collect();
+    let literals: Vec<(TermId, bool)> = roots.iter().map(|&root| (root, true)).collect();
+    let mut live = checked_live(&ctx, &roots, &literals);
+    let mut model = live.extract_model();
+    let mut lia = None;
+    let mut work = 0usize;
+    let probe = Probe::new(true);
+    let result = run_observed(
+        &ctx,
+        &live,
+        &roots,
+        &mut model,
+        &mut lia,
+        &mut |units, _| {
+            work = work.checked_add(units).unwrap();
+            Ok(())
+        },
+        &probe,
+    );
+    assert!(
+        probe.closure_complete(),
+        "the fixture must reach and finish the closure, got {result:?}"
+    );
+    assert!(
+        work < (2 * n) * (2 * n) / 4,
+        "recovery over one live class of {n} constants paid {work} work units"
+    );
+}
+
 mod extended;
 
 mod predicate_completion;

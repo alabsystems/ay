@@ -928,7 +928,7 @@ fn test_default_drat_proof_path_no_file_returns_none() {
 #[test]
 fn test_default_proof_path_cnf_is_drat() {
     let file = PathBuf::from("/tmp/example.cnf");
-    let (path, format) = default_proof_path(Some(&file)).expect("cnf gets a default proof");
+    let (path, format) = default_proof_path(Some(&file), None).expect("cnf gets a default proof");
     assert_eq!(path, "/tmp/example.cnf.drat");
     assert_eq!(format, ProofFormat::Drat);
 }
@@ -938,7 +938,7 @@ fn test_default_proof_path_smt2_is_alethe() {
     // SMT-LIB UNSAT is proof-carrying by default: a `.smt2` input gets an
     // Alethe certificate written next to it.
     let file = PathBuf::from("/tmp/example.smt2");
-    let (path, format) = default_proof_path(Some(&file)).expect("smt2 gets a default proof");
+    let (path, format) = default_proof_path(Some(&file), None).expect("smt2 gets a default proof");
     assert_eq!(path, "/tmp/example.smt2.alethe");
     assert_eq!(format, ProofFormat::Alethe);
 }
@@ -946,7 +946,7 @@ fn test_default_proof_path_smt2_is_alethe() {
 #[test]
 fn test_default_proof_path_smt_extension_is_alethe() {
     let file = PathBuf::from("bench/foo.smt");
-    let (path, format) = default_proof_path(Some(&file)).expect(".smt gets a default proof");
+    let (path, format) = default_proof_path(Some(&file), None).expect(".smt gets a default proof");
     assert_eq!(path, "bench/foo.smt.alethe");
     assert_eq!(format, ProofFormat::Alethe);
 }
@@ -954,7 +954,8 @@ fn test_default_proof_path_smt_extension_is_alethe() {
 #[test]
 fn test_default_proof_path_smt2_case_insensitive() {
     let file = PathBuf::from("Problem.SMT2");
-    let (path, format) = default_proof_path(Some(&file)).expect("SMT2 (uppercase) gets a default");
+    let (path, format) =
+        default_proof_path(Some(&file), None).expect("SMT2 (uppercase) gets a default");
     assert_eq!(path, "Problem.SMT2.alethe");
     assert_eq!(format, ProofFormat::Alethe);
 }
@@ -962,9 +963,9 @@ fn test_default_proof_path_smt2_case_insensitive() {
 #[test]
 fn test_default_proof_path_unknown_extension_returns_none() {
     // MaxSAT/QBF/unknown inputs have no default-proof infrastructure yet.
-    assert!(default_proof_path(Some(&PathBuf::from("/tmp/x.wcnf"))).is_none());
-    assert!(default_proof_path(Some(&PathBuf::from("/tmp/x.qdimacs"))).is_none());
-    assert!(default_proof_path(None).is_none());
+    assert!(default_proof_path(Some(&PathBuf::from("/tmp/x.wcnf")), None).is_none());
+    assert!(default_proof_path(Some(&PathBuf::from("/tmp/x.qdimacs")), None).is_none());
+    assert!(default_proof_path(None, None).is_none());
 }
 
 #[test]
@@ -1248,7 +1249,7 @@ fn default_dimacs_status_collides_with_every_solve_path_class() {
     let temp = tempfile::tempdir().expect("tempdir");
     let input = temp.path().join("problem.cnf");
     std::fs::write(&input, b"p cnf 1 1\n1 0\n").expect("write input");
-    let (proof, format) = default_proof_path(Some(&input)).expect("default DIMACS proof");
+    let (proof, format) = default_proof_path(Some(&input), None).expect("default DIMACS proof");
     assert_eq!(format, ProofFormat::Drat);
     let status = dimacs::dimacs_proof_status_path(&proof);
     let status_lock = dimacs::dimacs_proof_status_lock_path(&status);

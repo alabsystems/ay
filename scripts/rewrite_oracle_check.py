@@ -45,11 +45,15 @@ def resolve(inst):
     return None
 
 
-def run_one(binary, smt2, timeout, memlimit_mb, env):
+def run_one(binary, smt2, timeout, memlimit_mb, env, proof_store):
     argv = [binary, "solve"]
     # Per-child envelope: the standalone default is 85% of RAM per process,
     # sibling-blind across jobs (scripts/_oom_guard.py).
     argv += ["--memory", str(memlimit_mb)]
+    # The golden verdicts were taken with proofs on; keep the proof cycle, and
+    # send the certificate to a proof store instead of beside the benchmark
+    # (DC-77).
+    argv += ["--proof-store", proof_store]
     argv.append(smt2)
     try:
         captured = run_captured(
@@ -83,7 +87,16 @@ def main():
     ap.add_argument("--sample", type=int, default=0, help="0 = all")
     ap.add_argument("--out", default="rewrite_oracle_check.json",
                     help="persist verdicts and the exact execution envelope")
+    ap.add_argument("--proof-store",
+                    help="where ay writes each default certificate (ay --proof-store); "
+                         "never beside the benchmark. Default: a new, empty store under "
+                         "$TMPDIR, since a proof a store already holds counts and ay then "
+                         "writes none, which would shed the proof cycle the golden "
+                         "verdicts were taken with")
     args = ap.parse_args()
+    if args.proof_store is None:
+        args.proof_store = tempfile.mkdtemp(prefix="ay-proof-store-")
+        print(f"proof store: {args.proof_store}", file=sys.stderr)
 
     if args.jobs <= 0:
         ap.error("--jobs must be positive")
@@ -131,7 +144,7 @@ def main():
     records = []
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futs = {ex.submit(run_one, args.binary, f, args.timeout,
-                          plan.memlimit_mb, child_env): (inst, f, exp)
+                          plan.memlimit_mb, child_env, args.proof_store): (inst, f, exp)
                 for inst, f, exp in items}
         for fut in cf.as_completed(futs):
             inst, path, exp = futs[fut]

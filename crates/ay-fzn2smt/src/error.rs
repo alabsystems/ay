@@ -231,6 +231,12 @@ pub enum Fzn2smtError {
         translator: &'static str,
     },
 
+    /// The direct CP engine declined the model before printing anything: its
+    /// dense order encoding would exceed the engine's capacity. This is not a
+    /// verdict; a caller with another backend should hand the model to it.
+    #[error("direct-CP order encoding exceeds its capacity: {0}")]
+    CpEncodingCapacity(String),
+
     /// The direct CP portfolio received an unusable worker count.
     #[error("parallel worker count must be in 1..={maximum}, got {requested}")]
     InvalidWorkerCount {

@@ -16,6 +16,8 @@ pub(super) fn value<'a>(
             .get(node)
             .ok_or(FunctionalArrayError::Value)?;
         let next = match description.kind {
+            // Periodic snapshots have integer indices; this partition certifies BV64 copies.
+            SnapshotKind::Periodic(_) => return Err(FunctionalArrayError::Sort),
             SnapshotKind::Finite(value) => {
                 // Chronological finite stores: last matching write wins.
                 for (at, cell) in value.store.iter().rev() {

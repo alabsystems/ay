@@ -29,9 +29,12 @@ impl IncrementalSolver {
         // Create solver with permissive logic; parse_smtlib2 will override
         // with the actual logic from the declarations (set-logic is idempotent).
         let mut solver = Solver::new(Logic::All);
+        // No timeout means no time limit of AY's own (see
+        // `execution::flatzinc_executor`).
+        solver.set_exact_deadline(true);
 
         // Set timeout from config so all check_sat calls respect it
-        if let Some(ms) = config.timeout_ms {
+        if let Some(ms) = call_timeout_ms(config, Instant::now()) {
             solver.set_timeout(Some(Duration::from_millis(ms)));
         }
 

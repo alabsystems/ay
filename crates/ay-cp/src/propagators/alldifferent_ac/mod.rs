@@ -164,13 +164,16 @@ impl AllDifferentAc {
     // augmenting_path, compute_matching, build_conflict, compute_sccs,
     // compute_free_reachable, filter_unsupported extracted to filtering.rs
 
-    /// Collect bound and domain-hole reason literals for a variable.
+    /// Collect the bound reason literals for a variable.
     ///
-    /// Adds `[var >= lb]`, `[var <= ub]`, and for each hole value `w` in
-    /// `[lb, ub]` where `!trail.contains(var, w)`, adds `[var >= w+1]`.
-    /// The hole literals are necessary for soundness: without them, the SAT
-    /// solver sees the domain as the full interval `[lb, ub]`, overcounting
-    /// available values and potentially deriving unsound learned clauses.
+    /// Adds `[var >= lb]` and `[var <= ub]`. The adjacency also reads exact
+    /// domain membership, but the trail only ever tightens bounds: a value
+    /// missing inside `[lb, ub]` is a hole of the root domain, excluded for
+    /// good by the clauses `prepare_domain_holes` adds before search, so it
+    /// holds in every solution and needs no reason literal. (Before
+    /// 2026-11-18 each hole `w` added `[var >= w + 1]`, a literal false on
+    /// the trail: the clause was valid but not unit, so the pruning did not
+    /// propagate and a conflict was no conflict.)
     ///
     /// Returns `false` if any required literal is missing from the encoder,
     /// indicating the explanation would be incomplete. Callers must bail
@@ -184,34 +187,14 @@ impl AllDifferentAc {
         encoder: &IntegerEncoder,
         reasons: &mut Vec<ay_sat::Literal>,
     ) -> bool {
-        let lb = trail.lb(var);
-        let ub = trail.ub(var);
-        let Some(ge_lit) = encoder.lookup_ge(var, lb) else {
+        let Some(ge_lit) = encoder.lookup_ge(var, trail.lb(var)) else {
             return false;
         };
         reasons.push(ge_lit);
-        let Some(le_lit) = encoder.lookup_le(var, ub) else {
+        let Some(le_lit) = encoder.lookup_le(var, trail.ub(var)) else {
             return false;
         };
         reasons.push(le_lit);
-        // Include domain hole reasons: for each value w in [lb, ub] that is
-        // not in the domain, the forbid_value clause ¬[x >= w] ∨ [x >= w+1]
-        // was unit-propagated. Since [x >= w] is implied by [x >= lb] (as
-        // lb <= w), the derived literal [x >= w+1] is the witness for the
-        // hole. Including it as a reason ensures the explanation correctly
-        // reflects the smaller effective domain size.
-        //
-        // We iterate all integers in [lb, ub], not just val_to_idx entries,
-        // because val_to_idx is built from initial domain values which
-        // already exclude root-level holes (forbid_value at registration).
-        for w in lb..=ub {
-            if !trail.contains(var, w) {
-                let Some(ge_next) = encoder.lookup_ge(var, w + 1) else {
-                    return false;
-                };
-                reasons.push(ge_next);
-            }
-        }
         true
     }
 }

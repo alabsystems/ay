@@ -21,7 +21,7 @@
 //!
 //! ## Data structures used
 //!
-//! - `cold.clause_ids: Vec<u64>` — maps arena offsets to clause IDs (always
+//! - `cold.clause_ids: ClauseIdTable` — maps arena offsets to clause IDs (always
 //!   populated since Phase 2a, #8069).
 //! - `var_data[vi].reason: u32` — propagation reason for each assigned variable.
 //! - `trail: Vec<Literal>` — assignment order.

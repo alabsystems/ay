@@ -6,7 +6,8 @@
 //
 // FlatZinc constraints int_div, int_mod, int_pow are translated to Table
 // constraints over enumerated domain values. For small domains (≤10,000
-// cross-product entries), all valid (input, output) tuples are enumerated.
+// cross-product entries), all valid (input, output) tuples are enumerated;
+// a larger int_div gets the CP engine's `Div` bounds propagator.
 // Special constant cases (divisor ±1, exponent 0/1) use direct LinearEq.
 
 use crate::error::Result;
@@ -23,7 +24,8 @@ impl CpContext {
     /// - b constant -1: negate c = -a
     /// - b constant, small a domain: Table constraint
     /// - Both variable, small domains: Table constraint (excludes b=0)
-    /// - Otherwise: unsupported
+    /// - Otherwise: the `Div` bounds propagator (b constant 0 stays
+    ///   unsupported)
     pub(super) fn translate_int_div(&mut self, c: &ConstraintItem) -> Result<()> {
         let b_const = self.eval_const_int(&c.args[1]);
 
@@ -64,7 +66,13 @@ impl CpContext {
                         tuples,
                     });
                 } else {
-                    self.mark_unsupported("int_div");
+                    // Above the table size: bounds propagation, any domain.
+                    let k_var = self.resolve_var(&c.args[1])?;
+                    self.engine.add_constraint(Constraint::Div {
+                        x: a,
+                        y: k_var,
+                        result: r,
+                    });
                 }
             }
         } else {
@@ -88,7 +96,12 @@ impl CpContext {
                     tuples,
                 });
             } else {
-                self.mark_unsupported("int_div");
+                // Above the table size: bounds propagation, any domain.
+                self.engine.add_constraint(Constraint::Div {
+                    x: a,
+                    y: b,
+                    result: r,
+                });
             }
         }
         Ok(())

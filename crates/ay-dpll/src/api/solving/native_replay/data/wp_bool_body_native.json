@@ -1,0 +1,548 @@
+{
+  "assertions": [
+    {
+      "index": 0,
+      "name": null,
+      "scope_depth": 1,
+      "term": 7
+    },
+    {
+      "index": 1,
+      "name": null,
+      "scope_depth": 1,
+      "term": 10
+    },
+    {
+      "index": 2,
+      "name": null,
+      "scope_depth": 2,
+      "term": 17
+    }
+  ],
+  "ay_revision": "f362c0a583566345f932831e249327d2e8927809",
+  "ay_version": "0.28.0",
+  "checked_replay": null,
+  "created_unix_ms": "0",
+  "declarations": [],
+  "events": [
+    {
+      "index": 0,
+      "kind": {
+        "event": "set_logic",
+        "logic": "ALL"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 1,
+      "kind": {
+        "event": "declare_const",
+        "name": "heap",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 2
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 2,
+      "kind": {
+        "event": "declare_const",
+        "name": "domain",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 3
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 3,
+      "kind": {
+        "event": "declare_const",
+        "name": "perms",
+        "sort": "(Array Int Int)",
+        "sort_data": {
+          "element": {
+            "kind": "int"
+          },
+          "index": {
+            "kind": "int"
+          },
+          "kind": "array"
+        },
+        "term": 4
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 4,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 5,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "domain_data": [
+          {
+            "kind": "int"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member",
+        "range": "Bool",
+        "range_data": {
+          "kind": "bool"
+        }
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 6,
+      "kind": {
+        "domain": [
+          "Bool"
+        ],
+        "domain_data": [
+          {
+            "kind": "bool"
+          }
+        ],
+        "event": "declare_fun",
+        "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member",
+        "range": "Bool",
+        "range_data": {
+          "kind": "bool"
+        }
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 7,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 7
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 8,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 10
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 9,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 10,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 17
+      },
+      "scope_depth": 2
+    },
+    {
+      "index": 11,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 2
+    }
+  ],
+  "function_declarations": [
+    {
+      "core_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member",
+      "domain": [
+        "Int"
+      ],
+      "domain_data": [
+        {
+          "kind": "int"
+        }
+      ],
+      "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member",
+      "range": "Bool",
+      "range_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "core_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member",
+      "domain": [
+        "Bool"
+      ],
+      "domain_data": [
+        {
+          "kind": "bool"
+        }
+      ],
+      "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member",
+      "range": "Bool",
+      "range_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "logic": "ALL",
+  "metadata": {
+    "consumer": null,
+    "consumer_revision": null,
+    "fixture_path": null,
+    "function_path": null,
+    "notes": null,
+    "obligation_kind": null,
+    "source_span": null
+  },
+  "panic_payload": null,
+  "replay_gaps": [],
+  "schema": "ay.native-replay.v1",
+  "scope_depth": 2,
+  "selected_route": "native-api:ALL",
+  "solve": null,
+  "sort_declarations": [],
+  "symbol_identities": [
+    {
+      "api_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "int"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "int"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member"
+    },
+    {
+      "api_domain": [
+        {
+          "kind": "bool"
+        }
+      ],
+      "api_range": {
+        "kind": "bool"
+      },
+      "core_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member",
+      "datatype_core": null,
+      "datatype_surface": null,
+      "engine_domain": [
+        {
+          "kind": "bool"
+        }
+      ],
+      "engine_range": {
+        "kind": "bool"
+      },
+      "kind": "uninterpreted",
+      "public_domain": [
+        {
+          "kind": "core",
+          "sort": {
+            "kind": "bool"
+          }
+        }
+      ],
+      "public_range": {
+        "kind": "core",
+        "sort": {
+          "kind": "bool"
+        }
+      },
+      "surface_name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member"
+    }
+  ],
+  "terms": [
+    {
+      "data": {
+        "kind": "var",
+        "name": "rust_domain_value_3",
+        "var_id": 3
+      },
+      "id": 5,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          5
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member"
+        }
+      },
+      "id": 6,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "body": 6,
+        "kind": "forall",
+        "triggers": [],
+        "vars": [
+          {
+            "name": "rust_domain_value_3",
+            "sort": "Int",
+            "sort_data": {
+              "kind": "int"
+            }
+          }
+        ]
+      },
+      "id": 7,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "rust_domain_value_4",
+        "var_id": 4
+      },
+      "id": 8,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          8
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member"
+        }
+      },
+      "id": 9,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "body": 9,
+        "kind": "forall",
+        "triggers": [],
+        "vars": [
+          {
+            "name": "rust_domain_value_4",
+            "sort": "Bool",
+            "sort_data": {
+              "kind": "bool"
+            }
+          }
+        ]
+      },
+      "id": 10,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "bool",
+          "value": true
+        }
+      },
+      "id": 0,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          0
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991aca778_member"
+        }
+      },
+      "id": 13,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "native_q_0_5",
+        "var_id": 5
+      },
+      "id": 11,
+      "is_datatype_constructor": false,
+      "sort": "Int",
+      "sort_data": {
+        "kind": "int"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          11
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__verification_consumer_rust_type_16d75bb80_4294967295_4294967295_991ac61b0_member"
+        }
+      },
+      "id": 12,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 12,
+        "kind": "not"
+      },
+      "id": 14,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "args": [
+          13,
+          14
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 15,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "body": 15,
+        "kind": "forall",
+        "triggers": [],
+        "vars": [
+          {
+            "name": "native_q_0_5",
+            "sort": "Int",
+            "sort_data": {
+              "kind": "int"
+            }
+          }
+        ]
+      },
+      "id": 16,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    },
+    {
+      "data": {
+        "inner": 16,
+        "kind": "not"
+      },
+      "id": 17,
+      "is_datatype_constructor": false,
+      "sort": "Bool",
+      "sort_data": {
+        "kind": "bool"
+      }
+    }
+  ],
+  "timeout_ms": "5624",
+  "unsupported_atoms": []
+}

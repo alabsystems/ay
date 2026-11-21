@@ -18,9 +18,12 @@ use ay_core::term::TermStoreSnapshotStamp;
 use ay_core::{Sort, TermId, TermStore};
 
 mod authored_progress;
+mod projection_lookup_cost;
 mod provenance;
+pub use projection_lookup_cost::ProjectionLookupFootprint;
 mod query_window_work;
 
+pub use commands::NativeOwnedConstantError;
 use provenance::ContextIdentity;
 pub use provenance::{
     CheckedProjectionBinding, CheckedProjectionBindings, DeclarationId, DeclarationKind,
@@ -1186,9 +1189,16 @@ struct PolymorphicAssertion {
 }
 
 #[derive(Debug, Clone)]
+enum AuthoredAssertionOrigin {
+    Text,
+    Native,
+}
+
+#[derive(Debug, Clone)]
 enum AuthoredAssertion {
     Concrete {
         term: TermId,
+        origin: AuthoredAssertionOrigin,
         parsed_index: Option<usize>,
         /// Compact provenance retained when the optional parsed AST is not.
         /// A canonical `false` TermId alone cannot distinguish literal source
@@ -1275,10 +1285,10 @@ pub struct InternalLogicBorrow {
     saved_logic: Option<String>,
     /// The source revision before the borrow's own outbound write.
     saved_revision: u64,
-    /// The source revision immediately after that outbound write. If the live
-    /// revision has moved past this, something other than the borrow changed
-    /// the source context and `saved_revision` must NOT be restored.
-    entry_revision: u64,
+    /// Exact context identity AND revision after that outbound write. A token
+    /// cannot restore a foreign/cloned/reset context or one whose revision
+    /// overflow rotated its identity, even when the numeric revisions match.
+    entry_context: SourceContextStamp,
 }
 
 /// Elaboration context
@@ -1939,6 +1949,36 @@ impl Context {
         self.symbol_iter()
     }
 
+    /// Raw symbol-table bucket allowance for resource-bounded diagnostics.
+    ///
+    /// A sparse hash-table scan costs capacity rather than live length. This
+    /// does not identify active declarations or grant symbol authority.
+    #[doc(hidden)]
+    pub fn native_input_symbol_storage_capacity(&self) -> usize {
+        self.symbols
+            .capacity()
+            .saturating_add(self.overloaded_symbols.capacity())
+            .saturating_add(self.datatype_member_symbols.capacity())
+    }
+
+    /// Borrow raw signature storage without hashing a source name first.
+    ///
+    /// Resource preflight uses this after charging the bucket allowance, before
+    /// the semantic iterator performs its overload-name lookups. A base entry
+    /// can appear beside its overloads; use `symbols_iter` for declaration
+    /// semantics. No payload is copied here.
+    #[doc(hidden)]
+    pub fn native_input_symbol_storage_iter(&self) -> impl Iterator<Item = (&String, &SymbolInfo)> {
+        self.symbols
+            .iter()
+            .chain(
+                self.overloaded_symbols
+                    .iter()
+                    .flat_map(|(name, infos)| infos.iter().map(move |info| (name, info))),
+            )
+            .chain(self.datatype_member_symbols.iter())
+    }
+
     /// Whether a declared symbol named `name` exists with EXACTLY this
     /// signature (argument sorts and result sort), considering overloads.
     ///
@@ -2130,8 +2170,8 @@ impl Context {
     /// Enabling restores the #5115 BitVec-width zero-extension leniency.
     pub fn set_lenient_sort_coercions(&mut self, lenient: bool) {
         if self.lenient_sort_coercions != lenient {
-            self.lenient_sort_coercions = lenient;
             self.advance_source_revision();
+            self.lenient_sort_coercions = lenient;
         }
     }
 
@@ -2148,8 +2188,8 @@ impl Context {
     /// textual `Set` extension for compatibility.
     pub fn set_finite_set_typing_mode(&mut self, mode: FiniteSetTypingMode) {
         if self.finite_set_typing_mode != mode {
-            self.finite_set_typing_mode = mode;
             self.advance_source_revision();
+            self.finite_set_typing_mode = mode;
         }
     }
 
@@ -2240,8 +2280,8 @@ impl Context {
     /// Set the logic for this context.
     pub fn set_logic(&mut self, logic: String) {
         if self.logic.as_ref() != Some(&logic) {
-            self.logic = Some(logic);
             self.advance_source_revision();
+            self.logic = Some(logic);
         }
     }
 
@@ -2284,7 +2324,7 @@ impl Context {
         InternalLogicBorrow {
             saved_logic,
             saved_revision,
-            entry_revision: self.source_revision,
+            entry_context: self.source_context_stamp(),
         }
     }
 
@@ -2294,12 +2334,18 @@ impl Context {
         let InternalLogicBorrow {
             saved_logic,
             saved_revision,
-            entry_revision,
+            entry_context,
         } = borrow;
+        let current = self.source_context_stamp();
+        // The token is publicly movable. Reject a different mutable context
+        // before restoring EITHER its logic OR its numeric revision.
+        if !entry_context.is_same_context(&current) {
+            return;
+        }
         // Only this borrow's outbound write may have moved the revision. If
         // anything else did, the source context genuinely changed and the
         // rollback below is withheld.
-        let untouched = self.source_revision == entry_revision;
+        let untouched = current == entry_context;
         match saved_logic {
             Some(logic) => self.set_logic(logic),
             // The caller had no logic at all. `set_logic` cannot express that,
@@ -2439,6 +2485,27 @@ impl Context {
         }
     }
 
+    /// A fully retained SMT-LIB stack whose quantified definition was expanded
+    /// when asserted. Text check-sat can retry its original unexpanded roots.
+    #[doc(hidden)]
+    pub fn has_parsed_definition_retry(&self) -> bool {
+        !self.adopted_macro_interps.is_empty()
+            && self.soft_constraints().is_empty()
+            && self.objectives().is_empty()
+            && !self.assertions.is_empty()
+            && self.assertions_parsed.len() == self.assertions.len()
+            && self.authored_assertions.len() == self.assertions.len()
+            && self.authored_assertions.iter().all(|origin| {
+                matches!(
+                    origin,
+                    AuthoredAssertion::Concrete {
+                        origin: AuthoredAssertionOrigin::Text,
+                        ..
+                    }
+                )
+            })
+    }
+
     /// Return user-authored assertions in source order for `get-assertions`.
     ///
     /// Query-local monomorphic instances of schematic assertions are
@@ -2529,6 +2596,60 @@ impl Context {
         )
     }
 
+    /// Exact native-authored roots, including repeated occurrences, aligned
+    /// with the complete current hard assertion stack. Origin is recorded at
+    /// insertion and never inferred from a parsed placeholder or term spelling.
+    /// Parsed-AST retention is independent of this compact typed provenance.
+    #[doc(hidden)]
+    pub fn native_authored_assertion_terms_aligned_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Option<Vec<TermId>> {
+        if self.assertions.is_empty()
+            || self.assertions.len() > max_rows
+            || self.authored_assertions.len() != self.assertions.len()
+        {
+            return None;
+        }
+        for (assertion, &active) in self.authored_assertions.iter().zip(&self.assertions) {
+            if !matches!(assertion, AuthoredAssertion::Concrete {
+                term,
+                origin: AuthoredAssertionOrigin::Native,
+                ..
+            } if *term == active)
+            {
+                return None;
+            }
+        }
+        Some(self.assertions.clone())
+    }
+
+    /// Match exact original native occurrences against an independently frozen
+    /// query window. Preprocessing may rewrite the working assertion stack;
+    /// this only inspects insertion provenance and grants no query authority.
+    /// Callers must separately authenticate their expected query and its epoch.
+    #[doc(hidden)]
+    pub fn native_authored_originals_match_bounded(
+        &self,
+        expected: &[TermId],
+        max_rows: usize,
+    ) -> bool {
+        !expected.is_empty()
+            && expected.len() <= max_rows
+            && self.authored_assertions.len() == expected.len()
+            && self
+                .authored_assertions
+                .iter()
+                .zip(expected)
+                .all(|(assertion, expected)| {
+                    matches!(assertion, AuthoredAssertion::Concrete {
+                        term,
+                        origin: AuthoredAssertionOrigin::Native,
+                        ..
+                    } if term == expected)
+                })
+    }
+
     /// Classify retained assertion surfaces without cloning or re-interning.
     ///
     /// `originals` must be the caller's borrowed original ASSERTIONS, excluding
@@ -2596,8 +2717,9 @@ impl Context {
             if !progress(1) {
                 return None;
             }
-            if !matches!(row, AuthoredAssertion::Concrete { term, parsed_index, .. }
-                if *term == original && *parsed_index == Some(index))
+            if !matches!(row, AuthoredAssertion::Concrete {
+                term, parsed_index, origin: AuthoredAssertionOrigin::Native, ..
+            } if *term == original && *parsed_index == Some(index))
             {
                 return Some(NativeAssertionSurfaces::Unavailable);
             }
@@ -2766,16 +2888,65 @@ impl Context {
         depths
     }
 
+    /// Borrow named-sort definitions before bounded input metadata lowering.
+    #[doc(hidden)]
+    pub fn native_input_sort_storage_iter(&self) -> impl Iterator<Item = (&String, &Sort)> {
+        self.sort_defs.iter()
+    }
+
+    /// Capacity allowance for named-sort/carrier lookup tables.
+    #[doc(hidden)]
+    pub fn native_input_sort_storage_capacity(&self) -> usize {
+        self.sort_defs
+            .capacity()
+            .saturating_add(self.nominal_sort_surfaces.capacity())
+            .saturating_add(self.datatypes.capacity())
+            .saturating_add(self.live_datatype_carriers.capacity())
+    }
+
+    /// Number of borrowed assertion boundaries, including the current end.
+    #[doc(hidden)]
+    pub fn native_input_assertion_boundary_count(&self) -> usize {
+        self.scopes.len().saturating_add(1)
+    }
+
+    /// Borrow assertion boundaries for resource-bounded native input export.
+    /// No map or boundary vector is allocated by this accessor.
+    #[doc(hidden)]
+    pub fn native_input_assertion_boundaries(&self) -> impl Iterator<Item = usize> + '_ {
+        self.scopes
+            .iter()
+            .map(|frame| frame.assertion_count)
+            .chain(std::iter::once(self.assertions.len()))
+    }
+
     /// Push an assertion and its parsed form together, keeping them aligned.
     ///
     /// The parsed form is retained only under the retention policy — see
     /// [`Self::set_retain_parsed_assertions`] and the `retain_parsed_assertions`
     /// field docs (prefix-alignment invariant).
     pub fn add_assertion_with_parsed(&mut self, term: TermId, parsed: ParsedTerm) {
+        self.add_authored_assertion_with_parsed(term, parsed, AuthoredAssertionOrigin::Text);
+    }
+
+    /// Insert a typed native assertion, independently of its optional retained
+    /// presentation. Only the native API assertion boundary uses this origin.
+    #[doc(hidden)]
+    pub fn add_native_assertion_with_parsed(&mut self, term: TermId, parsed: ParsedTerm) {
+        self.add_authored_assertion_with_parsed(term, parsed, AuthoredAssertionOrigin::Native);
+    }
+
+    fn add_authored_assertion_with_parsed(
+        &mut self,
+        term: TermId,
+        parsed: ParsedTerm,
+        origin: AuthoredAssertionOrigin,
+    ) {
         let source_is_literal_false = authored_source_is_literal_false(&parsed);
         let parsed_index = self.push_assertion_stacks(term, parsed);
         self.authored_assertions.push(AuthoredAssertion::Concrete {
             term,
+            origin,
             parsed_index,
             source_is_literal_false,
         });

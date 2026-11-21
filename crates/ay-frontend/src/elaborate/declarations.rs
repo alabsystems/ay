@@ -352,6 +352,7 @@ impl Context {
                                 );
                                 // Register the field so it is collected as a
                                 // solvable variable and resolvable in get-value.
+                                self.advance_source_revision();
                                 self.track_scoped_symbol(&field_name);
                                 self.symbols.insert(
                                     field_name.clone(),
@@ -646,6 +647,11 @@ impl Context {
 
         self.validate_defined_function_body(&params, &ret_sort, body)?;
 
+        // Retire checked binding leases before any definition/symbol write.
+        // `name` had no prior binding (the gates above), so the introducing
+        // form keeps unrelated expansion memo entries built during validation.
+        // Its one builtin-shadowing exception is checked inside that helper.
+        self.advance_source_revision_introducing(name);
         // Store the definition for expansion
         self.fun_defs.insert(
             name.to_string(),
@@ -676,12 +682,6 @@ impl Context {
         );
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
-        // `name` had no binding of any kind on entry (the redefinition,
-        // overload, reserved-symbol and datatype-member gates above), so the
-        // macro expansion memo built while type-checking this body stays valid
-        // — that is what keeps a chain of definitions linear rather than
-        // quadratic. The one spelling-shadowing exception is checked inside.
-        self.advance_source_revision_introducing(name);
         Ok(())
     }
 
@@ -730,6 +730,7 @@ impl Context {
         // expansion after the definition is committed.
         let internal_name = self.ordinary_source_binding_internal_name(name);
         let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
+        self.advance_source_revision();
         self.track_scoped_symbol(name);
         let previous_symbol = self.symbols.insert(
             name.to_string(),
@@ -772,8 +773,6 @@ impl Context {
 
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
-
-        self.advance_source_revision();
 
         Ok(())
     }
@@ -892,6 +891,7 @@ impl Context {
         // symbol snapshots.
         let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
         let mut previous_symbols: Vec<(String, Option<SymbolInfo>)> = Vec::new();
+        self.advance_source_revision();
         for (name, params, ret_sort, public_arg_sorts, public_sort, internal_name) in
             &elaborated_decls
         {
@@ -963,7 +963,6 @@ impl Context {
             self.track_scoped_fun_def(name.clone());
         }
 
-        self.advance_source_revision();
         Ok(())
     }
 }

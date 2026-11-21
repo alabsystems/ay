@@ -27,6 +27,7 @@ mod conflicts;
 mod d1_propagate;
 mod d2_split;
 mod egraph_pass;
+mod seq_owned;
 mod solver_state;
 mod theory_impl;
 
@@ -108,6 +109,8 @@ struct DtScope {
     registered_ctors: Vec<TermId>,
     /// Length of `asserted_eq_lits` before this scope (for rollback).
     asserted_eq_lits_len: usize,
+    /// Scoped native integer guards used only for explained Seq membership.
+    seq_owned_guards_len: usize,
     /// Length of `asserted_diseqs` before this scope was pushed.
     asserted_diseqs_len: usize,
     /// Tester result keys added in this scope (for undo on pop).
@@ -157,6 +160,14 @@ pub struct DtSolver<'a> {
     tester_results: HashMap<TermId, (String, bool, TermId)>,
     /// Equality literals asserted true (used for conflict explanation).
     asserted_eq_lits: Vec<TermId>,
+    /// Exact scoped guard assignments; no proposed model values enter here.
+    seq_owned_guards: Vec<TheoryLit>,
+    /// Cumulative across checks/scopes, never replenished by pop/reset.
+    seq_owned_budget: ay_core::proof_validation::OwnedSubvalueBudget,
+    /// Sticky inability to retain the exact source guard inventory.
+    seq_owned_refused: bool,
+    /// Set while the ordinary constructor walk sees an actual Seq field.
+    seq_owned_possible: bool,
     /// Pending injectivity equalities to propagate via Nelson-Oppen.
     /// These are discovered when same-constructor terms are in the same equivalence class.
     pending_injectivity_eqs: Vec<DiscoveredEquality>,

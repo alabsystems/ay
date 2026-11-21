@@ -10,6 +10,7 @@ use super::*;
 use crate::{recognize_identity_lambda, recognize_range_lambda, ArraySnapshot};
 
 mod fill;
+mod periodic;
 
 impl Evaluator<'_> {
     pub(super) fn charge_functional_work(&self, amount: usize) -> EvalResult<()> {
@@ -130,12 +131,16 @@ impl Evaluator<'_> {
         if (term.0 as usize) >= self.terms.len() {
             return Err("invalid functional array term".into());
         }
-        if self
-            .terms
-            .children(term)
-            .iter()
-            .any(|child| (child.0 as usize) >= self.terms.len())
-        {
+        let data = self.terms.get(term);
+        let count = crate::residual::term_child_count(data)
+            .ok_or_else(|| EvalError::from("unsupported functional array node"))?;
+        self.charge_functional_work(count)?;
+        let mut invalid = false;
+        crate::residual::for_each_term_child(data, |child| {
+            invalid |= self.terms.entry_stamp(child).is_none();
+        })
+        .ok_or_else(|| EvalError::from("unsupported functional array node"))?;
+        if invalid {
             return Err("invalid functional array child".into());
         }
         // The same checked projection contract owns ordinary array semantics.
@@ -143,6 +148,9 @@ impl Evaluator<'_> {
             return self.functional_snapshot(projected, depth + 1);
         }
         if let Some(value) = self.checked_or_identity_snapshot(term, depth)? {
+            return Ok(value);
+        }
+        if let Some(value) = self.periodic_lambda_snapshot(term, depth)? {
             return Ok(value);
         }
         if let Some(value) = self.fill_lambda_snapshot(term, depth)? {
@@ -336,14 +344,16 @@ impl Evaluator<'_> {
         let first = self.functional_snapshot(args[0], depth + 1)?;
         for &term in &args[1..] {
             let other = self.functional_snapshot(term, depth + 1)?;
-            if !self.snapshot_work(|work| {
-                first.same_function_with_stop(&other, work, &mut || {
+            match self.snapshot_work(|work| {
+                first.equality_with_stop(&other, work, &mut || {
                     self.model.functional_array_interrupted()
                 })
             })? {
-                // Different programs may still denote equal functions. No
-                // finite probe or structural mismatch supplies disequality.
-                return Err("functional array equality not independently established".into());
+                Some(true) => {}
+                Some(false) => return Ok(Some(false)),
+                None => {
+                    return Err("functional array equality not independently established".into())
+                }
             }
         }
         Ok(Some(true))

@@ -266,6 +266,15 @@ impl Executor {
         }
     }
 
+    /// Whether `assertions` form exactly ONE symbol-connected component, so
+    /// that `try_partition_rescue` cannot fire after a dispatch over them
+    /// (#nia-persist-until-deadline). `false` on a quantifier or an empty
+    /// vector: fail-closed, the caller then assumes a rescue may follow.
+    pub(in crate::executor) fn single_symbol_component(&self, assertions: &[TermId]) -> bool {
+        self.partition_symbol_disjoint(assertions)
+            .is_some_and(|(components, _)| components.len() == 1)
+    }
+
     /// All firing conditions (§2.1). Any failure returns `false` → no rescue.
     fn partition_rescue_firing_gate(&self, pre_dispatch_assertions: &[TermId]) -> bool {
         // The measured reason on every live probe; excludes Timeout/Interrupted.

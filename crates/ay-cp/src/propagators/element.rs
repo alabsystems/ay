@@ -98,8 +98,10 @@ impl Element {
         encoder: &IntegerEncoder,
         clauses: &mut Vec<Vec<ay_sat::Literal>>,
     ) -> Option<Vec<ay_sat::Literal>> {
-        let idx_lb = trail.lb(self.index).max(0) as usize;
-        let idx_ub = trail.ub(self.index).min(self.array.len() as i64 - 1) as usize;
+        // Clamp in i64 first: an index whose upper bound is below 0 would
+        // otherwise wrap to a huge usize and index past the array.
+        let idx_lb = trail.lb(self.index).max(0);
+        let idx_ub = trail.ub(self.index).min(self.array.len() as i64 - 1);
 
         if idx_lb > idx_ub {
             // No valid index → conflict
@@ -113,6 +115,7 @@ impl Element {
         // Compute union of array[i]'s bounds across valid index values
         let mut result_min = i64::MAX;
         let mut result_max = i64::MIN;
+        let (idx_lb, idx_ub) = (idx_lb as usize, idx_ub as usize);
         for i in idx_lb..=idx_ub {
             let arr_var = self.array[i];
             result_min = result_min.min(trail.lb(arr_var));

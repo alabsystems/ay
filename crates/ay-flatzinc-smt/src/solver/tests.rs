@@ -342,3 +342,77 @@ fn test_run_ay_library_trivial_sat() {
         "output should contain check-sat result: {output:?}"
     );
 }
+
+/// Without -t a FlatZinc call has no time limit of AY's own: its executor
+/// honours the (absent) deadline exactly instead of adding the 5-minute
+/// safety deadline that ended untimed MiniZinc runs at about 300 s.
+#[test]
+fn an_untimed_flatzinc_call_gets_no_default_deadline() {
+    assert!(execution::flatzinc_executor().exact_deadline());
+    let config = SolverConfig {
+        timeout_ms: None,
+        all_solutions: false,
+        global_deadline: None,
+    };
+    assert_eq!(call_timeout_ms(&config, Instant::now()), None);
+}
+
+/// -t bounds the whole run: one call's timer never reaches past the global
+/// deadline, and a per-call timeout below it is kept.
+#[test]
+fn a_call_timer_never_outlives_the_global_deadline() {
+    let now = Instant::now();
+    let config = |timeout_ms, after_ms: Option<u64>| SolverConfig {
+        timeout_ms,
+        all_solutions: false,
+        global_deadline: after_ms.map(|ms| now + Duration::from_millis(ms)),
+    };
+    assert_eq!(
+        call_timeout_ms(&config(Some(60_000), Some(5_000)), now),
+        Some(5_000)
+    );
+    assert_eq!(
+        call_timeout_ms(&config(Some(2_000), Some(5_000)), now),
+        Some(2_000)
+    );
+    assert_eq!(
+        call_timeout_ms(&config(None, Some(5_000)), now),
+        Some(5_000)
+    );
+    assert_eq!(
+        call_timeout_ms(&config(Some(2_000), None), now),
+        Some(2_000)
+    );
+    let later = now + Duration::from_secs(10);
+    assert_eq!(
+        call_timeout_ms(&config(Some(60_000), Some(5_000)), later),
+        Some(0)
+    );
+}
+
+/// A call whose time is up before its check-sat answers `unknown` without
+/// declaring the model: declaring is not interruptible, and on MiniZinc
+/// `nside/EASY_1000_100` it ran 30 s past `-t 30000`. Before, the script
+/// ran to the end and this one answered `sat` with its values.
+#[test]
+fn a_call_out_of_time_answers_unknown_without_running_the_script() {
+    let script = "(set-logic QF_LIA)\n(declare-const x Int)\n(assert (= x 3))\n\
+                  (check-sat)\n(get-value (x))\n";
+    let expired = SolverConfig {
+        timeout_ms: None,
+        all_solutions: false,
+        global_deadline: Some(Instant::now()),
+    };
+    let output = run_ay(script, &expired).expect("an expired call is not an error");
+    assert_eq!(output, "unknown\n");
+
+    let timed = SolverConfig {
+        timeout_ms: Some(60_000),
+        all_solutions: false,
+        global_deadline: None,
+    };
+    let output = run_ay(script, &timed).expect("a call in time runs");
+    let (status, lines) = parse_ay_output(&output).expect("check-sat answer");
+    assert_eq!(status, CheckSatResult::Sat);
+    assert_eq!(parse_get_value(&lines).expect("values")["x"], "3");
+}

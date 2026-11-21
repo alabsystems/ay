@@ -320,7 +320,8 @@ ROWS
  L  R2
 COLUMNS
     MARKER                 'MARKER'                 'INTORG'
-    X         COST      1.0        R1        2.0        R2       -1.0
+    X         COST      1.0        R1        2.0
+    X         R2       -1.0
     Y         COST      1.0        R1        2.0
     MARKER                 'MARKER'                 'INTEND'
     Z         R2        1.0

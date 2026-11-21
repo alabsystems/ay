@@ -17,6 +17,7 @@
 //! with disequalities and model equalities is `final_check`.
 
 mod int;
+mod integer_chain;
 mod shared;
 
 use ay_core::kani_compat::DetHashSet as HashSet;
@@ -52,6 +53,9 @@ pub struct LraPlugin {
     fractional_rounds: u64,
     /// Gomory cut lemmas added so far.
     cuts_added: usize,
+    /// One bounded cross-row integer check per plug-in lifetime. Scopes and
+    /// successive fractional vertices cannot renew this search allowance.
+    integer_chain_attempted: bool,
     /// Xorshift state for the unboxed branch choice.
     branch_rng: u64,
     /// A bound was asserted or retracted since the last BCP-time check.
@@ -99,6 +103,7 @@ impl LraPlugin {
             lin: Linearizer::default(),
             fractional_rounds: 0,
             cuts_added: 0,
+            integer_chain_attempted: false,
             branch_rng: 0x9E37_79B9_7F4A_7C15,
             dirty: true,
             indexed: false,
@@ -348,6 +353,9 @@ impl TheoryPlugin for LraPlugin {
         };
         match result {
             TheoryResult::Sat if self.integer => {
+                if self.integer_chain_conflict(ctx)? {
+                    return Ok(Final::Continue);
+                }
                 if let Some(reasons) = self.bracket(ctx.terms(), |lra| lra.gcd_test_term_conflict())
                 {
                     ctx.conflict(Conflict {

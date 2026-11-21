@@ -14,6 +14,8 @@ use ay_frontend::{parse, Command};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
+mod alethe_transport;
+
 #[test]
 fn test_get_info_name_trims_colon_prefix() {
     let exec = Executor::new();

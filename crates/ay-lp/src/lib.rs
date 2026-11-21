@@ -43,7 +43,7 @@ pub mod solve;
 pub use error::LpError;
 pub use exact::{ExactColumn, ExactProblem, ExactRow};
 pub use model::{Constraint, Problem, RowKind, Sense, Solution, VarKind, Variable};
-pub use parser::{parse_lp, parse_mps, parse_mps_exact};
+pub use parser::{parse_lp, parse_lp_exact, parse_mps, parse_mps_exact};
 pub use simplex::{solve_lp_relaxation, solve_lp_relaxation_budgeted, LpRelaxation};
 pub use solve::{check_point, solve, solve_with_incumbents};
 

@@ -1188,7 +1188,7 @@ pub(crate) struct ColdState {
     /// solver is built and the eager reservation charged 162 MB of `--memory`
     /// budget at load (18 M-clause reference instance) for a vector that is
     /// never written. Same shape as the OccList size-on-first-use fix.
-    pub(super) clause_ids: Vec<u64>,
+    pub(super) clause_ids: ClauseIdTable,
     /// Capacity `clause_ids` reserves on its first write — the same
     /// `clauses_capacity` the retired construction-time `with_capacity` used,
     /// so the enabled (proof) route sees an identical capacity ladder. Also
@@ -1199,10 +1199,11 @@ pub(crate) struct ColdState {
     pub(super) clause_ids_reserve_hint: usize,
     /// Opt-OUT of maintaining [`Self::clause_ids`].
     ///
-    /// `clause_ids` is indexed by ARENA WORD OFFSET rather than by clause, so it
-    /// costs 8 bytes per arena word — twice the clause arena itself — and it is
-    /// `resize`-written, so every slot is resident. On the 18 M-clause SAT-COMP
-    /// 2026 reference instance that is 760 MB of a 4.75 GB peak.
+    /// `clause_ids` is keyed by ARENA WORD OFFSET rather than by clause. It
+    /// used to cost 8 bytes per arena word — twice the clause arena itself,
+    /// 760 MB of a 4.75 GB peak on the 18 M-clause SAT-COMP 2026 reference
+    /// instance; [`super::ClauseIdTable`] stores one slot per header stride,
+    /// 3 bytes per word (AY-SAT-1).
     ///
     /// Default `false`, i.e. every existing path is untouched. Only a caller
     /// that knows no consumer exists sets it — today just the DIMACS
@@ -2414,7 +2415,7 @@ impl ColdState {
     pub(super) fn record_clause_id(&mut self, idx: usize, id: u64) {
         if !self.clause_ids_disabled {
             self.clause_ids_grow_for(idx);
-            self.clause_ids[idx] = id;
+            self.clause_ids.set(idx, id);
         }
     }
 
@@ -2422,13 +2423,11 @@ impl ColdState {
     /// hold another `cold` field borrowed (e.g. iterating the original
     /// ledger).
     #[inline]
-    pub(super) fn grow_clause_ids(clause_ids: &mut Vec<u64>, reserve_hint: usize, idx: usize) {
-        if clause_ids.capacity() == 0 && reserve_hint > 0 {
-            clause_ids.reserve_exact(reserve_hint);
+    pub(super) fn grow_clause_ids(clause_ids: &mut ClauseIdTable, reserve_hint: usize, idx: usize) {
+        if !clause_ids.is_allocated() && reserve_hint > 0 {
+            clause_ids.reserve_exact_len(reserve_hint);
         }
-        if idx >= clause_ids.len() {
-            clause_ids.resize(idx + 1, 0);
-        }
+        clause_ids.grow_to(idx + 1);
     }
 
     /// Create the full cold solver tail for `Solver::build`.
@@ -2688,7 +2687,7 @@ impl ColdState {
             // no-proof route disables clause_ids right after construction and
             // must not pay the 162 MB `--memory` charge for an unwritten
             // vector.
-            clause_ids: Vec::new(),
+            clause_ids: ClauseIdTable::new(),
             clause_ids_reserve_hint: clauses_capacity,
             clause_ids_disabled: false,
             load_slack_reclaimed_bytes: 0,

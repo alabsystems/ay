@@ -806,6 +806,30 @@ impl Executor {
         }
         // Note: a symbolic/zero-divisor `(rem a b)` is degraded to `unknown`
         // universally in `route_to_solver` before this point (#nia-symbolic-rem-bypass).
+
+        // #nia-box-blast (AY-SMT-5): before the incremental-linearisation
+        // search and its 60 % local-search share, look for a SMALL model by
+        // bit-blasting growing boxes (`combined/int_blast_box.rs`), within
+        // at most 10 % of the remaining deadline. SAT-only: a box without a
+        // model concludes nothing, and a found model must re-evaluate every
+        // root to `true` and then pass the ordinary SAT finalisation below.
+        // Quantifier probes can use fresh executors with local flags reset.
+        // Admit boxes only in the original, outer quantifier-free dispatch.
+        if self.nia_box_allowed
+            && self.mod_div_or_branch_rescue_depth == 0
+            && !self.quantifier_pipeline_engaged
+            && !self.incremental_mode
+        {
+            let roots = self.ctx.assertions.clone();
+            if let Some(model) = self.try_nia_box_blast(&roots)? {
+                if self.accept_nia_box_witness(*model)? {
+                    return Ok(SolveResult::Sat);
+                }
+                self.last_statistics
+                    .set_string("nia.box_blast", "finalize-rejected");
+            }
+        }
+
         let (mut result, (var_subst, introduced_unconstrained_div_mod)) = self
             .with_nia_theory_window(|this| {
                 let (var_subst, introduced_unconstrained_div_mod) =
@@ -859,6 +883,27 @@ impl Executor {
         // instance.
         let split_probe = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // #nia-persist-until-deadline (AY-SMT-5): this solve may keep
+        // searching to its wall deadline instead of ending `unknown` at the
+        // split-drift guard or the refinement stall, only when nothing else
+        // is waiting for its `unknown`: a deadline is installed (it is what
+        // ends the search); this is the primary dispatch of a `check-sat`
+        // whose assertions form one symbol-connected component, so the
+        // post-dispatch partition rescue cannot fire (`nia_persist_allowed`,
+        // armed in `check_sat.rs`; a rescue component solve never sees it);
+        // and this is neither the mod/div rescue sub-solve nor a quantifier
+        // round (both have an outer strategy that runs after an `unknown`).
+        // Search order and tautological splits only: no verdict depends on
+        // it.
+        let persist_until_deadline = solve_deadline.get().is_some()
+            && self.nia_persist_allowed
+            && self.mod_div_or_branch_rescue_depth == 0
+            && !self.quantifier_pipeline_engaged;
+        self.last_statistics.set_int(
+            "nia.persist_until_deadline",
+            u64::from(persist_until_deadline),
+        );
+
         solve_incremental_split_loop_pipeline!(self,
             tag: "NIA",
             persistent_sat_field: persistent_sat,
@@ -891,6 +936,7 @@ impl Executor {
                     theory.set_local_search_deadline(cutoff);
                 }
                 theory.set_split_probe_flag(split_probe.clone());
+                theory.set_persist_until_deadline(persist_until_deadline);
                 theory
             },
             extract_models: |theory| {

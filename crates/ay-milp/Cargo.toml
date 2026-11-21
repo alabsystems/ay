@@ -30,6 +30,7 @@ dcensus = []
 
 [dependencies]
 ay-dpll = { workspace = true, optional = true }
+ay-lp.workspace = true
 ay-pb-core.workspace = true
 ay-sat.workspace = true
 ay-lra.workspace = true

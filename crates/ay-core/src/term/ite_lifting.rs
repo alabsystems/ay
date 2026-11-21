@@ -133,6 +133,11 @@ impl TermStore {
                     }
                 }
 
+                // Lambda arrays bind their first operand in their body.
+                // Moving a body condition outside this application changes
+                // its scope. Ground selects beta-reduce before this pass.
+                TermData::App(Symbol::Named(ref name), _) if name == "lambda-array" => term,
+
                 TermData::App(Symbol::Named(ref name), ref args) => {
                     // Arithmetic predicates: Shannon-expand ITE in arguments (#5081).
                     let is_pred =
@@ -620,3 +625,7 @@ impl TermStore {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "ite_lifting/binder_tests.rs"]
+mod binder_tests;

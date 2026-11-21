@@ -17,9 +17,11 @@
 //   4. Find cliques in the graph — each clique is a machine
 //   5. Add Constraint::Disjunctive for each machine
 //
-// The int_lin_le_reif constraints are STILL translated normally (Big-M encoding
-// provides the SAT-level OR choice). The Disjunctive propagator adds stronger
-// bounds propagation via O(n log n) edge-finding.
+// When a machine covers a pair and both ordering indicators are private,
+// its Disjunctive propagator enforces their no-overlap condition. Translation
+// then skips the two reified inequalities and their ordering clause. Each
+// private indicator appears only in its inequality and the clause, and is
+// absent from the model outputs.
 
 use std::collections::{BTreeMap as HashMap, BTreeSet as HashSet};
 

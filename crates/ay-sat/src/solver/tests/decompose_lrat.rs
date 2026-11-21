@@ -530,7 +530,7 @@ fn test_lrat_decompose_preflight_rejects_missing_source_id_before_mutation() {
     solver.initialize_watches();
 
     let target_idx = active_clause_index(&solver, &[x2, y]);
-    solver.cold.clause_ids[target_idx] = 0;
+    solver.cold.clause_ids.set(target_idx, 0);
     let clauses_before = active_clause_lits(&solver);
     let clause_ids_before = solver.cold.clause_ids.clone();
     let reconstruction_before = solver.inproc.reconstruction.len();
@@ -592,7 +592,7 @@ fn test_lrat_decompose_preflight_rejects_missing_chain_edge_id_before_mutation()
     solver.initialize_watches();
 
     let chain_edge_idx = active_clause_index(&solver, &[x2.negated(), x0]);
-    solver.cold.clause_ids[chain_edge_idx] = 0;
+    solver.cold.clause_ids.set(chain_edge_idx, 0);
     let clauses_before = active_clause_lits(&solver);
     let clause_ids_before = solver.cold.clause_ids.clone();
     let reconstruction_before = solver.inproc.reconstruction.len();

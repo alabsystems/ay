@@ -38,6 +38,8 @@ mod finite_field;
 mod functional_arrays;
 pub(crate) mod quantifier;
 mod scratch_admission;
+mod sequence;
+mod symbolic_function;
 use quantifier::QuantifierState;
 
 #[cfg(test)]
@@ -67,7 +69,7 @@ mod select_equality_tests;
 /// One entry of the per-evaluator uninterpreted-function graph: a function
 /// name, the VALUES its arguments evaluated to, and the single result value
 /// adopted for that argument-value key. See [`Evaluator::eval_uninterpreted_app`].
-type UfGraphEntry = (String, Vec<ModelValue>, ModelValue);
+type UfGraphEntry = (String, Option<TermId>, Vec<ModelValue>, ModelValue);
 
 /// One entry of the per-evaluator array-`select` graph: the array-expression
 /// TERM after authenticated store misses and known conditional branches have
@@ -364,6 +366,8 @@ pub struct Evaluator<'a> {
     /// environment. Binder-independent terms remain valid model observations
     /// inside an unrelated lambda body.
     local_bindings: RefCell<Vec<LocalBinding>>,
+    symbolic_definitions: RefCell<Vec<(Symbol, Vec<TermId>, TermId, TermId)>>,
+    symbolic_active: RefCell<Vec<Symbol>>,
     /// Number of currently active [`Self::eval`] calls. Projection dispatch
     /// uses this only as a native-stack safety backstop; SMT term depth remains
     /// governed by [`MAX_EVAL_DEPTH`].
@@ -519,6 +523,8 @@ impl<'a> Evaluator<'a> {
             uf_graph: RefCell::new(Vec::new()),
             select_graph: RefCell::new(Vec::new()),
             local_bindings: RefCell::new(Vec::new()),
+            symbolic_definitions: RefCell::new(Vec::new()),
+            symbolic_active: RefCell::new(Vec::new()),
             memo: RefCell::new(ay_core::kani_compat::DetHashMap::default()),
             active_eval_calls: Cell::new(0),
             quantifier_state: QuantifierState::default(),
@@ -670,6 +676,7 @@ impl<'a> Evaluator<'a> {
         array: &ArrayValue,
         index: &ModelValue,
     ) -> EvalResult<ModelValue> {
+        self.admit_symbolic_array_read(array, index)?;
         // The free helper clones its selected member. Admit all possible source
         // members before entering it; equality semantics are unchanged.
         self.admit_array(array)?;
@@ -771,6 +778,14 @@ impl<'a> Evaluator<'a> {
             || self.term_depends_on_local_binding(term)?
         {
             return self.checked_fp_result(term, self.eval_uncached(term, depth));
+        }
+        let hit = self
+            .memo
+            .borrow()
+            .get(&term)
+            .is_some_and(|(_, stored_depth)| depth <= *stored_depth);
+        if hit {
+            self.validate_symbolic_currency()?;
         }
         if let Some((v, d)) = self.memo.borrow().get(&term) {
             if depth <= *d {
@@ -1307,6 +1322,9 @@ impl<'a> Evaluator<'a> {
                 bitvec::eval_named(name, &vals).map_err(EvalError::from)
             }
             _ if name.starts_with("seq.") => {
+                if name == "seq.nth" {
+                    return self.eval_sequence_nth(term, args, depth);
+                }
                 let vals = self.eval_all(args, depth)?;
                 seq::eval(name, &vals).map_err(EvalError::from)
             }
@@ -1490,7 +1508,8 @@ impl<'a> Evaluator<'a> {
             ProvenUnconstrainedKind::RealDivByZero => ("/", Sort::Real, Sort::Real),
             ProvenUnconstrainedKind::IntDivByZero => ("div", Sort::Int, Sort::Int),
             ProvenUnconstrainedKind::IntModByZero => ("mod", Sort::Int, Sort::Int),
-            ProvenUnconstrainedKind::FpToRealNonFinite => {
+            ProvenUnconstrainedKind::FpToRealNonFinite
+            | ProvenUnconstrainedKind::SeqNthOutOfBounds => {
                 return Err("non-arithmetic unconstrained reason at division-by-zero site".into());
             }
         };
@@ -1513,7 +1532,8 @@ impl<'a> Evaluator<'a> {
                 ProvenUnconstrainedKind::IntDivByZero | ProvenUnconstrainedKind::IntModByZero => {
                     matches!(adopted, ModelValue::Int(_))
                 }
-                ProvenUnconstrainedKind::FpToRealNonFinite => false,
+                ProvenUnconstrainedKind::FpToRealNonFinite
+                | ProvenUnconstrainedKind::SeqNthOutOfBounds => false,
             };
             if well_sorted {
                 Ok(())
@@ -1850,16 +1870,73 @@ impl<'a> Evaluator<'a> {
         proven_unconstrained: Option<ProvenUnconstrainedKind>,
         residue: impl Fn(&ModelValue) -> EvalResult<()>,
     ) -> EvalResult<ModelValue> {
+        self.eval_uninterpreted_app_checked(
+            term,
+            name,
+            args,
+            depth,
+            dt_err,
+            proven_unconstrained,
+            |value| residue(value).map_err(EvalError::from),
+        )
+    }
+
+    fn eval_uninterpreted_app_checked(
+        &self,
+        term: TermId,
+        name: &str,
+        args: &[TermId],
+        depth: usize,
+        dt_err: String,
+        proven_unconstrained: Option<ProvenUnconstrainedKind>,
+        residue: impl Fn(&ModelValue) -> EvalResult<()>,
+    ) -> EvalResult<ModelValue> {
         // Evaluate the arguments ourselves. If any argument is unevaluable, the
         // application is unevaluable (fail closed).
+        if let Some(function) = self.model.symbolic_function(term)? {
+            let value = self.eval_symbolic_application(term, args, depth, function)?;
+            residue(&value)?;
+            return Ok(value);
+        }
+        self.require_symbolic_function_absent(name)?;
         let arg_vals = self.eval_all(args, depth)?;
         // Consult the value-keyed graph: same function, argument values all
-        // equal ⇒ same result.
+        // equal ⇒ same result. The partial polymorphic sequence operation also
+        // retains an originating application for its element-sort instance.
+        // The numeric id is not type equality: both stored sorts are checked.
+        let instance: Option<TermId> = matches!(
+            proven_unconstrained,
+            Some(ProvenUnconstrainedKind::SeqNthOutOfBounds)
+        )
+        .then_some(term);
         {
             let graph = self.uf_graph.borrow();
+            if instance.is_some() {
+                self.charge_sequence_work(graph.len())?;
+            }
             let arg_sorts: Vec<&Sort> = args.iter().map(|&arg| self.terms.sort(arg)).collect();
-            for (f, keys, val) in graph.iter() {
-                if f == name && self.congruence_keys_equal_at_sorts(keys, &arg_vals, &arg_sorts)? {
+            for (f, stored_instance, keys, val) in graph.iter() {
+                if f != name {
+                    continue;
+                }
+                let same_instance = match (stored_instance, instance) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => {
+                        if self.terms.entry_stamp(*left).is_none()
+                            || self.terms.entry_stamp(right).is_none()
+                        {
+                            return Err("sequence graph instance has an invalid origin".into());
+                        }
+                        self.sequence_instance_sorts_equal(
+                            self.terms.sort(*left),
+                            self.terms.sort(right),
+                        )?
+                    }
+                    _ => false,
+                };
+                if same_instance
+                    && self.congruence_keys_equal_at_sorts(keys, &arg_vals, &arg_sorts)?
+                {
                     residue(val)?;
                     return self.clone_value(val);
                 }
@@ -1914,10 +1991,38 @@ impl<'a> Evaluator<'a> {
         residue(&val)?;
         self.admit_evaluation(0, name.len())?;
         let copied = self.clone_value(&val)?;
-        self.uf_graph
-            .borrow_mut()
-            .push((name.to_string(), arg_vals, copied));
+        self.push_uf_graph_entry((name.to_string(), instance, arg_vals, copied))?;
         Ok(val)
+    }
+
+    fn push_uf_graph_entry(&self, entry: UfGraphEntry) -> EvalResult<()> {
+        let (length, previous_capacity) = {
+            let graph = self.uf_graph.borrow();
+            (graph.len(), graph.capacity())
+        };
+        let capacity = if length == previous_capacity {
+            let capacity = previous_capacity.saturating_mul(2).max(4);
+            let bytes = capacity
+                .checked_mul(std::mem::size_of::<UfGraphEntry>())
+                .ok_or("UF graph allocation overflow")?;
+            self.admit_evaluation(length, bytes)?;
+            capacity
+        } else {
+            previous_capacity
+        };
+        let mut graph = self.uf_graph.borrow_mut();
+        if graph.len() != length || graph.capacity() != previous_capacity {
+            drop(graph);
+            return Err(self.admission_error("UF graph changed during storage admission"));
+        }
+        if capacity != previous_capacity {
+            let additional = capacity.saturating_sub(length);
+            graph
+                .try_reserve_exact(additional)
+                .map_err(|_| "UF graph allocation refused")?;
+        }
+        graph.push(entry);
+        Ok(())
     }
 
     // ----- boolean connectives --------------------------------------------
@@ -2101,6 +2206,7 @@ impl<'a> Evaluator<'a> {
     ) -> EvalResult<bool> {
         self.charge_exact_fp_value(left)?;
         self.charge_exact_fp_value(right)?;
+        self.admit_symbolic_numeric_work(&[left, right])?;
         self.charge_quantifier_work(1)?;
         *comparison_work = comparison_work.checked_add(1).ok_or_else(|| {
             EvalError::resource(
@@ -2837,7 +2943,9 @@ impl<'a> Evaluator<'a> {
         args: &[TermId],
         depth: usize,
     ) -> EvalResult<ModelValue> {
+        self.admit_symbolic_value_scratch(args.len())?;
         let vals = self.eval_all(args, depth)?;
+        self.admit_symbolic_arithmetic(&vals)?;
         let sort = self.terms.sort(term);
         match name {
             // An ALGEBRAIC operand cannot be folded into a `BigRational` --
@@ -3938,8 +4046,9 @@ impl<'a> Evaluator<'a> {
         if let Some(key) = &arg_key {
             let graph = self.uf_graph.borrow();
             let arg_sort = [self.terms.sort(arg)];
-            for (f, keys, val) in graph.iter() {
+            for (f, instance, keys, val) in graph.iter() {
                 if f == name
+                    && instance.is_none()
                     && self.congruence_keys_equal_at_sorts(
                         keys,
                         std::slice::from_ref(key),
@@ -3955,9 +4064,7 @@ impl<'a> Evaluator<'a> {
         if let Some(key) = arg_key {
             self.admit_evaluation(0, name.len())?;
             let copied = self.clone_value(&val)?;
-            self.uf_graph
-                .borrow_mut()
-                .push((name.to_string(), vec![key], copied));
+            self.push_uf_graph_entry((name.to_string(), None, vec![key], copied))?;
         }
         Ok(val)
     }

@@ -94,15 +94,19 @@ pub(crate) struct Prober {
 }
 
 impl Prober {
-    /// Create a new prober for the given number of variables
+    /// Create a new prober for the given number of variables.
+    ///
+    /// Its per-literal arrays (25 bytes per variable, `propfixed` written at
+    /// once) are allocated on first use (`ensure_arrays`), not here: on
+    /// e85fb114 (32.2 M variables) they were 0.78 GB of the construction
+    /// that broke the 16 GB ceiling (AY-SAT-1).
     pub(crate) fn new(num_vars: usize) -> Self {
-        let num_lits = num_vars * 2;
         Self {
             num_vars,
             probes: Vec::new(),
-            bin_occs: vec![0; num_lits],
-            propfixed: vec![-1; num_lits],
-            uip_seen: vec![false; num_vars],
+            bin_occs: Vec::new(),
+            propfixed: Vec::new(),
+            uip_seen: Vec::new(),
             stats: ProbeStats::default(),
             last_search_ticks: 0,
         }
@@ -124,6 +128,17 @@ impl Prober {
             return;
         }
         self.num_vars = num_vars;
+        if self.bin_occs.is_empty() {
+            // Not used yet: `ensure_arrays` sizes the arrays on first use.
+            return;
+        }
+        self.ensure_arrays();
+    }
+
+    /// Size the per-literal arrays to `num_vars`, with the values the eager
+    /// construction gave new entries (0, -1, false).
+    fn ensure_arrays(&mut self) {
+        let num_vars = self.num_vars;
         let num_lits = num_vars.saturating_mul(2);
         if self.bin_occs.len() < num_lits {
             self.bin_occs.resize(num_lits, 0);
@@ -148,6 +163,7 @@ impl Prober {
 
     /// Reusable 1UIP scratch for failed literal probing.
     pub(crate) fn uip_seen_mut(&mut self) -> &mut Vec<bool> {
+        self.ensure_arrays();
         &mut self.uip_seen
     }
 
@@ -161,6 +177,7 @@ impl Prober {
     /// For each binary clause {a, b}:
     /// - Increment `bin_occs[a]` and `bin_occs[b]`
     fn count_binary_occurrences(&mut self, clauses: &ClauseArena, vals: &[i8]) {
+        self.ensure_arrays();
         self.reset_occs();
 
         for idx in clauses.indices() {
@@ -361,6 +378,7 @@ impl Prober {
 
     /// Mark a literal as probed at the current fixed point
     pub(crate) fn mark_probed(&mut self, lit: Literal, current_fixed: i64) {
+        self.ensure_arrays();
         let idx = lit.index();
         if idx < self.propfixed.len() {
             self.propfixed[idx] = current_fixed;

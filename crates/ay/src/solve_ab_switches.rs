@@ -679,6 +679,17 @@ pub(super) struct SolveAbSwitches {
         value_name = "BOOL"
     )]
     sat_xor_proof_route: Option<bool>,
+    /// The parity-space SAT route for near-pure XOR CNFs (AY-SAT-2); default on.
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_parity_space_route: Option<bool>,
+    /// The parity-space route's wall budget in milliseconds (0 turns it off).
+    #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
+    sat_parity_space_budget_ms: Option<u64>,
     #[arg(
         long,
         hide_short_help = true,
@@ -1018,6 +1029,14 @@ pub(super) struct SolveAbSwitches {
         value_name = "BYTES"
     )]
     sat_proof_cap_bytes: Option<u64>,
+    /// Active-clause cap of the opt-in signed-symmetry route.
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "CLAUSES"
+    )]
+    sat_signed_symmetry_max_clauses: Option<u64>,
     #[arg(
         long,
         hide_short_help = true,
@@ -1476,6 +1495,14 @@ pub(super) struct SolveAbSwitches {
         value_name = "BOOL"
     )]
     sat_queue_freeze_kissat: Option<bool>,
+    /// Decide the highest variable index first initially (CaDiCaL/Kissat order).
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_initial_order_high_first: Option<bool>,
     #[arg(
         long,
         hide_short_help = true,

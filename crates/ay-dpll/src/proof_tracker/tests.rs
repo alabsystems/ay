@@ -233,14 +233,63 @@ fn test_single_forall_skolem_ite_nnf_bridge_is_strict_context_valid() {
     );
 
     let not_skolemized_body = terms.mk_not_raw(skolemized_body);
-    let negated = proof.add_assume(not_skolemized_body, None);
+    // Preserve the old packet as a real negative: putting a formula over w
+    // in the ORIGINAL scope makes that witness pre-existing. A local
+    // substitution derivation cannot turn this satisfiable source into UNSAT.
+    let mut invalid_original = proof.clone();
+    let negated = invalid_original.add_assume(not_skolemized_body, None);
+    invalid_original.add_resolution(Vec::new(), skolemized_body, derived, negated);
+    let error = ay_proof::check_proof_strict_with_context(
+        &invalid_original,
+        &terms,
+        None,
+        None,
+        Some(&[original_not_forall, not_skolemized_body]),
+    )
+    .expect_err("an original occurrence cannot be a fresh Skolem choice");
+    assert!(format!("{error:?}").contains("not fresh"), "{error:?}");
+
+    // The genuine counterfact is universal and mentions only the original
+    // bound x. Instantiate it at the freshly introduced w with a real
+    // forall_inst proof, instead of assuming its instance as an original root.
+    let not_p_x = terms.mk_not_raw(p_x);
+    let not_q_x = terms.mk_not_raw(q_x);
+    let nnf_branch_x = terms.mk_ite_raw(cond, not_p_x, not_q_x);
+    let nnf_body_x = terms.mk_and(vec![r_x, nnf_branch_x]);
+    let counter_body = terms.mk_not_raw(nnf_body_x);
+    let counterfact = terms.mk_forall(vec![("ite_nnf_x".to_string(), Sort::Int)], counter_body);
+    let not_counterfact = terms.mk_not_raw(counterfact);
+    let implication = terms.mk_app(
+        Symbol::named("or"),
+        [not_counterfact, not_skolemized_body],
+        Sort::Bool,
+    );
+    let authored_counterfact = proof.add_assume(counterfact, None);
+    let instantiation = proof.add_rule_step(
+        AletheRule::ForallInst,
+        vec![implication],
+        Vec::new(),
+        vec![witness],
+    );
+    let clause = proof.add_rule_step(
+        AletheRule::Or,
+        vec![not_counterfact, not_skolemized_body],
+        vec![instantiation],
+        Vec::new(),
+    );
+    let negated = proof.add_resolution(
+        vec![not_skolemized_body],
+        counterfact,
+        clause,
+        authored_counterfact,
+    );
     proof.add_resolution(Vec::new(), skolemized_body, derived, negated);
     let quality = ay_proof::check_proof_strict_with_context(
         &proof,
         &terms,
         None,
         None,
-        Some(&[original_not_forall, not_skolemized_body]),
+        Some(&[original_not_forall, counterfact]),
     )
     .expect("ITE NNF derivation must pass the independent strict checker");
     assert!(quality.is_complete());

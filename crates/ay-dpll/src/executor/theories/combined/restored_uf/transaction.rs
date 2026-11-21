@@ -1,6 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+use ay_core::kani_compat::DetHashMap as Map;
+
 use super::inventory::Inventory;
 use super::{charge, entries, same_sort, Atom, Checked, Pay, Probe, Refusal};
 
@@ -106,6 +108,7 @@ impl Closure<'_> {
     fn validate_semantics(&self, inventory: &Inventory<'_>, pay: &mut Pay<'_>) -> Checked<()> {
         // Derived terms can constrain a live class, but do not acquire a free
         // model variable or authority from a speculative raw compound value.
+        let mut first_of_class: Map<ay_core::TermId, usize> = Map::default();
         for (left, a) in inventory.nodes.iter().enumerate() {
             if let Some(pin) = &a.hard {
                 self.probe.check("semantic-hard-pin", Some(a.term), None);
@@ -115,21 +118,30 @@ impl Closure<'_> {
                     return Err(Refusal::Conflict);
                 }
             }
-            for b in &inventory.nodes[..left] {
-                pay(1, 0)?;
-                if a.live_class.is_some() && a.live_class == b.live_class {
-                    self.probe
-                        .check("semantic-class", Some(a.term), Some(b.term));
-                    if !same_sort(a.sort, b.sort, pay)?
-                        || !self
-                            .evaluate(inventory, a.term, pay)?
-                            .same(&self.evaluate(inventory, b.term, pay)?, pay)?
-                    {
-                        self.probe
-                            .check("semantic-class-conflict", Some(a.term), Some(b.term));
-                        return Err(Refusal::Conflict);
-                    }
-                }
+            // Compare with the first node of the same live class only
+            // (AY-SMT-3): sort and value equality are both `==`, so every
+            // node agreeing with that first one is exactly every pair
+            // agreeing, as the former all-pairs scan checked.
+            pay(1, 0)?;
+            let Some(class) = a.live_class else {
+                continue;
+            };
+            let Some(&first) = first_of_class.get(&class) else {
+                entries(pay, 1)?;
+                first_of_class.insert(class, left);
+                continue;
+            };
+            let b = &inventory.nodes[first];
+            self.probe
+                .check("semantic-class", Some(a.term), Some(b.term));
+            if !same_sort(a.sort, b.sort, pay)?
+                || !self
+                    .evaluate(inventory, a.term, pay)?
+                    .same(&self.evaluate(inventory, b.term, pay)?, pay)?
+            {
+                self.probe
+                    .check("semantic-class-conflict", Some(a.term), Some(b.term));
+                return Err(Refusal::Conflict);
             }
         }
         for &(left, right) in inventory.equalities.iter().chain(&inventory.semantic_peers) {
@@ -229,11 +241,27 @@ pub(super) fn close<'p>(
     }
     // Preserve complete live equality components before using model-only
     // congruence. Missing graph nodes were explicit None, never singleton proof.
+    //
+    // Each leaf merges with the FIRST (least-index) leaf of its live class
+    // (AY-SMT-3). The former all-pairs scan made exactly these merges in this
+    // order: for each leaf, its first same-class partner is that least leaf
+    // and every later partner was already in the same component, a no-op.
+    // It paid for N^2/2 pairs, and on SMT-COMP incremental QF_AUFLIA
+    // 2721719d (985 inventory nodes) that pair scan took about 1 s of every
+    // check-sat that reached UF model recovery.
+    let mut first_leaf_of_class: Map<ay_core::TermId, usize> = Map::default();
     for (left, a) in inventory.nodes.iter().enumerate() {
-        for (right, b) in inventory.nodes[..left].iter().enumerate() {
-            pay(1, 0)?;
-            if a.leaf && b.leaf && a.live_class.is_some() && a.live_class == b.live_class {
+        pay(1, 0)?;
+        let (true, Some(class)) = (a.leaf, a.live_class) else {
+            continue;
+        };
+        match first_leaf_of_class.get(&class) {
+            Some(&right) => {
                 closure.merge(inventory, left, right, pay)?;
+            }
+            None => {
+                entries(pay, 1)?;
+                first_leaf_of_class.insert(class, left);
             }
         }
     }

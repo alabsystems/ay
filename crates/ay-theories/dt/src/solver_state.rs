@@ -29,6 +29,13 @@ impl<'a> DtSolver<'a> {
             ctor_selectors: HashMap::default(),
             tester_results: HashMap::default(),
             asserted_eq_lits: Vec::new(),
+            seq_owned_guards: Vec::new(),
+            seq_owned_budget: ay_core::proof_validation::OwnedSubvalueBudget::new(
+                64 << 20,
+                64 << 20,
+            ),
+            seq_owned_refused: false,
+            seq_owned_possible: false,
             pending_injectivity_eqs: Vec::new(),
             propagated_eq_pairs: HashSet::default(),
             asserted_diseqs: Vec::new(),
@@ -279,6 +286,9 @@ impl<'a> DtSolver<'a> {
             // from panicking.
             if (arg.0 as usize) >= self.terms.len() {
                 continue;
+            }
+            if matches!(self.terms.sort(arg), ay_core::Sort::Seq(_)) {
+                self.seq_owned_possible = true;
             }
             if let Some((dt, ctor, arg_args)) = self.try_extract_constructor(arg) {
                 self.register_constructor(arg, &dt, &ctor, &arg_args);

@@ -26,8 +26,8 @@
 //! step keeps its `hole`.
 
 use super::surface_tokens::split_smt_terms;
-use super::AlethePrinter;
-use ay_core::{ProofId, TermData, TermId};
+use super::{AlethePrinter, AssembledRendering, HashMap};
+use ay_core::{ProofId, TermData, TermId, TermStore};
 
 impl AlethePrinter<'_> {
     /// The checked derivation of a `qnt_neg_exists` step, or `None` when the
@@ -37,6 +37,18 @@ impl AlethePrinter<'_> {
         id: ProofId,
         clause: &[TermId],
     ) -> Option<String> {
+        let (e, f) = self.printed_negated_exists_duals(clause)?;
+        let definition = format!("(= {e} (not {f}))");
+        Some(format!(
+            "(step {id}.d (cl {definition}) :rule connective_def)\n\
+             (step {id}.p (cl (not {definition}) {e} (not (not {f}))) :rule equiv_pos1)\n\
+             (step {id}.r (cl {e} (not (not {f}))) :rule resolution :premises ({id}.d {id}.p))\n\
+             (step {id}.n (cl (not (not (not {f}))) {f}) :rule not_not)\n\
+             (step {id} (cl {e} {f}) :rule resolution :premises ({id}.r {id}.n))"
+        ))
+    }
+
+    fn printed_negated_exists_duals(&self, clause: &[TermId]) -> Option<(String, String)> {
         let [exists, forall] = clause else {
             return None;
         };
@@ -58,15 +70,30 @@ impl AlethePrinter<'_> {
         if e_binders != f_binders || f_body != format!("(not {e_body})") {
             return None;
         }
-        let definition = format!("(= {e} (not {f}))");
-        Some(format!(
-            "(step {id}.d (cl {definition}) :rule connective_def)\n\
-             (step {id}.p (cl (not {definition}) {e} (not (not {f}))) :rule equiv_pos1)\n\
-             (step {id}.r (cl {e} (not (not {f}))) :rule resolution :premises ({id}.d {id}.p))\n\
-             (step {id}.n (cl (not (not (not {f}))) {f}) :rule not_not)\n\
-             (step {id} (cl {e} {f}) :rule resolution :premises ({id}.r {id}.n))"
-        ))
+        Some((e, f))
     }
+}
+
+/// Whether the printer can derive this exact dual with standard Alethe rules
+/// in the remaining proof-wide rendering allowance. Both the internal terms
+/// and their effective wire spellings must match.
+pub fn qnt_neg_exists_step_lowering_supported(
+    terms: &TermStore,
+    clause: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+    remaining: &mut u64,
+) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    let printer =
+        AlethePrinter::new_with_overrides_and_budget(terms, term_overrides, Some(*remaining))
+            .with_assembled_rendering(AssembledRendering::CachedWithinBudget);
+    let duals = printer.printed_negated_exists_duals(clause);
+    let used = printer.work_used().saturating_add(1);
+    let fits = used <= *remaining;
+    *remaining = remaining.saturating_sub(used);
+    fits && !printer.work_budget_exhausted() && duals.is_some()
 }
 
 /// `(binder list, body)` of a printed `(QUANTIFIER (..) BODY)`.

@@ -9,6 +9,12 @@ use ay_core::{DatatypeSort, Sort, TermId};
 use ay_frontend::PublicSort;
 
 mod evidence;
+mod export_budget;
+
+pub use export_budget::{
+    NativeReplayExportBudget, NativeReplayExportError, NativeReplayExportLimits,
+    NativeReplayExportResource, NativeReplayExportUsage,
+};
 
 pub(crate) use evidence::NativeReplayAdmissionToken;
 pub use evidence::{
@@ -203,6 +209,13 @@ pub enum NativeReplayEventKind {
         /// SMT-LIB logic name.
         logic: String,
     },
+    /// A native zero-arity opaque sort was registered globally.
+    DeclareSort {
+        /// Authored public sort name.
+        name: String,
+        /// Actual frontend-allocated nominal carrier at this declaration event.
+        core_name: String,
+    },
     /// A constant declaration was registered.
     DeclareConst {
         /// Symbol name.
@@ -226,6 +239,11 @@ pub enum NativeReplayEventKind {
         /// Complete datatype definition, including constructors and fields.
         datatype: DatatypeSort,
     },
+    /// One atomic monomorphic group, retaining mutual forward references.
+    DeclareDatatypes {
+        /// Definitions in the order submitted by the native producer.
+        datatypes: Vec<DatatypeSort>,
+    },
     /// A top-level assertion was added.
     Assert {
         /// Asserted term id.
@@ -248,6 +266,26 @@ pub enum NativeReplayEventKind {
         /// Assumption term ids.
         assumptions: Vec<TermId>,
     },
+}
+
+impl NativeReplayEventKind {
+    /// Borrow every declaration while preserving its enclosing event boundary.
+    pub(crate) fn datatypes(&self) -> &[DatatypeSort] {
+        match self {
+            Self::DeclareDatatype { datatype } => std::slice::from_ref(datatype),
+            Self::DeclareDatatypes { datatypes } => datatypes,
+            _ => &[],
+        }
+    }
+}
+
+/// One native zero-arity sort declaration and its exact allocated carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReplaySortDeclaration {
+    /// Authored public name.
+    pub name: String,
+    /// Actual nominal engine identity, never inferred from the public spelling.
+    pub core_name: String,
 }
 
 /// Complete native API reducer/replay artifact.
@@ -274,6 +312,8 @@ pub struct NativeReplayArtifact {
     pub timeout_ms: Option<u128>,
     /// Native API event trace.
     pub events: Vec<NativeReplayEvent>,
+    /// Ordered native opaque-sort declarations, paired exactly with declaration events.
+    pub sort_declarations: Vec<NativeReplaySortDeclaration>,
     /// Declared constants.
     pub declarations: Vec<NativeReplayDeclaration>,
     /// Declared functions.

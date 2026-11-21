@@ -312,6 +312,10 @@
    "run_script": "competition/bin/starexec_run_ai_tuned",
    "package_name": "ay-sat-ai-tuned",
    "solver_variant": "aggressive",
+   "$comment": "search_flags: --sat-symmetry-fix-and-cut (AY-SAT-2, 2026-11-19). Without it the aggressive solve of 22c8d6aa (ordering principle under XOR lifting, UNSAT) ran out the 95 s budget; with it the same binary answered UNSATISFIABLE in 4.0 s, and the proof checked with VeriPB 3.0.2 (-u --cnf --elaborate) and CakePB-CNF. The regular profile has carried this flag since B10P. Cost measured 2026-11-19 on a 20-instance main-ai sample through the rendered launcher, both arms at the same load: no answer gained or lost, PAR-2 sum +1.1%, 77bfac6b 10 s -> 26 s.",
+   "search_flags": [
+    "--sat-symmetry-fix-and-cut"
+   ],
    "runtime_env": {
     "AY_SAT_COMPETITION_PROFILE": "ai-tuned",
     "AY_SAT_PROFILE_ID": "ay-sat-ai-tuned-main",

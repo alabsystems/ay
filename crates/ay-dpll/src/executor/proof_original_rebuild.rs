@@ -482,6 +482,13 @@ impl Executor {
             return;
         }
 
+        // Term-level ITE lifting can leave Boolean clauses whose native
+        // source is an exact authored ITE formula, rather than another clause.
+        // Derive those consequences before same-head substitution bridges.
+        if self.try_rebuild_native_ite_clausification(proof) {
+            return;
+        }
+
         // A syntactic contradiction between exact authored roots is already a
         // complete strict proof.  Prefer that proof before any partial
         // trust-surgery route can claim the input and return a proof that only

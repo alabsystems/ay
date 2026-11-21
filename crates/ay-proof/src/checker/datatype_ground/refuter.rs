@@ -10,6 +10,7 @@ use super::super::datatype_axiom::{
     tester_application, DatatypeDecls, SelectorDecls,
 };
 use super::cycle::has_cycle;
+use super::resources::Control;
 
 mod boolean;
 
@@ -103,10 +104,17 @@ impl<'a> GroundRefuter<'a> {
         true
     }
 
-    pub(super) fn collect_universe(&mut self, atoms: &[TermId]) -> Result<(), ()> {
+    pub(super) fn collect_universe(
+        &mut self,
+        atoms: &[TermId],
+        control: &mut Control<'_>,
+    ) -> Result<(), ()> {
         let mut seen: HashSet<TermId> = HashSet::default();
         let mut pending = atoms.to_vec();
         while let Some(term) = pending.pop() {
+            if !control.poll() {
+                return Err(());
+            }
             if !seen.insert(term) {
                 continue;
             }
@@ -143,33 +151,34 @@ impl<'a> GroundRefuter<'a> {
         }
     }
 
-    pub(super) fn round(&mut self, changed: &mut bool) -> bool {
-        self.close_congruence(changed);
-        self.close_boolean_semantics(changed);
-        let classes = self.classes();
-        if self.close_datatype_structure(&classes, changed) {
+    pub(super) fn round(&mut self, changed: &mut bool, control: &mut Control<'_>) -> bool {
+        self.close_congruence(changed, control);
+        self.close_boolean_semantics(changed, control);
+        let classes = self.classes(control);
+        if self.close_datatype_structure(&classes, changed, control) {
             return true;
         }
-        self.close_tester_evaluation(&classes, changed);
-        self.close_selector_projection(&classes, changed);
-        self.close_equality_clash(&classes, changed);
-        self.has_tester_exclusivity()
-            || self.has_direct_contradiction()
-            || self.has_structural_cycle(&classes)
+        self.close_tester_evaluation(&classes, changed, control);
+        self.close_selector_projection(&classes, changed, control);
+        self.close_equality_clash(&classes, changed, control);
+        self.has_tester_exclusivity(control)
+            || self.has_direct_contradiction(control)
+            || self.has_structural_cycle(&classes, control)
     }
 
-    fn signature(&mut self, term: TermId) -> Option<(SigOp, Vec<u64>)> {
+    fn signature(&mut self, term: TermId, control: &mut Control<'_>) -> Option<(SigOp, Vec<u64>)> {
         match self.terms.get(term) {
             TermData::App(symbol, args) => {
                 let symbol = symbol.clone();
                 let args = args.clone();
-                let children = args
-                    .into_iter()
-                    .map(|argument| {
-                        let node = self.node(argument);
-                        self.find(node)
-                    })
-                    .collect();
+                let mut children = Vec::with_capacity(args.len());
+                for argument in args {
+                    if !control.poll() {
+                        return None;
+                    }
+                    let node = self.node(argument);
+                    children.push(self.find(node));
+                }
                 Some((SigOp::App(symbol), children))
             }
             TermData::Not(inner) => {
@@ -191,11 +200,14 @@ impl<'a> GroundRefuter<'a> {
         }
     }
 
-    fn close_congruence(&mut self, changed: &mut bool) {
+    fn close_congruence(&mut self, changed: &mut bool, control: &mut Control<'_>) {
         let mut signatures: HashMap<(SigOp, Vec<u64>), u64> = HashMap::default();
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return;
+            }
             let term = self.universe[index];
-            let Some(signature) = self.signature(term) else {
+            let Some(signature) = self.signature(term, control) else {
                 continue;
             };
             let node = self.node(term);
@@ -206,10 +218,12 @@ impl<'a> GroundRefuter<'a> {
             }
         }
     }
-
-    fn classes(&mut self) -> HashMap<u64, Vec<TermId>> {
+    fn classes(&mut self, control: &mut Control<'_>) -> HashMap<u64, Vec<TermId>> {
         let mut classes: HashMap<u64, Vec<TermId>> = HashMap::default();
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return classes;
+            }
             let term = self.universe[index];
             let node = self.node(term);
             let root = self.find(node);
@@ -217,13 +231,16 @@ impl<'a> GroundRefuter<'a> {
         }
         classes
     }
-
     fn close_datatype_structure(
         &mut self,
         classes: &HashMap<u64, Vec<TermId>>,
         changed: &mut bool,
+        control: &mut Control<'_>,
     ) -> bool {
         for members in classes.values() {
+            if !control.poll() {
+                return false;
+            }
             let heads: Vec<(String, &str, TermId)> = members
                 .iter()
                 .filter_map(|&member| {
@@ -232,7 +249,13 @@ impl<'a> GroundRefuter<'a> {
                 })
                 .collect();
             for first in 0..heads.len() {
+                if !control.poll() {
+                    return false;
+                }
                 for second in (first + 1)..heads.len() {
+                    if !control.poll() {
+                        return false;
+                    }
                     let (first_ctor, first_dt, first_term) =
                         (&heads[first].0, heads[first].1, heads[first].2);
                     let (second_ctor, second_dt, second_term) =
@@ -256,6 +279,9 @@ impl<'a> GroundRefuter<'a> {
                         _ => continue,
                     };
                     for (first_arg, second_arg) in pairs {
+                        if !control.poll() {
+                            return false;
+                        }
                         let nodes = (self.node(first_arg), self.node(second_arg));
                         *changed |= self.union(nodes.0, nodes.1);
                     }
@@ -272,10 +298,21 @@ impl<'a> GroundRefuter<'a> {
     /// cross-class complement of the in-class clash rule — the transition
     /// guards' skipped move-enum equalities die by exactly this inference
     /// once the taken move's enum fact is assumed.
-    fn close_equality_clash(&mut self, classes: &HashMap<u64, Vec<TermId>>, changed: &mut bool) {
+    fn close_equality_clash(
+        &mut self,
+        classes: &HashMap<u64, Vec<TermId>>,
+        changed: &mut bool,
+        control: &mut Control<'_>,
+    ) {
         let mut head_by_root: HashMap<u64, (String, String)> = HashMap::default();
         for (&root, members) in classes {
+            if !control.poll() {
+                return;
+            }
             for &member in members {
+                if !control.poll() {
+                    return;
+                }
                 if let Some((constructor, datatype)) =
                     constructor_head(self.terms, self.dt_decls, member)
                 {
@@ -287,6 +324,9 @@ impl<'a> GroundRefuter<'a> {
             }
         }
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return;
+            }
             let term = self.universe[index];
             let Some((first, second)) = equality_sides(self.terms, term) else {
                 continue;
@@ -310,9 +350,16 @@ impl<'a> GroundRefuter<'a> {
             }
         }
     }
-
-    fn close_tester_evaluation(&mut self, classes: &HashMap<u64, Vec<TermId>>, changed: &mut bool) {
+    fn close_tester_evaluation(
+        &mut self,
+        classes: &HashMap<u64, Vec<TermId>>,
+        changed: &mut bool,
+        control: &mut Control<'_>,
+    ) {
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return;
+            }
             let term = self.universe[index];
             let Some((tester_ctor, subject)) = tester_application(self.terms, term) else {
                 continue;
@@ -341,13 +388,16 @@ impl<'a> GroundRefuter<'a> {
             }
         }
     }
-
     fn close_selector_projection(
         &mut self,
         classes: &HashMap<u64, Vec<TermId>>,
         changed: &mut bool,
+        control: &mut Control<'_>,
     ) {
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return;
+            }
             let term = self.universe[index];
             let TermData::App(Symbol::Named(selector), args) = self.terms.get(term) else {
                 continue;
@@ -382,11 +432,13 @@ impl<'a> GroundRefuter<'a> {
             }
         }
     }
-
-    fn has_tester_exclusivity(&mut self) -> bool {
+    fn has_tester_exclusivity(&mut self, control: &mut Control<'_>) -> bool {
         let true_root = self.find(TRUE_NODE);
         let mut true_testers: Vec<(u64, String, String)> = Vec::new();
         for index in 0..self.universe.len() {
+            if !control.poll() {
+                return false;
+            }
             let term = self.universe[index];
             let Some((constructor, subject)) = tester_application(self.terms, term) else {
                 continue;
@@ -416,12 +468,14 @@ impl<'a> GroundRefuter<'a> {
         }
         false
     }
-
-    fn has_direct_contradiction(&mut self) -> bool {
+    fn has_direct_contradiction(&mut self, control: &mut Control<'_>) -> bool {
         if self.find(TRUE_NODE) == self.find(FALSE_NODE) {
             return true;
         }
         for index in 0..self.diseqs.len() {
+            if !control.poll() {
+                return false;
+            }
             let (first, second) = self.diseqs[index];
             if self.find(first) == self.find(second) {
                 return true;
@@ -430,11 +484,82 @@ impl<'a> GroundRefuter<'a> {
         false
     }
 
-    fn has_structural_cycle(&mut self, classes: &HashMap<u64, Vec<TermId>>) -> bool {
+    pub(super) fn has_sequence_owned_cycle(
+        &mut self,
+        budget: &mut ay_core::proof_validation::OwnedSubvalueBudget,
+        progress: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<bool, super::ProofCheckError> {
+        use ay_core::proof_validation::{
+            owned_subvalue_cycle_with_progress, OwnedSubvalueConstructor,
+        };
+        let count = self
+            .dt_decls
+            .iter()
+            .map(|(_, constructors)| constructors.len())
+            .fold(0usize, usize::saturating_add);
+        budget
+            .charge_with_progress(
+                self.dt_decls.len().saturating_add(count),
+                count.saturating_mul(std::mem::size_of::<OwnedSubvalueConstructor<'_>>()),
+                progress,
+            )
+            .map_err(|_| super::ProofCheckError::ResourceLimit)?;
+        let mut constructors = Vec::new();
+        constructors
+            .try_reserve_exact(count)
+            .map_err(|_| super::ProofCheckError::ResourceLimit)?;
+        for (carrier, names) in self.dt_decls {
+            budget
+                .charge_with_progress(0, 0, progress)
+                .map_err(|_| super::ProofCheckError::ResourceLimit)?;
+            constructors.extend(
+                names
+                    .iter()
+                    .map(|identity| OwnedSubvalueConstructor { identity, carrier }),
+            );
+        }
+        // The callback mutates only the fresh checker's path-compression
+        // state. Its facts were rebuilt from the negation of this exact clause.
+        let universe = std::mem::take(&mut self.universe);
+        let result = owned_subvalue_cycle_with_progress(
+            self.terms,
+            &constructors,
+            &universe,
+            &mut |term| {
+                let node = self.node(term);
+                let class = self.find(node);
+                let truth = if class == self.find(TRUE_NODE) {
+                    Some(true)
+                } else if class == self.find(FALSE_NODE) {
+                    Some(false)
+                } else {
+                    None
+                };
+                (class, truth)
+            },
+            budget,
+            progress,
+        )
+        .map(|witness| witness.is_some())
+        .map_err(|_| super::ProofCheckError::ResourceLimit);
+        self.universe = universe;
+        result
+    }
+    fn has_structural_cycle(
+        &mut self,
+        classes: &HashMap<u64, Vec<TermId>>,
+        control: &mut Control<'_>,
+    ) -> bool {
         let mut edges: HashMap<u64, Vec<u64>> = HashMap::default();
         let mut roots = Vec::new();
         for (&root, members) in classes {
+            if !control.poll() {
+                return false;
+            }
             for &member in members {
+                if !control.poll() {
+                    return false;
+                }
                 if constructor_head(self.terms, self.dt_decls, member).is_none() {
                     continue;
                 }
@@ -443,6 +568,9 @@ impl<'a> GroundRefuter<'a> {
                 };
                 let args = args.clone();
                 for argument in args {
+                    if !control.poll() {
+                        return false;
+                    }
                     let node = self.node(argument);
                     let argument_root = self.find(node);
                     edges.entry(root).or_default().push(argument_root);
@@ -450,6 +578,6 @@ impl<'a> GroundRefuter<'a> {
             }
             roots.push(root);
         }
-        has_cycle(&edges, &roots)
+        has_cycle(&edges, &roots, control)
     }
 }

@@ -10,7 +10,9 @@
 //! original plus the fixed literals), which makes it sound for every track —
 //! unweighted, weighted (zero/negative weights), projected, and algebraic.
 //! Nothing here is merely equisatisfiable: no pure-literal elimination, no
-//! blocked-clause elimination, no variable elimination.
+//! blocked-clause elimination. The one exception to model preservation is
+//! definability elimination (G, in `prep_eg`), which keeps the count but not
+//! the model set, and only removes the variables [`Elimination`] admits.
 //!
 //! Vivification: for a clause `C = (l1 ... lk)`, assume `¬l1, ¬l2, ...` in
 //! order with unit propagation. If a conflict arises after assuming `i < k`
@@ -24,14 +26,35 @@ use crate::engine::{Engine, EngineConfig};
 use crate::value::WeightTable;
 use num_bigint::BigUint;
 
+/// Which variables definability elimination (G) may remove.
+///
+/// G is count-preserving but not model-preserving: it resolves a defined
+/// variable away and pins it true. That keeps the count of a track only for
+/// the variables the caller admits here (AY-OTHER-3):
+/// * unweighted, unprojected: every variable;
+/// * weighted, unprojected: a variable whose two literals carry the same
+///   weight (1 when undeclared; complex weights compared exactly);
+/// * projected (weighted or not): a variable outside the projection set
+///   whose two literals also carry the same weight. The caller passes
+///   [`Elimination::Off`] here unless the projected run asked for it
+///   (`SolveOptions::projected_definability_elimination`), because its speed
+///   on the projected tracks has not been measured.
+#[derive(Clone, Copy, Debug)]
+pub enum Elimination<'a> {
+    /// G does not run (projected instances by default).
+    Off,
+    /// Every variable may be eliminated (unweighted, unprojected counting).
+    AllVariables,
+    /// Variable `v` (1-based) may be eliminated iff `mask[v - 1]` is true;
+    /// a variable beyond the mask's end may not.
+    Variables(&'a [bool]),
+}
+
 /// Preprocessing options (track gates + budgets).
-#[derive(Clone, Copy)]
-pub struct PrepOptions {
-    /// Weighted semantics (wmc/pwmc/amc): disables G (definability
-    /// elimination changes weighted counts).
-    pub weighted: bool,
-    /// A (partial) projection set is present: disables G in v1.
-    pub projected: bool,
+#[derive(Clone, Copy, Debug)]
+pub struct PrepOptions<'a> {
+    /// The variables definability elimination may remove.
+    pub elimination: Elimination<'a>,
 }
 
 /// Result of preprocessing.
@@ -62,8 +85,14 @@ pub struct Prepped {
 const VIVIFY_ASSIGN_BUDGET: u64 = 20_000_000;
 const MAX_ROUNDS: u32 = 8;
 
-/// Preprocess a formula. The result is equivalent to the input.
-pub fn preprocess(num_vars: usize, clauses: &[Vec<i32>], opts: PrepOptions) -> Prepped {
+/// Preprocess a formula.
+///
+/// Every step except definability elimination keeps the model set, so the
+/// result is equivalent to the input exactly when `model_preserving` is true.
+/// When G removed variables (`pinned_defined` non-empty), the result only has
+/// the same count as the input for the track whose admitted variables
+/// `opts.elimination` names, and the same satisfiability.
+pub fn preprocess(num_vars: usize, clauses: &[Vec<i32>], opts: PrepOptions<'_>) -> Prepped {
     let mut current: Vec<Vec<i32>> = clauses.to_vec();
     let mut total_vivified = 0u64;
     let mut fixed: Vec<i32> = Vec::new();
@@ -194,7 +223,8 @@ pub fn preprocess(num_vars: usize, clauses: &[Vec<i32>], opts: PrepOptions) -> P
         }
 
         // E+G (spec: prep-lever-spec.md). E is equivalence-preserving,
-        // all tracks; G is count-preserving-only, unweighted+unprojected.
+        // all tracks; G is count-preserving-only, restricted to the
+        // variables `opts.elimination` admits for the track.
         let mut eg_changed = false;
         {
             let residual_vars: std::collections::HashSet<u32> = vivified
@@ -214,11 +244,16 @@ pub fn preprocess(num_vars: usize, clauses: &[Vec<i32>], opts: PrepOptions) -> P
                     }
                     e_budget = e_budget.saturating_sub(t0.elapsed());
                 }
-                if !opts.weighted && !opts.projected && !g_budget.is_zero() {
+                let eliminable = match opts.elimination {
+                    Elimination::Off => None,
+                    Elimination::AllVariables => Some(None),
+                    Elimination::Variables(mask) => Some(Some(mask)),
+                };
+                if let Some(eliminable) = eliminable.filter(|_| !g_budget.is_zero()) {
                     let t0 = std::time::Instant::now();
-                    if let Some(g) =
-                        crate::prep_eg::eliminate_defined_simplicial(num_vars, &vivified, g_budget)
-                    {
+                    if let Some(g) = crate::prep_eg::eliminate_defined_simplicial(
+                        num_vars, &vivified, eliminable, g_budget,
+                    ) {
                         pinned_total.extend(&g.pinned);
                         vivified = g.clauses;
                         eg_changed = true;
@@ -380,8 +415,7 @@ mod tests {
                 num_vars,
                 &clauses,
                 PrepOptions {
-                    weighted: false,
-                    projected: false,
+                    elimination: Elimination::AllVariables,
                 },
             );
             let after = if prep.unsat {
@@ -431,8 +465,7 @@ mod tests {
             num_vars,
             &padded,
             PrepOptions {
-                weighted: false,
-                projected: false,
+                elimination: Elimination::AllVariables,
             },
         );
         assert!(!prep.unsat, "false UNSAT from backbone/G composition");
@@ -446,8 +479,7 @@ mod tests {
             2,
             &[vec![1], vec![-1]],
             PrepOptions {
-                weighted: false,
-                projected: false,
+                elimination: Elimination::AllVariables,
             },
         );
         assert!(prep.unsat);
@@ -464,8 +496,7 @@ mod tests {
             3,
             &clauses,
             PrepOptions {
-                weighted: false,
-                projected: false,
+                elimination: Elimination::AllVariables,
             },
         );
         let after = count(3, &prep.clauses);

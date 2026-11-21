@@ -165,6 +165,8 @@ impl Executor {
     /// After assertion-stack mutation, model/proof/core queries remain invalid
     /// until the next check-sat, matching SMT-LIB solver behavior.
     pub(super) fn invalidate_last_check_result(&mut self) {
+        self.native_proof_source_scope = None;
+        self.checked_external_proof_support.borrow_mut().take();
         self.last_result = None;
         self.last_model = None;
         self.lane_ground_model = None;

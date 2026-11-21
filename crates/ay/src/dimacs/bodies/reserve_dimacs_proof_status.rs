@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn create_dimacs_status_reservation(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
+fn create_dimacs_status_reservation(
+    proof_path: &str,
+    label: Option<&ay::proof_store::ProofSubject>,
+) -> io::Result<DimacsProofStatusReservation> {
     // An exit waits for this reservation until its custody is registered
     // (status_custody.rs), and the process-exit sweep exists before the lock.
     let _reserving = DimacsStatusReserving::enter();
@@ -18,7 +21,19 @@ fn create_dimacs_status_reservation(proof_path: &str) -> io::Result<DimacsProofS
     let proof_path = resolved_dimacs_proof_path(proof_path)?;
     let status_path = dimacs_proof_status_path_from_path(&proof_path);
     let lock_path = dimacs_proof_status_lock_path(&status_path);
-    let mut lock_descriptor = open_dimacs_status_lock(&lock_path)?;
+    let mut lock_descriptor = if label
+        .is_some_and(|subject| subject.placement == ay::proof_store::ProofPlacement::Store)
+    {
+        // The checker must see a live locked descriptor or an abandoned name,
+        // never a newly created name whose writer has not acquired its lock yet.
+        let directory = lock_path
+            .parent()
+            .ok_or_else(|| io::Error::other("missing proof slot"))?;
+        let _directory = ay::proof_store::lock_slot_directory(directory)?;
+        open_dimacs_status_lock(&lock_path)?
+    } else {
+        open_dimacs_status_lock(&lock_path)?
+    };
     let lock_identity = regular_file_identity(&lock_descriptor, &lock_path).map_err(|error| {
         dimacs_invalidation_error(
             error,
@@ -36,6 +51,14 @@ fn create_dimacs_status_reservation(proof_path: &str) -> io::Result<DimacsProofS
     };
     #[cfg(not(test))]
     let validation = regular_single_link_identity(&lock_descriptor, &lock_path);
+    // The lock, which becomes the published marker, says what it is from its
+    // creation on, as its proof does (DC-77).
+    let validation = validation.and_then(|identity| match label {
+        Some(subject) => {
+            ay::proof_store::label_at_creation(&lock_descriptor, subject).map(|()| identity)
+        }
+        None => Ok(identity),
+    });
     if let Err(error) = validation {
         return Err(status_transaction_error(
             error,
@@ -103,7 +126,7 @@ fn open_dimacs_status_lock(lock_path: &Path) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt as _;
         options.share_mode(ay_sys::windows_fs::SHARE_READ_WRITE_DELETE);
     }
-    options.open(lock_path).map_err(|error| {
+    let lock = options.open(lock_path).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -115,7 +138,15 @@ fn open_dimacs_status_lock(lock_path: &Path) -> io::Result<File> {
         } else {
             error
         }
-    })
+    })?;
+    // Held for the run's life, on this descriptor and every clone of it, and
+    // still held once the lock is renamed onto the marker: a lock or marker
+    // whose lock another process can take belongs to no live run, whatever
+    // process id it records (`ay::proof_store`'s check again). It is taken
+    // before the header is written, so a free lock with a header is one its
+    // run left. The wait is only for a check again's momentary hold.
+    lock.lock()?;
+    Ok(lock)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -158,6 +189,9 @@ fn reject_preexisting_dimacs_status(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn reserve_dimacs_proof_status_body(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
-    reject_preexisting_dimacs_status(create_dimacs_status_reservation(proof_path)?)
+fn reserve_dimacs_proof_status_body(
+    proof_path: &str,
+    label: Option<&ay::proof_store::ProofSubject>,
+) -> io::Result<DimacsProofStatusReservation> {
+    reject_preexisting_dimacs_status(create_dimacs_status_reservation(proof_path, label)?)
 }

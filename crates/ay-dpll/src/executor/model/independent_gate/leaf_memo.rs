@@ -216,6 +216,24 @@ impl IndependentModelView<'_> {
         true
     }
 
+    /// Record a read of the in-flight leaf `t` that is answered with a
+    /// trial value instead of being cut (AY-SMT-3,
+    /// [`Self::array_self_referential_fixpoint`]). The bookkeeping is a cycle
+    /// cut's: every resolution above `t`'s frame that saw the trial value is
+    /// context-dependent and is not memoized. `false` when `t` is not in
+    /// flight, in which case nothing may answer for it.
+    pub(super) fn note_trial_read(&self, t: TermId) -> bool {
+        let depth = self.leaf_stack.depth.borrow();
+        let Some(&cut) = depth.get(&t) else {
+            return false;
+        };
+        let mut frames = self.leaf_stack.frames.borrow_mut();
+        if let Some(top) = frames.last_mut() {
+            top.low = top.low.min(cut);
+        }
+        true
+    }
+
     /// Leave the resolution of `t` entered by [`Self::enter_leaf`], which
     /// returned `result`. With `memoize`, the result is kept when no cycle cut
     /// inside it hit a frame that was in flight before it started.

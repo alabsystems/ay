@@ -5557,8 +5557,9 @@ impl Executor {
     /// instead of returning Unknown. The original assertion set is restored on
     /// every path so incremental callers keep seeing the same formulas. A
     /// definitive UNSAT, its terminal missing-artifact downgrade, or an error
-    /// is adopted. Only `None` restores the predecessor model/capabilities and
-    /// permits the caller to continue through existing SAT-side gates.
+    /// is adopted. A checked full-domain replacement model can be kept only
+    /// if its grant remains current after restoring the exact authored
+    /// query. Otherwise `None` restores the predecessor model/capabilities.
     fn try_skipped_quantifier_mbqi_refinement(
         &mut self,
         pre_restore_assertions: &[TermId],
@@ -5612,6 +5613,18 @@ impl Executor {
         self.incr_bv_state = saved_bv_state;
 
         match refinement_result {
+            Some(Ok(SolveResult::Sat))
+                if self.restored_refinement_sat_model_is_current()
+                    && !self.should_abort_theory_loop() =>
+            {
+                // The producer checked the full authored window, even while
+                // refinement used a temporary ground stack. Keep its sealed
+                // model and grant together for the unchanged SAT gates.
+                if ay_core::misc_cli_flags().debug_cert {
+                    eprintln!("CERT/restored-refinement: adopted checked replacement model");
+                }
+                Some(Ok(SolveResult::Sat))
+            }
             Some(Ok(SolveResult::Unsat(_))) => {
                 // The probe made a public semantic decision. Discard both its
                 // disposable authority and the predecessor's parked grants;
@@ -9029,6 +9042,9 @@ impl Executor {
         probe.ctx = ctx;
         probe.random_seed = self.random_seed;
         probe.qlra_lane.nested_inert = true;
+        // The caller reads the probe's `unknown` and goes on: a NIA solve in
+        // it must not spend the probe's whole budget (AY-SMT-5).
+        probe.nia_persist_forbidden = true;
         probe.set_verification_level(self.verification_level());
         probe.set_self_check(self.self_check());
         probe.set_learned_clause_limit(self.learned_clause_limit());

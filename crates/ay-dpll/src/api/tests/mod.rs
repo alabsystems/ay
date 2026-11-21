@@ -5,6 +5,16 @@
 // Tests use the deprecated panicking convenience API; migration tracked in ay#6183.
 #![allow(deprecated)]
 
+/// Reuse the pinned whole-document checker and its invalid-empty-reflexivity
+/// control across crate-internal source-candidate regressions.
+pub(crate) fn check_paired_document_for_test(problem: &str, proof: &str) {
+    test_native_datatype_batch::check_whole_paired_document(
+        problem,
+        proof,
+        &crate::api::CarcaraSurface::Supported,
+    );
+}
+
 mod test_abduction;
 mod test_annotated_core;
 mod test_api_health;
@@ -39,13 +49,23 @@ mod test_native_assertion_source;
 mod test_native_assertion_source_binders;
 mod test_native_assertion_source_elaborated;
 mod test_native_bv_assumption_proofs;
+mod test_native_datatype_batch;
+mod test_native_opaque_sort;
+mod test_native_owned_constant;
+mod test_native_owned_function;
+mod test_native_owned_function_bounded;
 mod test_native_replay;
 mod test_native_replay_identity_scope;
 mod test_native_replay_qf_ufbvlia;
+mod test_native_replay_transport;
+mod test_native_seq_empty;
+mod test_native_sequence_operations;
 mod test_overloaded_ctor_model;
+mod test_periodic_int_array_model;
 mod test_proof_access;
 mod test_proof_artifact;
 mod test_query_dump;
+mod test_seq_owned_datatype;
 mod test_solver_scope;
 mod test_solving_assumptions;
 mod test_solving_controls;
@@ -59,5 +79,12 @@ mod test_try_check_sat;
 mod test_type_logic;
 mod test_type_model_value;
 mod test_unsat_core;
+mod test_verification_consumer_conditional_mutref;
 mod test_verification_consumer_popcount_reducer;
+mod test_verification_consumer_scaled_relational_exit;
 mod test_verification_consumer_seq_carrier;
+
+mod test_verification_consumer_nullary_constructor;
+mod test_verification_consumer_proportional_equality;
+
+mod test_native_sort_inspection;

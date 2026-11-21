@@ -341,6 +341,10 @@ pub(super) struct IndependentModelView<'a> {
     // Real source validation belongs to this immutable view, not each field
     // debit and not a cross-view pointer/length cache.
     construction_source_valid: OnceCell<bool>,
+    /// Successful full symbolic-source checks are functions of these two
+    /// immutable borrows. Never shared with another view or model/source.
+    /// Every use still pays its original owner and original/current stop.
+    symbolic_source_checked: Cell<bool>,
     /// One bounded datatype-schema snapshot and per-sort fragment memo for all
     /// rendered cells parsed by this fixed gate view.
     datatype_guard: Rc<OnceCell<super::rendered_dt_guard::RenderedDatatypeGuard>>,
@@ -381,6 +385,22 @@ pub(super) struct IndependentModelView<'a> {
     /// conditions (bool/bv discriminators, independent of array defs) evaluate
     /// without recursing back into a half-built index.
     building_index: Cell<bool>,
+    /// Memo of [`Self::term_is_array_dt_free`] (#gate-dt-free-dag). `true`
+    /// for every term whose whole sub-DAG was walked and found free of
+    /// array/datatype-sorted subterms, `false` for a queried term whose
+    /// sub-DAG holds one. The answer is a fact about the term's structure and
+    /// sorts alone (never the model, never a budget), so a cached entry is
+    /// exactly what a fresh walk would compute. Without it the walk followed
+    /// every PATH of a shared definition DAG: the first query of the SMT-COMP
+    /// incremental QF_UFLRA benchmark 27a0035f (14,444 nested Boolean
+    /// `define-fun`s, 2,523 distinct terms, about 9.4e17 paths) spent the
+    /// whole time limit here after the search had already found a model.
+    array_dt_free_memo: RefCell<HashMap<TermId, bool>>,
+    /// Trial values of array leaves whose only asserted definition reads the
+    /// leaf itself, while [`Self::array_self_referential_fixpoint`] checks
+    /// them (AY-SMT-3). A read of a seeded leaf is bookkept as a cycle cut, so
+    /// no resolution that saw a trial value is memoized.
+    array_seeds: RefCell<HashMap<TermId, ModelValue>>,
     /// Memo of the PUBLISHED total UF interpretation per function identity
     /// (#g3-gate-reads-printed-uf, perf-only). Deriving it re-resolves every
     /// `@?N` placeholder in the whole function table, so without this memo an
@@ -402,6 +422,29 @@ pub(super) struct IndependentModelView<'a> {
     /// How this view reads applications of declared functions; see
     /// [`UfReadPolicy`].
     uf_reads: UfReadPolicy,
+}
+
+/// One node's outcome in [`IndependentModelView::term_is_array_dt_free`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DtFreeNode {
+    /// Its own sort is neither an array nor a datatype.
+    Free,
+    /// Its own sort is an array or a datatype.
+    Structured,
+    /// The recovery budget refused the visit.
+    Refused,
+}
+
+/// Whether the gate's definition-index walks run inside a private recovery
+/// transaction (#gate-dt-free-dag, AY-SMT-3). There they keep their original
+/// per-path walks and payments, so a recovery transaction admits, refuses and
+/// indexes exactly as before. Elsewhere they walk a shared DAG once per
+/// distinct term: with no native evaluation-copy owner every payment is a
+/// no-op and each answer equals the old walk's; with one, the walk pays one
+/// unit per distinct term (never more than the per-path walk paid), and a
+/// refusal still answers the fail-closed `false`.
+fn in_recovery_transaction() -> bool {
+    super::recovery_admission::RecoveryAdmission::current().is_some()
 }
 
 /// How an [`IndependentModelView`] reads an application of a declared
@@ -877,20 +920,76 @@ impl IndependentModelView<'_> {
 }
 
 impl ModelView for IndependentModelView<'_> {
-    fn has_evaluation_admission(&self) -> bool {
-        super::evaluation_copies::active()
-            || super::recovery_admission::RecoveryAdmission::current_for(self.exec).is_some()
+    fn symbolic_function(
+        &self,
+        term: TermId,
+    ) -> std::result::Result<Option<ay_model_check::SymbolicFunctionView<'_>>, String> {
+        let TermData::App(symbol, _) = self.exec.ctx.terms.get(term) else {
+            return Ok(None);
+        };
+        let package = &self.model.certified_total_ufs.symbolic;
+        if package.is_empty() {
+            return Ok(None);
+        }
+        let work = package
+            .head_lookup_work(symbol.name().len())
+            .ok_or_else(|| "symbolic function lookup accounting overflow".to_owned())?;
+        self.admit_evaluation_work(work, 0)?;
+        let Some(definition) = package.definition(symbol) else {
+            return Ok(None);
+        };
+        if !self.symbolic_source_checked.get() {
+            self.admit_evaluation_work(package.lookup_work(), 0)?;
+            if !package.is_current(self.exec) {
+                return Err("symbolic function source identity is stale".to_owned());
+            }
+            self.symbolic_source_checked.set(true);
+        }
+        Ok(Some(ay_model_check::SymbolicFunctionView {
+            symbol: definition.binding.symbol(),
+            parameters: &definition.parameters,
+            body: definition.body,
+        }))
     }
 
-    fn admit_evaluation_work(&self, work: usize, bytes: usize) -> Result<(), String> {
+    fn has_evaluation_admission(&self) -> bool {
+        super::evaluation_copies::active()
+            || !self.model.certified_total_ufs.symbolic.is_empty()
+            || super::recovery_admission::RecoveryAdmission::current_for(self.exec)
+                .or_else(|| {
+                    super::recovery_admission::RecoveryAdmission::current_for_append_only(self.exec)
+                })
+                .is_some()
+    }
+
+    fn admit_evaluation_work(&self, work: usize, bytes: usize) -> std::result::Result<(), String> {
+        if !self.model.certified_total_ufs.symbolic.is_empty() {
+            let admitted = super::evaluation_copies::validate(self.exec)
+                && super::evaluation_copies::pay(work, bytes)
+                && self
+                    .model
+                    .certified_total_ufs
+                    .symbolic
+                    .pay_for(self.exec, work, bytes)
+                && super::evaluation_copies::validate(self.exec);
+            return admitted.then_some(()).ok_or_else(|| {
+                format!(
+                    "retained symbolic model admission refused: {:?}",
+                    self.model.certified_total_ufs.symbolic.refusal()
+                )
+            });
+        }
         super::recovery_admission::pay_for(self.exec, work, bytes)
             .then_some(())
             .ok_or_else(|| "private model recovery admission refused".to_string())
     }
 
     fn refuse_evaluation_work(&self, _reason: &str) {
+        self.model.certified_total_ufs.symbolic.refuse();
         if let Some(admission) =
-            super::recovery_admission::RecoveryAdmission::current_for(self.exec)
+            super::recovery_admission::RecoveryAdmission::current_for(self.exec).or_else(|| {
+                super::recovery_admission::RecoveryAdmission::current_for_append_only(self.exec)
+            })
         {
             admission.refuse();
         }
@@ -1239,6 +1338,10 @@ impl ModelView for IndependentModelView<'_> {
                 self.exec.ctx.terms.sort(*left) == &Sort::Int
                     && self.exec.ctx.terms.sort(*right) == &Sort::Int
             }
+            (ProvenUnconstrainedKind::SeqNthOutOfBounds, "seq.nth", [sequence, index], result) => {
+                matches!(self.exec.ctx.terms.sort(*sequence), Sort::Seq(element) if element.as_ref() == result)
+                    && self.exec.ctx.terms.sort(*index) == &Sort::Int
+            }
             _ => false,
         };
         exact_shape
@@ -1518,12 +1621,15 @@ impl<'a> IndependentModelView<'a> {
             _constant_array_read: array_read,
             _field_read: field_read,
             construction_source_valid: OnceCell::new(),
+            symbolic_source_checked: Cell::new(false),
             datatype_guard: caches.datatype_guard,
             exact_datatype_cells: caches.exact_datatype_cells,
             leaf_stack: leaf_memo::LeafStack::new(&caches.leaf_memo),
             leaf_memo: caches.leaf_memo,
             def_index: caches.def_index,
             building_index: Cell::new(false),
+            array_dt_free_memo: RefCell::new(HashMap::new()),
+            array_seeds: RefCell::new(HashMap::new()),
             printed_uf_tables: RefCell::new(HashMap::new()),
             printed_over_pin: RefCell::new(None),
             uf_reads: UfReadPolicy::Gate,
@@ -2289,8 +2395,9 @@ impl IndependentModelView<'_> {
         let roots = independent_gate_query_roots(self.exec)?;
         self.building_index.set(true);
         let mut map: HashMap<TermId, Vec<TermId>> = HashMap::new();
+        let mut seen: HashMap<TermId, u32> = HashMap::new();
         for assertion in roots {
-            self.index_walk(assertion, 32, &mut map);
+            self.index_walk(assertion, 32, &mut map, &mut seen);
         }
         self.building_index.set(false);
         super::construction_owner::pay_metadata(self.exec, 0, 0)?;
@@ -2309,13 +2416,38 @@ impl IndependentModelView<'_> {
     /// Record every array/datatype equality reachable from `cand` along an
     /// unconditionally-asserted path into `map` (both directions). See
     /// [`Self::ensure_def_index`] for the soundness argument.
-    fn index_walk(&self, cand: TermId, depth: u32, map: &mut HashMap<TermId, Vec<TermId>>) {
-        if depth == 0
-            || !super::recovery_admission::pay_current(
-                1,
-                2 * size_of::<(TermId, Vec<TermId>)>() + 2 * size_of::<TermId>(),
-            )
-        {
+    ///
+    /// `seen` holds, per term, the largest remaining depth it was walked with
+    /// (#gate-dt-free-dag, AY-SMT-3). Outside a recovery transaction, a term
+    /// reached again with no more depth left than before is not walked again:
+    /// that walk would evaluate the same conditions under the same fixed
+    /// model and append only partners the first walk already appended, in
+    /// the same order, so every consumer (which takes the first partner that
+    /// evaluates) sees the same list up to repeated copies. Without it a
+    /// Boolean definition DAG whose `and`s share a sub-definition is walked
+    /// once per PATH down to depth 32 (2^32 visits). Inside a recovery
+    /// transaction the walk is the original one, so its payments and
+    /// refusals there are unchanged.
+    fn index_walk(
+        &self,
+        cand: TermId,
+        depth: u32,
+        map: &mut HashMap<TermId, Vec<TermId>>,
+        seen: &mut HashMap<TermId, u32>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        if !in_recovery_transaction() {
+            if seen.get(&cand).is_some_and(|&walked| walked >= depth) {
+                return;
+            }
+            seen.insert(cand, depth);
+        }
+        if !super::recovery_admission::pay_current(
+            1,
+            2 * size_of::<(TermId, Vec<TermId>)>() + 2 * size_of::<TermId>(),
+        ) {
             return;
         }
         if let TermData::App(_, args) = self.exec.ctx.terms.get(cand) {
@@ -2378,7 +2510,7 @@ impl IndependentModelView<'_> {
             TermData::App(sym, args) if sym.name() == "and" => {
                 let args = args.clone();
                 for c in args {
-                    self.index_walk(c, depth - 1, map);
+                    self.index_walk(c, depth - 1, map, seen);
                 }
             }
             // Model-selected branch of a conditional: the asserted branch.
@@ -2387,14 +2519,14 @@ impl IndependentModelView<'_> {
             {
                 if let Some(b) = self.eval_bool_cond(args[0]) {
                     let branch = if b { args[1] } else { args[2] };
-                    self.index_walk(branch, depth - 1, map);
+                    self.index_walk(branch, depth - 1, map, seen);
                 }
             }
             TermData::Ite(c, then_b, else_b) => {
                 let (c, then_b, else_b) = (*c, *then_b, *else_b);
                 if let Some(b) = self.eval_bool_cond(c) {
                     let branch = if b { then_b } else { else_b };
-                    self.index_walk(branch, depth - 1, map);
+                    self.index_walk(branch, depth - 1, map, seen);
                 }
             }
             // Model-entailed disjunct of an asserted `or`. The `or` holds, so if
@@ -2436,7 +2568,7 @@ impl IndependentModelView<'_> {
                 }
                 if unique {
                     if let Some(d) = survivor {
-                        self.index_walk(d, depth - 1, map);
+                        self.index_walk(d, depth - 1, map, seen);
                     }
                 }
             }
@@ -2446,12 +2578,98 @@ impl IndependentModelView<'_> {
 
     /// Whether `term` contains NO array-sorted or datatype-sorted subterm (so its
     /// value is a fact about pinned bool/bv/int/real leaves that no
-    /// array/datatype reconstruction can flip). Short-circuits on the first
-    /// array/datatype subterm found. Used by the `or`-entailment rule in
-    /// [`Self::index_walk`] to decide which disjuncts are AUTHORITATIVELY false.
+    /// array/datatype reconstruction can flip). Used by the `or`-entailment
+    /// rule in [`Self::index_walk`] to decide which disjuncts are
+    /// AUTHORITATIVELY false.
+    ///
+    /// Two regimes (#gate-dt-free-dag, AY-SMT-3):
+    ///
+    /// - Inside a recovery transaction (see [`in_recovery_transaction`]) it is
+    ///   the original per-PATH walk, paying per visit exactly as before, with
+    ///   no memo read or written. That budget is small and does refuse, and a
+    ///   refusal answers `false`; keeping the old walk there keeps every
+    ///   answer of a recovery transaction (and so the survivor
+    ///   [`Self::index_walk`] picks) identical to before.
+    /// - Elsewhere the answer is a fact about the term's structure and sorts
+    ///   alone. It walks the sub-DAG once per distinct term, post-order,
+    ///   paying one unit per term it expands, and memoizes `true` or `false`
+    ///   for every term it finishes (each such entry is a complete structural
+    ///   fact). A refused payment answers the fail-closed `false`. The old
+    ///   path walk followed all ~9.4e17 paths of the first query of SMT-COMP
+    ///   incremental QF_UFLRA 27a0035f and never finished.
     fn term_is_array_dt_free(&self, term: TermId) -> bool {
+        if in_recovery_transaction() {
+            return self.term_is_array_dt_free_paid(term);
+        }
+        if let Some(&known) = self.array_dt_free_memo.borrow().get(&term) {
+            return known;
+        }
+        // (term, children pushed). Terms are hash-consed and acyclic, so a
+        // term is finished before any second copy of it is popped.
+        let mut stack: Vec<(TermId, bool)> = vec![(term, false)];
+        while let Some((t, expanded)) = stack.pop() {
+            if self.array_dt_free_memo.borrow().contains_key(&t) {
+                continue;
+            }
+            if expanded {
+                let free = {
+                    let memo = self.array_dt_free_memo.borrow();
+                    self.exec
+                        .ctx
+                        .terms
+                        .children(t)
+                        .iter()
+                        .all(|c| memo.get(c) == Some(&true))
+                };
+                self.array_dt_free_memo.borrow_mut().insert(t, free);
+                continue;
+            }
+            if !super::recovery_admission::pay_current(1, 0) {
+                return false;
+            }
+            if self.term_sort_is_array_or_dt(t) {
+                self.array_dt_free_memo.borrow_mut().insert(t, false);
+                continue;
+            }
+            stack.push((t, true));
+            let children = self.exec.ctx.terms.children(t);
+            let memo = self.array_dt_free_memo.borrow();
+            stack.extend(
+                children
+                    .into_iter()
+                    .filter(|c| !memo.contains_key(c))
+                    .map(|c| (c, false)),
+            );
+        }
+        self.array_dt_free_memo.borrow().get(&term) == Some(&true)
+    }
+
+    fn term_sort_is_array_or_dt(&self, term: TermId) -> bool {
+        let sort = self.exec.ctx.terms.sort(term);
+        matches!(sort, Sort::Array(_)) || self.exec.datatype_sort_name(sort).is_some()
+    }
+
+    /// The budgeted regime of [`Self::term_is_array_dt_free`]: the original
+    /// per-path walk, unchanged. Short-circuits on the first array/datatype
+    /// subterm; a refused budget answers `false` (fail closed).
+    fn term_is_array_dt_free_paid(&self, term: TermId) -> bool {
+        match self.array_dt_free_node(term) {
+            DtFreeNode::Refused | DtFreeNode::Structured => false,
+            DtFreeNode::Free => self
+                .exec
+                .ctx
+                .terms
+                .children(term)
+                .into_iter()
+                .all(|child| self.term_is_array_dt_free_paid(child)),
+        }
+    }
+
+    /// One node of [`Self::term_is_array_dt_free_paid`]: pay for it (and,
+    /// inside a recovery transaction, for its children) and test its own sort.
+    fn array_dt_free_node(&self, term: TermId) -> DtFreeNode {
         if !super::recovery_admission::pay_current(1, 0) {
-            return false;
+            return DtFreeNode::Refused;
         }
         if super::recovery_admission::RecoveryAdmission::current().is_some() {
             let children = match self.exec.ctx.terms.get(term) {
@@ -2461,26 +2679,20 @@ impl IndependentModelView<'_> {
                 TermData::Const(_) | TermData::Var(_, _) => 0,
                 _ => {
                     super::recovery_admission::refuse_current();
-                    return false;
+                    return DtFreeNode::Refused;
                 }
             };
             if !super::recovery_admission::pay_current(
                 children,
                 children.saturating_mul(size_of::<TermId>()),
             ) {
-                return false;
+                return DtFreeNode::Refused;
             }
         }
-        let sort = self.exec.ctx.terms.sort(term);
-        if matches!(sort, Sort::Array(_)) || self.exec.datatype_sort_name(sort).is_some() {
-            return false;
+        if self.term_sort_is_array_or_dt(term) {
+            return DtFreeNode::Structured;
         }
-        for child in self.exec.ctx.terms.children(term) {
-            if !self.term_is_array_dt_free(child) {
-                return false;
-            }
-        }
-        true
+        DtFreeNode::Free
     }
 
     /// Evaluate a Boolean condition under the model with the gate's own evaluator.
@@ -12351,6 +12563,172 @@ mod tests {
             outputs[0], "unsat",
             "contradictory reads through an asserted-equal array class must \
              stay unsat"
+        );
+    }
+
+    /// `(and t t)` stacked `depth` times over `leaf`: `depth + 1` distinct
+    /// terms and 2^depth root-to-leaf paths.
+    fn doubling_and_dag(exec: &mut Executor, leaf: TermId, depth: usize) -> TermId {
+        let mut root = leaf;
+        for _ in 0..depth {
+            root = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("and"), vec![root, root], Sort::Bool);
+        }
+        root
+    }
+
+    /// #gate-dt-free-dag (AY-SMT-3): with no resource budget active, the
+    /// array/datatype-free test walks each distinct term of a shared DAG
+    /// once. The old walk followed every path: on the 65-term, 2^64-path DAG
+    /// below it never returns (the def-index build of SMT-COMP incremental
+    /// QF_UFLRA 27a0035f, about 9.4e17 paths, spent its whole time limit
+    /// there). Under a recovery budget the original per-path walk is kept on
+    /// purpose, so a budgeted gate run answers exactly as before: 1,024 work
+    /// units run out on the paths and the answer is the fail-closed `false`,
+    /// with nothing memoized.
+    #[test]
+    #[ntest::timeout(60_000)]
+    fn array_dt_free_walk_visits_each_shared_term_once() {
+        use super::super::recovery_admission::RecoveryScope;
+        let mut exec = Executor::new();
+        let leaf = exec.ctx.terms.mk_var("dt_free_leaf", Sort::Bool);
+        let root = doubling_and_dag(&mut exec, leaf, 64);
+        let model = Model::empty();
+        let view = IndependentModelView::new(&exec, &model);
+        {
+            let _scope =
+                RecoveryScope::enter(&exec, 1024, usize::MAX).expect("a fresh recovery scope");
+            assert!(
+                !view.term_is_array_dt_free(root),
+                "under a budget the walk is the original per-path one, which runs out"
+            );
+        }
+        assert!(
+            view.array_dt_free_memo.borrow().is_empty(),
+            "the budgeted walk neither reads nor writes the memo"
+        );
+        assert!(view.term_is_array_dt_free(root));
+        assert_eq!(view.array_dt_free_memo.borrow().get(&root), Some(&true));
+        assert_eq!(view.array_dt_free_memo.borrow().get(&leaf), Some(&true));
+        assert_eq!(view.array_dt_free_memo.borrow().len(), 65);
+        // A memoized answer is the walk's answer.
+        assert!(view.term_is_array_dt_free(root));
+    }
+
+    /// The DAG walk still finds an array-sorted subterm under the shared
+    /// structure and memoizes `false` for every term above it, and the
+    /// budgeted walk still answers the fail-closed `false` when its budget
+    /// refuses (#gate-dt-free-dag).
+    #[test]
+    #[ntest::timeout(60_000)]
+    fn array_dt_free_walk_finds_array_below_a_shared_dag_and_fails_closed() {
+        use super::super::recovery_admission::RecoveryScope;
+        let mut exec = Executor::new();
+        let arr = exec
+            .ctx
+            .terms
+            .mk_var("dt_free_arr", Sort::array(Sort::Int, Sort::Int));
+        let index = exec.ctx.terms.mk_var("dt_free_i", Sort::Int);
+        let read = exec.ctx.terms.mk_select(arr, index);
+        let is_index = exec.ctx.terms.mk_eq(read, index);
+        let root = doubling_and_dag(&mut exec, is_index, 64);
+        let leaf = exec.ctx.terms.mk_var("dt_free_refused_leaf", Sort::Bool);
+        let free_root = doubling_and_dag(&mut exec, leaf, 64);
+        let model = Model::empty();
+        {
+            let view = IndependentModelView::new(&exec, &model);
+            assert!(!view.term_is_array_dt_free(root));
+            assert_eq!(view.array_dt_free_memo.borrow().get(&root), Some(&false));
+            assert_eq!(
+                view.array_dt_free_memo.borrow().get(&is_index),
+                Some(&false)
+            );
+            assert_eq!(view.array_dt_free_memo.borrow().get(&index), Some(&true));
+            assert!(!view.term_is_array_dt_free(root));
+            assert!(view.term_is_array_dt_free(free_root));
+        }
+        let view = IndependentModelView::new(&exec, &model);
+        {
+            let _scope =
+                RecoveryScope::enter(&exec, 8, usize::MAX).expect("a fresh recovery scope");
+            assert!(
+                !view.term_is_array_dt_free(free_root),
+                "a refused budget must answer the fail-closed `false`"
+            );
+        }
+        assert!(
+            view.array_dt_free_memo.borrow().is_empty(),
+            "a refused walk memoizes nothing"
+        );
+        assert!(view.term_is_array_dt_free(free_root));
+    }
+
+    /// `(and (or false t) (or false t))` stacked `depth` times over `leaf`:
+    /// each `or` has the unique survivor `t`, so [`IndependentModelView::index_walk`]
+    /// descends both conjuncts into the same shared `t` at every level.
+    fn doubling_entailed_or_dag(exec: &mut Executor, leaf: TermId, depth: usize) -> TermId {
+        let false_term = exec.ctx.terms.false_term();
+        let mut root = leaf;
+        for _ in 0..depth {
+            let left =
+                exec.ctx
+                    .terms
+                    .mk_app(Symbol::named("or"), vec![false_term, root], Sort::Bool);
+            let right =
+                exec.ctx
+                    .terms
+                    .mk_app(Symbol::named("or"), vec![root, false_term], Sort::Bool);
+            root = exec
+                .ctx
+                .terms
+                .mk_app(Symbol::named("and"), vec![left, right], Sort::Bool);
+        }
+        root
+    }
+
+    /// #gate-dt-free-dag (AY-SMT-3): the definition index walks a shared
+    /// sub-definition once per remaining depth, not once per path. With 15
+    /// doubling levels the array definition at the bottom is reached along
+    /// 2^15 paths; the old walk appended its partner 32,768 times, the new
+    /// one once. With 64 levels the old walk made 2^32 visits (depth bound
+    /// 32) and did not finish; the new one does.
+    #[test]
+    #[ntest::timeout(60_000)]
+    fn def_index_walks_a_shared_entailed_definition_once() {
+        let mut exec = Executor::new();
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let constant = exec.ctx.terms.mk_const_array(Sort::Int, zero);
+        let array_leaf = exec
+            .ctx
+            .terms
+            .mk_var("dag_indexed_array", Sort::array(Sort::Int, Sort::Int));
+        let definition = exec.ctx.terms.mk_eq(array_leaf, constant);
+        let shallow = doubling_entailed_or_dag(&mut exec, definition, 15);
+        exec.independent_gate_authored_assertions = Some(vec![shallow]);
+        let model = Model::empty();
+        {
+            let view = IndependentModelView::new(&exec, &model);
+            view.ensure_def_index().expect("index builds");
+            let index = view.def_index.borrow();
+            let map = index.as_ref().expect("index memoized");
+            assert_eq!(
+                map.get(&array_leaf),
+                Some(&vec![constant]),
+                "the entailed definition is recorded once, not once per path"
+            );
+        }
+        let deep = doubling_entailed_or_dag(&mut exec, definition, 64);
+        exec.independent_gate_authored_assertions = Some(vec![deep]);
+        let view = IndependentModelView::new(&exec, &model);
+        view.ensure_def_index().expect("index builds");
+        assert!(
+            view.def_index
+                .borrow()
+                .as_ref()
+                .is_some_and(|map| !map.contains_key(&array_leaf)),
+            "64 levels lie beyond the depth bound of 32, so nothing is recorded"
         );
     }
 

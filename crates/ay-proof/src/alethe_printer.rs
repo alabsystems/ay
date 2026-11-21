@@ -8,6 +8,7 @@
 
 mod aci_simp_step;
 mod arith_disequality_split;
+pub use arith_disequality_split::arith_disequality_split_lowering_supported;
 mod authored_assume;
 #[cfg(test)]
 #[path = "alethe_printer_authored_assume_tests.rs"]
@@ -35,6 +36,14 @@ pub use dt_project::dt_project_lowering_supported;
 mod emission_progress;
 #[path = "alethe_printer_eq_congruent.rs"]
 mod eq_congruent;
+mod unary_congruence;
+pub use unary_congruence::checked_unary_congruence_lowering_supported;
+mod lia_equality_chain;
+pub use lia_equality_chain::checked_lia_equality_chain_lowering_supported;
+mod affine_equality_cycle;
+pub use affine_equality_cycle::checked_affine_equality_cycle_lowering_supported;
+mod proportional_equality;
+pub use proportional_equality::arith_proportional_equality_lowering_supported;
 #[path = "alethe_printer_eq_congruent_pred.rs"]
 mod eq_congruent_pred;
 #[path = "alethe_printer_eq_transitive.rs"]
@@ -62,6 +71,7 @@ mod let_assume_confinement;
 mod let_substitution;
 mod mul_overflow_cert;
 mod negated_exists;
+pub use negated_exists::qnt_neg_exists_step_lowering_supported;
 mod urem_bound;
 pub use mul_overflow_cert::{
     mul_overflow_division_lowering_supported, recognize_mul_overflow_division,
@@ -665,6 +675,9 @@ pub(crate) struct AlethePrinter<'a> {
     assume_printed: std::cell::RefCell<HashMap<ProofId, String>>,
     /// Accumulated rendering work; see [`AlethePrintError::EmissionBudgetExhausted`].
     work: std::cell::Cell<u64>,
+    /// A bounded copy cannot reuse admission after its rendering channel
+    /// disappears or changes size during a callback. Discard that document.
+    rendering_channel_refused: std::cell::Cell<bool>,
     /// Optional cap on `work` (#A2b, synthesized-default emission only).
     work_budget: Option<u64>,
     /// How assembled renderings are built; see [`AssembledRendering`].
@@ -816,6 +829,7 @@ impl<'a> AlethePrinter<'a> {
             proof_clauses: std::cell::RefCell::new(HashMap::default()),
             assume_printed: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
+            rendering_channel_refused: std::cell::Cell::new(false),
             work_budget,
             assembled_rendering: AssembledRendering::Cached,
             purpose: PrinterPurpose::Emission,
@@ -2860,7 +2874,8 @@ impl<'a> AlethePrinter<'a> {
     /// Under a renderability check, also once the check or any printer built
     /// within it has run out ([`check_budget`]).
     pub(crate) fn work_budget_exhausted(&self) -> bool {
-        !self.emission_progress.poll()
+        self.rendering_channel_refused.get()
+            || !self.emission_progress.poll()
             || self.work_budget.is_some_and(|b| self.work.get() > b)
             || self
                 .check_budget()
@@ -4014,7 +4029,21 @@ impl<'a> AlethePrinter<'a> {
         if let Some(text) = complement {
             return Ok(text);
         }
+        // This derivation re-proves the entire clause from checked primitives;
+        // it neither consumes nor reorders an existing Farkas annotation.
         if let Some(text) = self.format_arith_disequality_split(id, kind, clause) {
+            return Ok(text);
+        }
+        if let Some(text) = self.format_arith_proportional_equality(id, kind, clause) {
+            return Ok(text);
+        }
+        if let Some(text) = self.format_checked_unary_congruence(id, kind, clause) {
+            return Ok(text);
+        }
+        if let Some(text) = self.format_checked_lia_equality_chain(id, kind, clause) {
+            return Ok(text);
+        }
+        if let Some(text) = self.format_affine_equality_cycle(id, kind, clause) {
             return Ok(text);
         }
         // A render inside a solve does not lower again what that solve's
@@ -4104,6 +4133,9 @@ impl<'a> AlethePrinter<'a> {
             });
         }
         if kind.alethe_rule() == "eq_congruent" {
+            if let Some(text) = self.format_native_tester_eq_congruent(id, clause, &[], &[]) {
+                return Ok(text);
+            }
             match self.surface_eq_congruent_bridge(id, clause, &[], &[]) {
                 Ok(Some(text)) => return Ok(text),
                 Ok(None) => {}
@@ -6968,6 +7000,9 @@ impl<'a> AlethePrinter<'a> {
             }
         }
         if matches!(rule, ay_core::AletheRule::EqCongruent) {
+            if let Some(text) = self.format_native_tester_eq_congruent(id, clause, premises, args) {
+                return Ok(text);
+            }
             match self.surface_eq_congruent_bridge(id, clause, premises, args) {
                 Ok(Some(text)) => return Ok(text),
                 Ok(None) => {}

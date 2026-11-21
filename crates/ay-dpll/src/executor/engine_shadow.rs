@@ -149,8 +149,19 @@ impl Executor {
         &mut self,
         authority: Option<super::AuthoredPlainHardQueryPermit>,
     ) -> Result<SolveResult> {
+        self.check_sat_shadowed_observed(authority, None)
+    }
+
+    pub(in crate::executor) fn check_sat_shadowed_observed(
+        &mut self,
+        authority: Option<super::AuthoredPlainHardQueryPermit>,
+        observer: Option<super::NativeProofObserver<'_>>,
+    ) -> Result<SolveResult> {
         self.engine_shadow.depth += 1;
-        let result = self.check_sat_with_authority(authority);
+        let result = match observer {
+            Some(observer) => self.check_sat_with_authority_observed(authority, Some(observer)),
+            None => self.check_sat_with_authority(authority),
+        };
         self.engine_shadow.depth = self.engine_shadow.depth.saturating_sub(1);
         result
     }

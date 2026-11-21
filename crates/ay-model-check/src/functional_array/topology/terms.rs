@@ -22,7 +22,7 @@ pub enum SnapshotTermError {
     ResourceLimit,
     #[error("snapshot term requires a complete backwards DAG")]
     InvalidTopology,
-    #[error("snapshot term admits only BV64 arrays of Bool or BV1..128")]
+    #[error("snapshot term requires BV64 Bool/BV1..128 cells or integer Bool/Int cells")]
     UnsupportedSort,
     #[error("snapshot term producer refused: {0}")]
     Producer(ControlledTermInternError),
@@ -70,13 +70,13 @@ impl SnapshotTopology<'_> {
     ///
     /// Export this topology with `topology_with_progress` under the SAME sink.
     /// All rows, ordered overrides, shared edges and even empty-range captures
-    /// are admitted before construction. Index arithmetic is unsigned BV64;
-    /// Range source indexing is `(i - lo + source_lo) mod 2^64`.
+    /// are admitted before construction. Range source indexing is unsigned
+    /// `(i - lo + source_lo) mod 2^64`. Integer periodic nodes use Euclidean mod.
     ///
     /// The sink retains the original finite work/storage/end/stop across every
     /// call and must latch typed ResourceLimit (including allocation/overflow)
     /// before retry. No grant, timer, model choice, sampled read or proof seal is
-    /// created. BRAY controlled producer interning and controlled fresh BV64
+    /// created. BRAY controlled producer interning and controlled fresh typed
     /// binders are prerequisites. Scratch drops precede the final zero poll;
     /// committed inert arena entries can remain on refusal, with no rollback or
     /// refund. Existing caller-owned topology/arena disposal remains its owner.
@@ -116,6 +116,7 @@ impl Builder<'_, '_> {
             self.admission.pay(1, 0)?;
             let id = match node.kind {
                 SnapshotKind::Finite(value) => self.finite(value, node.sort)?,
+                SnapshotKind::Periodic(values) => self.periodic(values, node.sort)?,
                 SnapshotKind::Store { base, index, value } => {
                     let base = *built.get(base).ok_or(SnapshotTermError::InvalidTopology)?;
                     self.store(base, index, value, node.sort)?
@@ -162,7 +163,10 @@ impl Builder<'_, '_> {
         value: &ModelValue,
         sort: &Sort,
     ) -> Result<TermId> {
-        let index = self.scalar(index, &Sort::bitvec(64))?;
+        let Sort::Array(array) = sort else {
+            return Err(SnapshotTermError::UnsupportedSort);
+        };
+        let index = self.scalar(index, &array.index_sort)?;
         let value = self.scalar(value, validate::element(sort)?)?;
         self.app("store", &[base, index, value], sort)
     }
@@ -172,6 +176,7 @@ impl Builder<'_, '_> {
         self.admission.pay(512, 4096)?;
         let constant = match value {
             ModelValue::Bool(value) => Constant::Bool(*value),
+            ModelValue::Int(value) => Constant::Int(value.clone()),
             ModelValue::BitVec { value, width } => Constant::BitVec {
                 value: value.clone(),
                 width: *width,
@@ -190,6 +195,28 @@ impl Builder<'_, '_> {
             }),
             &Sort::bitvec(64),
         )
+    }
+
+    fn periodic(&mut self, values: &[ModelValue], sort: &Sort) -> Result<TermId> {
+        let element = validate::element(sort)?;
+        let admission = &mut self.admission;
+        let bound = self
+            .terms
+            .try_fresh_int_binder_with_progress(&mut |work, bytes| {
+                admission.pay(work, bytes).is_ok()
+            })
+            .map_err(map_intern)?;
+        let period = self.scalar(&ModelValue::Int(BigInt::from(values.len())), &Sort::Int)?;
+        let residue = self.app("mod", &[bound, period], &Sort::Int)?;
+        let last = values.last().ok_or(SnapshotTermError::InvalidTopology)?;
+        let mut body = self.scalar(last, element)?;
+        for (index, value) in values[..values.len() - 1].iter().enumerate().rev() {
+            let index = self.scalar(&ModelValue::Int(BigInt::from(index)), &Sort::Int)?;
+            let condition = self.app("=", &[residue, index], &Sort::Bool)?;
+            let value = self.scalar(value, element)?;
+            body = self.intern(&TermData::Ite(condition, value, body), element)?;
+        }
+        self.app("lambda-array", &[bound, body], sort)
     }
 
     fn app(&mut self, name: &'static str, args: &[TermId], sort: &Sort) -> Result<TermId> {

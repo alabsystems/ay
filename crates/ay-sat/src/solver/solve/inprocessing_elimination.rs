@@ -1537,7 +1537,7 @@ mod tests {
         solver.disable_all_inprocessing();
         add_small_lrat_bve_surface(&mut solver);
         let clause_indices: Vec<usize> = solver.arena.indices().collect();
-        solver.cold.clause_ids[clause_indices[0]] = 0;
+        solver.cold.clause_ids.set(clause_indices[0], 0);
         let active_before = solver.arena.active_clause_count();
         solver.inproc_ctrl.sbva.next_conflict = 123;
         solver.inproc_ctrl.gate.next_conflict = 456;

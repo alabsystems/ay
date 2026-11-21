@@ -21,6 +21,7 @@ use ay_frontend::Context;
 
 use super::super::FiniteExpansionRecord;
 use crate::ematching::contains_quantifier;
+use crate::executor::proof::native_universal_lineage::NativeUniversalSource;
 use crate::executor::{Executor, QuantExpansionRecord};
 use crate::proof_tracker::guarded_instance::GuardedInstance;
 
@@ -66,7 +67,7 @@ impl Executor {
         expanded: TermId,
         instances: Vec<(Vec<TermId>, TermId)>,
     ) {
-        self.derive_finite_expansion(assertion_index, expanded, &instances);
+        self.derive_finite_expansion(original, assertion_index, expanded, &instances);
         self.quant_expansion_records.push(QuantExpansionRecord {
             original,
             assertion_index,
@@ -127,6 +128,7 @@ impl Executor {
     /// is all it was before; the replacement itself is unchanged either way.
     fn derive_finite_expansion(
         &mut self,
+        original: TermId,
         assertion_index: usize,
         expanded: TermId,
         instances: &[(Vec<TermId>, TermId)],
@@ -144,6 +146,24 @@ impl Executor {
             .sum();
         if recorded.saturating_add(instances.len()) > MAX_DERIVED_SOLVE_INSTANCES {
             return;
+        }
+        // Native insertions have no authored SMT Forall surface. Admit them
+        // only from the frozen full query plus positive insertion custody;
+        // the parsed/Text path below retains its existing D7 surface rules.
+        if let Some(source) = NativeUniversalSource::capture(self) {
+            if source.admits(self, original) {
+                for (values, target) in instances {
+                    let _ = self.derive_native_universal_target(&source, original, values, *target);
+                }
+                if source.is_current(self)
+                    && self.admit_native_universal_terms(&[expanded]).is_some()
+                {
+                    let _ = self
+                        .proof_tracker
+                        .add_conjunction_of_derived_units(&mut self.ctx.terms, expanded);
+                }
+                return;
+            }
         }
         let Some(provenance) = self.proof_problem_assertion_provenance.as_ref() else {
             return;

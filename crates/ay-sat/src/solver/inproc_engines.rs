@@ -173,7 +173,7 @@ impl InprocessingEngines {
         self.bce.ensure_num_vars(num_vars);
         self.cce.ensure_num_vars(num_vars);
         self.decompose_engine.ensure_num_vars(num_vars);
-        self.factor_engine.ensure_num_vars(num_vars);
+        self.factor_engine.grow_num_vars(num_vars);
         self.sbva_engine.ensure_num_vars(num_vars);
         self.transred_engine.ensure_num_vars(num_vars);
         self.htr.ensure_num_vars(num_vars);
